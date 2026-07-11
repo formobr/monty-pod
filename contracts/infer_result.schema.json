@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/infer_result.schema.json",
   "title": "InferResult — pod→CP completion envelope (POST /pod/infer-result)",
-  "description": "The payload itself was already PUT to the request's put_url; result_key is its storage key. timing.infer_s is mandatory on success — face-probe latency is a watched number.",
+  "description": "The payload itself was already PUT to the request's put_url; result_key echoes the put_url path (opaque, possibly bucket-prefixed under path-style presigning — consumers must use the key they presigned, not parse this). timing.infer_s is mandatory on success — face-probe latency is a watched number.",
   "type": "object",
   "additionalProperties": false,
   "required": ["infer_version", "job_id", "kind", "status"],

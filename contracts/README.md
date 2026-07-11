@@ -34,8 +34,10 @@ Transport conventions (frozen alongside the envelope):
   is `CP_URL` + `JOB_TOKEN` (env); the pod dials out only, nothing dials in.
 - `POST /pod/event` — free-form progress/error events (stage, status, ...).
 - `POST /pod/infer-result` — completion envelope for `kind=infer` jobs (`infer_result.schema.json`).
-- `result_key` — the presigned `put_url`'s path with the leading slash stripped; the CP resolves
-  it back to storage.
+- `result_key` — the presigned `put_url`'s path with the leading slash stripped. OPAQUE and
+  informational only: under path-style presigning the URL path starts with the bucket name, so
+  the value may be bucket-prefixed. Consumers must locate the payload by the key they presigned
+  `put_url` for — never by parsing `result_key`.
 
 ## Invariants (enforced by schema + goldens)
 
