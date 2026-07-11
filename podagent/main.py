@@ -35,6 +35,41 @@ def _env_or_exit(name: str) -> str:
     return val
 
 
+def _setup_vulkan_icd() -> None:
+    # driver's default ICD points at libGLX_nvidia (X11 front); headless pod has no X11 → loader finds no driver
+    # → libplacebo SILENTLY CPU-falls-back. libEGL_nvidia is the headless ICD; ffmpeg children inherit the env.
+    import subprocess
+    if os.environ.get("VK_ICD_FILENAMES"):
+        return
+    try:
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    lib = next((ln.split()[-1] for ln in out.splitlines() if "libEGL_nvidia.so.0" in ln), None)
+    if not lib:
+        _log("WARNING no libEGL_nvidia.so.0 — Vulkan/libplacebo will CPU-fall-back (slow, 0% GPU)")
+        return
+    icd = "/tmp/nvidia_egl_icd.json"
+    Path(icd).write_text(
+        '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"1.4.0"}}\n' % lib)
+    os.environ["VK_ICD_FILENAMES"] = icd
+    _log(f"Vulkan ICD → {lib}")
+
+
+def _log_gpu_status() -> None:
+    # LOUD at boot: we rent a GPU to compute on it, not to crawl on CPU. Surface the torch arch so a host our
+    # torch can't run shows immediately, not as a mystery-slow job.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            _log(f"GPU {torch.cuda.get_device_name(0)} sm_{cap[0]}{cap[1]} torch={torch.__version__}")
+        else:
+            _log("WARNING torch sees NO CUDA device — align will run on CPU (slow)")
+    except Exception as e:  # noqa: BLE001 — a diagnostic must never block boot
+        _log(f"WARNING GPU status check failed: {e}")
+
+
 def _run_infer(
     raw: dict[str, Any],
     cp: ControlPlane,
@@ -105,6 +140,8 @@ def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
     cp = ControlPlane(cp_url, job_token)
+    _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/head_motion run on GPU, not a silent CPU crawl
+    _log_gpu_status()
 
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
     align_cache: dict[str, "AlignService"] = {}

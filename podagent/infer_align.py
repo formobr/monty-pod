@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -28,6 +29,21 @@ class AlignService:
         self.processor = Wav2Vec2Processor.from_pretrained(model_id)
         self.model = Wav2Vec2ForCTC.from_pretrained(model_id).to(self.device).eval()
 
+    def _emit(self, seg):
+        # one window → log-softmax emission. A CUDA runtime error (e.g. an arch this torch build has no kernels
+        # for) degrades LOUDLY to CPU once — a rented GPU that can't run is a visible fault, not a silent crawl.
+        try:
+            logits = self.model(seg.to(self.device)).logits[0]
+        except RuntimeError as e:
+            if self.device == "cpu":
+                raise
+            print(f"[podagent] WARNING align CUDA failed ({str(e)[:120]}) → CPU fallback (SLOW)",
+                  file=sys.stderr, flush=True)
+            self.device = "cpu"
+            self.model = self.model.to("cpu")
+            logits = self.model(seg.to("cpu")).logits[0]
+        return self.torch.log_softmax(logits, dim=-1)
+
     def _vocab(self) -> list[str]:
         v = self.processor.tokenizer.get_vocab()
         return [tok for tok, _ in sorted(v.items(), key=lambda kv: kv[1])]
@@ -49,9 +65,8 @@ class AlignService:
             arrays: dict[str, "np.ndarray"] = {}
             with self.torch.inference_mode():
                 for i, (a, b) in enumerate((w[0], w[1]) for w in params.windows):
-                    seg = wave[:, int(a * _SR): int(b * _SR)].to(self.device)
-                    logits = self.model(seg).logits[0]
-                    emission = self.torch.log_softmax(logits, dim=-1)
+                    seg = wave[:, int(a * _SR): int(b * _SR)]
+                    emission = self._emit(seg)
                     arrays[f"emissions_{i}"] = emission.cpu().numpy().astype("float32")
 
             meta = {

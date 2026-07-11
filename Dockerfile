@@ -3,7 +3,9 @@
 #
 # Layers ordered cheap-to-expensive, code copied LAST (it churns the most,
 # everything above it is cache-stable across normal commits).
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# CUDA 12.8 base + torch cu128 = ONE universal image: sm_75..sm_120 (Ada 4090 AND Blackwell RTX 50xx). cu124
+# had no sm_120 kernels, so align crashed on 50xx hosts (NVENC is ffmpeg, arch-independent, so it kept working).
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -41,7 +43,7 @@ RUN curl -L -o /tmp/ffmpeg.tar.xz \
 
 # --- python deps: torch/torchaudio (cu124 wheel, the huge one) first, then
 # the rest ---------------------------------------------------------------
-RUN python3 -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu124 \
+RUN python3 -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 \
     # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
     && python3 -m pip install --no-cache-dir transformers opencv-python-headless numpy requests pydantic huggingface_hub soundfile
 
