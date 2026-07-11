@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/pod_job.schema.json",
+  "title": "PodJob — control-plane→pod job envelope (GET /pod/job)",
+  "description": "What the pod's long-poll returns: one unit of work, dispatched on type. request is an InferRequest (infer_request.schema.json); spec is a RenderSpec (spec.schema.json). Each carries its own version const (infer_version/spec_version) — this envelope has none, contracts/VERSION stays the single pin for both.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type"],
+  "properties": {
+    "type": { "enum": ["infer", "render"] },
+    "request": {
+      "description": "Present iff type=infer. Opaque here — validated against infer_request.schema.json.",
+      "type": "object"
+    },
+    "spec": {
+      "description": "Present iff type=render. Opaque here — validated against spec.schema.json.",
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "infer" } }, "required": ["type"] },
+      "then": { "required": ["request"], "not": { "required": ["spec"] } },
+      "else": { "required": ["spec"], "not": { "required": ["request"] } }
+    }
+  ]
+}

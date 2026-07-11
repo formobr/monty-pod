@@ -1,0 +1,18 @@
+{
+  "type": "infer",
+  "request": {
+    "infer_version": 1,
+    "job_id": "job_9f2c1a",
+    "kind": "align",
+    "model": "jonatasgrosman/wav2vec2-large-xlsr-53-russian",
+    "put_url": "https://storage.example/o/62955.npz?sig=PUT",
+    "align": {
+      "audio_url": "https://storage.example/o/92581.wav?sig=GET",
+      "windows": [
+        [0.0, 15.84],
+        [15.84, 31.2],
+        [31.2, 46.9]
+      ]
+    }
+  }
+}

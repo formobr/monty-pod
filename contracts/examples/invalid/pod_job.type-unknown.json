@@ -1,0 +1,11 @@
+{
+  "type": "upscale",
+  "request": {
+    "infer_version": 1,
+    "job_id": "j",
+    "kind": "align",
+    "model": "m",
+    "put_url": "p",
+    "align": { "audio_url": "u", "windows": [[0.0, 10.0]] }
+  }
+}

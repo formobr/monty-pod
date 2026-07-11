@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import requests
+from pydantic import ValidationError
 
 from .cp import ControlPlane
-from .models import InferRequest, InferResult, InferTiming, RenderSpec
+from .models import InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 
 if TYPE_CHECKING:
     from .infer_align import AlignService
@@ -116,14 +117,20 @@ def main() -> None:
             if job is None:
                 continue
 
-            # envelope shape is transitional until the control-plane API freezes
-            jtype = job.get("type")
-            if jtype == "infer":
-                boot_reported = _run_infer(job.get("request", {}), cp, align_cache, probe_cache, yunet_path, boot_reported)
-            elif jtype == "render":
-                _run_render(job.get("spec", {}), cp)
+            try:
+                pod_job = PodJob.model_validate(job)
+            except ValidationError as e:
+                cp.post_event({"stage": "dispatch", "status": "error", "error": str(e)[:500]})
+                continue
+
+            if pod_job.type == "infer":
+                assert pod_job.request is not None
+                request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
+                boot_reported = _run_infer(request_raw, cp, align_cache, probe_cache, yunet_path, boot_reported)
             else:
-                cp.post_event({"stage": "dispatch", "status": "error", "error": f"unknown job type {jtype!r}"})
+                assert pod_job.spec is not None
+                spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
+                _run_render(spec_raw, cp)
         except requests.RequestException as e:
             _log(f"control-plane request failed: {e}")
             time.sleep(5)

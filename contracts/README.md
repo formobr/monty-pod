@@ -5,10 +5,11 @@ code**: the planning side decides, writes a `spec.json`, the pod applies it. Thi
 SSOT for that seam — JSON Schema (draft 2020-12) + golden examples + a `validate.py` tripwire.
 Consumers on both sides mirror these schemas and re-run the same goldens against their mirrors.
 
-## The four schemas
+## The five schemas
 
 | schema | direction | what |
 |---|---|---|
+| `pod_job.schema.json` | CP→pod (`GET /pod/job`) | the job envelope: `type` dispatches to `request` (infer) or `spec` (render) |
 | `spec.schema.json` | planner→pod (object storage) | the render instruction: inputs, timeline (EDL+speed), motion keyframes, overlays (final only), encode, outputs |
 | `infer_request.schema.json` | planner→pod (CP job queue) | one BATCHED inference task: `align` or `face_probe` |
 | `infer_result.schema.json` | pod→CP (`POST /pod/infer-result`) | completion envelope; payload already PUT to storage |
@@ -16,6 +17,25 @@ Consumers on both sides mirror these schemas and re-run the same goldens against
 
 Transport: the planner and the pod NEVER talk directly. Requests ride the control-plane job queue
 (the pod polls `GET /pod/job`), payloads ride presigned URLs, completion is reported to the CP.
+
+## The job envelope (frozen, v1)
+
+`pod_job.schema.json` is the exact shape the pod's poll loop dispatches on — frozen, not
+transitional. `{"type": "infer", "request": {...}}` or `{"type": "render", "spec": {...}}`;
+`additionalProperties: false` and the `type`-conditional `allOf` make the other block a hard
+error. It has no version const of its own — `request`/`spec` each pin their own
+(`infer_version`/`spec_version`); `contracts/VERSION` stays the single shared pin (see
+Versioning below) since the envelope is additive, not a new seam.
+
+Transport conventions (frozen alongside the envelope):
+
+- `GET /pod/job` — long-poll; `204` = no work, poll again.
+- Auth — `Authorization: Bearer <JOB_TOKEN>` on every request. The pod's entire runtime config
+  is `CP_URL` + `JOB_TOKEN` (env); the pod dials out only, nothing dials in.
+- `POST /pod/event` — free-form progress/error events (stage, status, ...).
+- `POST /pod/infer-result` — completion envelope for `kind=infer` jobs (`infer_result.schema.json`).
+- `result_key` — the presigned `put_url`'s path with the leading slash stripped; the CP resolves
+  it back to storage.
 
 ## Invariants (enforced by schema + goldens)
 

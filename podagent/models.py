@@ -354,6 +354,26 @@ class ProbeShot(BaseModel):
     frames: list[ProbeFrame]
 
 
+class PodJob(BaseModel):
+    """The control-plane→pod job envelope (GET /pod/job). No version const of its
+    own — request/spec each pin their own version; contracts/VERSION is the shared pin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["infer", "render"]
+    request: InferRequest | None = None
+    spec: RenderSpec | None = None
+
+    @model_validator(mode="after")
+    def _block_matches_type(self) -> "PodJob":
+        want, other = (self.request, self.spec) if self.type == "infer" else (self.spec, self.request)
+        if want is None:
+            raise ValueError(f"type={self.type} requires its matching block")
+        if other is not None:
+            raise ValueError(f"type={self.type} must not carry the other type's block")
+        return self
+
+
 class FaceProbePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

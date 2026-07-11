@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Golden tripwire for the SSOT itself: every examples/*.json must validate against
-its schema; every examples/invalid/*.json must be REJECTED. Schema is picked by
-filename prefix (spec. / infer_request. / infer_result. / face_probe.). Run:
-python validate.py (needs jsonschema). Language-neutral guard — the engine and the
-pod-agent re-test these same goldens after codegen/mirroring."""
+"""Golden tripwire for the SSOT: examples/*.json must validate, examples/invalid/*.json
+must be REJECTED. Schema picked by filename prefix against every *.schema.json here.
+Run: python validate.py (needs jsonschema)."""
 import json
 import pathlib
 import sys

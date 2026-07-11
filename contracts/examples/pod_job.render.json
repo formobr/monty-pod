@@ -1,0 +1,66 @@
+{
+  "type": "render",
+  "spec": {
+    "spec_version": 1,
+    "job_id": "job_9f2c1a",
+    "slug": "demo-clip",
+    "mode": "preview",
+    "inputs": [
+      {
+        "id": "src",
+        "kind": "video",
+        "sha256": "a3f54e21b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3",
+        "url": "https://storage.example/o/14311.mkv?sig=GET"
+      }
+    ],
+    "timeline": {
+      "fps": 30,
+      "width": 1080,
+      "height": 1920,
+      "segments": [
+        { "src": "src", "in": 12.333, "out": 18.9, "speed": 1.5 },
+        { "src": "src", "in": 24.067, "out": 31.433, "speed": 1.5 }
+      ]
+    },
+    "motion": {
+      "segments": [
+        {
+          "seg": 0,
+          "interp": "ease_in_out",
+          "keyframes": [
+            { "t": 0.0, "rect": [0.1, 0.05, 0.8, 0.8] },
+            { "t": 5.566, "rect": [0.14, 0.08, 0.72, 0.72] }
+          ]
+        },
+        {
+          "seg": 1,
+          "interp": "ease_in_out",
+          "keyframes": [
+            { "t": 0.0, "rect": [0.14, 0.08, 0.72, 0.72] },
+            { "t": 6.242, "rect": [0.1, 0.05, 0.8, 0.8] }
+          ]
+        }
+      ]
+    },
+    "encode": {
+      "video": "h264_nvenc",
+      "preset": "p4",
+      "cq": 29,
+      "pix_fmt": "yuv420p",
+      "audio": "aac",
+      "audio_bitrate": "192k"
+    },
+    "outputs": [
+      {
+        "id": "proxy",
+        "kind": "proxy",
+        "put_url": "https://storage.example/o/43842.mp4?sig=PUT"
+      },
+      {
+        "id": "motion_base",
+        "kind": "cache",
+        "put_url": "https://storage.example/o/42788.mp4?sig=PUT"
+      }
+    ]
+  }
+}

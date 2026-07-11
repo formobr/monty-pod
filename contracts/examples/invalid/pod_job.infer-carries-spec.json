@@ -1,0 +1,21 @@
+{
+  "type": "infer",
+  "request": {
+    "infer_version": 1,
+    "job_id": "j",
+    "kind": "align",
+    "model": "m",
+    "put_url": "p",
+    "align": { "audio_url": "u", "windows": [[0.0, 10.0]] }
+  },
+  "spec": {
+    "spec_version": 1,
+    "job_id": "j",
+    "slug": "s",
+    "mode": "preview",
+    "inputs": [{ "id": "src", "kind": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "url": "u" }],
+    "timeline": { "fps": 30, "width": 2, "height": 2, "segments": [{ "src": "src", "in": 0, "out": 1, "speed": 1 }] },
+    "encode": { "video": "libx264", "preset": "p4", "cq": 29, "pix_fmt": "yuv420p", "audio": "aac", "audio_bitrate": "192k" },
+    "outputs": [{ "id": "proxy", "kind": "proxy", "put_url": "p" }]
+  }
+}
