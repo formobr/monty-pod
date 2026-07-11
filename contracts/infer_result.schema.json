@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/infer_result.schema.json",
+  "title": "InferResult — pod→CP completion envelope (POST /pod/infer-result)",
+  "description": "The payload itself was already PUT to the request's put_url; result_key is its storage key. timing.infer_s is mandatory on success — face-probe latency is a watched number.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["infer_version", "job_id", "kind", "status"],
+  "properties": {
+    "infer_version": { "const": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["align", "face_probe"] },
+    "status": { "enum": ["ok", "error"] },
+    "result_key": { "type": "string", "minLength": 1 },
+    "error": { "type": "string", "minLength": 1 },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["infer_s"],
+      "properties": {
+        "infer_s": { "type": "number", "minimum": 0 },
+        "boot_s": { "type": "number", "minimum": 0 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
+      "then": { "required": ["result_key", "timing"], "not": { "required": ["error"] } },
+      "else": { "required": ["error"], "not": { "required": ["result_key"] } }
+    }
+  ]
+}

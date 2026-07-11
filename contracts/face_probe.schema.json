@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/face_probe.schema.json",
+  "title": "FaceProbePayload — the JSON the pod PUTs for kind=face_probe",
+  "description": "RAW detections, pixel space — the planner normalizes by width/height and makes every decision (speaker pick, medians, keyframes). boxes: all post-NMS detections per sampled frame as [x, y, w, h, score]. diff: mean-abs frame difference vs the previous sampled frame (present when the request asked frame_diff), for splice detection.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["model", "width", "height", "shots"],
+  "properties": {
+    "model": { "type": "string", "minLength": 1 },
+    "width": { "type": "integer", "minimum": 2 },
+    "height": { "type": "integer", "minimum": 2 },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["a", "b", "frames"],
+        "properties": {
+          "a": { "type": "number", "minimum": 0 },
+          "b": { "type": "number", "exclusiveMinimum": 0 },
+          "frames": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["t", "boxes"],
+              "properties": {
+                "t": { "type": "number", "minimum": 0 },
+                "boxes": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "minItems": 5,
+                    "maxItems": 5,
+                    "items": { "type": "number" }
+                  }
+                },
+                "diff": { "type": "number", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

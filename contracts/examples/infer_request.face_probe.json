@@ -1,0 +1,16 @@
+{
+  "infer_version": 1,
+  "job_id": "job_9f2c1a",
+  "kind": "face_probe",
+  "model": "yunet-2023mar",
+  "put_url": "https://storage.example/o/11787.json?sig=PUT",
+  "face_probe": {
+    "video_url": "https://storage.example/o/14311.mkv?sig=GET",
+    "shots": [
+      [12.333, 18.9],
+      [24.067, 31.433]
+    ],
+    "stride": 2,
+    "frame_diff": true
+  }
+}

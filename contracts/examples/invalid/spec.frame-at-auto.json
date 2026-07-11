@@ -1,0 +1,11 @@
+{
+  "spec_version": 1,
+  "job_id": "j",
+  "slug": "s",
+  "mode": "final",
+  "inputs": [{ "id": "base", "kind": "video", "sha256": "0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f", "url": "u" }],
+  "timeline": { "fps": 30, "width": 1080, "height": 1920, "segments": [{ "src": "base", "in": 0.0, "out": 10.0, "speed": 1.0 }] },
+  "overlays": { "cover": { "frame_at": "auto", "headline": { "lines": ["X"] } } },
+  "encode": { "video": "h264_nvenc", "preset": "p7", "cq": 23, "pix_fmt": "yuv420p", "audio": "aac", "audio_bitrate": "192k" },
+  "outputs": [{ "id": "master", "kind": "master", "put_url": "p" }]
+}

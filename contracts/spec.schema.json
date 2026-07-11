@@ -1,0 +1,607 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/spec.schema.json",
+  "title": "RenderSpec — the planner→pod render instruction (data, never code)",
+  "description": "Everything the pod needs to render ONE output pass. Invariants: every number is a number (no 'auto'); no threshold carries meaning (the planner already applied it — the pod is told WHAT, never WHY); no prompts, no scores, no rationale. Every media path referenced anywhere (timeline src, overlays clip/track) MUST equal an inputs[].id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "spec_version",
+    "job_id",
+    "slug",
+    "mode",
+    "inputs",
+    "timeline",
+    "encode",
+    "outputs"
+  ],
+  "properties": {
+    "spec_version": {
+      "const": 1
+    },
+    "job_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "slug": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "enum": [
+        "preview",
+        "final"
+      ]
+    },
+    "inputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/input"
+      }
+    },
+    "timeline": {
+      "$ref": "#/$defs/timeline"
+    },
+    "motion": {
+      "$ref": "#/$defs/motion"
+    },
+    "overlays": {
+      "$ref": "#/$defs/overlays"
+    },
+    "encode": {
+      "$ref": "#/$defs/encode"
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/output"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "preview"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "overlays"
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "sha256",
+        "url"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "video",
+            "audio",
+            "image"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "timeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fps",
+        "width",
+        "height",
+        "segments"
+      ],
+      "properties": {
+        "fps": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/segment"
+          }
+        }
+      }
+    },
+    "segment": {
+      "description": "One kept span, SOURCE time, seconds, frame-snapped by the planner at timeline.fps. speed is a per-segment atempo/setpts factor.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "src",
+        "in",
+        "out",
+        "speed"
+      ],
+      "properties": {
+        "src": {
+          "type": "string",
+          "minLength": 1
+        },
+        "in": {
+          "type": "number",
+          "minimum": 0
+        },
+        "out": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "speed": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "motion": {
+      "description": "Camera-motion keyframes the planner computed; the pod only interpolates rects and applies the crop/zoom. t = seconds from the rendered segment's start on the OUTPUT clock (post-speed). rect = [x, y, w, h] normalized fractions of the source frame.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segments"
+      ],
+      "properties": {
+        "segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "seg",
+              "interp",
+              "keyframes"
+            ],
+            "properties": {
+              "seg": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "interp": {
+                "enum": [
+                  "linear",
+                  "ease_in",
+                  "ease_out",
+                  "ease_in_out"
+                ]
+              },
+              "keyframes": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "t",
+                    "rect"
+                  ],
+                  "properties": {
+                    "t": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "rect": {
+                      "type": "array",
+                      "minItems": 4,
+                      "maxItems": 4,
+                      "items": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "overlays": {
+      "description": "FINAL tier only (the preview tier composites overlays client-side). The RESOLVED render fields of the plan — planning metadata never crosses this seam.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "broll_final": {
+          "$ref": "#/$defs/broll_final"
+        },
+        "motion_plan": {
+          "$ref": "#/$defs/motion_plan"
+        },
+        "music": {
+          "$ref": "#/$defs/music"
+        },
+        "cover": {
+          "$ref": "#/$defs/cover"
+        },
+        "trims": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/trim"
+          }
+        }
+      }
+    },
+    "broll_final": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "broll"
+      ],
+      "properties": {
+        "broll": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/broll_clip"
+          }
+        }
+      }
+    },
+    "broll_clip": {
+      "description": "clip references an inputs[].id. start/dur on the final output clock; in = source offset inside the cutaway asset.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clip",
+        "start",
+        "preset"
+      ],
+      "properties": {
+        "clip": {
+          "type": "string",
+          "minLength": 1
+        },
+        "start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "preset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dur": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "in": {
+          "type": "number",
+          "minimum": 0
+        },
+        "scale": {
+          "type": "string"
+        },
+        "amount": {
+          "type": "number"
+        },
+        "accent": {
+          "type": "boolean"
+        },
+        "transition_in": {
+          "$ref": "#/$defs/transition"
+        },
+        "transition_out": {
+          "$ref": "#/$defs/transition"
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "edge",
+        "dur"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "slide_wipe",
+            "push",
+            "dissolve"
+          ]
+        },
+        "edge": {
+          "enum": [
+            "entry",
+            "return"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "left",
+            "right",
+            "up",
+            "down"
+          ]
+        },
+        "dur": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "dissolve"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "direction"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "direction"
+            ]
+          }
+        }
+      ]
+    },
+    "motion_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sections"
+      ],
+      "properties": {
+        "sections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "comp",
+              "start",
+              "props"
+            ],
+            "properties": {
+              "comp": {
+                "type": "string",
+                "minLength": 1
+              },
+              "start": {
+                "type": "number",
+                "minimum": 0
+              },
+              "props": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "captions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "centerY": {
+              "type": "number"
+            },
+            "accent": {
+              "type": "string"
+            },
+            "style": {
+              "enum": [
+                "oneword",
+                "phrase",
+                "phrase_jump"
+              ]
+            },
+            "hot": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    },
+    "music": {
+      "description": "track references an inputs[].id. gain is the linear mix multiplier under the voice — the pod has no brand profile, the number crosses the seam.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "track",
+        "gain"
+      ],
+      "properties": {
+        "track": {
+          "type": "string",
+          "minLength": 1
+        },
+        "start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "gain": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 2
+        }
+      }
+    },
+    "cover": {
+      "description": "frame_at is a NUMBER (seconds, final clock) — never 'auto'; the planner resolves the face-pick before writing the spec.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame_at",
+        "headline"
+      ],
+      "properties": {
+        "frame_at": {
+          "type": "number",
+          "minimum": 0
+        },
+        "headline": {
+          "type": "object",
+          "required": [
+            "lines"
+          ],
+          "properties": {
+            "lines": {
+              "type": "array"
+            },
+            "pos": {
+              "type": "string"
+            },
+            "y": {
+              "type": "number"
+            },
+            "size": {
+              "type": "number"
+            },
+            "box": {
+              "type": "boolean"
+            }
+          }
+        },
+        "logo": {
+          "type": "object"
+        },
+        "elements": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "trim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "a",
+        "b"
+      ],
+      "properties": {
+        "a": {
+          "type": "number",
+          "minimum": 0
+        },
+        "b": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "encode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "video",
+        "preset",
+        "cq",
+        "pix_fmt",
+        "audio",
+        "audio_bitrate"
+      ],
+      "properties": {
+        "video": {
+          "enum": [
+            "h264_nvenc",
+            "libx264"
+          ]
+        },
+        "preset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 51
+        },
+        "pix_fmt": {
+          "enum": [
+            "yuv420p"
+          ]
+        },
+        "audio": {
+          "enum": [
+            "aac"
+          ]
+        },
+        "audio_bitrate": {
+          "type": "string",
+          "pattern": "^[0-9]+k$"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "put_url"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "proxy",
+            "master",
+            "cache"
+          ]
+        },
+        "put_url": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "spec_version": 1,
+  "job_id": "job_b81d02",
+  "slug": "demo-clip",
+  "mode": "final",
+  "inputs": [
+    {
+      "id": "base",
+      "kind": "video",
+      "sha256": "0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f",
+      "url": "https://storage.example/o/04925.mp4?sig=GET"
+    },
+    {
+      "id": "broll/clip-01.mp4",
+      "kind": "video",
+      "sha256": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+      "url": "https://storage.example/o/96931.mp4?sig=GET"
+    },
+    {
+      "id": "music/track-01.mp3",
+      "kind": "audio",
+      "sha256": "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c",
+      "url": "https://storage.example/o/15414.mp3?sig=GET"
+    }
+  ],
+  "timeline": {
+    "fps": 30,
+    "width": 1080,
+    "height": 1920,
+    "segments": [
+      {
+        "src": "base",
+        "in": 0.0,
+        "out": 62.4,
+        "speed": 1.0
+      }
+    ]
+  },
+  "overlays": {
+    "broll_final": {
+      "broll": [
+        {
+          "clip": "broll/clip-01.mp4",
+          "start": 14.2,
+          "preset": "cutaway",
+          "dur": 2.8,
+          "in": 1.5,
+          "scale": "cover",
+          "amount": 1.0,
+          "accent": false,
+          "transition_in": {
+            "kind": "push",
+            "edge": "entry",
+            "direction": "left",
+            "dur": 0.4
+          },
+          "transition_out": {
+            "kind": "dissolve",
+            "edge": "return",
+            "dur": 0.3
+          }
+        }
+      ]
+    },
+    "motion_plan": {
+      "sections": [
+        {
+          "comp": "lower_third",
+          "start": 22.5,
+          "props": {
+            "text": "hello"
+          }
+        }
+      ],
+      "captions": {
+        "centerY": 0.78,
+        "accent": "#FFFFFF",
+        "style": "oneword",
+        "hot": [
+          3.1,
+          17.6,
+          41.0
+        ]
+      }
+    },
+    "music": {
+      "track": "music/track-01.mp3",
+      "start": 0.0,
+      "gain": 0.35
+    },
+    "cover": {
+      "frame_at": 41.633,
+      "headline": {
+        "lines": [
+          "DEMO",
+          "CLIP"
+        ],
+        "pos": "bottom",
+        "y": 0.72,
+        "size": 148.0,
+        "box": true
+      },
+      "logo": {
+        "corner": "top_right",
+        "opacity": 0.85
+      },
+      "elements": [
+        {
+          "kind": "arrow",
+          "x": 0.62,
+          "y": 0.4
+        }
+      ]
+    },
+    "trims": [
+      {
+        "a": 33.2,
+        "b": 35.9
+      }
+    ]
+  },
+  "encode": {
+    "video": "h264_nvenc",
+    "preset": "p7",
+    "cq": 23,
+    "pix_fmt": "yuv420p",
+    "audio": "aac",
+    "audio_bitrate": "192k"
+  },
+  "outputs": [
+    {
+      "id": "master",
+      "kind": "master",
+      "put_url": "https://storage.example/o/10324.mp4?sig=PUT"
+    }
+  ]
+}

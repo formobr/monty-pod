@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/infer_request.schema.json",
+  "title": "InferRequest — planner→pod inference task (CP-mediated; the pod polls, nothing dials in)",
+  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["infer_version", "job_id", "kind", "model", "put_url"],
+  "properties": {
+    "infer_version": { "const": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["align", "face_probe"] },
+    "model": { "type": "string", "minLength": 1 },
+    "put_url": { "type": "string", "minLength": 1 },
+    "align": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["audio_url", "windows"],
+      "properties": {
+        "audio_url": { "type": "string", "minLength": 1 },
+        "windows": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/span" }
+        }
+      }
+    },
+    "face_probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["video_url", "shots", "stride", "frame_diff"],
+      "properties": {
+        "video_url": { "type": "string", "minLength": 1 },
+        "shots": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/span" }
+        },
+        "stride": { "type": "integer", "minimum": 1 },
+        "frame_diff": { "type": "boolean" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "align" } }, "required": ["kind"] },
+      "then": { "required": ["align"], "not": { "required": ["face_probe"] } },
+      "else": { "required": ["face_probe"], "not": { "required": ["align"] } }
+    }
+  ],
+  "$defs": {
+    "span": {
+      "description": "[start, end] seconds, source time, end > start (model-enforced).",
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "type": "number", "minimum": 0 }
+    }
+  }
+}

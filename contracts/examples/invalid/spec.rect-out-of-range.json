@@ -1,0 +1,11 @@
+{
+  "spec_version": 1,
+  "job_id": "j",
+  "slug": "s",
+  "mode": "preview",
+  "inputs": [{ "id": "src", "kind": "video", "sha256": "0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f", "url": "u" }],
+  "timeline": { "fps": 30, "width": 1080, "height": 1920, "segments": [{ "src": "src", "in": 0.0, "out": 10.0, "speed": 1.0 }] },
+  "motion": { "segments": [{ "seg": 0, "interp": "linear", "keyframes": [{ "t": 0.0, "rect": [0.1, 0.05, 1.2, 0.8] }] }] },
+  "encode": { "video": "h264_nvenc", "preset": "p4", "cq": 29, "pix_fmt": "yuv420p", "audio": "aac", "audio_bitrate": "192k" },
+  "outputs": [{ "id": "proxy", "kind": "proxy", "put_url": "p" }]
+}
