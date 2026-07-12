@@ -100,7 +100,8 @@
           "enum": [
             "video",
             "audio",
-            "image"
+            "image",
+            "font"
           ]
         },
         "sha256": {
@@ -513,6 +514,21 @@
           "items": {
             "type": "object"
           }
+        },
+        "colors": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "font": {
+          "type": "string"
+        },
+        "display_weight": {
+          "type": "integer"
         }
       }
     },

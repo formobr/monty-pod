@@ -392,8 +392,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
     """Fetch inputs, run the single encode pass, PUT every non-cache output, report the event."""
     if spec.mode == "final" and spec.overlays is not None:
         ov = spec.overlays
-        pending = [name for name, val in (("cover", ov.cover),
-                                          ("motion_plan", ov.motion_plan), ("trims", ov.trims)) if val]
+        pending = [name for name, val in (("motion_plan", ov.motion_plan), ("trims", ov.trims)) if val]
         if pending:  # fail loud, never silently drop an overlay the brain asked for
             raise NotImplementedError(f"final overlay(s) not yet composited on the pod: {pending}")
 
@@ -431,12 +430,22 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
             detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
             raise RuntimeError(f"ffmpeg exited {exc.returncode}: {detail}") from exc
 
+        # cover is the LAST step: extract the base frame, compose the still, weld it onto the master tail.
+        master = out
+        cover = spec.overlays.cover if (spec.mode == "final" and spec.overlays is not None) else None
+        if cover is not None:
+            from .cover import render_cover
+            welded = tmp / "render_cover.mp4"
+            render_cover(cover.model_dump(by_alias=True), input_paths[spec.timeline.segments[0].src],
+                         out, input_paths, welded, gpu, spec.timeline.width, spec.timeline.height)
+            master = welded
+
         done: list[str] = []
         for o in spec.outputs:
             if o.kind == "cache":
                 print(f"cache output {o.id!r} skipped (v1)", file=sys.stderr)
                 continue
-            upload(out, o.put_url, "video/mp4")
+            upload(master, o.put_url, "video/mp4")
             done.append(o.id)
 
     cp.post_event({

@@ -86,9 +86,9 @@ def test_render_spec_fails_loud_on_unimplemented_overlays():
         "inputs": [_BASE_INPUT, _CLIP_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
         "overlays": {"broll_final": {"broll": [clip]},
-                     "cover": {"frame_at": 5.0, "headline": {"lines": [[{"t": "X", "c": "white"}]]}}},
+                     "motion_plan": {"sections": [{"comp": "SplitScreen", "start": 1.0, "props": {}}]}},
     })
-    with pytest.raises(NotImplementedError, match="cover"):
+    with pytest.raises(NotImplementedError, match="motion_plan"):
         render.render_spec(spec, None)  # type: ignore[arg-type]
 
 

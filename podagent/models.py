@@ -13,7 +13,7 @@ class SpecInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
-    kind: Literal["video", "audio", "image"]
+    kind: Literal["video", "audio", "image", "font"]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     url: str = Field(min_length=1)
 
@@ -161,6 +161,9 @@ class SpecCover(BaseModel):
     headline: SpecCoverHeadline
     logo: dict[str, Any] | None = None
     elements: list[dict[str, Any]] = Field(default_factory=list)
+    colors: dict[str, list[int]] | None = None
+    font: str | None = None
+    display_weight: int = 800
 
 
 class SpecTrim(BaseModel):
