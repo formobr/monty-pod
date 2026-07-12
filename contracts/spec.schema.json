@@ -101,7 +101,8 @@
             "video",
             "audio",
             "image",
-            "font"
+            "font",
+            "code"
           ]
         },
         "sha256": {
@@ -481,7 +482,11 @@
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["text", "start", "end"],
+                "required": [
+                  "text",
+                  "start",
+                  "end"
+                ],
                 "properties": {
                   "text": {
                     "type": "string",
@@ -511,10 +516,17 @@
           "description": "Brand design for the agnostic Remotion bundle. tokens = brand_tokens.resolve; fonts = mograph_fonts.resolve. Role font files ride as inputs id 'mograph/public/<file>'; the pod stages them into the bundle public/ before render.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["tokens", "fonts"],
+          "required": [
+            "tokens",
+            "fonts"
+          ],
           "properties": {
-            "tokens": {"type": "object"},
-            "fonts": {"type": "object"}
+            "tokens": {
+              "type": "object"
+            },
+            "fonts": {
+              "type": "object"
+            }
           }
         }
       }

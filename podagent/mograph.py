@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 FPS = 30
-_STAGE_PREFIX = "mograph/public/"
+_STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/<rel> (public/ fonts+media, src/ bespoke)
 
 
 def remotion_dir() -> Path:
@@ -24,41 +24,23 @@ def remotion_dir() -> Path:
 
 
 def _stage_public(input_paths: dict, rd: Path) -> None:
-    """Copy every `mograph/public/<rel>` input into the bundle public/<rel> so staticFile() resolves them."""
+    """Copy every `mograph/<rel>` input into <bundle>/<rel> (public/ fonts+media, src/ bespoke .tsx+entry)."""
     for iid, path in input_paths.items():
         if iid.startswith(_STAGE_PREFIX):
-            dest = rd / "public" / iid[len(_STAGE_PREFIX):]
+            dest = rd / iid[len(_STAGE_PREFIX):]
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, dest)
 
 
-def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path) -> list[dict]:
-    """Render each catalog section to a transparent qtrle layer via one bundle+Chrome batch. Bespoke sections
-    (LLM-authored .tsx) are not yet compiled on the pod — skipped LOUD, never a silent drop."""
-    rd = remotion_dir()
-    _stage_public(input_paths, rd)
-    tok = (brand or {}).get("tokens")
-    fnt = (brand or {}).get("fonts")
-    items, metas = [], []
-    for i, sec in enumerate(sections):
-        if sec.comp.startswith("Bespoke"):
-            print(f"mograph: SKIP Bespoke @ {sec.start}s — per-job .tsx not compiled on the pod yet",
-                  file=sys.stderr)
-            continue
-        props = dict(sec.props or {})
-        if tok is not None:
-            props["brandTokens"] = tok
-        if fnt is not None:
-            props["brandFonts"] = fnt
-        seqdir = tmp / f"seq{i}"
-        seqdir.mkdir(parents=True, exist_ok=True)
-        items.append({"comp": sec.comp, "props": props, "seqdir": str(seqdir)})
-        metas.append({"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass)})
-    if not items:
-        return []
-    spec = tmp / "batch.json"
-    spec.write_text(json.dumps({"concurrency": 4, "items": items}, ensure_ascii=False), encoding="utf-8")
-    subprocess.run(["node", "render_batch.mjs", str(spec)], cwd=rd, check=True, capture_output=True)
+def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) -> None:
+    body = {"concurrency": 4, "items": items}
+    if entry_point:
+        body["entryPoint"] = entry_point
+    spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+    subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, check=True, capture_output=True)
+
+
+def _pack(metas: list[dict], tmp: Path) -> list[dict]:
     layers = []
     for m in metas:
         pngs = sorted(m["seqdir"].glob("*.png"))
@@ -69,6 +51,48 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
                         "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", str(mov)], check=True)
         layers.append({"mov": str(mov), "start": m["start"], "dur": len(pngs) / FPS, "glass": m["glass"]})
     return layers
+
+
+def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path) -> list[dict]:
+    """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch; each Bespoke
+    (LLM .tsx delivered + staged by the brain) via its own per-job entry. A missing bespoke entry = skip loud."""
+    rd = remotion_dir()
+    _stage_public(input_paths, rd)
+    tok = (brand or {}).get("tokens")
+    fnt = (brand or {}).get("fonts")
+
+    def _props(sec):
+        p = dict(sec.props or {})
+        if tok is not None:
+            p["brandTokens"] = tok
+        if fnt is not None:
+            p["brandFonts"] = fnt
+        return p
+
+    cat_items, cat_metas, bespoke = [], [], []
+    for i, sec in enumerate(sections):
+        seqdir = tmp / f"seq{i}"
+        seqdir.mkdir(parents=True, exist_ok=True)
+        meta = {"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass)}
+        item = {"comp": sec.comp, "props": _props(sec), "seqdir": str(seqdir)}
+        if sec.comp.startswith("Bespoke"):
+            entry = f"src/index.bespoke.{sec.comp}.tsx"
+            if not (rd / entry).is_file():
+                print(f"mograph: SKIP {sec.comp} @ {sec.start}s — no delivered entry", file=sys.stderr)
+                continue
+            bespoke.append((entry, item, meta))
+        else:
+            cat_items.append(item)
+            cat_metas.append(meta)
+
+    metas: list[dict] = []
+    if cat_items:
+        _run_batch(rd, cat_items, tmp / "batch_catalog.json", None)
+        metas += cat_metas
+    for n, (entry, item, meta) in enumerate(bespoke):
+        _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
+        metas.append(meta)
+    return _pack(metas, tmp)
 
 
 def overlay_filtergraph(layers: list[dict]) -> tuple[str, str]:

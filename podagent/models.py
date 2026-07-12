@@ -13,7 +13,7 @@ class SpecInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
-    kind: Literal["video", "audio", "image", "font"]
+    kind: Literal["video", "audio", "image", "font", "code"]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     url: str = Field(min_length=1)
 
