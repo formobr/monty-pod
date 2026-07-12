@@ -179,6 +179,14 @@ class SpecTrim(BaseModel):
         return self
 
 
+class SpecSfx(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sound: str = Field(min_length=1)
+    at: float = Field(ge=0)
+    gain: float = Field(gt=0, le=2)
+
+
 class Overlays(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -187,6 +195,7 @@ class Overlays(BaseModel):
     music: SpecMusic | None = None
     cover: SpecCover | None = None
     trims: list[SpecTrim] | None = None
+    sfx: list[SpecSfx] | None = None
 
 
 class Encode(BaseModel):
@@ -238,6 +247,9 @@ class RenderSpec(BaseModel):
                 for n, c in enumerate(self.overlays.broll_final.broll):
                     if c.clip not in ids:
                         raise ValueError(f"broll[{n}].clip {c.clip!r} is not an inputs[].id")
+            for n, s in enumerate(self.overlays.sfx or []):
+                if s.sound not in ids:
+                    raise ValueError(f"sfx[{n}].sound {s.sound!r} is not an inputs[].id")
             if self.overlays.music is not None and self.overlays.music.track not in ids:
                 raise ValueError(f"music.track {self.overlays.music.track!r} is not an inputs[].id")
 

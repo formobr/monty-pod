@@ -211,11 +211,12 @@ _DUCK = 3
 
 
 class _AudioMix(NamedTuple):
-    voice_idx: int   # ffmpeg input index of the base (raw voice)
-    bed_idx: int     # ffmpeg input index of the pre-rendered, normalized, looped music bed
-    clean: str       # voice pre-filter (highpass [+ afftdn if the source is dirty])
-    vln: str         # measured two-pass loudnorm to -20 LUFS
+    voice_idx: int                            # ffmpeg input index of the base (raw voice)
+    bed_idx: int | None                       # music bed input index, or None (no music)
+    clean: str                                # voice pre-filter (highpass [+ afftdn if dirty])
+    vln: str                                  # measured two-pass loudnorm to -20 LUFS
     dur: float
+    sfx: tuple[tuple[int, float, float], ...] = ()   # (sound input index, start seconds, linear gain)
 
 
 def _probe_dur(path: Path) -> float:
@@ -271,16 +272,33 @@ def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
 
 
 def _audio_mix_chains(a: _AudioMix) -> list[str]:
-    """Voice (clean → measured loudnorm → padded to length) mixed with the ducked music bed → [aout].
-    Sidechain dips the bed under speech (locked DUCK); the bed level is its -33 normalize, never volume."""
+    """Voice (clean → measured loudnorm → padded) mixed with the ducked -33 bed (when music), then the
+    accent SFX summed on top with a peak-safe limiter → [aout]. Bed level is its normalize, not volume."""
     dur = _num(a.dur)
-    return [
-        f"[{a.voice_idx}:a]{a.clean},{a.vln},apad=whole_dur={dur},asplit=2[vc1][vc2]",
-        f"[{a.bed_idx}:a]volume=1.0[bg0]",
-        f"[bg0][vc2]sidechaincompress=threshold=0.06:ratio={_DUCK}:attack=20:release=500[bg]",
-        "[vc1][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[premix]",
-        "[premix]aresample=192000,alimiter=limit=0.63:attack=5:release=50:level=false,aresample=48000[aout]",
-    ]
+    chains: list[str] = []
+    if a.bed_idx is not None:
+        chains += [
+            f"[{a.voice_idx}:a]{a.clean},{a.vln},apad=whole_dur={dur},asplit=2[vc1][vc2]",
+            f"[{a.bed_idx}:a]volume=1.0[bg0]",
+            f"[bg0][vc2]sidechaincompress=threshold=0.06:ratio={_DUCK}:attack=20:release=500[bg]",
+            "[vc1][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[premix]",
+            "[premix]aresample=192000,alimiter=limit=0.63:attack=5:release=50:level=false,"
+            "aresample=48000[amaster]",
+        ]
+    else:
+        chains.append(f"[{a.voice_idx}:a]{a.clean},{a.vln},apad=whole_dur={dur}[amaster]")
+
+    if a.sfx:
+        labels = []
+        for i, (sidx, at, gain) in enumerate(a.sfx):
+            chains.append(f"[{sidx}:a]adelay={int(round(at * 1000))}:all=1,volume={_num(gain)}[sx{i}]")
+            labels.append(f"[sx{i}]")
+        # amix SUMS sfx onto the master → cap the tips with a lookahead limiter (peak-safe last stage).
+        chains.append(f"[amaster]{''.join(labels)}amix=inputs={len(a.sfx) + 1}:normalize=0:duration=first[mx]")
+        chains.append("[mx]alimiter=limit=0.84:attack=5:release=50:level=false[aout]")
+    else:
+        chains.append("[amaster]anull[aout]")
+    return chains
 
 
 def _music_of(spec: RenderSpec) -> "object | None":
@@ -411,16 +429,20 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
         extra_inputs: tuple[Path, ...] = ()
         audio: _AudioMix | None = None
         music = _music_of(spec)
-        if music is not None:
+        sfx = spec.overlays.sfx if (spec.mode == "final" and spec.overlays is not None) else None
+        if music is not None or sfx:
+            ids = input_ids(spec)
             voice = input_paths[spec.timeline.segments[0].src]
             dur = _probe_dur(voice)
             clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if _voice_is_dirty(voice) else "")
             vln = _measure_loudnorm(voice, clean)
-            bed = _prerender_bed(input_paths[music.track], music.start, dur, tmp)  # type: ignore[attr-defined]
-            extra_inputs = (bed,)
-            voice_idx = input_ids(spec).index(spec.timeline.segments[0].src)
-            audio = _AudioMix(voice_idx=voice_idx, bed_idx=len(input_ids(spec)),
-                              clean=clean, vln=vln, dur=dur)
+            bed_idx: int | None = None
+            if music is not None:
+                extra_inputs = (_prerender_bed(input_paths[music.track], music.start, dur, tmp),)
+                bed_idx = len(ids)
+            sfx_tuples = tuple((ids.index(s.sound), s.at, s.gain) for s in (sfx or []))
+            audio = _AudioMix(voice_idx=ids.index(spec.timeline.segments[0].src), bed_idx=bed_idx,
+                              clean=clean, vln=vln, dur=dur, sfx=sfx_tuples)
         out = tmp / "render.mp4"
         cmd = build_command(spec, input_paths, out, gpu, extra_inputs, audio)
         try:

@@ -120,3 +120,34 @@ def test_no_audio_keeps_segment_audio_concat():
     g = render.build_filtergraph(spec, gpu=False, audio=None)  # audio not resolved → base passthrough
     assert "concat=n=1:v=1:a=1[vout][aout]" in g
     assert "sidechaincompress" not in g
+
+
+def test_sfx_mix_delays_sounds_over_master_with_limiter():
+    a = render._AudioMix(voice_idx=0, bed_idx=1, clean="highpass=f=80",
+                         vln="loudnorm=I=-20:TP=-1.5:LRA=11", dur=60.0,
+                         sfx=((2, 12.56, 0.4), (3, 52.87, 0.5)))
+    g = ";".join(render._audio_mix_chains(a))
+    assert "[2:a]adelay=12560:all=1,volume=0.4[sx0]" in g
+    assert "[3:a]adelay=52870:all=1,volume=0.5[sx1]" in g
+    assert "[amaster][sx0][sx1]amix=inputs=3:normalize=0:duration=first[mx]" in g
+    assert "alimiter=limit=0.84" in g and g.endswith("[aout]")
+
+
+def test_unresolved_sfx_sound_reddens():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError, match="sfx"):
+        RenderSpec.model_validate({
+            "spec_version": 1, "job_id": "j", "slug": "s", "mode": "final",
+            "inputs": [_BASE_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
+            "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
+            "overlays": {"sfx": [{"sound": "sfx/missing.wav", "at": 1.0, "gain": 0.4}]},
+        })
+
+
+def test_sfx_without_music_skips_bed():
+    a = render._AudioMix(voice_idx=0, bed_idx=None, clean="highpass=f=80",
+                         vln="loudnorm=I=-20:TP=-1.5:LRA=11", dur=60.0, sfx=((2, 1.0, 0.4),))
+    g = ";".join(render._audio_mix_chains(a))
+    assert "sidechaincompress" not in g  # no bed to duck
+    assert "apad=whole_dur=60[amaster]" in g
+    assert "amix=inputs=2:normalize=0:duration=first[mx]" in g

@@ -260,6 +260,36 @@
           "items": {
             "$ref": "#/$defs/trim"
           }
+        },
+        "sfx": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sfx"
+          }
+        }
+      }
+    },
+    "sfx": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sound",
+        "at",
+        "gain"
+      ],
+      "properties": {
+        "sound": {
+          "type": "string",
+          "minLength": 1
+        },
+        "at": {
+          "type": "number",
+          "minimum": 0
+        },
+        "gain": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 2
         }
       }
     },
