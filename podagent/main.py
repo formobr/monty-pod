@@ -140,7 +140,7 @@ def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
     cp = ControlPlane(cp_url, job_token)
-    _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/head_motion run on GPU, not a silent CPU crawl
+    _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
 
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
