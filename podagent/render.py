@@ -468,7 +468,9 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
             ids = input_ids(spec)
             voice = input_paths[spec.timeline.segments[0].src]
             dur = _probe_dur(voice)
-            clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if _voice_is_dirty(voice) else "")
+            # base already DFN3/MF2-rescued upstream → keep only the rumble cut, DROP afftdn (no double-process)
+            dirty = _voice_is_dirty(voice) and not spec.base_voice_rescued
+            clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
             vln = _measure_loudnorm(voice, clean)
             bed_idx: int | None = None
             if music is not None:

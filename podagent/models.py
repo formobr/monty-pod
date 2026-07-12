@@ -250,6 +250,7 @@ class RenderSpec(BaseModel):
     overlays: Overlays | None = None
     encode: Encode
     outputs: list[SpecOutput] = Field(min_length=1)
+    base_voice_rescued: bool = False
 
     @model_validator(mode="after")
     def _seam_invariants(self) -> "RenderSpec":

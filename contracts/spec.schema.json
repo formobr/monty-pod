@@ -58,6 +58,9 @@
       "items": {
         "$ref": "#/$defs/output"
       }
+    },
+    "base_voice_rescued": {
+      "type": "boolean"
     }
   },
   "allOf": [
