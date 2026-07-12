@@ -27,6 +27,12 @@
       "url": "file:///fonts/Inter-ExtraBold.ttf",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "kind": "font"
+    },
+    {
+      "id": "mograph/public/druk.woff2",
+      "url": "file:///fonts/druk.woff2",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "kind": "font"
     }
   ],
   "timeline": {
@@ -102,6 +108,27 @@
           }
         ],
         "font": "caption_font"
+      },
+      "brand": {
+        "tokens": {
+          "color": {
+            "accent": "#d6ff3a",
+            "fg": "#f2f2f0"
+          },
+          "scale": 2.3
+        },
+        "fonts": {
+          "roles": {
+            "display": {
+              "family": "mg-display",
+              "file": "druk.woff2",
+              "weight": "800",
+              "style": "italic",
+              "cyrillic": true
+            }
+          },
+          "cyrillicFallback": "display"
+        }
       }
     },
     "music": {

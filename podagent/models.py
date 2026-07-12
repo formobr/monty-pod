@@ -140,11 +140,19 @@ class SpecCaptions(BaseModel):
     font: str | None = None
 
 
+class SpecBrandManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tokens: dict[str, Any]
+    fonts: dict[str, Any]
+
+
 class SpecMotionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sections: list[SpecMotionSection]
     captions: SpecCaptions | None = None
+    brand: SpecBrandManifest | None = None
 
 
 class SpecMusic(BaseModel):

@@ -503,6 +503,16 @@
               "type": "string"
             }
           }
+        },
+        "brand": {
+          "description": "Brand design for the agnostic Remotion bundle. tokens = brand_tokens.resolve; fonts = mograph_fonts.resolve. Role font files ride as inputs id 'mograph/public/<file>'; the pod stages them into the bundle public/ before render.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tokens", "fonts"],
+          "properties": {
+            "tokens": {"type": "object"},
+            "fonts": {"type": "object"}
+          }
         }
       }
     },
