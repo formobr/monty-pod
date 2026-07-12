@@ -117,12 +117,9 @@ def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc) -> Path:
     for lay in layers:
         cmd += ["-i", lay["mov"]]
     fc, last = overlay_filtergraph(layers)
+    from .render import _venc
     cmd += ["-filter_complex", fc, "-map", f"[{last}]", "-map", "0:a?"]
-    if gpu:
-        cmd += ["-c:v", "h264_nvenc", "-preset", enc.preset, "-tune", "hq", "-cq", str(enc.cq)]
-    else:
-        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", str(enc.cq)]
-    cmd += ["-pix_fmt", enc.pix_fmt, "-c:a", "copy", str(out)]
+    cmd += _venc(enc, gpu) + ["-c:a", "copy", str(out)]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as exc:

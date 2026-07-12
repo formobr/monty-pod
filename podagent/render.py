@@ -15,6 +15,17 @@ from .cp import ControlPlane, download, upload
 from .models import MotionKeyframe, RenderSpec, SpecBrollClip, SpecTransition
 
 _P_STYLE = re.compile(r"p\d+")  # NVENC preset names (p1..p7); libx264 can't take these
+# delivery signal: TAG bt709 (no convert — untagged made platforms guess the colourspace)
+_BT709 = ("-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709")
+
+
+def _venc(enc, gpu: bool) -> list[str]:
+    """Video-encoder argv for the delivery contract: cq (14), bt709 tag, nvenc maxrate/bufsize headroom."""
+    if gpu:
+        return ["-c:v", "h264_nvenc", "-preset", enc.preset, "-tune", "hq", "-cq", str(enc.cq),
+                "-maxrate", "24M", "-bufsize", "32M", "-pix_fmt", enc.pix_fmt, *_BT709]
+    preset = "medium" if _P_STYLE.fullmatch(enc.preset) else enc.preset
+    return ["-c:v", "libx264", "-preset", preset, "-crf", str(enc.cq), "-pix_fmt", enc.pix_fmt, *_BT709]
 
 
 def _num(x: float) -> str:
@@ -380,16 +391,8 @@ def build_command(
         cmd += ["-i", str(extra)]
     cmd += ["-filter_complex", build_filtergraph(spec, gpu, audio)]
     cmd += ["-map", "[vout]", "-map", "[aout]"]
-    if gpu:
-        cmd += ["-c:v", "h264_nvenc", "-preset", enc.preset, "-tune", "hq", "-cq", str(enc.cq)]
-    else:
-        preset = "medium" if _P_STYLE.fullmatch(enc.preset) else enc.preset
-        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(enc.cq)]
-    cmd += [
-        "-pix_fmt", enc.pix_fmt,
-        "-c:a", "aac", "-b:a", enc.audio_bitrate,
-        "-movflags", "+faststart", str(out_path),
-    ]
+    cmd += _venc(enc, gpu)
+    cmd += ["-c:a", "aac", "-b:a", enc.audio_bitrate, "-movflags", "+faststart", str(out_path)]
     return cmd
 
 
@@ -407,12 +410,7 @@ def _burn_captions(caps, src: Path, input_paths: dict, out_path: Path, gpu: bool
                              style=caps.style or "oneword"), encoding="utf-8")
     cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(src),
            "-vf", f"subtitles={ass}:fontsdir={font.parent}"]
-    if gpu:
-        cmd += ["-c:v", "h264_nvenc", "-preset", enc.preset, "-tune", "hq", "-cq", str(enc.cq)]
-    else:
-        preset = "medium" if _P_STYLE.fullmatch(enc.preset) else enc.preset
-        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(enc.cq)]
-    cmd += ["-pix_fmt", enc.pix_fmt, "-c:a", "copy", str(out_path)]
+    cmd += _venc(enc, gpu) + ["-c:a", "copy", str(out_path)]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as exc:

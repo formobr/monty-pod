@@ -277,8 +277,8 @@ def weld(video: Path, cover_png: Path, out: Path, hold: float, gpu: bool, w: int
     fps, sr, ch = _probe(video)
     layout = "stereo" if ch == "2" else "mono"
     bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
-    venc = (["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "20"] if gpu
-            else ["-c:v", "libx264", "-preset", "medium", "-crf", "18"])
+    venc = (["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "14", "-maxrate", "24M", "-bufsize", "32M"] if gpu
+            else ["-c:v", "libx264", "-preset", "medium", "-crf", "14"])  # delivery cq14 (terminal weld)
     with tempfile.TemporaryDirectory() as td:
         clip = Path(td) / "cover_clip.mp4"
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
