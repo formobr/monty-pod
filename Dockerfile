@@ -45,7 +45,7 @@ RUN curl -L -o /tmp/ffmpeg.tar.xz \
 # the rest ---------------------------------------------------------------
 RUN python3 -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 \
     # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
-    && python3 -m pip install --no-cache-dir transformers opencv-python-headless numpy requests pydantic huggingface_hub soundfile
+    && python3 -m pip install --no-cache-dir transformers opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow
 
 # --- bake model weights so the pod boots ready, no cold-start download -----
 ENV HF_HOME=/opt/hf

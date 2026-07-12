@@ -6,6 +6,7 @@ dependencies = [
     "pydantic>=2",
     "requests",
     "numpy",
+    "Pillow",
 ]
 
 [project.optional-dependencies]
