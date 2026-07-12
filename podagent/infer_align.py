@@ -51,12 +51,14 @@ class AlignService:
     def run(self, params: AlignParams, put_url: str) -> float:
         """Returns wall seconds spent on inference (reported in InferResult.timing)."""
         import numpy as np
-        import torchaudio
+        import soundfile as sf
+        import torchaudio  # resample only; torchaudio.load on 2.8 dispatches to torchcodec (absent) — decode via soundfile
 
         t0 = time.monotonic()
         with tempfile.TemporaryDirectory() as td:
             wav_path = download(params.audio_url, Path(td) / "audio")
-            wave, sr = torchaudio.load(str(wav_path))
+            data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)  # (frames, ch)
+            wave = self.torch.from_numpy(data.T.copy())                          # (ch, frames), channels-first
             if wave.shape[0] > 1:
                 wave = wave.mean(0, keepdim=True)
             if sr != _SR:
