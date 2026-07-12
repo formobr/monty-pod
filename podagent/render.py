@@ -99,10 +99,21 @@ def _atempo_chain(speed: float) -> list[str]:
 # --- graph & command ----------------------------------------------------------
 
 def input_ids(spec: RenderSpec) -> list[str]:
-    """Unique input ids in first-appearance order; an id's position is its ffmpeg input index."""
+    """Input ids the MAIN filtergraph consumes (timeline srcs, broll clips, music, sfx), in spec.inputs
+    order — an id's position is its ffmpeg -i index. Cover/caption ASSETS (fonts, logo) are downloaded
+    but NOT decoded here (the cover/caption passes read them off disk), so a TTF never becomes a bad -i."""
+    consumed: set[str] = {seg.src for seg in spec.timeline.segments}
+    ov = spec.overlays
+    if ov is not None:
+        if ov.broll_final:
+            consumed.update(c.clip for c in ov.broll_final.broll)
+        if ov.music:
+            consumed.add(ov.music.track)
+        if ov.sfx:
+            consumed.update(s.sound for s in ov.sfx)
     seen: list[str] = []
     for inp in spec.inputs:
-        if inp.id not in seen:
+        if inp.id in consumed and inp.id not in seen:
             seen.append(inp.id)
     return seen
 
@@ -382,6 +393,34 @@ def build_command(
     return cmd
 
 
+def _burn_captions(caps, src: Path, input_paths: dict, out_path: Path, gpu: bool,
+                   w: int, h: int, enc) -> None:
+    """Burn the subtitle track onto `src` via libass (one re-encode, audio copied through)."""
+    from .captions import build_ass
+    if not caps.font or caps.font not in input_paths:
+        raise RuntimeError("captions present but no resolved font input on the spec")
+    font = input_paths[caps.font]
+    words = [wd.model_dump() for wd in caps.words]
+    ass = out_path.parent / "captions.ass"
+    ass.write_text(build_ass(words, font=font, w=w, h=h, accent=caps.accent or "#d6ff3a",
+                             center_y=caps.centerY if caps.centerY is not None else 0.76,
+                             style=caps.style or "oneword"), encoding="utf-8")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(src),
+           "-vf", f"subtitles={ass}:fontsdir={font.parent}"]
+    if gpu:
+        cmd += ["-c:v", "h264_nvenc", "-preset", enc.preset, "-tune", "hq", "-cq", str(enc.cq)]
+    else:
+        preset = "medium" if _P_STYLE.fullmatch(enc.preset) else enc.preset
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(enc.cq)]
+    cmd += ["-pix_fmt", enc.pix_fmt, "-c:a", "copy", str(out_path)]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or b"")[-2000:]
+        detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
+        raise RuntimeError(f"caption burn ffmpeg exited {exc.returncode}: {detail}") from exc
+
+
 # --- I/O orchestration --------------------------------------------------------
 
 _GPU: bool | None = None
@@ -410,7 +449,12 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
     """Fetch inputs, run the single encode pass, PUT every non-cache output, report the event."""
     if spec.mode == "final" and spec.overlays is not None:
         ov = spec.overlays
-        pending = [name for name, val in (("motion_plan", ov.motion_plan), ("trims", ov.trims)) if val]
+        mp = ov.motion_plan
+        pending = []
+        if mp is not None and mp.sections:  # captions are done; mograph sections still are not
+            pending.append("motion_plan.sections")
+        if ov.trims:
+            pending.append("trims")
         if pending:  # fail loud, never silently drop an overlay the brain asked for
             raise NotImplementedError(f"final overlay(s) not yet composited on the pod: {pending}")
 
@@ -452,14 +496,23 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
             detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
             raise RuntimeError(f"ffmpeg exited {exc.returncode}: {detail}") from exc
 
-        # cover is the LAST step: extract the base frame, compose the still, weld it onto the master tail.
         master = out
+        # captions burn (libass) BEFORE the cover weld — the subtitle track covers the whole body.
+        _mp = spec.overlays.motion_plan if (spec.mode == "final" and spec.overlays is not None) else None
+        caps = _mp.captions if _mp is not None else None
+        if caps is not None and caps.words:
+            captioned = tmp / "render_caps.mp4"
+            _burn_captions(caps, master, input_paths, captioned, gpu,
+                           spec.timeline.width, spec.timeline.height, spec.encode)
+            master = captioned
+
+        # cover is the LAST step: extract the base frame, compose the still, weld it onto the master tail.
         cover = spec.overlays.cover if (spec.mode == "final" and spec.overlays is not None) else None
         if cover is not None:
             from .cover import render_cover
             welded = tmp / "render_cover.mp4"
             render_cover(cover.model_dump(by_alias=True), input_paths[spec.timeline.segments[0].src],
-                         out, input_paths, welded, gpu, spec.timeline.width, spec.timeline.height)
+                         master, input_paths, welded, gpu, spec.timeline.width, spec.timeline.height)
             master = welded
 
         done: list[str] = []

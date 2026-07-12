@@ -471,6 +471,36 @@
               "items": {
                 "type": "number"
               }
+            },
+            "words": {
+              "description": "Fully resolved subtitle events on the final clock (the brain bakes the transcript; the pod has no ASR/brand). hot = lit in the accent colour.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text", "start", "end"],
+                "properties": {
+                  "text": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "start": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "end": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "hot": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "font": {
+              "description": "an inputs[].id of the caption TTF (family the ASS style names).",
+              "type": "string"
             }
           }
         }

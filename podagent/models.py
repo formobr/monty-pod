@@ -120,6 +120,15 @@ class SpecMotionSection(BaseModel):
     props: dict[str, Any]
 
 
+class SpecCaptionWord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1)
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    hot: bool = False
+
+
 class SpecCaptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -127,6 +136,8 @@ class SpecCaptions(BaseModel):
     accent: str | None = None
     style: Literal["oneword", "phrase", "phrase_jump"] | None = None
     hot: list[float] = Field(default_factory=list)
+    words: list[SpecCaptionWord] = Field(default_factory=list)
+    font: str | None = None
 
 
 class SpecMotionPlan(BaseModel):

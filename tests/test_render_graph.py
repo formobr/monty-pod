@@ -96,6 +96,18 @@ def test_final_overlays_not_implemented() -> None:
         render.render_spec(spec, _StubCP())  # type: ignore[arg-type]
 
 
+def test_input_ids_excludes_non_av_assets() -> None:
+    # a caption/cover font is downloaded but must NOT be fed as ffmpeg -i (a TTF is not a decodable stream)
+    spec = _spec("spec.final.json")
+    ids = render.input_ids(spec)
+    assert "caption_font" not in ids
+    assert spec.timeline.segments[0].src in ids                 # the base video IS consumed
+    assert spec.overlays.broll_final.broll[0].clip in ids       # broll clips ARE consumed
+    ipaths = {i.id: Path(f"/work/{i.id}") for i in spec.inputs}
+    cmd = render.build_command(spec, ipaths, Path("/work/out.mp4"), gpu=False)
+    assert "/work/caption_font" not in [cmd[n + 1] for n, a in enumerate(cmd) if a == "-i"]
+
+
 def test_multi_source_input_order() -> None:
     data = _data("spec.preview.json")
     src2 = dict(data["inputs"][0])

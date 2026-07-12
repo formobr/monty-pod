@@ -89,16 +89,8 @@
         ],
         "words": [
           {
-            "text": "HELLO",
             "start": 0.1,
-            "end": 0.5,
-            "hot": false
-          },
-          {
-            "text": "WORLD",
-            "start": 0.55,
-            "end": 1.0,
-            "hot": true
+            "end": 0.5
           }
         ],
         "font": "caption_font"
