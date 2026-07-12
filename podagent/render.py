@@ -505,17 +505,26 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
 
         # cover is the LAST step: extract the base frame, compose the still, weld it onto the master tail.
         cover = spec.overlays.cover if (spec.mode == "final" and spec.overlays is not None) else None
+        cover_png: Path | None = None
         if cover is not None:
             from .cover import render_cover
             welded = tmp / "render_cover.mp4"
+            # keep the composed still when a cover output is declared — the deliverable = the welded end-card's pixels.
+            cover_png = (tmp / "cover.png") if any(o.kind == "cover" for o in spec.outputs) else None
             render_cover(cover.model_dump(by_alias=True), input_paths[spec.timeline.segments[0].src],
-                         master, input_paths, welded, gpu, spec.timeline.width, spec.timeline.height)
+                         master, input_paths, welded, gpu, spec.timeline.width, spec.timeline.height,
+                         png_out=cover_png)
             master = welded
 
         done: list[str] = []
         for o in spec.outputs:
             if o.kind == "cache":
                 print(f"cache output {o.id!r} skipped (v1)", file=sys.stderr)
+                continue
+            if o.kind == "cover":
+                if cover_png is not None and cover_png.is_file():
+                    upload(cover_png, o.put_url, "image/png")
+                    done.append(o.id)
                 continue
             upload(master, o.put_url, "video/mp4")
             done.append(o.id)

@@ -233,7 +233,7 @@ class SpecOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
-    kind: Literal["proxy", "master", "cache"]
+    kind: Literal["proxy", "master", "cache", "cover"]   # cover = the standalone cover.png deliverable
     put_url: str = Field(min_length=1)
 
 

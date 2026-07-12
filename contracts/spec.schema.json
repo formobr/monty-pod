@@ -698,7 +698,8 @@
           "enum": [
             "proxy",
             "master",
-            "cache"
+            "cache",
+            "cover"
           ]
         },
         "put_url": {

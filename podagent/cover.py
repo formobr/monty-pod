@@ -299,14 +299,15 @@ def weld(video: Path, cover_png: Path, out: Path, hold: float, gpu: bool, w: int
 
 def render_cover(cover: dict[str, Any], base_video: Path, composed_video: Path,
                  input_paths: dict[str, Path], out: Path, gpu: bool, w: int, h: int,
-                 hold: float = 0.6) -> None:
+                 hold: float = 0.6, png_out: Path | None = None) -> None:
     """Extract the base frame at frame_at (clean plate), compose the still, weld it onto the composited
-    video. base_video = clean head_dyn (no captions/logo); composed_video = the finished master."""
+    video. base_video = clean head_dyn (no captions/logo); composed_video = the finished master.
+    ``png_out`` (if given) keeps the composed still as the standalone cover.png deliverable — same pixels."""
     with tempfile.TemporaryDirectory() as td:
         frame = Path(td) / "frame.jpg"
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                         "-ss", str(cover["frame_at"]), "-i", str(base_video),
                         "-frames:v", "1", "-q:v", "2", str(frame)], check=True)
-        png = Path(td) / "cover.png"
+        png = png_out if png_out is not None else Path(td) / "cover.png"
         compose(frame, cover, input_paths, png, w, h)
         weld(composed_video, png, out, hold, gpu, w, h)
