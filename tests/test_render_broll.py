@@ -80,15 +80,14 @@ def test_dissolve_is_alpha_fade_not_overlay_move():
 
 
 def test_render_spec_fails_loud_on_unimplemented_overlays():
-    clip = _hardcut()
+    # trims are the last overlay still unimplemented on the pod (broll/music/cover/sfx/captions/mograph are done)
     spec = RenderSpec.model_validate({
         "spec_version": 1, "job_id": "j", "slug": "s", "mode": "final",
-        "inputs": [_BASE_INPUT, _CLIP_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
+        "inputs": [_BASE_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
-        "overlays": {"broll_final": {"broll": [clip]},
-                     "motion_plan": {"sections": [{"comp": "SplitScreen", "start": 1.0, "props": {}}]}},
+        "overlays": {"trims": [{"a": 1.0, "b": 2.0}]},
     })
-    with pytest.raises(NotImplementedError, match="motion_plan"):
+    with pytest.raises(NotImplementedError, match="trims"):
         render.render_spec(spec, None)  # type: ignore[arg-type]
 
 

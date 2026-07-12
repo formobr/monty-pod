@@ -118,6 +118,7 @@ class SpecMotionSection(BaseModel):
     comp: str = Field(min_length=1)
     start: float = Field(ge=0)
     props: dict[str, Any]
+    glass: bool = False
 
 
 class SpecCaptionWord(BaseModel):

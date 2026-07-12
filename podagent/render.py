@@ -447,16 +447,8 @@ def _gpu_available() -> bool:
 
 def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
     """Fetch inputs, run the single encode pass, PUT every non-cache output, report the event."""
-    if spec.mode == "final" and spec.overlays is not None:
-        ov = spec.overlays
-        mp = ov.motion_plan
-        pending = []
-        if mp is not None and mp.sections:  # captions are done; mograph sections still are not
-            pending.append("motion_plan.sections")
-        if ov.trims:
-            pending.append("trims")
-        if pending:  # fail loud, never silently drop an overlay the brain asked for
-            raise NotImplementedError(f"final overlay(s) not yet composited on the pod: {pending}")
+    if spec.mode == "final" and spec.overlays is not None and spec.overlays.trims:
+        raise NotImplementedError("final overlay(s) not yet composited on the pod: ['trims']")
 
     gpu = _gpu_available()
     if not gpu and spec.motion is not None and spec.motion.segments:
@@ -497,8 +489,13 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
             raise RuntimeError(f"ffmpeg exited {exc.returncode}: {detail}") from exc
 
         master = out
-        # captions burn (libass) BEFORE the cover weld — the subtitle track covers the whole body.
         _mp = spec.overlays.motion_plan if (spec.mode == "final" and spec.overlays is not None) else None
+        # mograph overlays first (under the captions), then captions, then the cover weld.
+        if _mp is not None and _mp.sections:
+            from .mograph import composite
+            master = composite(_mp, master, input_paths, tmp / "render_mograph.mp4", gpu, spec.encode, tmp)
+
+        # captions burn (libass) BEFORE the cover weld — the subtitle track covers the whole body.
         caps = _mp.captions if _mp is not None else None
         if caps is not None and caps.words:
             captioned = tmp / "render_caps.mp4"

@@ -445,6 +445,9 @@
               },
               "props": {
                 "type": "object"
+              },
+              "glass": {
+                "type": "boolean"
               }
             }
           }

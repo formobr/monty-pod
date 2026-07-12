@@ -81,7 +81,8 @@
           "start": 22.5,
           "props": {
             "text": "hello"
-          }
+          },
+          "glass": true
         }
       ],
       "captions": {
