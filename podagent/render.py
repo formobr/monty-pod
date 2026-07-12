@@ -3,11 +3,13 @@ PUT back over presigned URLs. No decisions here — every number was fixed by th
 module only translates those numbers into a filtergraph and an argv."""
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 from .cp import ControlPlane, download, upload
 from .models import MotionKeyframe, RenderSpec, SpecBrollClip, SpecTransition
@@ -201,13 +203,98 @@ def _has_broll(spec: RenderSpec) -> bool:
                and spec.overlays.broll_final is not None and spec.overlays.broll_final.broll)
 
 
-def build_filtergraph(spec: RenderSpec, gpu: bool) -> str:
+# locked audio chain (add_music.sh + memory voice-audio-chain): voice -20 LUFS denoise-only (no comp/deharsh),
+# music bed -33 LUFS, gentle sidechain duck. Master -14 loudnorm is a later step (after cover), not here.
+_VOICE_LUFS, _TP, _LRA = -20.0, -1.5, 11
+_MUSIC_LUFS = -33.0
+_DUCK = 3
+
+
+class _AudioMix(NamedTuple):
+    voice_idx: int   # ffmpeg input index of the base (raw voice)
+    bed_idx: int     # ffmpeg input index of the pre-rendered, normalized, looped music bed
+    clean: str       # voice pre-filter (highpass [+ afftdn if the source is dirty])
+    vln: str         # measured two-pass loudnorm to -20 LUFS
+    dur: float
+
+
+def _probe_dur(path: Path) -> float:
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                          "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
+    return float(out.stdout.strip() or 0.0)
+
+
+def _voice_is_dirty(voice: Path) -> bool:
+    """Denoise gate: afftdn on a CLEAN voice adds musical-noise + dulls it (memory voice-audio-chain), so
+    denoise ONLY a source whose post-highpass noise floor is above -50 dB."""
+    res = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(voice), "-map", "0:a?",
+                          "-af", "highpass=f=80,astats=metadata=1:reset=0", "-f", "null", "-"],
+                         capture_output=True, text=True)
+    for line in res.stderr.splitlines():
+        if "Noise floor dB" in line:
+            try:
+                return float(line.split(":")[-1].strip()) > -50.0
+            except ValueError:
+                return False
+    return False
+
+
+def _measure_loudnorm(voice: Path, pre: str) -> str:
+    """Two-pass loudnorm: measure the cleaned voice, return the loudnorm filter carrying measured_* +
+    linear=true (exact delivery). On a measure failure return the plain filter (single-pass dynamic)."""
+    vln = f"loudnorm=I={_num(_VOICE_LUFS)}:TP={_num(_TP)}:LRA={_LRA}"
+    res = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(voice),
+                          "-af", f"{pre},{vln}:print_format=json", "-f", "null", "-"],
+                         capture_output=True, text=True)
+    out = res.stderr
+    try:
+        d = json.loads(out[out.rindex("{"):out.rindex("}") + 1])
+        return (f"{vln}:measured_I={d['input_i']}:measured_TP={d['input_tp']}"
+                f":measured_LRA={d['input_lra']}:measured_thresh={d['input_thresh']}"
+                f":offset={d['target_offset']}:linear=true")
+    except (ValueError, KeyError):
+        return vln
+
+
+def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
+    """Normalize the track to the -33 LUFS bed, then loop+seek it to exactly `dur`. Order matters:
+    loudnorm on an infinite loop truncates, so normalize the finite track first, then loop the fixed bed."""
+    norm = tmp / "music_norm.flac"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(music),
+                    "-af", f"loudnorm=I={_num(_MUSIC_LUFS)}:TP=-2:LRA=11", "-ar", "48000", "-ac", "2",
+                    str(norm)], check=True)
+    bed = tmp / "music_bed.flac"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stream_loop", "-1",
+                    "-ss", _num(mstart), "-i", str(norm), "-t", _num(dur), "-ar", "48000", "-ac", "2",
+                    str(bed)], check=True)
+    return bed
+
+
+def _audio_mix_chains(a: _AudioMix) -> list[str]:
+    """Voice (clean → measured loudnorm → padded to length) mixed with the ducked music bed → [aout].
+    Sidechain dips the bed under speech (locked DUCK); the bed level is its -33 normalize, never volume."""
+    dur = _num(a.dur)
+    return [
+        f"[{a.voice_idx}:a]{a.clean},{a.vln},apad=whole_dur={dur},asplit=2[vc1][vc2]",
+        f"[{a.bed_idx}:a]volume=1.0[bg0]",
+        f"[bg0][vc2]sidechaincompress=threshold=0.06:ratio={_DUCK}:attack=20:release=500[bg]",
+        "[vc1][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[premix]",
+        "[premix]aresample=192000,alimiter=limit=0.63:attack=5:release=50:level=false,aresample=48000[aout]",
+    ]
+
+
+def _music_of(spec: RenderSpec) -> "object | None":
+    return spec.overlays.music if (spec.mode == "final" and spec.overlays is not None) else None
+
+
+def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = None) -> str:
     """Pure: the -filter_complex string trimming, speed-adjusting, motion-treating and concatenating
-    every timeline segment into [vout]/[aout], then compositing final b-roll cutaways over the base."""
+    every timeline segment into [vout]/[aout], compositing final b-roll, and mixing music when `audio`."""
     idx = {iid: n for n, iid in enumerate(input_ids(spec))}
     w, h = spec.timeline.width, spec.timeline.height
     motion_by_seg = {m.seg: m for m in spec.motion.segments} if spec.motion else {}
 
+    # `audio` overrides the segment audio with the voice+music mix (built by render_spec's pre-passes).
     chains: list[str] = []
     pads: list[str] = []
     for k, seg in enumerate(spec.timeline.segments):
@@ -225,33 +312,44 @@ def build_filtergraph(spec: RenderSpec, gpu: bool) -> str:
             video += "," + _cpu_crop(m.keyframes, w, h)
         chains.append(f"{video}[v{k}]")
 
-        audio = f"[{j}:a]atrim=start={_num(seg.in_)}:end={_num(seg.out)},asetpts=PTS-STARTPTS"
-        audio += "," + ",".join(_atempo_chain(seg.speed))
-        chains.append(f"{audio}[a{k}]")
-
-        pads.append(f"[v{k}][a{k}]")
+        if audio is None:
+            aud = f"[{j}:a]atrim=start={_num(seg.in_)}:end={_num(seg.out)},asetpts=PTS-STARTPTS"
+            aud += "," + ",".join(_atempo_chain(seg.speed))
+            chains.append(f"{aud}[a{k}]")
+            pads.append(f"[v{k}][a{k}]")
+        else:
+            pads.append(f"[v{k}]")
 
     n = len(spec.timeline.segments)
     # b-roll composites onto the concatenated base: base video → [vbase], last cutaway overlay → [vout].
     base_v = "vbase" if _has_broll(spec) else "vout"
-    chains.append(f"{''.join(pads)}concat=n={n}:v=1:a=1[{base_v}][aout]")
+    if audio is None:
+        chains.append(f"{''.join(pads)}concat=n={n}:v=1:a=1[{base_v}][aout]")
+    else:
+        chains.append(f"{''.join(pads)}concat=n={n}:v=1:a=0[{base_v}]")
     if _has_broll(spec):
         chains += _broll_chains(spec, idx, base_v)
+    if audio is not None:
+        chains += _audio_mix_chains(audio)
     return ";".join(chains)
 
 
 def build_command(
-    spec: RenderSpec, input_paths: dict[str, Path], out_path: Path, gpu: bool
+    spec: RenderSpec, input_paths: dict[str, Path], out_path: Path, gpu: bool,
+    extra_inputs: tuple[Path, ...] = (), audio: _AudioMix | None = None,
 ) -> list[str]:
     """Pure: the full ffmpeg argv for this spec. gpu decides the codec at runtime — the spec's
-    named encoder is only a hint; a CPU fallback overriding it is allowed mechanics."""
+    named encoder is only a hint; a CPU fallback overriding it is allowed mechanics. extra_inputs
+    (the pre-rendered music bed) append after the spec inputs, at the indices `audio` references."""
     enc = spec.encode
     cmd = ["ffmpeg", "-y", "-hide_banner"]
     if gpu:
         cmd += ["-init_hw_device", "vulkan"]  # libplacebo runs on a Vulkan device; hwupload derives from it
     for iid in input_ids(spec):
         cmd += ["-i", str(input_paths[iid])]
-    cmd += ["-filter_complex", build_filtergraph(spec, gpu)]
+    for extra in extra_inputs:
+        cmd += ["-i", str(extra)]
+    cmd += ["-filter_complex", build_filtergraph(spec, gpu, audio)]
     cmd += ["-map", "[vout]", "-map", "[aout]"]
     if gpu:
         cmd += ["-c:v", "h264_nvenc", "-preset", enc.preset, "-tune", "hq", "-cq", str(enc.cq)]
@@ -294,7 +392,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
     """Fetch inputs, run the single encode pass, PUT every non-cache output, report the event."""
     if spec.mode == "final" and spec.overlays is not None:
         ov = spec.overlays
-        pending = [name for name, val in (("music", ov.music), ("cover", ov.cover),
+        pending = [name for name, val in (("cover", ov.cover),
                                           ("motion_plan", ov.motion_plan), ("trims", ov.trims)) if val]
         if pending:  # fail loud, never silently drop an overlay the brain asked for
             raise NotImplementedError(f"final overlay(s) not yet composited on the pod: {pending}")
@@ -309,8 +407,23 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
         input_paths = {
             inp.id: download(inp.url, tmp / inp.id.replace("/", "__")) for inp in spec.inputs
         }
+        # music: pre-measure the voice loudnorm + pre-render the -33 LUFS bed (own ffmpeg passes), then
+        # the main pass mixes voice+bed instead of copying segment audio (locked add_music.sh chain).
+        extra_inputs: tuple[Path, ...] = ()
+        audio: _AudioMix | None = None
+        music = _music_of(spec)
+        if music is not None:
+            voice = input_paths[spec.timeline.segments[0].src]
+            dur = _probe_dur(voice)
+            clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if _voice_is_dirty(voice) else "")
+            vln = _measure_loudnorm(voice, clean)
+            bed = _prerender_bed(input_paths[music.track], music.start, dur, tmp)  # type: ignore[attr-defined]
+            extra_inputs = (bed,)
+            voice_idx = input_ids(spec).index(spec.timeline.segments[0].src)
+            audio = _AudioMix(voice_idx=voice_idx, bed_idx=len(input_ids(spec)),
+                              clean=clean, vln=vln, dur=dur)
         out = tmp / "render.mp4"
-        cmd = build_command(spec, input_paths, out, gpu)
+        cmd = build_command(spec, input_paths, out, gpu, extra_inputs, audio)
         try:
             subprocess.run(cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as exc:

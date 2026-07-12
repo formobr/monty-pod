@@ -80,16 +80,43 @@ def test_dissolve_is_alpha_fade_not_overlay_move():
 
 
 def test_render_spec_fails_loud_on_unimplemented_overlays():
-    from podagent.cp import ControlPlane  # noqa: F401  (only for type; we don't build one)
     clip = _hardcut()
     spec = RenderSpec.model_validate({
         "spec_version": 1, "job_id": "j", "slug": "s", "mode": "final",
-        "inputs": [_BASE_INPUT, _CLIP_INPUT, {"id": "music/t.mp3", "kind": "audio",
-                                              "sha256": "2" * 64, "url": "u"}],
-        "timeline": _TIMELINE, "encode": _ENCODE,
+        "inputs": [_BASE_INPUT, _CLIP_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
         "overlays": {"broll_final": {"broll": [clip]},
-                     "music": {"track": "music/t.mp3", "start": 30.0, "gain": 0.09}},
+                     "cover": {"frame_at": 5.0, "headline": {"lines": [[{"t": "X", "c": "white"}]]}}},
     })
-    with pytest.raises(NotImplementedError, match="music"):
+    with pytest.raises(NotImplementedError, match="cover"):
         render.render_spec(spec, None)  # type: ignore[arg-type]
+
+
+def _music_spec() -> RenderSpec:
+    return RenderSpec.model_validate({
+        "spec_version": 1, "job_id": "j", "slug": "s", "mode": "final",
+        "inputs": [_BASE_INPUT, {"id": "music/t.mp3", "kind": "audio", "sha256": "2" * 64, "url": "u"}],
+        "timeline": _TIMELINE, "encode": _ENCODE,
+        "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
+        "overlays": {"music": {"track": "music/t.mp3", "start": 30.0, "gain": 0.09}},
+    })
+
+
+def test_music_audio_graph_mixes_voice_and_bed():
+    spec = _music_spec()
+    a = render._AudioMix(voice_idx=0, bed_idx=1, clean="highpass=f=80",
+                         vln="loudnorm=I=-20:TP=-1.5:LRA=11", dur=60.0)
+    g = render.build_filtergraph(spec, gpu=False, audio=a)
+    # video concatenates WITHOUT audio (a=0); the mix owns [aout]
+    assert "concat=n=1:v=1:a=0[vout]" in g
+    assert "[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,apad=whole_dur=60" in g
+    assert "sidechaincompress=threshold=0.06:ratio=3" in g  # locked DUCK
+    assert "amix=inputs=2:duration=first:dropout_transition=0:normalize=0" in g
+    assert "[bg0]" in g and g.strip().endswith("[aout]")
+
+
+def test_no_audio_keeps_segment_audio_concat():
+    spec = _music_spec()
+    g = render.build_filtergraph(spec, gpu=False, audio=None)  # audio not resolved → base passthrough
+    assert "concat=n=1:v=1:a=1[vout][aout]" in g
+    assert "sidechaincompress" not in g
