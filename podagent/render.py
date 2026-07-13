@@ -188,10 +188,45 @@ def _broll_dissolve_frag(clip: SpecBrollClip, start: float, end: float) -> str:
     return frag
 
 
+# Ken Burns cutaway move: prepare at 2x supersample, then zoompan down to canvas so sub-pixel pans stay
+# smooth (anti-jitter). z/x/y interpolate linearly across the clip per the preset (in=zoom-in, pans slide x/y).
+_KB_SS = 2
+_KB_PAN = {  # preset -> (fx0, fx1, fy0, fy1); z resolved by _kb_zooms. Unknown preset → "in" (centered zoom).
+    "in": (0.5, 0.5, 0.5, 0.5), "out": (0.5, 0.5, 0.5, 0.5),
+    "left": (0.85, 0.15, 0.5, 0.5), "right": (0.15, 0.85, 0.5, 0.5),
+    "up": (0.5, 0.5, 0.85, 0.15), "down": (0.5, 0.5, 0.15, 0.85),
+    "in_left": (0.65, 0.35, 0.5, 0.5), "in_right": (0.35, 0.65, 0.5, 0.5),
+    "out_left": (0.35, 0.65, 0.5, 0.5), "out_right": (0.65, 0.35, 0.5, 0.5),
+}
+
+
+def _kb_zooms(preset: str, amount: float, pan_zoom: float) -> tuple[float, float]:
+    if preset.startswith("in"):
+        return 1.0, 1.0 + amount
+    if preset.startswith("out"):
+        return 1.0 + amount, 1.0
+    return 1.0 + pan_zoom, 1.0 + pan_zoom  # pure pans keep a small constant zoom for pan room
+
+
+def _kenburns(preset: str, amount: float, pan_zoom: float, n: int, w: int, h: int, fps: float) -> str:
+    """The scale-2x → zoompan filter fragment for one cutaway's Ken Burns move (cover mode)."""
+    p = preset if preset in _KB_PAN else "in"
+    nf = max(1, n - 1)
+    z0, z1 = _kb_zooms(p, amount, pan_zoom)
+    fx0, fx1, fy0, fy1 = _KB_PAN[p]
+    r = lambda v: round(v, 5)  # noqa: E731 — clean filtergraph coeffs (no float dust)
+    z = f"({r(z0)}+({r(z1 - z0)})*on/{nf})"
+    x = f"(iw-iw/zoom)*({r(fx0)}+({r(fx1 - fx0)})*on/{nf})"
+    y = f"(ih-ih/zoom)*({r(fy0)}+({r(fy1 - fy0)})*on/{nf})"
+    sw, sh = w * _KB_SS, h * _KB_SS
+    return (f"scale={sw}:{sh}:force_original_aspect_ratio=increase:flags=lanczos,crop={sw}:{sh},"
+            f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps={_num(fps)}")
+
+
 def _broll_chains(spec: RenderSpec, idx: dict[str, int], base_label: str) -> list[str]:
-    """Overlay every resolved cutaway onto [base_label] → [vout]: cover-crop to canvas (Ken Burns bake
-    NOT reproduced — fidelity gap vs engine, FINAL_COMPOSITE_BUILD.md §C2), trim [in,in+dur], seat at
-    `start`, ride authored slide/push (overlay x/y) or dissolve (alpha fade). Audio untouched."""
+    """Overlay every resolved cutaway onto [base_label] → [vout]: Ken Burns move (scale-2x→zoompan per the
+    clip's preset/amount), trim [in,in+dur], seat at `start`, ride authored slide/push (overlay x/y) or
+    dissolve (alpha fade). Audio untouched."""
     assert spec.overlays is not None and spec.overlays.broll_final is not None
     clips = spec.overlays.broll_final.broll
     w, h = spec.timeline.width, spec.timeline.height
@@ -205,10 +240,11 @@ def _broll_chains(spec: RenderSpec, idx: dict[str, int], base_label: str) -> lis
         start, end = c.start, c.start + c.dur
         frag = _broll_dissolve_frag(c, start, end)
         j = idx[c.clip]
+        kb = _kenburns(c.preset, c.amount if c.amount is not None else 0.12, 0.08,
+                       max(1, round(c.dur * fps)), w, h, fps)
         chains.append(
             f"[{j}:v]trim=start={_num(c.in_ or 0.0)}:duration={_num(c.dur)},setpts=PTS-STARTPTS,"
-            f"fps={_num(fps)},scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={w}:{h},setpts=PTS-STARTPTS+{start:.3f}/TB{frag}[b{i}]"
+            f"fps={_num(fps)},{kb},setpts=PTS-STARTPTS+{start:.3f}/TB{frag}[b{i}]"
         )
         xy = _broll_slide_xy(c, start, end)
         over = f"overlay=x='{xy[0]}':y='{xy[1]}':" if xy else "overlay="

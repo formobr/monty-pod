@@ -33,10 +33,23 @@ def test_hardcut_broll_overlays_and_covers():
     # base lands in [vbase], the cutaway overlay produces [vout]
     assert "[vbase][aout]" in g
     assert "[vout]" in g
-    # cover-crop the raw clip to canvas, trim [in,in+dur], seat at start
+    # trim [in,in+dur], Ken Burns move (scale-2x cover → zoompan), seat at start
     assert "trim=start=0.3:duration=2.4" in g
-    assert "scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920" in g
+    assert "scale=2160:3840:force_original_aspect_ratio=increase:flags=lanczos,crop=2160:3840" in g
+    assert "zoompan=z='(1.0+(0.12" in g            # 'in' preset zooms 1.0→1.0+amount (cutaway is NOT frozen)
+    assert ":d=1:s=1080x1920:fps=30" in g          # zoompan emits canvas-size frames
     assert "setpts=PTS-STARTPTS+23.750/TB" in g
+
+
+def test_broll_kenburns_preset_direction():
+    # 'out' zooms 1+amount→1.0; a pure pan ('right') keeps a constant pan-zoom and moves x across the clip
+    clip = _hardcut(); clip["preset"] = "out"; clip["amount"] = 0.2
+    g = render.build_filtergraph(_spec(clip), gpu=False)
+    assert "zoompan=z='(1.2+(-0.2" in g            # out: z0=1.2 → z1=1.0
+    clip2 = _hardcut(); clip2["preset"] = "right"
+    g2 = render.build_filtergraph(_spec(clip2), gpu=False)
+    assert "zoompan=z='(1.08+(0.0" in g2           # pan: constant 1+pan_zoom (0.08)
+    assert "(iw-iw/zoom)*(0.15+(0.7" in g2         # x pans 0.15→0.85
     # hard cut → plain overlay gated to the clip's span, base passes on eof
     assert "overlay=enable='between(t,23.750,26.150)':eof_action=pass" in g
 
