@@ -101,8 +101,11 @@ def overlay_filtergraph(layers: list[dict]) -> tuple[str, str]:
     filters, src = [], "0:v"
     for i, lay in enumerate(layers):
         s, e, idx = lay["start"], lay["start"] + lay["dur"], i + 1
-        # NO engine full-frame glass blur: comps bake their own LOCAL scrim, so a full-frame gblur here would
-        # only turn neon-lit footage into acid mush behind the overlay (background must stay visible).
+        if lay.get("glass"):
+            # frosted-glass takeover: blur+darken the frame behind the card, gated to its window (parity with engine _composite).
+            filters.append(f"[{src}]gblur=sigma=22:enable='between(t,{s},{e})',"
+                           f"eq=brightness=-0.05:enable='between(t,{s},{e})'[g{i}]")
+            src = f"g{i}"
         filters.append(f"[{idx}:v]setpts=PTS-STARTPTS+{s}/TB[o{i}];"
                        f"[{src}][o{i}]overlay=enable='between(t,{s},{e})':eof_action=pass[v{i}]")
         src = f"v{i}"
