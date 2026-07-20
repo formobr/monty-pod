@@ -211,6 +211,12 @@ def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> 
 
 # --- 4. delivery loudness -----------------------------------------------------
 
+# loudnorm's linear-mode TP is a PREDICTION, not a brickwall (it overshoots ~0.2 dB), so the delivery pass
+# aims this far UNDER the declared ceiling. Named, not inline: it has no engine mirror to drift against, so
+# a test pins it directly (test_finalize_parity) — otherwise editing it re-levels every master, silently.
+TP_HEADROOM_DB = 0.7
+
+
 def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> tuple[str | None, str]:
     """Delivery filter for the MEASURED master. Clean -> normalize to target; a source the planner
     flagged as clipping-hot and already at/under target -> ship as-is (boosting a hot mic only
@@ -231,9 +237,7 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     ln = fin.loudnorm
     if ln is None:
         return src
-    # loudnorm linear-mode TP is a PREDICTION, not a brickwall (it overshoots ~0.2 dB), so the pass
-    # aims 0.7 dB under the declared ceiling.
-    tp_aim = round(ln.tp - 0.7, 2)
+    tp_aim = round(ln.tp - TP_HEADROOM_DB, 2)
     meas = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostats", "-i", str(src),
          "-af", f"loudnorm=I={ln.i}:TP={tp_aim}:LRA={ln.lra}:print_format=json", "-f", "null", "-"],
