@@ -51,9 +51,21 @@ Transport conventions (frozen alongside the envelope):
 - **Every media reference resolves.** `timeline.segments[].src`, `overlays.broll_final.broll[].clip`,
   `overlays.music.track` must each equal an `inputs[].id` (mirror-model validation — JSON Schema
   cannot express it).
+- **The delivery tail is data too.** `overlays.finalize` carries the accents, logo, watermark and delivery
+  loudness that turn a composite into a deliverable. Every value is a number or an enum: an accent is
+  `{kind, at, intensity}`, a placement is pixels (never an ffmpeg expression), a level is a number. Brand
+  assets ride as `inputs[]` — the pod has no brand profile and no asset tree, so anything not delivered as
+  an input is simply not available. A disabled step is an ABSENT block, never a flag the pod interprets.
 - **Inference stays dumb.** `align` = pure wav2vec2 forward, emissions come back. `face_probe` =
   raw boxes back. `clip_rank` = both SigLIP towers plus the cosine, numbers back — the reorder, the
   relevance floor and the MMR dedup are the planner's. One batched call per kind, never per-segment.
+
+## outputs
+
+`outputs[].kind` says what a PUT is for: `master` (the deliverable), `cover` (the standalone cover.png),
+`proxy`, `cache`, and `presync` — the composite as it stood BEFORE the delivery tail. `presync` exists so
+the origin can measure the finished master against a video-identical reference and attribute any A/V drift
+to the tail; it is uploaded only when a `finalize` block actually ran.
 
 ## align payload (binary, not JSON-schema'd)
 

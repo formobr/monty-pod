@@ -552,10 +552,25 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
                          png_out=cover_png)
             master = welded
 
+        # The COMPOSITE is complete here; everything below is the delivery tail. `presync` pins this
+        # exact frame: it is the video-identical reference the origin's A/V-sync guard measures the
+        # finished master against, so the guard can attribute any drift to the tail and nothing else.
+        presync = master
+        fin = spec.overlays.finalize if (spec.mode == "final" and spec.overlays is not None) else None
+        if fin is not None:
+            from .finalize import finalize
+            master = finalize(fin, master, input_paths, tmp, gpu)
+
         done: list[str] = []
         for o in spec.outputs:
             if o.kind == "cache":
                 print(f"cache output {o.id!r} skipped (v1)", file=sys.stderr)
+                continue
+            if o.kind == "presync":
+                # only meaningful when a tail ran; without one the master IS the composite
+                if fin is not None:
+                    upload(presync, o.put_url, "video/mp4")
+                    done.append(o.id)
                 continue
             if o.kind == "cover":
                 if cover_png is not None and cover_png.is_file():

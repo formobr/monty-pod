@@ -1,5 +1,5 @@
 {
-  "spec_version": 4,
+  "spec_version": 5,
   "job_id": "job_b81d02",
   "slug": "demo-clip",
   "mode": "final",
@@ -33,6 +33,24 @@
       "url": "file:///fonts/druk.woff2",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "kind": "font"
+    },
+    {
+      "id": "brand/logo.png",
+      "kind": "image",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "url": "https://storage.example/i/logo.png?sig=GET"
+    },
+    {
+      "id": "brand/wm-sting.webm",
+      "kind": "video",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "url": "https://storage.example/i/wm-sting.webm?sig=GET"
+    },
+    {
+      "id": "brand/wm-idle.webm",
+      "kind": "video",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "url": "https://storage.example/i/wm-idle.webm?sig=GET"
     }
   ],
   "timeline": {
@@ -171,7 +189,47 @@
         "a": 33.2,
         "b": 35.9
       }
-    ]
+    ],
+    "finalize": {
+      "accents": [
+        {
+          "kind": "zoom_punch",
+          "at": 12.5,
+          "intensity": 0.6
+        },
+        {
+          "kind": "glitch",
+          "at": 31.0,
+          "intensity": 0.45
+        }
+      ],
+      "logo": {
+        "asset": "brand/logo.png",
+        "corner": "tr",
+        "width": 150,
+        "opacity": 0.55,
+        "margin": 40,
+        "cover_hold": 0.6
+      },
+      "watermark": {
+        "sting": "brand/wm-sting.webm",
+        "idle": "brand/wm-idle.webm",
+        "width": 422,
+        "margin": 60,
+        "position": "bottom-center",
+        "x": 40.0,
+        "y": 1253.0,
+        "delay": 2.5,
+        "chime": true,
+        "chime_volume": 1.0
+      },
+      "loudnorm": {
+        "i": -14.0,
+        "tp": -1.0,
+        "lra": 11.0,
+        "attenuate_only": false
+      }
+    }
   },
   "encode": {
     "video": "h264_nvenc",
@@ -186,6 +244,11 @@
       "id": "master",
       "kind": "master",
       "put_url": "https://storage.example/o/10324.mp4?sig=PUT"
+    },
+    {
+      "id": "presync",
+      "kind": "presync",
+      "put_url": "https://storage.example/o/10324.presync.mp4?sig=PUT"
     }
   ]
 }

@@ -213,7 +213,7 @@ def test_a_cache_dir_without_the_completion_sentinel_is_not_a_hit(served):
 
 # --- the contract ------------------------------------------------------------------------------
 
-_BASE = {"infer_version": 4, "job_id": "j", "kind": "align", "model": "m", "put_url": "p",
+_BASE = {"infer_version": 5, "job_id": "j", "kind": "align", "model": "m", "put_url": "p",
          "align": {"audio_url": "u", "windows": [[0.0, 1.0]]}}
 _W = {"url": "https://r2.example/x.tar", "sha256": "a" * 64}
 
@@ -231,7 +231,7 @@ def test_align_with_weights_is_accepted():
 
 
 def test_face_probe_must_not_carry_weights():
-    req = {"infer_version": 4, "job_id": "j", "kind": "face_probe", "model": "m", "put_url": "p",
+    req = {"infer_version": 5, "job_id": "j", "kind": "face_probe", "model": "m", "put_url": "p",
            "face_probe": {"video_url": "u", "shots": [[0.0, 1.0]], "stride": 5, "frame_diff": False},
            "weights": _W}
     with pytest.raises(ValidationError, match="must not carry weights"):

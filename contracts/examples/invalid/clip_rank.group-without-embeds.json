@@ -1,4 +1,11 @@
 {
   "model": "google/siglip2-so400m-patch14-384",
-  "groups": [{ "scores": [0.31, 0.22] }]
+  "groups": [
+    {
+      "scores": [
+        0.31,
+        0.22
+      ]
+    }
+  ]
 }

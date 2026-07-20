@@ -27,6 +27,30 @@
       "url": "file:///fonts/Inter-ExtraBold.ttf",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "kind": "font"
+    },
+    {
+      "id": "mograph/public/druk.woff2",
+      "url": "file:///fonts/druk.woff2",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "kind": "font"
+    },
+    {
+      "id": "brand/logo.png",
+      "kind": "image",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "url": "https://storage.example/i/logo.png?sig=GET"
+    },
+    {
+      "id": "brand/wm-sting.webm",
+      "kind": "video",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "url": "https://storage.example/i/wm-sting.webm?sig=GET"
+    },
+    {
+      "id": "brand/wm-idle.webm",
+      "kind": "video",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "url": "https://storage.example/i/wm-idle.webm?sig=GET"
     }
   ],
   "timeline": {
@@ -75,7 +99,8 @@
           "start": 22.5,
           "props": {
             "text": "hello"
-          }
+          },
+          "glass": true
         }
       ],
       "captions": {
@@ -89,11 +114,45 @@
         ],
         "words": [
           {
+            "text": "HELLO",
             "start": 0.1,
-            "end": 0.5
+            "end": 0.5,
+            "hot": false
+          },
+          {
+            "text": "WORLD",
+            "start": 0.55,
+            "end": 1.0,
+            "hot": true
           }
         ],
         "font": "caption_font"
+      },
+      "brand": {
+        "tokens": {
+          "color": {
+            "accent": "#d6ff3a",
+            "fg": "#f2f2f0"
+          },
+          "scale": 2.3
+        },
+        "fonts": {
+          "roles": {
+            "display": {
+              "family": "mg-display",
+              "file": "druk.woff2",
+              "weight": "800",
+              "style": "italic",
+              "cyrillic": true
+            }
+          },
+          "cyrillicFallback": "display"
+        }
+      },
+      "bundle": {
+        "url": "https://r2.example/bundle/remotion-9f2c.tar?sig=…",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "size": 528482304
       }
     },
     "music": {
@@ -130,7 +189,47 @@
         "a": 33.2,
         "b": 35.9
       }
-    ]
+    ],
+    "finalize": {
+      "accents": [
+        {
+          "kind": "zoom_punch",
+          "at": 12.5,
+          "intensity": 1.4
+        },
+        {
+          "kind": "glitch",
+          "at": 31.0,
+          "intensity": 0.45
+        }
+      ],
+      "logo": {
+        "asset": "brand/logo.png",
+        "corner": "tr",
+        "width": 150,
+        "opacity": 0.55,
+        "margin": 40,
+        "cover_hold": 0.6
+      },
+      "watermark": {
+        "sting": "brand/wm-sting.webm",
+        "idle": "brand/wm-idle.webm",
+        "width": 422,
+        "margin": 60,
+        "position": "bottom-center",
+        "x": 40.0,
+        "y": 1253.0,
+        "delay": 2.5,
+        "chime": true,
+        "chime_volume": 1.0
+      },
+      "loudnorm": {
+        "i": -14.0,
+        "tp": -1.0,
+        "lra": 11.0,
+        "attenuate_only": false
+      }
+    }
   },
   "encode": {
     "video": "h264_nvenc",
@@ -145,6 +244,11 @@
       "id": "master",
       "kind": "master",
       "put_url": "https://storage.example/o/10324.mp4?sig=PUT"
+    },
+    {
+      "id": "presync",
+      "kind": "presync",
+      "put_url": "https://storage.example/o/10324.presync.mp4?sig=PUT"
     }
   ]
 }

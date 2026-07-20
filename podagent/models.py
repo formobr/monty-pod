@@ -6,7 +6,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION: Final = 4
+SPEC_VERSION: Final = 5
 
 
 class SpecInput(BaseModel):
@@ -232,6 +232,88 @@ class SpecSfx(BaseModel):
     gain: float = Field(gt=0, le=2)
 
 
+# -- finalize: the delivery tail (final tier only) ------------------------------------------------
+
+
+class SpecAccent(BaseModel):
+    """One resolved frame-accent: WHICH treatment, WHERE on the final clock, HOW hard. The Director's
+    reasoning (the anchor phrase, the score, why this beat earned an accent) never crosses — only
+    these three resolved values do."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["camera_shake", "grain", "zoom_punch", "glitch", "zoom_blur", "rgb_split", "pixelate"]
+    at: float = Field(ge=0)
+    intensity: float = Field(ge=0, le=1)
+
+
+class SpecLogo(BaseModel):
+    """The persistent corner logo over the BODY. `asset` is an inputs[].id of the logo PNG — the pod
+    holds no brand profile and never reads one. `cover_hold` is the length of the cover end-card tail
+    the logo must NOT cover (the end-card carries its own logo)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset: str = Field(min_length=1)
+    corner: Literal["tl", "tr", "bl", "br"]
+    width: int = Field(gt=0)
+    opacity: float = Field(ge=0, le=1)
+    margin: int = Field(ge=0)
+    cover_hold: float = Field(ge=0)
+
+
+class SpecWatermark(BaseModel):
+    """The animated brand watermark. `sting`/`idle` are inputs[].id of the two alpha .webm clips; the
+    chime is the sting's own audio track. `x`/`y` are NUMBERS in pixels, never ffmpeg expressions —
+    an expression would be a filtergraph fragment crossing the seam."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sting: str = Field(min_length=1)
+    idle: str = Field(min_length=1)
+    width: int = Field(gt=0)
+    margin: int = Field(ge=0)
+    position: Literal["bottom-center", "bottom-right", "bottom-left",
+                      "top-center", "top-right", "top-left", "center"]
+    x: float | None = None
+    y: float | None = None
+    delay: float = Field(default=0.0, ge=0)
+    chime: bool = True
+    chime_volume: float = Field(default=1.0, gt=0, le=2)
+
+    @model_validator(mode="after")
+    def _xy_together(self) -> "SpecWatermark":
+        if (self.x is None) != (self.y is None):
+            raise ValueError("watermark x and y are one placement — pass both or neither")
+        return self
+
+
+class SpecLoudnorm(BaseModel):
+    """Delivery loudness. `attenuate_only` is the PLANNER's verdict that the source clipped hot (it
+    read the clipping sidecar the pod has never seen); the pod applies it, it does not re-decide it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    i: float
+    tp: float
+    lra: float = Field(gt=0)
+    attenuate_only: bool = False
+
+
+class SpecFinalize(BaseModel):
+    """The delivery tail applied AFTER the composite: frame accents, body logo, animated watermark,
+    delivery loudness. Every sub-block is independently optional, so `--no-logo` / `--no-watermark`
+    are expressed by OMISSION rather than by a flag the pod has to interpret — the pod runs exactly
+    the steps it was handed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accents: list[SpecAccent] = Field(default_factory=list)
+    logo: SpecLogo | None = None
+    watermark: SpecWatermark | None = None
+    loudnorm: SpecLoudnorm | None = None
+
+
 class Overlays(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -241,6 +323,7 @@ class Overlays(BaseModel):
     cover: SpecCover | None = None
     trims: list[SpecTrim] | None = None
     sfx: list[SpecSfx] | None = None
+    finalize: SpecFinalize | None = None
 
 
 class Encode(BaseModel):
@@ -258,14 +341,14 @@ class SpecOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
-    kind: Literal["proxy", "master", "cache", "cover"]   # cover = the standalone cover.png deliverable
+    kind: Literal["proxy", "master", "cache", "cover", "presync"]   # cover = the standalone cover.png deliverable
     put_url: str = Field(min_length=1)
 
 
 class RenderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    spec_version: Literal[4]
+    spec_version: Literal[5]
     job_id: str = Field(min_length=1)
     slug: str = Field(min_length=1)
     mode: Literal["preview", "final"]
@@ -296,6 +379,15 @@ class RenderSpec(BaseModel):
             for n, s in enumerate(self.overlays.sfx or []):
                 if s.sound not in ids:
                     raise ValueError(f"sfx[{n}].sound {s.sound!r} is not an inputs[].id")
+            fin = self.overlays.finalize
+            if fin is not None:
+                refs = [("logo.asset", fin.logo.asset)] if fin.logo is not None else []
+                if fin.watermark is not None:
+                    refs += [("watermark.sting", fin.watermark.sting),
+                             ("watermark.idle", fin.watermark.idle)]
+                for what, ref in refs:
+                    if ref not in ids:
+                        raise ValueError(f"finalize.{what} {ref!r} is not an inputs[].id")
             if self.overlays.music is not None and self.overlays.music.track not in ids:
                 raise ValueError(f"music.track {self.overlays.music.track!r} is not an inputs[].id")
 
@@ -379,7 +471,7 @@ _NEEDS_WEIGHTS = ("align", "clip_rank")   # face_probe's YuNet is 227 KB and sta
 class InferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[4]
+    infer_version: Literal[5]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     model: str = Field(min_length=1)
@@ -421,7 +513,7 @@ class InferTiming(BaseModel):
 class InferResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[4]
+    infer_version: Literal[5]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]

@@ -17,7 +17,7 @@
   ],
   "properties": {
     "spec_version": {
-      "const": 4
+      "const": 5
     },
     "job_id": {
       "type": "string",
@@ -270,6 +270,9 @@
           "items": {
             "$ref": "#/$defs/sfx"
           }
+        },
+        "finalize": {
+          "$ref": "#/$defs/finalize"
         }
       }
     },
@@ -741,12 +744,203 @@
             "proxy",
             "master",
             "cache",
-            "cover"
+            "cover",
+            "presync"
           ]
         },
         "put_url": {
           "type": "string",
           "minLength": 1
+        }
+      }
+    },
+    "accent": {
+      "description": "One resolved frame-accent. The Director decided WHICH treatment fires WHERE and HOW HARD; the anchor phrase, the score and the reasoning that produced it never cross. `at` is on the FINAL output clock.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "at",
+        "intensity"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "camera_shake",
+            "grain",
+            "zoom_punch",
+            "glitch",
+            "zoom_blur",
+            "rgb_split",
+            "pixelate"
+          ]
+        },
+        "at": {
+          "type": "number",
+          "minimum": 0
+        },
+        "intensity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "logo": {
+      "description": "The persistent corner logo over the BODY. `asset` is an inputs[].id of the logo PNG — the pod holds no brand profile. `cover_hold` is the length of the cover end-card tail the logo must not cover (the end-card carries its own logo).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset",
+        "corner",
+        "width",
+        "opacity",
+        "margin",
+        "cover_hold"
+      ],
+      "properties": {
+        "asset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "corner": {
+          "enum": [
+            "tl",
+            "tr",
+            "bl",
+            "br"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "exclusiveMinimum": 0
+        },
+        "opacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "margin": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cover_hold": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "watermark": {
+      "description": "The animated brand watermark. `sting`/`idle` are inputs[].id of the two alpha .webm clips; the chime is the sting's own audio. `x`/`y` are NUMBERS in pixels (pass both or neither) — never an ffmpeg expression, which would be a filtergraph fragment crossing the seam.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sting",
+        "idle",
+        "width",
+        "margin",
+        "position"
+      ],
+      "properties": {
+        "sting": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "width": {
+          "type": "integer",
+          "exclusiveMinimum": 0
+        },
+        "margin": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "position": {
+          "enum": [
+            "bottom-center",
+            "bottom-right",
+            "bottom-left",
+            "top-center",
+            "top-right",
+            "top-left",
+            "center"
+          ]
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "delay": {
+          "type": "number",
+          "minimum": 0
+        },
+        "chime": {
+          "type": "boolean"
+        },
+        "chime_volume": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 2
+        }
+      },
+      "dependentRequired": {
+        "x": [
+          "y"
+        ],
+        "y": [
+          "x"
+        ]
+      }
+    },
+    "loudnorm": {
+      "description": "Delivery loudness. `attenuate_only` is the PLANNER's verdict that the source clipped hot (it read a clipping sidecar the pod has never seen) — the pod applies it, it does not re-decide it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "i",
+        "tp",
+        "lra"
+      ],
+      "properties": {
+        "i": {
+          "type": "number"
+        },
+        "tp": {
+          "type": "number"
+        },
+        "lra": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "attenuate_only": {
+          "type": "boolean"
+        }
+      }
+    },
+    "finalize": {
+      "description": "The delivery tail applied AFTER the composite: frame accents, body logo, animated watermark, delivery loudness — in that order. Every sub-block is independently optional: a partner deliverable drops `logo`/`watermark` by OMISSION, never by a flag the pod interprets.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/accent"
+          }
+        },
+        "logo": {
+          "$ref": "#/$defs/logo"
+        },
+        "watermark": {
+          "$ref": "#/$defs/watermark"
+        },
+        "loudnorm": {
+          "$ref": "#/$defs/loudnorm"
         }
       }
     }
