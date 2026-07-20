@@ -69,20 +69,42 @@ def safe_extract(tar_path: Path, dest: Path) -> None:
         tf.extractall(dest, filter="data")   # belt-and-braces over the explicit check above
 
 
+def _chunks(url: str):
+    """Byte stream for a presigned GET, or for a `file://` url.
+
+    `file://` is how the LOCAL transport reaches this code — podagent.cp.download already makes the same
+    degradation for spec inputs, and it matters here for the same reason: the laptop path then exercises
+    the REAL fetch/verify/extract/publish sequence rather than a shortcut around it, so an artifact that
+    would fail to verify or unpack on a pod fails locally first. `requests` has no file:// handler, so
+    this split is not optional.
+    """
+    if url.startswith("file://"):
+        with open(url_to_path(url), "rb") as fh:
+            while chunk := fh.read(_CHUNK):
+                yield chunk
+        return
+    with requests.get(url, stream=True, timeout=(30, 600)) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_content(_CHUNK):
+            if chunk:
+                yield chunk
+
+
+def url_to_path(url: str) -> Path:
+    from urllib.parse import unquote, urlparse
+    return Path(unquote(urlparse(url).path))
+
+
 def download_verified(ref: TarRef, dst: Path) -> int:
     """Stream the tar to `dst`, hashing as we go. A digest mismatch raises — we never extract unverified
     bytes, so a truncated or swapped object fails here instead of surfacing as mystery-bad output."""
     digest = hashlib.sha256()
     total = 0
-    with requests.get(ref.url, stream=True, timeout=(30, 600)) as resp:
-        resp.raise_for_status()
-        with dst.open("wb") as fh:
-            for chunk in resp.iter_content(_CHUNK):
-                if not chunk:
-                    continue
-                digest.update(chunk)
-                fh.write(chunk)
-                total += len(chunk)
+    with dst.open("wb") as fh:
+        for chunk in _chunks(ref.url):
+            digest.update(chunk)
+            fh.write(chunk)
+            total += len(chunk)
     got = digest.hexdigest()
     if got != ref.sha256:
         raise ValueError(f"sha256 mismatch: expected {ref.sha256}, got {got} ({total} bytes)")

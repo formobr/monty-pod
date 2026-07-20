@@ -2,12 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/pod_job.schema.json",
   "title": "PodJob — control-plane→pod job envelope (GET /pod/job)",
-  "description": "What the pod's long-poll returns: one unit of work, dispatched on type. request is an InferRequest (infer_request.schema.json); spec is a RenderSpec (spec.schema.json). Each carries its own version const (infer_version/spec_version) — this envelope has none, contracts/VERSION stays the single pin for both.",
+  "description": "What the pod's long-poll returns: one unit of work, dispatched on type. request is an InferRequest (infer_request.schema.json); spec is a RenderSpec (spec.schema.json); chain is an OpChain — a DAG of declared operations (op.schema.json + ops/*.json) run on ONE box with local-disk handoff between steps. Each carries its own version const (infer_version/spec_version/chain_version) — this envelope has none, contracts/VERSION stays the single pin for all three. Adding `ops` is ADDITIVE: every envelope that validated before still validates unchanged, which is why it needs no VERSION bump — examples/pod_job.infer.json and pod_job.render.json are the regression goldens for exactly that.",
   "type": "object",
   "additionalProperties": false,
   "required": ["type"],
   "properties": {
-    "type": { "enum": ["infer", "render"] },
+    "type": { "enum": ["infer", "render", "ops"] },
     "request": {
       "description": "Present iff type=infer. Opaque here — validated against infer_request.schema.json.",
       "type": "object"
@@ -15,13 +15,24 @@
     "spec": {
       "description": "Present iff type=render. Opaque here — validated against spec.schema.json.",
       "type": "object"
+    },
+    "chain": {
+      "description": "Present iff type=ops. Opaque here — each step's params are validated against that op's own schema fragment in ops/<op>.json, read by BOTH sides. Deliberately not expanded inline: a per-op block here would be exactly the hand-mirrored surface the op registry exists to abolish.",
+      "type": "object"
     }
   },
   "allOf": [
     {
       "if": { "properties": { "type": { "const": "infer" } }, "required": ["type"] },
-      "then": { "required": ["request"], "not": { "required": ["spec"] } },
-      "else": { "required": ["spec"], "not": { "required": ["request"] } }
+      "then": { "required": ["request"], "not": { "anyOf": [{ "required": ["spec"] }, { "required": ["chain"] }] } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "render" } }, "required": ["type"] },
+      "then": { "required": ["spec"], "not": { "anyOf": [{ "required": ["request"] }, { "required": ["chain"] }] } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "ops" } }, "required": ["type"] },
+      "then": { "required": ["chain"], "not": { "anyOf": [{ "required": ["request"] }, { "required": ["spec"] }] } }
     }
   ]
 }

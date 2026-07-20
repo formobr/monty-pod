@@ -1,0 +1,48 @@
+{
+  "op": "mograph.render",
+  "version": 1,
+  "summary": "Render ONE Remotion composition to a transparent qtrle .mov (headless Chrome PNG sequence, then pack).",
+  "needs": ["browser", "video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "perceptual",
+    "note": "Headless Chrome rasterisation is not byte-reproducible across GPU/driver/font-hinting, so bit_exact would be a lie. What IS guaranteed: frame COUNT, canvas size, fps and alpha channel are exact (asserted in tests/test_op_mograph_render.py), because those are the properties the downstream overlay filtergraph depends on — a drifted frame count desynchronises every later beat, a drifted subpixel does not. This is the honest mode for anything that goes through a rasteriser."
+  },
+  "inputs": [
+    {"id": "bundle", "kind": "dir", "optional": true},
+    {"id": "entry", "kind": "code", "optional": true},
+    {"id": "assets", "kind": "dir", "optional": true}
+  ],
+  "outputs": [
+    {"id": "mov", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["comp", "fps"],
+    "properties": {
+      "comp": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Composition id inside the bundle (catalog comp such as `Statement`, or a `Bespoke*` id whose .tsx arrives as the `entry` input). The LLM that AUTHORED that .tsx, and the compile/repair loop around it, are BRAIN and stay on the control plane — this op only rasterises what it is handed."
+      },
+      "props": {
+        "type": "object",
+        "description": "inputProps for the composition. Free-form BY DESIGN: these are already brand/plan DATA computed upstream (brandTokens, brandFonts, copy), not encoder tuning. This is the one open sub-object in the registry and it is open because the alternative is mirroring the entire Remotion prop surface into a schema that would rot on every comp change."
+      },
+      "fps": {"type": "integer", "minimum": 1, "maximum": 120},
+      "duration_frames": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Omit to use the composition's own exported duration."
+      },
+      "concurrency": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 16,
+        "description": "Chrome tabs. A resource knob, not a decision — the runner may clamp it to what the box actually has."
+      }
+    }
+  },
+  "handler": "montyops.mograph_render:run"
+}

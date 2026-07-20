@@ -1,0 +1,26 @@
+{
+  "type": "ops",
+  "chain": {
+    "chain_version": 1,
+    "job_id": "demo-job",
+    "pack": {
+      "url": "https://r2.example/ops-pack/6b1f0c8a.tar?X-Amz-Signature=redacted",
+      "sha256": "6b1f0c8a2d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8",
+      "size": 20480
+    },
+    "steps": [
+      {
+        "id": "proxy",
+        "op": "media.scale",
+        "needs": [],
+        "params": { "height": 960, "encode_profile": "proxy", "audio": "copy" },
+        "inputs": [
+          { "port": "src", "url": "https://r2.example/work/demo/out/demo.cut.mp4?X-Amz-Signature=redacted" }
+        ],
+        "outputs": [
+          { "port": "dst", "url": "https://r2.example/work/demo/out/demo.proxy.mp4?X-Amz-Signature=redacted" }
+        ]
+      }
+    ]
+  }
+}

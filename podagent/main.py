@@ -155,6 +155,19 @@ def _run_render(raw: dict[str, Any], cp: ControlPlane) -> None:
         cp.post_event({"job_id": job_id, "stage": "render", "status": "error", "error": str(e)[:500]})
 
 
+def _run_ops(chain: Any, cp: ControlPlane) -> None:
+    """Run an op chain. There is NO per-op branch here and there must never be one: the op names its
+    handler in contracts/ops/<op>.json, the pack provides it, and dispatch is a registry LOOKUP. Adding a
+    tool costs a declaration and a handler — this file is not one of the files that changes.
+    tests/test_ops_dispatch_is_a_lookup.py keeps it that way."""
+    from .ops.runner import run_chain
+
+    try:
+        run_chain(chain, cp)
+    except Exception as e:
+        cp.post_event({"job_id": chain.job_id, "stage": "ops", "status": "error", "error": str(e)[:500]})
+
+
 def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
@@ -185,6 +198,9 @@ def main() -> None:
                 request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
                 boot_reported = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
                                            yunet_path, boot_reported)
+            elif pod_job.type == "ops":
+                assert pod_job.chain is not None
+                _run_ops(pod_job.chain, cp)
             else:
                 assert pod_job.spec is not None
                 spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")

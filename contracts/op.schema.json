@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://monty.dev/contracts/op.schema.json",
+  "title": "Operation declaration",
+  "description": "ONE named unit of mechanical work. The declaration is the SSOT both sides read: the control plane validates params and decides placement from it, the pod dispatches from it. Adding a tool = this file + one handler; nothing else may need to change, and the gates in tests/ enforce that.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["op", "version", "summary", "needs", "judgement", "parity", "inputs", "outputs", "params", "handler"],
+  "properties": {
+    "op": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$",
+      "description": "Registry key, `domain.verb`. Also the join key into docs/CAPABILITY_REGISTRY.md (`executor.op`)."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "THIS op's version, independent of contracts/VERSION. contracts/VERSION pins the ENVELOPE/transport; an op evolving its params bumps only itself, and a NEW op is purely additive — no envelope bump. That split is what makes adding a tool cheap."
+    },
+    "summary": {"type": "string", "minLength": 1},
+    "needs": {
+      "type": "array",
+      "description": "Closed capability vocabulary. Placement is DERIVED from this plus `judgement` — never declared per-stage. A box that cannot supply a need cannot be handed the op.",
+      "items": {"enum": ["video_encode", "model_weights", "browser", "net", "keys", "llm"]},
+      "uniqueItems": true
+    },
+    "judgement": {
+      "type": "boolean",
+      "description": "True = this op DECIDES something (which keeps, which drops, pacing, tempo, shot planning, the b-roll judge, thresholds). A judgement op is control-plane-only BY CONSTRUCTION: the pod dispatcher refuses it and the placement gate refuses to route it, so the cut algorithm cannot reach a pod even if some future stage table says otherwise. This is the field that kills the render_base contradiction."
+    },
+    "parity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "description": "How the local and pod transports are allowed to differ. An op that changes output MUST say so here — silence is not permitted.",
+      "properties": {
+        "mode": {"enum": ["bit_exact", "perceptual", "numeric"]},
+        "tol": {"type": "number", "exclusiveMinimum": 0, "description": "Required iff mode=numeric."},
+        "note": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "numeric"}}, "required": ["mode"]},
+          "then": {"required": ["tol"]},
+          "else": {"not": {"required": ["tol"]}}
+        }
+      ]
+    },
+    "inputs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/port"},
+      "description": "Declared ports. A port is satisfied EITHER by a presigned URL (crossing a job boundary) or by a local path produced by an earlier op in the same chain on the same box — the second costs no R2 round-trip and is the normal case inside a job."
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/port"}
+    },
+    "params": {
+      "type": "object",
+      "description": "JSON Schema fragment for this op's params, validated by BOTH sides straight from here. There is nothing to mirror and no hand-written Pydantic model per op: the envelope stays closed, `params` is checked against this. MUST be a closed object — argv is code, and an open params bag is argv wearing a hat.",
+      "required": ["type", "additionalProperties"],
+      "properties": {
+        "type": {"const": "object"},
+        "additionalProperties": {"const": false}
+      }
+    },
+    "handler": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*)*:[a-z_][a-z0-9_]*$",
+      "description": "`module:callable`, resolved inside the ops pack. EXACTLY ONE handler per op — LocalBackend imports it in-process and PodBackend sends typed params to the same symbol. Parity is structural, not tested into existence."
+    }
+  },
+  "$defs": {
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["video", "audio", "image", "font", "code", "json", "dir"]},
+        "optional": {"type": "boolean", "default": false},
+        "durable": {
+          "type": "boolean",
+          "default": false,
+          "description": "Output only. True = must materialise to R2 (a deliverable, or something a LATER JOB reads). False = intra-job intermediate; it stays on the pod's local disk and the next op in the chain reads the path directly. THIS FLAG IS THE R2 BUDGET: docs/RENDER_FLEET_AND_4MIN_BUDGET.md measured ~10 min of a ~25 min pod run as per-stage R2 transport, so defaulting to false is what keeps op granularity from multiplying that."
+        }
+      }
+    }
+  }
+}

@@ -7,6 +7,10 @@ dependencies = [
     "requests",
     "numpy",
     "Pillow",
+    # op params are validated against the registry schema fragment on BOTH sides, so the pod needs a
+    # JSON Schema validator at RUNTIME (it was dev-only when contracts were checked in CI alone).
+    # Pure-python and ~200 KB against a 4.7 GB image.
+    "jsonschema",
 ]
 
 [project.optional-dependencies]

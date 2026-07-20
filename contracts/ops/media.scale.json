@@ -1,0 +1,40 @@
+{
+  "op": "media.scale",
+  "version": 1,
+  "summary": "Downscale a video to a target height, preserving aspect, and re-encode at a named profile.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "Deterministic for a fixed ffmpeg build: libx264 at a pinned preset/crf over identical input bytes emits identical output bytes. The condition is the BUILD, not the box — local and pod run the same pinned ffmpeg, and tests/test_op_media_scale.py asserts the argv is a pure function of params so a drift shows as an argv diff rather than as mystery-different pixels. Across ffmpeg majors this degrades to perceptual; that is a version-pin problem and belongs to the image, not to this op."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["height", "encode_profile"],
+    "properties": {
+      "height": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 4320,
+        "multipleOf": 2,
+        "description": "Target height in pixels. Width follows from the source aspect (-2 = nearest even). The DECISION is 'how big'; how it is scaled is the handler's."
+      },
+      "encode_profile": {
+        "enum": ["proxy", "preview", "final"],
+        "description": "Named quality tier, NOT encoder flags. `-preset veryfast -crf 26` is tuning and stays in the handler (scripts/render_profile.py is the same SSOT pattern). Sending argv here would publish the encoder ladder and void additionalProperties:false."
+      },
+      "audio": {
+        "enum": ["copy", "drop"],
+        "default": "copy"
+      }
+    }
+  },
+  "handler": "montyops.media_scale:run"
+}
