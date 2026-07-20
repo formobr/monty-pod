@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from podagent.models import PodJob
 
 _ALIGN_REQUEST = {
-    "infer_version": 1,
+    "infer_version": 2,
     "job_id": "j",
     "kind": "align",
     "model": "m",
@@ -17,7 +17,7 @@ _ALIGN_REQUEST = {
 }
 
 _PREVIEW_SPEC = {
-    "spec_version": 1,
+    "spec_version": 2,
     "job_id": "j",
     "slug": "s",
     "mode": "preview",

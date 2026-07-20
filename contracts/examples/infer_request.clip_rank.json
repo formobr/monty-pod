@@ -1,0 +1,30 @@
+{
+  "infer_version": 2,
+  "job_id": "job_9f2c1a",
+  "kind": "clip_rank",
+  "model": "google/siglip2-so400m-patch14-384",
+  "put_url": "https://storage.example/o/70412.json?sig=PUT",
+  "clip_rank": {
+    "groups": [
+      {
+        "intent": "a falling crypto chart on a trading screen",
+        "image_urls": [
+          "https://storage.example/o/33901.png?sig=GET",
+          "https://storage.example/o/33902.png?sig=GET",
+          "https://storage.example/o/33903.png?sig=GET"
+        ]
+      },
+      {
+        "intent": "a crowded city street at night",
+        "image_urls": ["https://storage.example/o/41180.png?sig=GET"]
+      },
+      {
+        "intent": "",
+        "image_urls": [
+          "https://storage.example/o/52277.png?sig=GET",
+          "https://storage.example/o/52278.png?sig=GET"
+        ]
+      }
+    ]
+  }
+}

@@ -5,15 +5,16 @@ code**: the planning side decides, writes a `spec.json`, the pod applies it. Thi
 SSOT for that seam — JSON Schema (draft 2020-12) + golden examples + a `validate.py` tripwire.
 Consumers on both sides mirror these schemas and re-run the same goldens against their mirrors.
 
-## The five schemas
+## The six schemas
 
 | schema | direction | what |
 |---|---|---|
 | `pod_job.schema.json` | CP→pod (`GET /pod/job`) | the job envelope: `type` dispatches to `request` (infer) or `spec` (render) |
 | `spec.schema.json` | planner→pod (object storage) | the render instruction: inputs, timeline (EDL+speed), motion keyframes, overlays (final only), encode, outputs |
-| `infer_request.schema.json` | planner→pod (CP job queue) | one BATCHED inference task: `align` or `face_probe` |
+| `infer_request.schema.json` | planner→pod (CP job queue) | one BATCHED inference task: `align`, `face_probe` or `clip_rank` |
 | `infer_result.schema.json` | pod→CP (`POST /pod/infer-result`) | completion envelope; payload already PUT to storage |
 | `face_probe.schema.json` | payload (object storage) | raw face boxes + frame_diff per shot, pixel space |
+| `clip_rank.schema.json` | payload (object storage) | per-group SigLIP cosines + L2-normalized image embeddings |
 
 Transport: the planner and the pod NEVER talk directly. Requests ride the control-plane job queue
 (the pod polls `GET /pod/job`), payloads ride presigned URLs, completion is reported to the CP.
@@ -51,7 +52,8 @@ Transport conventions (frozen alongside the envelope):
   `overlays.music.track` must each equal an `inputs[].id` (mirror-model validation — JSON Schema
   cannot express it).
 - **Inference stays dumb.** `align` = pure wav2vec2 forward, emissions come back. `face_probe` =
-  raw boxes back. One batched call per kind, never per-segment.
+  raw boxes back. `clip_rank` = both SigLIP towers plus the cosine, numbers back — the reorder, the
+  relevance floor and the MMR dedup are the planner's. One batched call per kind, never per-segment.
 
 ## align payload (binary, not JSON-schema'd)
 
@@ -61,6 +63,22 @@ The pod PUTs a single `.npz`:
 - `meta.json` (stored as an npz string entry): `{"model": "<hf id>", "sr": 16000,
   "frame_stride_s": 0.02, "vocab": ["<pad>", ...]}` — `vocab` pins the checkpoint's token order so
   alignment targets can never silently shift against a re-baked image.
+
+## clip_rank payload (JSON, `clip_rank.schema.json`)
+
+`groups[i]` answers `clip_rank.groups[i]` of the request, and within a group `scores[j]`/`embeds[j]`
+answer `image_urls[j]` — position IS the join, nothing is reordered.
+
+- `scores[j]` — cosine(image, intent). `-1.0` means "no score to give": an image the pod could not
+  fetch or decode, or an embed-only group.
+- `embeds[j]` — the L2-normalized image embedding (image↔image cosine is then a plain dot, which is
+  what the planner's MMR anti-repeat runs on); `null` for an image that never decoded.
+- `intent: ""` — **embed-only**. The image tower is text-independent, so the group still yields
+  embeddings and every score comes back `-1.0`. Bailing out instead would blind a caller that asked
+  ONLY for embeddings.
+- Both towers and the cosine run inside one fp16/no_grad block, so a group is a single forward.
+- A dead image is data, not a fault: it is scored `-1.0`/`null` and the batch completes. Only a
+  failure that invalidates the whole call raises.
 
 ## Versioning
 

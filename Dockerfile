@@ -55,6 +55,12 @@ RUN --mount=type=secret,id=hf_token \
         from huggingface_hub import snapshot_download; \
         tok = pathlib.Path('/run/secrets/hf_token').read_text().strip(); \
         snapshot_download('voidful/wav2vec2-xlsr-multilingual-56', token=tok)"
+# SigLIP (clip_rank): baked for the same reason — the offload exists so the ORIGIN holds no weights
+RUN --mount=type=secret,id=hf_token \
+    python3 -c "import pathlib; \
+        from huggingface_hub import snapshot_download; \
+        tok = pathlib.Path('/run/secrets/hf_token').read_text().strip(); \
+        snapshot_download('google/siglip2-so400m-patch14-384', token=tok)"
 # weights are baked — runtime never dials HF (rented boxes may block egress anyway)
 ENV HF_HUB_OFFLINE=1
 

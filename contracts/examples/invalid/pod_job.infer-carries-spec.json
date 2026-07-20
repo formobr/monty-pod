@@ -1,7 +1,7 @@
 {
   "type": "infer",
   "request": {
-    "infer_version": 1,
+    "infer_version": 2,
     "job_id": "j",
     "kind": "align",
     "model": "m",
@@ -9,7 +9,7 @@
     "align": { "audio_url": "u", "windows": [[0.0, 10.0]] }
   },
   "spec": {
-    "spec_version": 1,
+    "spec_version": 2,
     "job_id": "j",
     "slug": "s",
     "mode": "preview",

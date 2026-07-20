@@ -14,7 +14,15 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from podagent.models import SPEC_VERSION, FaceProbePayload, InferRequest, InferResult, PodJob, RenderSpec
+from podagent.models import (
+    SPEC_VERSION,
+    ClipRankPayload,
+    FaceProbePayload,
+    InferRequest,
+    InferResult,
+    PodJob,
+    RenderSpec,
+)
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
 EXAMPLES = CONTRACTS / "examples"
@@ -26,6 +34,7 @@ MODELS = {
     "infer_request": InferRequest,
     "infer_result": InferResult,
     "face_probe": FaceProbePayload,
+    "clip_rank": ClipRankPayload,
     "pod_job": PodJob,
 }
 

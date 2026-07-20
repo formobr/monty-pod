@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/clip_rank.schema.json",
+  "title": "ClipRankPayload — the JSON the pod PUTs for kind=clip_rank",
+  "description": "Numbers only, no ranking and no threshold: one entry per request group, in request order. The cosine runs on the pod inside the same fp16/no_grad block as the towers, so scores and image embeddings come out of ONE forward — the planner's MMR dedup needs the embeddings. The reorder, the relevance floor and the dedup are planner decisions and never cross back.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["model", "groups"],
+  "properties": {
+    "model": { "type": "string", "minLength": 1 },
+    "groups": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scores", "embeds"],
+        "properties": {
+          "scores": {
+            "description": "Cosine(image, intent) per image, order mirrors the request group's image_urls. -1.0 = unreadable image, or an embed-only group (intent \"\") where a score has nothing to mean.",
+            "type": "array",
+            "items": { "type": "number" }
+          },
+          "embeds": {
+            "description": "L2-normalized image embedding per image, same order; null for an image the pod could not fetch or decode.",
+            "type": "array",
+            "items": {
+              "type": ["array", "null"],
+              "items": { "type": "number" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

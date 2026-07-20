@@ -1,5 +1,5 @@
 {
-  "infer_version": 1,
+  "infer_version": 2,
   "job_id": "job_9f2c1a",
   "kind": "face_probe",
   "model": "yunet-2023mar",

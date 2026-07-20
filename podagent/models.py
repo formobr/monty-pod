@@ -6,7 +6,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION: Final = 1
+SPEC_VERSION: Final = 2
 
 
 class SpecInput(BaseModel):
@@ -240,7 +240,7 @@ class SpecOutput(BaseModel):
 class RenderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    spec_version: Literal[1]
+    spec_version: Literal[2]
     job_id: str = Field(min_length=1)
     slug: str = Field(min_length=1)
     mode: Literal["preview", "final"]
@@ -317,24 +317,46 @@ class FaceProbeParams(BaseModel):
         return self
 
 
+class ClipRankGroup(BaseModel):
+    """One (intent, images) scoring unit. `intent` == "" means embed-only — the image tower is
+    text-independent, so the group still yields embeddings and its scores come back as -1.0."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    intent: str
+    image_urls: list[str] = Field(min_length=1)
+
+
+class ClipRankParams(BaseModel):
+    """Both SigLIP towers over MANY groups → cosines + image embeddings back. The reorder, the relevance
+    floor and the MMR dedup are PLANNER decisions — no threshold is in this block by construction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    groups: list[ClipRankGroup] = Field(min_length=1)
+
+
 class InferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[1]
+    infer_version: Literal[2]
     job_id: str = Field(min_length=1)
-    kind: Literal["align", "face_probe"]
+    kind: Literal["align", "face_probe", "clip_rank"]
     model: str = Field(min_length=1)
     put_url: str = Field(min_length=1)
     align: AlignParams | None = None
     face_probe: FaceProbeParams | None = None
+    clip_rank: ClipRankParams | None = None
 
     @model_validator(mode="after")
     def _block_matches_kind(self) -> "InferRequest":
-        want, other = (self.align, self.face_probe) if self.kind == "align" else (self.face_probe, self.align)
-        if want is None:
+        blocks: dict[str, Any] = {"align": self.align, "face_probe": self.face_probe,
+                                  "clip_rank": self.clip_rank}
+        if blocks[self.kind] is None:
             raise ValueError(f"kind={self.kind} requires its params block")
-        if other is not None:
-            raise ValueError(f"kind={self.kind} must not carry the other kind's params block")
+        extra = [k for k, v in blocks.items() if k != self.kind and v is not None]
+        if extra:
+            raise ValueError(f"kind={self.kind} must not carry another kind's params block: {extra}")
         return self
 
 
@@ -348,9 +370,9 @@ class InferTiming(BaseModel):
 class InferResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[1]
+    infer_version: Literal[2]
     job_id: str = Field(min_length=1)
-    kind: Literal["align", "face_probe"]
+    kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]
     result_key: str | None = Field(default=None, min_length=1)
     error: str | None = Field(default=None, min_length=1)
@@ -417,3 +439,21 @@ class FaceProbePayload(BaseModel):
     width: int = Field(ge=2)
     height: int = Field(ge=2)
     shots: list[ProbeShot] = Field(min_length=1)
+
+
+class ClipRankGroupResult(BaseModel):
+    """One group's raw SigLIP output; order mirrors the request group's image_urls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scores: list[float]
+    embeds: list[list[float] | None]
+
+
+class ClipRankPayload(BaseModel):
+    """The JSON the pod PUTs for kind=clip_rank — numbers only, no ranking and no threshold."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    groups: list[ClipRankGroupResult] = Field(min_length=1)

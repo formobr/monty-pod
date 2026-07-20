@@ -2,14 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/infer_request.schema.json",
   "title": "InferRequest — planner→pod inference task (CP-mediated; the pod polls, nothing dials in)",
-  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner.",
+  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction.",
   "type": "object",
   "additionalProperties": false,
   "required": ["infer_version", "job_id", "kind", "model", "put_url"],
   "properties": {
-    "infer_version": { "const": 1 },
+    "infer_version": { "const": 2 },
     "job_id": { "type": "string", "minLength": 1 },
-    "kind": { "enum": ["align", "face_probe"] },
+    "kind": { "enum": ["align", "face_probe", "clip_rank"] },
     "model": { "type": "string", "minLength": 1 },
     "put_url": { "type": "string", "minLength": 1 },
     "align": {
@@ -39,13 +39,48 @@
         "stride": { "type": "integer", "minimum": 1 },
         "frame_diff": { "type": "boolean" }
       }
+    },
+    "clip_rank": {
+      "description": "MANY groups per call: a montage scores many candidates across many beats, and one round trip per beat would dominate the wall clock.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["groups"],
+      "properties": {
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["intent", "image_urls"],
+            "properties": {
+              "intent": {
+                "description": "The English meaning to score against. \"\" = embed-only: the image tower is text-independent, so the group still yields embeddings and its scores come back as -1.0.",
+                "type": "string"
+              },
+              "image_urls": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "allOf": [
     {
       "if": { "properties": { "kind": { "const": "align" } }, "required": ["kind"] },
-      "then": { "required": ["align"], "not": { "required": ["face_probe"] } },
-      "else": { "required": ["face_probe"], "not": { "required": ["align"] } }
+      "then": { "required": ["align"], "not": { "anyOf": [{ "required": ["face_probe"] }, { "required": ["clip_rank"] }] } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "face_probe" } }, "required": ["kind"] },
+      "then": { "required": ["face_probe"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["clip_rank"] }] } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "clip_rank" } }, "required": ["kind"] },
+      "then": { "required": ["clip_rank"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["face_probe"] }] } }
     }
   ],
   "$defs": {

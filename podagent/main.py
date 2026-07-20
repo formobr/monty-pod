@@ -14,11 +14,14 @@ import requests
 from pydantic import ValidationError
 
 from .cp import ControlPlane
-from .models import InferRequest, InferResult, InferTiming, PodJob, RenderSpec
+from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 
 if TYPE_CHECKING:
     from .infer_align import AlignService
+    from .infer_cliprank import ClipRankService
     from .infer_probe import ProbeService
+
+INFER_KINDS = ("align", "face_probe", "clip_rank")
 
 BOOT_T0 = time.monotonic()
 
@@ -75,12 +78,13 @@ def _run_infer(
     cp: ControlPlane,
     align_cache: dict[str, "AlignService"],
     probe_cache: dict[tuple[Path, str], "ProbeService"],
+    rank_cache: dict[str, "ClipRankService"],
     yunet_path: Path,
     boot_reported: bool,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag."""
     job_id = raw.get("job_id", "unknown")
-    kind = raw.get("kind") if raw.get("kind") in ("align", "face_probe") else "align"
+    kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
     try:
         req = InferRequest.model_validate(raw)
         if req.kind == "align":
@@ -91,6 +95,14 @@ def _run_infer(
             if align_svc is None:
                 align_svc = align_cache[req.model] = AlignService(req.model)
             infer_s = align_svc.run(req.align, req.put_url)
+        elif req.kind == "clip_rank":
+            from .infer_cliprank import ClipRankService
+
+            assert req.clip_rank is not None
+            rank_svc = rank_cache.get(req.model)
+            if rank_svc is None:
+                rank_svc = rank_cache[req.model] = ClipRankService(req.model)
+            infer_s = rank_svc.run(req.clip_rank, req.put_url)
         else:
             from .infer_probe import ProbeService
 
@@ -115,7 +127,7 @@ def _run_infer(
     except Exception as e:
         _log(f"infer job {job_id} failed: {e}")
         error_result = InferResult(
-            infer_version=1,
+            infer_version=SPEC_VERSION,
             job_id=str(job_id),
             kind=kind,
             status="error",
@@ -146,6 +158,7 @@ def main() -> None:
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
     align_cache: dict[str, "AlignService"] = {}
     probe_cache: dict[tuple[Path, str], "ProbeService"] = {}
+    rank_cache: dict[str, "ClipRankService"] = {}
     boot_reported = False
 
     while True:
@@ -163,7 +176,8 @@ def main() -> None:
             if pod_job.type == "infer":
                 assert pod_job.request is not None
                 request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
-                boot_reported = _run_infer(request_raw, cp, align_cache, probe_cache, yunet_path, boot_reported)
+                boot_reported = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
+                                           yunet_path, boot_reported)
             else:
                 assert pod_job.spec is not None
                 spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")

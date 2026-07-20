@@ -27,7 +27,7 @@ downloads) rides through the control plane or was baked in at build time.
 | path | what |
 |---|---|
 | `contracts/` | the render/inference seam — SSOT (JSON Schema + goldens), consumed by both sides |
-| `podagent/` | the agent: control-plane client, align/face-probe inference, spec renderer |
+| `podagent/` | the agent: control-plane client, align/face-probe/clip-rank inference, spec renderer |
 | `Dockerfile` | one image, everything baked in |
 | `tests/` | contract-mirror goldens + a secret-scan gate |
 
@@ -40,13 +40,13 @@ downloads) rides through the control plane or was baked in at build time.
   `cover.logo/elements/headline` extras — are the exceptions, by design).
 - **Keyless pod.** No API keys, no long-lived credentials live on the box.
   The job token is short-lived and scoped to one job's storage URLs.
-- **One batched inference call per kind.** `align` and `face_probe` each run
-  once over a whole request's windows/shots, never per-segment.
+- **One batched inference call per kind.** `align`, `face_probe` and `clip_rank`
+  each run once over a whole request's windows/shots/groups, never per-segment.
 - **Every number is a number.** No `"auto"`, no sentinels — the planner
   resolves every decision before it crosses the seam.
 
 ## Status
 
-**v1**: single-pass timeline+motion render (preview tier), plus `align` and
-`face_probe` batched inference. Final-tier compositing raises
+**v2**: single-pass timeline+motion render (preview tier), plus `align`,
+`face_probe` and `clip_rank` batched inference. Final-tier compositing raises
 `NotImplementedError` for now.
