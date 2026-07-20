@@ -1,11 +1,16 @@
 {
   "type": "infer",
   "request": {
-    "infer_version": 2,
+    "infer_version": 3,
     "job_id": "job_9f2c1a",
     "kind": "align",
     "model": "jonatasgrosman/wav2vec2-large-xlsr-53-russian",
     "put_url": "https://storage.example/o/62955.npz?sig=PUT",
+    "weights": {
+      "url": "https://r2.example/models/wav2vec2-xlsr-multilingual-56.tar?X-Amz-Signature=deadbeef",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "size": 1310720000
+    },
     "align": {
       "audio_url": "https://storage.example/o/92581.wav?sig=GET",
       "windows": [

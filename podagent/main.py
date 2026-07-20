@@ -87,21 +87,28 @@ def _run_infer(
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
     try:
         req = InferRequest.model_validate(raw)
+        # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
+        # same model but carrying different checkpoints must not share a loaded model, and a warm pod that
+        # sees the same hash again skips both the fetch and the (dominant) load.
         if req.kind == "align":
             from .infer_align import AlignService
+            from .weights import ensure
 
-            assert req.align is not None
-            align_svc = align_cache.get(req.model)
+            assert req.align is not None and req.weights is not None
+            align_svc = align_cache.get(req.weights.sha256)
             if align_svc is None:
-                align_svc = align_cache[req.model] = AlignService(req.model)
+                wdir = ensure(req.weights, req.model)
+                align_svc = align_cache[req.weights.sha256] = AlignService(req.model, wdir)
             infer_s = align_svc.run(req.align, req.put_url)
         elif req.kind == "clip_rank":
             from .infer_cliprank import ClipRankService
+            from .weights import ensure
 
-            assert req.clip_rank is not None
-            rank_svc = rank_cache.get(req.model)
+            assert req.clip_rank is not None and req.weights is not None
+            rank_svc = rank_cache.get(req.weights.sha256)
             if rank_svc is None:
-                rank_svc = rank_cache[req.model] = ClipRankService(req.model)
+                wdir = ensure(req.weights, req.model)
+                rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
             infer_s = rank_svc.run(req.clip_rank, req.put_url)
         else:
             from .infer_probe import ProbeService

@@ -62,7 +62,7 @@ The pod PUTs a single `.npz`:
 - `emissions_<i>`: float32 `[frames, vocab]` — log-softmax CTC emissions for `windows[i]`.
 - `meta.json` (stored as an npz string entry): `{"model": "<hf id>", "sr": 16000,
   "frame_stride_s": 0.02, "vocab": ["<pad>", ...]}` — `vocab` pins the checkpoint's token order so
-  alignment targets can never silently shift against a re-baked image.
+  alignment targets can never silently shift against a re-delivered checkpoint.
 
 ## clip_rank payload (JSON, `clip_rank.schema.json`)
 
@@ -79,6 +79,21 @@ answer `image_urls[j]` — position IS the join, nothing is reordered.
 - Both towers and the cosine run inside one fp16/no_grad block, so a group is a single forward.
 - A dead image is data, not a fault: it is scored `-1.0`/`null` and the batch completes. Only a
   failure that invalidates the whole call raises.
+
+## weights — the model is an INPUT
+
+Nothing heavy is baked into the image. `InferRequest.weights = {url, sha256, size?}` is a presigned GET
+for a **tar of the model directory** plus that tar's digest. **Required for `align` and `clip_rank`;
+forbidden on `face_probe`** (its 227 KB YuNet stays in the image) — enforced by both the schema and the
+model mirrors, so a request naming no checkpoint is rejected at the seam.
+
+The pod verifies the digest before extracting, caches under `WEIGHTS_CACHE/<sha256>/`, and points
+`from_pretrained` at the extracted directory — **never at a hub id**. Two consequences worth stating:
+the **cache key is the content hash**, so a revised checkpoint can never be served from a stale entry;
+and the only weights a pod can load are weights the origin hashed, since it holds no hub credential.
+
+Tar layout is not fixed: the pod locates the directory containing `config.json` (a flat model dir and an
+HF-hub-shaped `<repo>/snapshots/<rev>/` tar both work), so re-exporting weights cannot silently break it.
 
 ## Versioning
 

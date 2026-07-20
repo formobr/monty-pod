@@ -1,9 +1,14 @@
 {
-  "infer_version": 2,
+  "infer_version": 3,
   "job_id": "job_9f2c1a",
   "kind": "clip_rank",
   "model": "google/siglip2-so400m-patch14-384",
   "put_url": "https://storage.example/o/70412.json?sig=PUT",
+  "weights": {
+    "url": "https://r2.example/models/siglip2-so400m-patch14-384.tar?X-Amz-Signature=deadbeef",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "size": 4581234567
+  },
   "clip_rank": {
     "groups": [
       {

@@ -1,5 +1,5 @@
 {
-  "infer_version": 2,
+  "infer_version": 3,
   "job_id": "j",
   "kind": "clip_rank",
   "model": "google/siglip2-so400m-patch14-384",

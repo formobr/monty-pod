@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "required": ["infer_version", "job_id", "kind", "status"],
   "properties": {
-    "infer_version": { "const": 2 },
+    "infer_version": { "const": 3 },
     "job_id": { "type": "string", "minLength": 1 },
     "kind": { "enum": ["align", "face_probe", "clip_rank"] },
     "status": { "enum": ["ok", "error"] },

@@ -17,17 +17,22 @@ _SR = 16000
 
 
 class AlignService:
-    """Loads the checkpoint once (the dominant cost); serves every window batch after that."""
+    """Loads the checkpoint once (the dominant cost); serves every window batch after that.
 
-    def __init__(self, model_id: str) -> None:
+    Loads from a LOCAL directory the pod fetched and hash-verified — never from a hub id. `model_id` is
+    provenance only (it rides into the payload meta), so a request string can never steer what gets loaded.
+    """
+
+    def __init__(self, model_id: str, weights_dir: Path) -> None:
         import torch
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model_id = model_id
-        self.processor = Wav2Vec2Processor.from_pretrained(model_id)
-        self.model = Wav2Vec2ForCTC.from_pretrained(model_id).to(self.device).eval()
+        self.processor = Wav2Vec2Processor.from_pretrained(str(weights_dir), local_files_only=True)
+        self.model = Wav2Vec2ForCTC.from_pretrained(
+            str(weights_dir), local_files_only=True).to(self.device).eval()
 
     def _emit(self, seg):
         # one window → log-softmax emission. A CUDA runtime error (e.g. an arch this torch build has no kernels

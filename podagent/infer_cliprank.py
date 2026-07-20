@@ -18,9 +18,13 @@ _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
 
 
 class ClipRankService:
-    """Loads SigLIP once (the dominant cost); serves every group batch after that."""
+    """Loads SigLIP once (the dominant cost); serves every group batch after that.
 
-    def __init__(self, model_id: str) -> None:
+    Loads from a LOCAL directory the pod fetched and hash-verified — never from a hub id. `model_id` is
+    provenance only (it rides into the payload), so a request string can never steer what gets loaded.
+    """
+
+    def __init__(self, model_id: str, weights_dir: Path) -> None:
         import torch
         from transformers import AutoModel, AutoProcessor
 
@@ -28,8 +32,9 @@ class ClipRankService:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
         self.model_id = model_id
-        self.model = AutoModel.from_pretrained(model_id, dtype=self.dtype).to(self.device).eval()
-        self.proc = AutoProcessor.from_pretrained(model_id)
+        self.model = AutoModel.from_pretrained(
+            str(weights_dir), dtype=self.dtype, local_files_only=True).to(self.device).eval()
+        self.proc = AutoProcessor.from_pretrained(str(weights_dir), local_files_only=True)
 
     def run(self, params: ClipRankParams, put_url: str) -> float:
         """Returns wall seconds spent on inference (reported in InferResult.timing)."""

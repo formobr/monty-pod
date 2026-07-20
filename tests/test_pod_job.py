@@ -8,16 +8,17 @@ from pydantic import ValidationError
 from podagent.models import PodJob
 
 _ALIGN_REQUEST = {
-    "infer_version": 2,
+    "infer_version": 3,
     "job_id": "j",
     "kind": "align",
     "model": "m",
     "put_url": "p",
     "align": {"audio_url": "u", "windows": [[0.0, 10.0]]},
+    "weights": {"url": "https://r2.example/models/x.tar", "sha256": "a" * 64},
 }
 
 _PREVIEW_SPEC = {
-    "spec_version": 2,
+    "spec_version": 3,
     "job_id": "j",
     "slug": "s",
     "mode": "preview",

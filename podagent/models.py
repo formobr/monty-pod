@@ -6,7 +6,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION: Final = 2
+SPEC_VERSION: Final = 3
 
 
 class SpecInput(BaseModel):
@@ -240,7 +240,7 @@ class SpecOutput(BaseModel):
 class RenderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    spec_version: Literal[2]
+    spec_version: Literal[3]
     job_id: str = Field(min_length=1)
     slug: str = Field(min_length=1)
     mode: Literal["preview", "final"]
@@ -336,14 +336,30 @@ class ClipRankParams(BaseModel):
     groups: list[ClipRankGroup] = Field(min_length=1)
 
 
+class WeightsRef(BaseModel):
+    """Where the pod gets this job's checkpoint. A presigned GET for a tar of the model directory, plus
+    that tar's sha256 — which is BOTH the integrity check and the pod's cache key, so a re-exported or
+    revised checkpoint can never be served from a stale cache entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int | None = Field(default=None, gt=0)
+
+
+_NEEDS_WEIGHTS = ("align", "clip_rank")   # face_probe's YuNet is 227 KB and stays baked in the image
+
+
 class InferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[2]
+    infer_version: Literal[3]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     model: str = Field(min_length=1)
     put_url: str = Field(min_length=1)
+    weights: WeightsRef | None = None
     align: AlignParams | None = None
     face_probe: FaceProbeParams | None = None
     clip_rank: ClipRankParams | None = None
@@ -359,6 +375,16 @@ class InferRequest(BaseModel):
             raise ValueError(f"kind={self.kind} must not carry another kind's params block: {extra}")
         return self
 
+    @model_validator(mode="after")
+    def _weights_match_kind(self) -> "InferRequest":
+        # The image carries no heavy checkpoint any more, so a missing weights block is not a default to
+        # fall back on — it is an origin bug, and it must fail HERE rather than deep inside from_pretrained.
+        if self.kind in _NEEDS_WEIGHTS and self.weights is None:
+            raise ValueError(f"kind={self.kind} requires a weights block (nothing is baked in the image)")
+        if self.kind not in _NEEDS_WEIGHTS and self.weights is not None:
+            raise ValueError(f"kind={self.kind} uses a baked model and must not carry weights")
+        return self
+
 
 class InferTiming(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -370,7 +396,7 @@ class InferTiming(BaseModel):
 class InferResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[2]
+    infer_version: Literal[3]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]

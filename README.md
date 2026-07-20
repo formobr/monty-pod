@@ -1,9 +1,16 @@
 # monty-pod — dumb render & inference executor
 
-A worker for rented GPU boxes. It boots ready — everything is baked into the
-image, no setup step, no cold-start download — dials out to a control plane,
-receives fully-resolved render specs and batched inference tasks as **data**,
-and returns artifacts via presigned URLs.
+A worker for rented GPU boxes. It dials out to a control plane, receives
+fully-resolved render specs and batched inference tasks as **data**, and
+returns artifacts via presigned URLs.
+
+The image is deliberately **thin**: runtime only (CUDA base + torch + ffmpeg),
+no model weights. Rented boxes wipe the image between rents, so every gigabyte
+baked in is a gigabyte re-pulled before any work starts. **Model weights are
+just another input** — a job that needs a checkpoint carries a presigned tar
+for it (`InferRequest.weights`), and the pod caches it on local disk by content
+hash, so a warm pod pays for each checkpoint exactly once and never pays for
+one it does not use.
 
 It makes zero editing decisions. Every number in every job was decided
 upstream by the planner; the pod just executes it. See `contracts/README.md`
@@ -20,15 +27,17 @@ docker run --gpus all \
 
 `CP_URL` and `JOB_TOKEN` are the **entire** runtime configuration. The box
 holds no other credentials — auth to everything else (media storage, model
-downloads) rides through the control plane or was baked in at build time.
+weights) rides in as presigned URLs from the control plane. `WEIGHTS_CACHE`
+(default `/var/cache/monty/weights`) is where fetched checkpoints land; point
+it at the roomiest local disk.
 
 ## Layout
 
 | path | what |
 |---|---|
 | `contracts/` | the render/inference seam — SSOT (JSON Schema + goldens), consumed by both sides |
-| `podagent/` | the agent: control-plane client, align/face-probe/clip-rank inference, spec renderer |
-| `Dockerfile` | one image, everything baked in |
+| `podagent/` | the agent: control-plane client, align/face-probe/clip-rank inference, spec renderer, weight fetch+cache |
+| `Dockerfile` | the thin runtime image (no weights, no browser) |
 | `tests/` | contract-mirror goldens + a secret-scan gate |
 
 ## Design rules

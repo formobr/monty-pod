@@ -7,11 +7,22 @@
   "additionalProperties": false,
   "required": ["infer_version", "job_id", "kind", "model", "put_url"],
   "properties": {
-    "infer_version": { "const": 2 },
+    "infer_version": { "const": 3 },
     "job_id": { "type": "string", "minLength": 1 },
     "kind": { "enum": ["align", "face_probe", "clip_rank"] },
     "model": { "type": "string", "minLength": 1 },
     "put_url": { "type": "string", "minLength": 1 },
+    "weights": {
+      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align and clip_rank; forbidden on face_probe, whose 227 KB YuNet stays in the image.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "sha256"],
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size": { "description": "Expected tar size in bytes; a mismatch fails the fetch.", "type": "integer", "minimum": 1 }
+      }
+    },
     "align": {
       "type": "object",
       "additionalProperties": false,
@@ -72,15 +83,15 @@
   "allOf": [
     {
       "if": { "properties": { "kind": { "const": "align" } }, "required": ["kind"] },
-      "then": { "required": ["align"], "not": { "anyOf": [{ "required": ["face_probe"] }, { "required": ["clip_rank"] }] } }
+      "then": { "required": ["align", "weights"], "not": { "anyOf": [{ "required": ["face_probe"] }, { "required": ["clip_rank"] }] } }
     },
     {
       "if": { "properties": { "kind": { "const": "face_probe" } }, "required": ["kind"] },
-      "then": { "required": ["face_probe"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["clip_rank"] }] } }
+      "then": { "required": ["face_probe"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["clip_rank"] }, { "required": ["weights"] }] } }
     },
     {
       "if": { "properties": { "kind": { "const": "clip_rank" } }, "required": ["kind"] },
-      "then": { "required": ["clip_rank"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["face_probe"] }] } }
+      "then": { "required": ["clip_rank", "weights"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["face_probe"] }] } }
     }
   ],
   "$defs": {
