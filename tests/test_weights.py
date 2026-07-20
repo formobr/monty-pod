@@ -14,7 +14,7 @@ import tarfile
 import pytest
 from pydantic import ValidationError
 
-from podagent import weights
+from podagent import artifact, weights
 from podagent.models import InferRequest, WeightsRef
 
 
@@ -58,7 +58,7 @@ def served(monkeypatch, tmp_path):
         def _get(url, **kw):
             calls.append(url)
             return _FakeResp(payload)
-        monkeypatch.setattr(weights.requests, "get", _get)
+        monkeypatch.setattr(artifact.requests, "get", _get)
         return calls
 
     return _serve
@@ -162,9 +162,9 @@ def test_a_changed_checkpoint_is_a_cache_MISS_even_under_the_same_model_name(ser
     old = _tar_bytes({"config.json": "{}", "model.safetensors": "OLD"})
     new = _tar_bytes({"config.json": "{}", "model.safetensors": "NEW"})
 
-    monkeypatch.setattr(weights.requests, "get", lambda url, **kw: _FakeResp(old))
+    monkeypatch.setattr(artifact.requests, "get", lambda url, **kw: _FakeResp(old))
     old_dir = weights.ensure(_ref(old), "acme/model")
-    monkeypatch.setattr(weights.requests, "get", lambda url, **kw: _FakeResp(new))
+    monkeypatch.setattr(artifact.requests, "get", lambda url, **kw: _FakeResp(new))
     new_dir = weights.ensure(_ref(new), "acme/model")
 
     assert old_dir != new_dir, "a revised checkpoint reused the stale cache entry"
@@ -182,13 +182,13 @@ def test_an_interrupted_fetch_does_not_publish_a_usable_cache_entry(served, monk
             yield payload[: len(payload) // 2]
             raise OSError("connection reset")
 
-    monkeypatch.setattr(weights.requests, "get", lambda url, **kw: _Boom(payload))
+    monkeypatch.setattr(artifact.requests, "get", lambda url, **kw: _Boom(payload))
     with pytest.raises(OSError):
         weights.ensure(ref, "acme/model")
 
     assert not (weights.cache_root() / ref.sha256).exists()
 
-    monkeypatch.setattr(weights.requests, "get", lambda url, **kw: _FakeResp(payload))
+    monkeypatch.setattr(artifact.requests, "get", lambda url, **kw: _FakeResp(payload))
     assert (weights.ensure(ref, "acme/model") / "config.json").is_file()
 
 
@@ -213,7 +213,7 @@ def test_a_cache_dir_without_the_completion_sentinel_is_not_a_hit(served):
 
 # --- the contract ------------------------------------------------------------------------------
 
-_BASE = {"infer_version": 3, "job_id": "j", "kind": "align", "model": "m", "put_url": "p",
+_BASE = {"infer_version": 4, "job_id": "j", "kind": "align", "model": "m", "put_url": "p",
          "align": {"audio_url": "u", "windows": [[0.0, 1.0]]}}
 _W = {"url": "https://r2.example/x.tar", "sha256": "a" * 64}
 
@@ -231,7 +231,7 @@ def test_align_with_weights_is_accepted():
 
 
 def test_face_probe_must_not_carry_weights():
-    req = {"infer_version": 3, "job_id": "j", "kind": "face_probe", "model": "m", "put_url": "p",
+    req = {"infer_version": 4, "job_id": "j", "kind": "face_probe", "model": "m", "put_url": "p",
            "face_probe": {"video_url": "u", "shots": [[0.0, 1.0]], "stride": 5, "frame_diff": False},
            "weights": _W}
     with pytest.raises(ValidationError, match="must not carry weights"):

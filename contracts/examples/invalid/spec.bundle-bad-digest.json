@@ -133,7 +133,7 @@
       },
       "bundle": {
         "url": "https://r2.example/bundle/remotion-9f2c.tar?sig=…",
-        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "sha256": "nope",
         "size": 528482304
       }
     },

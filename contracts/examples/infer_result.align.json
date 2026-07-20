@@ -1,8 +1,11 @@
 {
-  "infer_version": 3,
+  "infer_version": 4,
   "job_id": "job_9f2c1a",
   "kind": "align",
   "status": "ok",
   "result_key": "o/31337.npz",
-  "timing": { "infer_s": 3.7, "boot_s": 58.2 }
+  "timing": {
+    "infer_s": 3.7,
+    "boot_s": 58.2
+  }
 }

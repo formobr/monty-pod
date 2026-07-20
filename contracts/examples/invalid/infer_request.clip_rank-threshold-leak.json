@@ -1,11 +1,19 @@
 {
-  "infer_version": 3,
+  "infer_version": 4,
   "job_id": "j",
   "kind": "clip_rank",
   "model": "google/siglip2-so400m-patch14-384",
   "put_url": "p",
   "clip_rank": {
-    "groups": [{ "intent": "a falling crypto chart", "image_urls": ["u1", "u2"] }],
+    "groups": [
+      {
+        "intent": "a falling crypto chart",
+        "image_urls": [
+          "u1",
+          "u2"
+        ]
+      }
+    ],
     "floor": 0.12
   }
 }

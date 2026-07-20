@@ -1,8 +1,18 @@
 {
-  "infer_version": 3,
+  "infer_version": 4,
   "job_id": "j",
   "kind": "align",
   "model": "jonatasgrosman/wav2vec2-large-xlsr-53-russian",
   "put_url": "p",
-  "face_probe": { "video_url": "u", "shots": [[0.0, 10.0]], "stride": 2, "frame_diff": false }
+  "face_probe": {
+    "video_url": "u",
+    "shots": [
+      [
+        0.0,
+        10.0
+      ]
+    ],
+    "stride": 2,
+    "frame_diff": false
+  }
 }

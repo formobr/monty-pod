@@ -17,7 +17,7 @@
   ],
   "properties": {
     "spec_version": {
-      "const": 3
+      "const": 4
     },
     "job_id": {
       "type": "string",
@@ -531,8 +531,50 @@
               "type": "object"
             }
           }
+        },
+        "bundle": {
+          "description": "Presigned GET for a tar of the Remotion project (src + node_modules + render_batch.mjs) plus its sha256 — the integrity check AND the pod's content-hash cache key. REQUIRED whenever sections is non-empty: the image bakes no bundle, so a section without one cannot render.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "url",
+            "sha256"
+          ],
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "size": {
+              "type": "integer",
+              "exclusiveMinimum": 0
+            }
+          }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "sections": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "sections"
+            ]
+          },
+          "then": {
+            "required": [
+              "bundle"
+            ]
+          }
+        }
+      ]
     },
     "music": {
       "description": "track references an inputs[].id. gain is the linear mix multiplier under the voice — the pod has no brand profile, the number crosses the seam.",

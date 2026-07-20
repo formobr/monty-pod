@@ -1,8 +1,16 @@
 {
-  "infer_version": 3,
+  "infer_version": 4,
   "job_id": "j",
   "kind": "upscale",
   "model": "esrgan-x4",
   "put_url": "p",
-  "align": { "audio_url": "u", "windows": [[0.0, 10.0]] }
+  "align": {
+    "audio_url": "u",
+    "windows": [
+      [
+        0.0,
+        10.0
+      ]
+    ]
+  }
 }

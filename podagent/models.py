@@ -6,7 +6,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION: Final = 3
+SPEC_VERSION: Final = 4
 
 
 class SpecInput(BaseModel):
@@ -148,12 +148,37 @@ class SpecBrandManifest(BaseModel):
     fonts: dict[str, Any]
 
 
+class BundleRef(BaseModel):
+    """Where the pod gets the Remotion bundle this job renders its mograph with. A presigned GET for a tar
+    of the project (src + node_modules + render_batch.mjs), plus that tar's sha256 — BOTH the integrity
+    check and the cache key, so a rebuilt bundle can never be served from a stale entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int | None = Field(default=None, gt=0)
+
+
 class SpecMotionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sections: list[SpecMotionSection]
     captions: SpecCaptions | None = None
     brand: SpecBrandManifest | None = None
+    bundle: BundleRef | None = None
+
+    @model_validator(mode="after")
+    def _sections_need_a_bundle(self) -> "SpecMotionPlan":
+        # Nothing renders a section without the bundle, and the image deliberately bakes no copy. Refusing
+        # HERE makes a bundle-less job fail at validation with one clear line; without it the pod would get
+        # as far as the renderer and then either crash mid-encode or — worse, and the reason this exists —
+        # skip the sections and publish a green manifest for a video with no mograph in it.
+        if self.sections and self.bundle is None:
+            raise ValueError(
+                "motion_plan.sections requires motion_plan.bundle — the pod bakes no Remotion bundle, so "
+                "sections without one cannot render (see docs/POD_RUNBOOK.md)")
+        return self
 
 
 class SpecMusic(BaseModel):
@@ -240,7 +265,7 @@ class SpecOutput(BaseModel):
 class RenderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    spec_version: Literal[3]
+    spec_version: Literal[4]
     job_id: str = Field(min_length=1)
     slug: str = Field(min_length=1)
     mode: Literal["preview", "final"]
@@ -354,7 +379,7 @@ _NEEDS_WEIGHTS = ("align", "clip_rank")   # face_probe's YuNet is 227 KB and sta
 class InferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[3]
+    infer_version: Literal[4]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     model: str = Field(min_length=1)
@@ -396,7 +421,7 @@ class InferTiming(BaseModel):
 class InferResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[3]
+    infer_version: Literal[4]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]

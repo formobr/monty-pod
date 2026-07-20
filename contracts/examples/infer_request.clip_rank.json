@@ -1,5 +1,5 @@
 {
-  "infer_version": 3,
+  "infer_version": 4,
   "job_id": "job_9f2c1a",
   "kind": "clip_rank",
   "model": "google/siglip2-so400m-patch14-384",
@@ -21,7 +21,9 @@
       },
       {
         "intent": "a crowded city street at night",
-        "image_urls": ["https://storage.example/o/41180.png?sig=GET"]
+        "image_urls": [
+          "https://storage.example/o/41180.png?sig=GET"
+        ]
       },
       {
         "intent": "",

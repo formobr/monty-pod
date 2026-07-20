@@ -1,6 +1,8 @@
-"""Mograph overlays on the pod: render motion_plan.sections via the baked (brand-agnostic) Remotion bundle
-— brand crosses through inputProps, role fonts + section media are staged into the bundle public/. Each
-section packs to a transparent qtrle layer, overlaid onto the base gated to its [start,start+dur] window."""
+"""Mograph overlays on the pod: render motion_plan.sections via the (brand-agnostic) Remotion bundle the
+job delivers — brand crosses through inputProps, role fonts + section media are staged into the bundle
+public/. Each section packs to a transparent qtrle layer, overlaid onto the base gated to its
+[start,start+dur] window. The bundle is a per-job input cached by content hash, not image ballast: see
+bundle.py."""
 from __future__ import annotations
 
 import json
@@ -14,13 +16,25 @@ FPS = 30
 _STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/<rel> (public/ fonts+media, src/ bespoke)
 
 
-def remotion_dir() -> Path:
-    """The baked Remotion project dir (render_batch.mjs + node_modules + src). MONTY_REMOTION_DIR overrides."""
-    d = os.environ.get("MONTY_REMOTION_DIR")
-    cand = Path(d) if d else Path(__file__).resolve().parents[2] / "remotion"
-    if not (cand / "render_batch.mjs").is_file():
-        raise RuntimeError(f"Remotion bundle not found at {cand} (set MONTY_REMOTION_DIR)")
-    return cand
+def remotion_dir(ref, tmp: Path) -> Path:
+    """A writable Remotion project for THIS job.
+
+    The bundle is not baked into the image (504 MB most jobs never touch) — it arrives per job as a
+    presigned tar, is cached by content hash, and each job renders out of its own workspace over that
+    cache (bundle.workspace explains why the copy is not optional). MONTY_REMOTION_DIR still overrides
+    with a local tree so `worker.py --local` runs against the repo's own remotion/ unchanged.
+    """
+    if d := os.environ.get("MONTY_REMOTION_DIR"):
+        cand = Path(d)
+        if not (cand / "render_batch.mjs").is_file():
+            raise RuntimeError(f"MONTY_REMOTION_DIR={cand} holds no render_batch.mjs")
+        return cand
+    if ref is None:
+        # Unreachable through the contract (SpecMotionPlan rejects sections without a bundle); kept so a
+        # hand-built call fails with the reason rather than an AttributeError.
+        raise RuntimeError("no Remotion bundle for this job and no MONTY_REMOTION_DIR — cannot render mograph")
+    from . import bundle
+    return bundle.workspace(bundle.ensure(ref), tmp / "remotion")
 
 
 def _stage_public(input_paths: dict, rd: Path) -> None:
@@ -53,10 +67,11 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
     return layers
 
 
-def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path) -> list[dict]:
+def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path,
+                   bundle_ref=None) -> list[dict]:
     """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch; each Bespoke
     (LLM .tsx delivered + staged by the brain) via its own per-job entry. A missing bespoke entry = skip loud."""
-    rd = remotion_dir()
+    rd = remotion_dir(bundle_ref, tmp)
     _stage_public(input_paths, rd)
     tok = (brand or {}).get("tokens")
     fnt = (brand or {}).get("fonts")
@@ -133,5 +148,5 @@ def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc) -> Path:
 def composite(motion_plan, base: Path, input_paths: dict, out: Path, gpu: bool, enc, tmp: Path) -> Path:
     """Render motion_plan.sections and overlay them onto `base`. Returns `base` unchanged if nothing rendered."""
     layers = _render_layers(motion_plan.sections, motion_plan.brand.model_dump() if motion_plan.brand else None,
-                            input_paths, tmp)
+                            input_paths, tmp, getattr(motion_plan, "bundle", None))
     return _overlay(base, layers, out, gpu, enc) if layers else base

@@ -1,7 +1,9 @@
 {
-  "infer_version": 3,
+  "infer_version": 4,
   "job_id": "j",
   "kind": "align",
   "status": "ok",
-  "timing": { "infer_s": 3.7 }
+  "timing": {
+    "infer_s": 3.7
+  }
 }

@@ -1,5 +1,5 @@
 # THIN image: only what EVERY job needs. Model weights are NOT baked — they arrive per-job as a
-# presigned tar in InferRequest.weights (contracts v3) and are cached on local disk, so an align pod
+# presigned tar in InferRequest.weights (contracts v4) and are cached on local disk, so an align pod
 # never pays for SigLIP and a render pod pays for neither. Runtime still needs exactly two env vars —
 # CP_URL and JOB_TOKEN — see README.
 #
@@ -15,17 +15,34 @@ FROM nvidia/cuda:12.8.1-base-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# --- system: python3.11 (via deadsnakes, ubuntu22.04 ships 3.10). fontconfig stays: libass resolves
-# caption fonts through it. NO chromium libs and NO node/chrome — see the mograph note at the bottom. --
+# --- system: python3.11 (via deadsnakes, ubuntu22.04 ships 3.10) + headless-chrome's runtime deps
+# (standard puppeteer list). fontconfig stays: libass resolves caption fonts through it. ------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common curl xz-utils ca-certificates gnupg \
         fonts-dejavu-core fontconfig \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3.11-distutils \
+        libnss3 libatk-bridge2.0-0 libgtk-3-0 libasound2 libxss1 libgbm1 \
+        libxshmfence1 libxcomposite1 libxdamage1 libxrandr2 libxi6 \
+        libpango-1.0-0 libcairo2 libxkbcommon0 libx11-xcb1 \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
+
+# --- node 20 + chrome stable: the RUNTIME for mograph. ~243 MB, and unlike the bundle it is genuinely
+# image-shaped — it is a binary toolchain, not content, so it neither churns with our code nor differs
+# per brand. The bundle it executes (node_modules + src, 506 MB) is NOT here: that arrives per job as a
+# presigned tar cached by content hash, so a pod that renders no mograph pays for none of it. -------
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && curl -L -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm -rf /tmp/chrome.deb /var/lib/apt/lists/*
+# Remotion must use the chrome we installed, never download its own at render time: a rented pod may have
+# blocked egress, and a silent per-job browser fetch is exactly the cold-start cost this lane exists to avoid.
+ENV REMOTION_CHROME_EXECUTABLE=/usr/bin/google-chrome-stable \
+    REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
 
 # --- ffmpeg: BtbN static build (NVENC + libplacebo, not in ubuntu22.04 apt) -
 RUN curl -L -o /tmp/ffmpeg.tar.xz \
@@ -69,9 +86,10 @@ COPY podagent/ ./podagent/
 COPY contracts/ ./contracts/
 RUN python3 -m pip install --no-cache-dir --no-deps .
 
-# NOTE on mograph: podagent/mograph.py shells `node render_batch.mjs`, but the Remotion bundle it needs has
-# never been in this image — `remotion_dir()` raises before node is ever spawned, so node+chrome were 243 MB
-# of unreachable weight and are gone. Finishing pod-side mograph means DELIVERING the bundle per job (same
-# shape as weights), not re-baking a browser. See docs/POD_RUNBOOK.md §2a.
+# mograph is now COMPLETE on the pod: node+chrome above are the runtime, and the Remotion bundle
+# (node_modules + src + render_batch.mjs) is delivered per job as `motion_plan.bundle` — a presigned tar
+# cached under REMOTION_BUNDLE_CACHE by content hash, same shape as weights (podagent/bundle.py). The
+# contract refuses sections without a bundle, so a mis-deployed pod fails loud instead of quietly
+# publishing a video with no motion graphics in it. See docs/POD_RUNBOOK.md §2a.
 
 ENTRYPOINT ["python3", "-m", "podagent.main"]

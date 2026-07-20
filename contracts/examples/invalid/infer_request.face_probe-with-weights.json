@@ -1,5 +1,5 @@
 {
-  "infer_version": 3,
+  "infer_version": 4,
   "job_id": "job_9f2c1a",
   "kind": "face_probe",
   "model": "yunet-2023mar",
@@ -12,8 +12,14 @@
   "face_probe": {
     "video_url": "https://storage.example/o/14311.mkv?sig=GET",
     "shots": [
-      [12.333, 18.9],
-      [24.067, 31.433]
+      [
+        12.333,
+        18.9
+      ],
+      [
+        24.067,
+        31.433
+      ]
     ],
     "stride": 2,
     "frame_diff": true
