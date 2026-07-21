@@ -1,0 +1,81 @@
+{
+  "op": "cut.apply",
+  "version": 1,
+  "summary": "Apply an already-decided EDL keep-list to the source: the frame-quantized trim/setpts/atempo per-segment render + video-only concat + room-tone crossfade audio graph that turns a decided cut into the spliced film. Mechanics only — WHICH spans to keep and the per-segment speed are decided on the brain and cross as data.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "The per-segment trim=start/end_frame + setpts + atempo filtergraph, the video-only concat and the room-tone acrossfade audio graph are PURE functions of (keep, speed F, fps_grid, xfade) — all of which are DECISIONS made by the cut brain and arriving as params. libx264 at the pinned preset/crf over identical input frames emits identical output bytes; the byte-exact proof forces libx264 (make check-cut, both hermetic synthetic grid incl. a speed-change segment + a crossfade join, and a real ear-approved corpus spot-check) since NVENC — the fast default — is not byte-reproducible run-to-run like every encoder op. The caller's render DIRECTIVES (crf quality, thread cap, cpu/hwaccel selection) cross because they affect the bytes and must reproduce for every caller; the ffmpeg flag construction (preset p6/medium, -tune, -hwaccel, the encoder arg strings) stays in the handler. NO cut DECISION is in these params by construction: the keep-list is the already-composed cut, not a threshold; the whole ASR→Director→dedup→pause/retake removal that PRODUCES it stays on the control plane."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "video", "durable": true},
+    {"id": "durs", "kind": "json", "durable": false}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["keep", "fps_grid"],
+    "properties": {
+      "keep": {
+        "type": "array",
+        "minItems": 1,
+        "description": "The [start, end] source-time spans to KEEP, in order — the already-composed, frame-snapped cut. WHICH spans is the editorial decision and it arrives as data; how they become a trim+concat render is the handler's. These are spans to keep, never a threshold.",
+        "items": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "number", "minimum": 0}
+        }
+      },
+      "fps_grid": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 240,
+        "description": "The source video frame rate the keep boundaries were snapped to. Renders exactly nf=round(dur*fps_grid) frames per segment so V and A agree to the sample."
+      },
+      "speed": {
+        "type": "number",
+        "minimum": 0.5,
+        "maximum": 2.0,
+        "default": 1.0,
+        "description": "The tempo factor F folded into this ONE render (video setpts/F, audio atempo=F per segment). DECIDED on the brain (speed factor); 1.0 = off, byte-identical to the un-sped path. Bounded to atempo's single-stage [0.5,2.0]."
+      },
+      "xfade": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1.0,
+        "default": 0.07,
+        "description": "Equal-power room-tone crossfade at every speech join (s). 0 = butt-concat. Bounded to the trimmed gap and <0.45 of each adjacent range so no speech onset is faded."
+      },
+      "crf": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 51,
+        "default": 14,
+        "description": "Intermediate quality (crf/cq). The cut is the FIRST of several chained lossy passes, so it runs at high quality; the FINAL delivery encode is downstream. A quality directive, not encoder flags."
+      },
+      "threads": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 64,
+        "default": 4,
+        "description": "ffmpeg CPU thread cap. Affects libx264 output bytes, so it crosses and reproduces per caller; keeps the render gentle on the machine."
+      },
+      "cpu": {
+        "type": "boolean",
+        "default": false,
+        "description": "Force the libx264 rung (Mac / no GPU / the reproducible byte-exact proof). Default false = NVENC-with-degrade-ladder."
+      },
+      "no_hwaccel": {
+        "type": "boolean",
+        "default": false,
+        "description": "Disable NVDEC hardware decode of the source (decode-only, quality-neutral; off on the cpu path anyway)."
+      }
+    }
+  },
+  "handler": "montyops.cut_apply:run"
+}
