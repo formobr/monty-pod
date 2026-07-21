@@ -1,0 +1,24 @@
+{
+  "op": "measure.master",
+  "version": 1,
+  "summary": "Measure a finished master's delivery NUMBERS — integrated loudness, true-peak, LRA (ffmpeg loudnorm analysis) and colour tag + video bitrate (ffprobe). Numbers only; the pass/fail verdict is the brain's.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "numeric",
+    "tol": 0.5,
+    "note": "ffmpeg's loudnorm analysis pass and ffprobe report the same values for identical input bytes on a pinned build; a fractional-dB jitter across ffmpeg minors is far below any verdict band, so numeric(0.5) is the honest mode for a MEASUREMENT. Critically, NO THRESHOLD is measured here — this op returns raw values and check_master.gate() (on the brain, reading the brand's own delivery target) decides ok/off/?. Shaped like cp_infer: numbers cross, judgement does not."
+  },
+  "inputs": [
+    {"id": "master", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "measured", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "handler": "montyops.measure_master:run"
+}

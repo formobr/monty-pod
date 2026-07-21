@@ -1,0 +1,38 @@
+{
+  "op": "edit.weld",
+  "version": 1,
+  "summary": "Weld a cold-open onto the FRONT of a finished master with the branded film-burn transition (frame-jerk + warm burn overlay + two-click sound) at the junction, then encode.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "perceptual",
+    "note": "The weld FILTERGRAPH — the film-burn overlay, the old-film frame-jerk offset expression and the two-click audio delay — is a pure function of params, pinned byte-identical in tests/test_op_edit_weld.py, so the transition the viewer sees is exact. The terminal ENCODE defaults to h264_nvenc (not byte-reproducible across GPU/driver) and degrades to libx264 on a box without NVENC, so bit_exact would be a lie; perceptual is the honest mode for anything whose final encode is NVENC. The flare detection is a deterministic probe of the burn clip, not a decision."
+  },
+  "inputs": [
+    {"id": "cold", "kind": "video"},
+    {"id": "main", "kind": "video"},
+    {"id": "burn", "kind": "video"},
+    {"id": "clicks", "kind": "audio"}
+  ],
+  "outputs": [
+    {"id": "welded", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "cold_trim": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Seconds trimmed off the cold-open END before the weld — a creative dial the brain authors, defaulted to 0. Not a threshold."
+      },
+      "gain": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 2,
+        "description": "Film-burn click level (0..1 typical), defaulted to 0.4. A brand/creative dial, not encoder tuning."
+      }
+    }
+  },
+  "handler": "montyops.edit_weld:run"
+}

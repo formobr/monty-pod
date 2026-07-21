@@ -1,0 +1,36 @@
+{
+  "op": "edit.splice",
+  "version": 1,
+  "summary": "Splice removed [a,b] spans out of a baked video by trim+concat re-encode — the render_final quick-trim dedup MECHANIC, not the edit DECISION.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "Deterministic for a fixed ffmpeg build: the trim+concat filtergraph is a pure function of the removed spans (and the source's own duration), and libx264 at a pinned preset/crf over identical input bytes emits identical output bytes. tests/test_op_edit_splice.py runs the handler twice on one clip and sha256-compares the bytes, and pins the filtergraph string, so a drift shows as a hash/argv diff rather than as mystery-different pixels. WHICH spans to remove is the FE's editorial decision and arrives as params (data); the overlay-timeline remap around it (broll/motion/fx times) is arithmetic that stays on the brain in apply_trims.py — only this splice crosses."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["spans"],
+    "properties": {
+      "spans": {
+        "type": "array",
+        "minItems": 1,
+        "description": "The removed [a,b] spans on the SOURCE clock — merged and non-overlapping, from the FE dedup marks. WHICH spans to cut is the decision and it arrives as data; how they become a trim+concat filtergraph is the handler's. These are spans to REMOVE, never a threshold.",
+        "items": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "number", "minimum": 0}
+        }
+      }
+    }
+  },
+  "handler": "montyops.edit_splice:run"
+}

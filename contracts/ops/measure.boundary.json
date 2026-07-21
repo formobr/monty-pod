@@ -1,0 +1,41 @@
+{
+  "op": "measure.boundary",
+  "version": 1,
+  "summary": "At each supplied join on a finished master, measure the numeric join heuristics — RMS before/after/jump, click ratio, frame-diff. Numbers only; which joins are DEFECTS (the flag thresholds) is the brain's.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "numeric",
+    "tol": 0.5,
+    "note": "The heuristics are ffmpeg-decoded audio RMS/click ratios and a downscaled frame-diff — deterministic for identical input bytes on a pinned build, with sub-dB jitter across ffmpeg minors, so numeric(0.5). No THRESHOLD crosses: the op returns raw per-join numbers and boundary_qc.py applies CLICK_RATIO_MIN / RMS_JUMP_DB / FRAME_JUMP on the brain to turn them into flags. WHICH joins to inspect is discovered on the brain (cut segments + b-roll plan) and arrives as data."
+  },
+  "inputs": [
+    {"id": "master", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "measured", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["boundaries"],
+    "properties": {
+      "boundaries": {
+        "type": "array",
+        "minItems": 1,
+        "description": "The joins to inspect on the master timeline, each {index, t, kind}. Discovered on the brain from the cut segments + b-roll plan (mechanical arithmetic, not a decision). The measurement is per-join; the verdict thresholds stay off this list by construction.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["index", "t", "kind"],
+          "properties": {
+            "index": {"type": "integer", "minimum": 0},
+            "t": {"type": "number", "minimum": 0},
+            "kind": {"enum": ["splice", "broll_in", "broll_out"]}
+          }
+        }
+      }
+    }
+  },
+  "handler": "montyops.measure_boundary:run"
+}
