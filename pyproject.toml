@@ -17,7 +17,11 @@ dependencies = [
 ml = [
     "torch",
     "torchaudio",
-    "transformers",
+    # PINNED: with an unpinned (newer) transformers, Siglip2Model.get_image_features returns a
+    # BaseModelOutputWithPooling instead of the pooled tensor, and clip_rank's F.normalize(...) dies with
+    # "'BaseModelOutputWithPooling' object has no attribute 'norm'". 4.57.6 is the version the control plane
+    # runs and is verified to return a Tensor for both the wav2vec2 (align) and SigLIP2 (clip_rank) towers.
+    "transformers==4.57.6",
     "opencv-python-headless",
 ]
 dev = [
