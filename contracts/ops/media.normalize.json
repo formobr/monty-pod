@@ -1,0 +1,67 @@
+{
+  "op": "media.normalize",
+  "version": 1,
+  "summary": "Canonical INGEST encode: bake rotation, VFR→CFR, square the pixels, HDR→SDR tonemap, multichannel→centered stereo, 8-bit 4:2:0 h264 + bounded autograde. The MECHANIC of ingest_normalize — WHAT to correct is measured on the brain and arrives as numeric params.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "The vf/audio/encoder argv is a PURE function of the params (target dims, tonemap transfer, fps, source channel count, the autograde brightness/contrast/saturation numbers), so libx264 at the pinned preset/crf over identical input bytes emits identical output bytes. tests/test_op_media_normalize.py pins video_filter()/argv() as strings, renders twice on the libx264 path (MONTY_OPS_CPU_ENCODE=1) and sha256-compares, and pins the eq= against autograde.grade_filter so an autograde drift reddens. This normalizes the raw source pixels EVERY downstream decision reads (ASR, Director, all measures) — a pixel shift here silently moves every decision below it, which is why the bar is byte-exact and not perceptual. WHICH corrections apply (needs_normalize gating, the autograde MEASUREMENT) is decided on the brain and crosses as data; NVENC is the fast default and non-reproducible run-to-run like every encoder op, which is a version-pin property of the image, not this op."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["width", "height", "fps"],
+    "properties": {
+      "width": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 8192,
+        "multipleOf": 2,
+        "description": "Target width — the TRUE displayed width (stored dims swapped if rotated 90/270), rounded even, native resolution KEPT (no downscale here; the final crop happens downstream). Decided on the brain from the probe."
+      },
+      "height": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 8192,
+        "multipleOf": 2,
+        "description": "Target height — the TRUE displayed height, rounded even. Aspect is preserved (decrease + pad), never squashed."
+      },
+      "fps": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 240,
+        "description": "Canonical constant frame rate. VFR sources desync the cut; force CFR at this fps."
+      },
+      "tonemap": {
+        "enum": ["none", "hlg", "pq"],
+        "default": "none",
+        "description": "Source HDR transfer to tonemap SDR→bt709 (hlg = iPhone default, pq). 'none' = an SDR source, no tonemap. The zscale+tonemap=hable chain is the handler's; this names WHICH transfer, not the filtergraph."
+      },
+      "audio_channels": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 32,
+        "default": 2,
+        "description": "Source audio channel count. >2 (quad/5.1 mono-in-a-container) → SUM all channels into BOTH stereo channels (voice CENTERED); 1/2 → plain stereo. The DECISION is the channel count from the probe; the pan is the handler's."
+      },
+      "grade": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Bounded autograde correction (±8%), MEASURED on the brain (autograde.measure/plan). Absent or identity → no eq. NOT an editorial grade — a mechanical exposure/saturation nudge toward neutral.",
+        "properties": {
+          "brightness": {"type": "number", "minimum": -0.08, "maximum": 0.08},
+          "contrast": {"type": "number", "minimum": 0.92, "maximum": 1.08},
+          "saturation": {"type": "number", "minimum": 0.92, "maximum": 1.08}
+        }
+      }
+    }
+  },
+  "handler": "montyops.media_normalize:run"
+}
