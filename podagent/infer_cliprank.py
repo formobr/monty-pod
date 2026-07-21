@@ -63,19 +63,28 @@ class ClipRankService:
             embeds=[emb_by_idx.get(i) for i in range(n)],
         )
 
+    @staticmethod
+    def _feat(out):
+        """The pooled embedding, whatever get_image/text_features returned. Some transformers versions hand
+        back a bare tensor; others a BaseModelOutputWithPooling whose pooled embed is `.pooler_output`. Extract
+        the tensor either way — F.normalize calls `.norm()` on its input, so a model-output object crashes with
+        `'BaseModelOutputWithPooling' object has no attribute 'norm'`. The Dockerfile pins transformers, but a
+        `pip install --no-deps .` once shipped an unpinned one past the pyproject pin, so guard in code too."""
+        return out.pooler_output if hasattr(out, "pooler_output") else out
+
     def _forward(self, intent: str, images: list) -> tuple[list[float], list[list[float]]]:
         torch = self.torch
         with torch.no_grad():
             iin = self.proc(images=images, return_tensors="pt").to(self.device)
             iin = {k: (v.to(self.dtype) if v.dtype == torch.float32 else v) for k, v in iin.items()}
-            ie = torch.nn.functional.normalize(self.model.get_image_features(**iin), dim=-1)
+            ie = torch.nn.functional.normalize(self._feat(self.model.get_image_features(**iin)), dim=-1)
             embeds = [[round(x, _DP) for x in e] for e in ie.float().cpu().tolist()]
             # NO intent = an embed-only caller (the image tower is text-independent). Bailing here would hand it
             # Nones and silently blind the dedup/MMR that asked ONLY for embeddings.
             if not intent:
                 return [_MISS] * len(images), embeds
             tin = self.proc(text=[intent], return_tensors="pt", padding="max_length", truncation=True)
-            te = torch.nn.functional.normalize(self.model.get_text_features(**tin.to(self.device)), dim=-1)
+            te = torch.nn.functional.normalize(self._feat(self.model.get_text_features(**tin.to(self.device))), dim=-1)
             sims = (ie @ te.T).squeeze(-1).float().cpu().tolist()
         return [round(s, _DP) for s in sims], embeds
 

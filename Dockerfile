@@ -56,7 +56,10 @@ RUN curl -L -o /tmp/ffmpeg.tar.xz \
 # the rest. This is the ONE unavoidably heavy layer: it is the runtime, not an input. ------
 RUN python3 -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 \
     # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
-    && python3 -m pip install --no-cache-dir transformers opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema
+    # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
+    # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
+    # transformers ships a get_image_features that returns a BaseModelOutputWithPooling → clip_rank crash.
+    && python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema
 
 # Weights are NOT baked and the pod holds no HF credential — it never dials HF. Every heavy checkpoint
 # arrives as a presigned tar the CP hands it (podagent/weights.py), cached under WEIGHTS_CACHE by content

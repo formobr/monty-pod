@@ -98,6 +98,23 @@ def test_empty_intent_is_embed_only_and_never_touches_the_text_tower() -> None:
     assert calls == [], "no intent must mean no text forward"
 
 
+def test_feat_unwraps_a_pooled_model_output_so_the_forward_never_crashes() -> None:
+    """Regression: some transformers versions return a BaseModelOutputWithPooling (pooled embed in
+    .pooler_output) from get_image/text_features instead of a bare tensor; F.normalize then calls .norm() on
+    the OBJECT — the '...has no attribute norm' crash that lost every b-roll. _feat must unwrap .pooler_output
+    so the forward runs. WITHOUT the guard this test raises AttributeError (the object has no .float())."""
+    class _Pooled:
+        def __init__(self, t):
+            self.pooler_output = t
+
+    svc = _svc()
+    svc.model.get_image_features = lambda **kw: _Pooled(_Vec([[0.6, 0.8], [0.8, 0.6]]))
+    svc.model.get_text_features = lambda **kw: _Pooled(_Vec([[1.0, 0.0]]))
+    scores, embeds = svc._forward("some intent", ["img", "img"])
+    assert scores == [0.6, 0.8]
+    assert embeds == [[0.6, 0.8], [0.8, 0.6]]
+
+
 def test_unfetchable_image_scores_minus_one_and_keeps_request_order(monkeypatch, tmp_path) -> None:
     import podagent.infer_cliprank as m
 
