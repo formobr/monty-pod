@@ -1,0 +1,55 @@
+{
+  "op": "camera.apply",
+  "version": 1,
+  "summary": "Bake the talking-head camera onto the clean cut: a rect-keyframe crop trajectory rendered to pixels (GPU libplacebo, CPU-static fallback).",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "perceptual",
+    "note": "The SHOT is JUDGEMENT and never crosses (detect_track / head_geometry / plan_shots / plan_punches decide it on the brain); only the rect keyframes it emits cross as params, and this op turns them into pixels. Two reasons it is not bit_exact. (1) The keyframes are a DENSE linear sampling (interp:linear, step 0.1s + every shot-cut and punch kink) of the camera planner's analytic COSINE ramp — linear-between-dense reproduces the cosine to a small residual (the planner measured 0.031→0.0036 max rect error at the punch kinks), so the trajectory itself carries a bounded approximation. (2) The primary render is GPU libplacebo on BOTH local and pod (the dev box and the rented pod both have Vulkan), so those two agree structurally — the crop filtergraph is pinned BYTE-EQUAL to the pod's rect renderer (podagent.render._gpu_crop) in the engine's parity suite — but a Vulkan-less box (driverless CI) falls back to a STATIC crop at the first keyframe, exactly as podagent.render._cpu_crop does in the final composite; that fallback is declared, not hidden. Tolerance for the GPU-vs-GPU path: PSNR >= 40 dB / SSIM >= 0.99 frame-to-frame is the intended bar (dominated by encoder quantisation, not geometry); UNPROVEN in a CPU-only environment with no GPU to run a real libplacebo render, so only the filtergraph STRINGS are pinned."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["keyframes", "interp", "out_w", "out_h", "encode_profile"],
+    "properties": {
+      "keyframes": {
+        "type": "array",
+        "minItems": 1,
+        "description": "The camera trajectory as DATA: per-frame crop rects in SOURCE fractions, emitted by head_trajectory.trajectory_for_keeps. Because cover is a uniform scale, a cover fraction IS a source fraction, so each rect applies straight to iw/ih (podagent.render.anim_expr, the SAME renderer the preview uses). Times are seconds on the segment clock.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["t", "rect"],
+          "properties": {
+            "t": {"type": "number", "minimum": 0},
+            "rect": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "items": {"type": "number", "minimum": 0, "maximum": 1},
+              "description": "[x, y, w, h] crop window, each in [0,1]."
+            }
+          }
+        }
+      },
+      "interp": {
+        "enum": ["linear", "ease_in", "ease_out", "ease_in_out"],
+        "description": "How adjacent keyframes are eased. The planner emits `linear` and relies on dense sampling (see parity note) rather than an analytic ease here — this stays an enum only so the same renderer serves the eased overlay presets."
+      },
+      "out_w": {"type": "integer", "minimum": 16, "maximum": 3840, "multipleOf": 2},
+      "out_h": {"type": "integer", "minimum": 16, "maximum": 3840, "multipleOf": 2},
+      "encode_profile": {
+        "enum": ["preview", "final"],
+        "description": "Named quality tier, NOT encoder flags. head_dyn.mp4 is an INTERMEDIATE re-encoded downstream, so `final` runs a high-quality cq (14) to limit compounding generation loss; `preview` trades quality for the 540x960 proxy. The nvenc/libx264 ladder is tuning and stays in the handler (scripts/render_profile.py is the same SSOT pattern)."
+      }
+    }
+  },
+  "handler": "montyops.camera_apply:run"
+}

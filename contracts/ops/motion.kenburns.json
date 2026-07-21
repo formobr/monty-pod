@@ -1,0 +1,75 @@
+{
+  "op": "motion.kenburns",
+  "version": 1,
+  "summary": "Bake a Ken-Burns move onto a still (photo/logo) into a 9:16 cutaway clip: cover-crop or blurfill, one eased zoom/pan per preset.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "perceptual",
+    "note": "The b-roll TASK does not move: sourcing, the network fetch and the LLM tile-judge that PICK the still and its preset all stay on the brain (they need keys + net + the model). Only the ENCODE crosses, which is why op granularity beats task granularity here. The move's z/x/y expressions are a SINGLE SSOT shared by the CPU zoompan and the GPU libplacebo sampler, so the handler carries a byte-for-byte copy of the engine's Ken-Burns builders (its filtergraph module plus the shared GPU translator, which live in the engine tree, not this public repo), pinned BYTE-EQUAL in the engine's parity suite — the CPU filtergraph is reproduced bit-for-bit (today's b-roll forces the CPU path, so the migrated op is byte-identical to what shipped). It is nonetheless `perceptual`, not `bit_exact`, because the pod now renders the same move on GPU libplacebo (spline36 resample) where the box ran CPU zoompan (bilinear): identical geometry, different rasteriser. Intended GPU-vs-CPU bar: PSNR >= 38 dB / SSIM >= 0.98. The GPU render is UNPROVEN in a CPU-only environment with no Vulkan device — only the strings are pinned; a Vulkan-less box falls back to the pinned CPU path."
+  },
+  "inputs": [
+    {"id": "still", "kind": "image"}
+  ],
+  "outputs": [
+    {"id": "clip", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["preset", "scale", "encode_profile"],
+    "properties": {
+      "preset": {
+        "enum": ["in", "out", "left", "right", "up", "down", "in_left", "in_right",
+                 "out_left", "out_right", "breathe", "zoom_pulse", "parallax"],
+        "description": "WHICH move — the judge/router's decision. Named, not an expression: the z/x/y filtergraph is the algorithm and stays in the handler."
+      },
+      "scale": {
+        "enum": ["cover", "blurfill"],
+        "description": "How non-vertical footage fills 9:16. `cover` crops to fill (a photo that fills the frame); `blurfill` fits the WHOLE image on a blurred bg (a logo / small / square mark that must never be cropped or blown up)."
+      },
+      "amount": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.12,
+        "description": "Peak zoom delta for in/out. A gentle 0.06 on a logo, 0.12-0.24 on a photo — the router's call, clamped to the frame."
+      },
+      "pan_zoom": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.08,
+        "description": "Constant zoom kept for pure pans so there is room to move."
+      },
+      "direction": {
+        "enum": ["left", "right"],
+        "default": "right",
+        "description": "Parallax pan direction."
+      },
+      "cycles": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 12,
+        "default": 3,
+        "description": "breathe/zoom_pulse oscillation count across the clip."
+      },
+      "dur": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "description": "Clip seconds. Omit for a still to use the 3.5s default cutaway length."
+      },
+      "seek": {
+        "type": "number",
+        "minimum": 0,
+        "default": 0,
+        "description": "Seek into a video source (ignored for a looped still)."
+      },
+      "encode_profile": {
+        "enum": ["preview", "final"],
+        "description": "Named quality tier, NOT encoder flags — same SSOT pattern as scripts/render_profile.py. The intermediate cq/preset ladder is tuning and stays in the handler."
+      }
+    }
+  },
+  "handler": "montyops.motion_kenburns:run"
+}
