@@ -41,6 +41,18 @@ def test_render_job_valid() -> None:
     assert job.spec is not None and job.request is None
 
 
+def test_pool_ids_default_none() -> None:
+    # old envelopes carry neither → optional, back-compat
+    job = PodJob.model_validate({"type": "infer", "request": _ALIGN_REQUEST})
+    assert job.session_id is None and job.corr_id is None
+
+
+def test_pool_ids_carried() -> None:
+    job = PodJob.model_validate(
+        {"type": "render", "spec": _PREVIEW_SPEC, "session_id": "tenant_1", "corr_id": "abc123"})
+    assert job.session_id == "tenant_1" and job.corr_id == "abc123"
+
+
 def test_mismatched_block_rejected() -> None:
     with pytest.raises(ValidationError):
         PodJob.model_validate({"type": "infer", "request": _ALIGN_REQUEST, "spec": _PREVIEW_SPEC})

@@ -158,8 +158,19 @@ def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Path]]) ->
     return outputs
 
 
-def run_chain(chain: Any, cp: Any) -> dict[str, Any]:
-    """Execute the whole chain. Returns {step_id: {port: str(path)}} for the caller to inspect."""
+def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
+              session_id: str | None = None) -> dict[str, Any]:
+    """Execute the whole chain. Returns {step_id: {port: str(path)}} for the caller to inspect.
+
+    corr_id/session_id are echoed from the claimed envelope onto every event/terminal (pool demux)."""
+
+    def _event(**payload: Any) -> None:
+        if corr_id is not None:
+            payload["corr_id"] = corr_id
+        if session_id is not None:
+            payload["session_id"] = session_id
+        cp.post_event(payload)
+
     pack.activate(chain.pack)
 
     tmp = Path(tempfile.mkdtemp(prefix="opchain_"))
@@ -190,15 +201,14 @@ def run_chain(chain: Any, cp: Any) -> dict[str, Any]:
                 try:
                     outs = fut.result()
                 except Exception as e:
-                    cp.post_event({"job_id": chain.job_id, "stage": "ops", "status": "error",
-                                   "step": sid, "error": f"{by_id[sid].op}: {e}"[:500]})
+                    _event(job_id=chain.job_id, stage="ops", status="error",
+                           step=sid, error=f"{by_id[sid].op}: {e}"[:500])
                     raise
                 with lock:
                     produced[sid] = outs
-                cp.post_event({"job_id": chain.job_id, "stage": "ops", "status": "step",
-                               "step": sid, "op": by_id[sid].op})
-        cp.post_event({"job_id": chain.job_id, "stage": "ops", "status": "ok",
-                       "steps": sorted(produced)})
+                _event(job_id=chain.job_id, stage="ops", status="step",
+                       step=sid, op=by_id[sid].op)
+        _event(job_id=chain.job_id, stage="ops", status="ok", steps=sorted(produced))
         return {sid: {p: str(v) for p, v in outs.items()} for sid, outs in produced.items()}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

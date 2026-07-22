@@ -12,6 +12,7 @@
     "kind": { "enum": ["align", "face_probe", "clip_rank"] },
     "status": { "enum": ["ok", "error"] },
     "result_key": { "type": "string", "minLength": 1 },
+    "corr_id": { "type": "string", "minLength": 1 },
     "error": { "type": "string", "minLength": 1 },
     "timing": {
       "type": "object",

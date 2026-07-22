@@ -518,6 +518,8 @@ class InferResult(BaseModel):
     kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]
     result_key: str | None = Field(default=None, min_length=1)
+    # echoed verbatim from the claimed job envelope's corr_id (pool result demux); None on old envelopes
+    corr_id: str | None = Field(default=None, min_length=1)
     error: str | None = Field(default=None, min_length=1)
     timing: InferTiming | None = None
 
@@ -695,6 +697,9 @@ class PodJob(BaseModel):
     request: InferRequest | None = None
     spec: RenderSpec | None = None
     chain: OpChain | None = None
+    # pool routing/correlation — additive & optional; old envelopes carry neither (Go falls back to job_id/FIFO)
+    session_id: str | None = Field(default=None, min_length=1)
+    corr_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _block_matches_type(self) -> "PodJob":

@@ -81,8 +81,11 @@ def _run_infer(
     rank_cache: dict[str, "ClipRankService"],
     yunet_path: Path,
     boot_reported: bool,
+    corr_id: str | None = None,
 ) -> bool:
-    """Runs one infer job, reports the result, and returns the updated boot_reported flag."""
+    """Runs one infer job, reports the result, and returns the updated boot_reported flag.
+
+    corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
     try:
@@ -127,6 +130,7 @@ def _run_infer(
             kind=req.kind,
             status="ok",
             result_key=urlparse(req.put_url).path.lstrip("/"),
+            corr_id=corr_id,
             timing=InferTiming(infer_s=infer_s, boot_s=boot_s),
         )
         cp.post_infer_result(result.model_dump(exclude_none=True))
@@ -138,24 +142,38 @@ def _run_infer(
             job_id=str(job_id),
             kind=kind,
             status="error",
+            corr_id=corr_id,
             error=str(e)[:500],
         )
         cp.post_infer_result(error_result.model_dump(exclude_none=True))
         return boot_reported
 
 
-def _run_render(raw: dict[str, Any], cp: ControlPlane) -> None:
+def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str | None = None,
+                session_id: str | None = None) -> None:
     job_id = raw.get("job_id", "unknown")
     try:
         spec = RenderSpec.model_validate(raw)
         from .render import render_spec  # posts its own events; heavy deps stay out until a render job lands
 
-        render_spec(spec, cp)
+        render_spec(spec, cp, corr_id=corr_id, session_id=session_id)
     except Exception as e:
-        cp.post_event({"job_id": job_id, "stage": "render", "status": "error", "error": str(e)[:500]})
+        ev = {"job_id": job_id, "stage": "render", "status": "error", "error": str(e)[:500]}
+        _tag(ev, corr_id, session_id)
+        cp.post_event(ev)
 
 
-def _run_ops(chain: Any, cp: ControlPlane) -> None:
+def _tag(ev: dict[str, Any], corr_id: str | None, session_id: str | None) -> dict[str, Any]:
+    """Stamp pool correlation onto an event/terminal — echoed from the claimed envelope, dropped when absent."""
+    if corr_id is not None:
+        ev["corr_id"] = corr_id
+    if session_id is not None:
+        ev["session_id"] = session_id
+    return ev
+
+
+def _run_ops(chain: Any, cp: ControlPlane, corr_id: str | None = None,
+             session_id: str | None = None) -> None:
     """Run an op chain. There is NO per-op branch here and there must never be one: the op names its
     handler in contracts/ops/<op>.json, the pack provides it, and dispatch is a registry LOOKUP. Adding a
     tool costs a declaration and a handler — this file is not one of the files that changes.
@@ -163,9 +181,11 @@ def _run_ops(chain: Any, cp: ControlPlane) -> None:
     from .ops.runner import run_chain
 
     try:
-        run_chain(chain, cp)
+        run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
     except Exception as e:
-        cp.post_event({"job_id": chain.job_id, "stage": "ops", "status": "error", "error": str(e)[:500]})
+        ev = {"job_id": chain.job_id, "stage": "ops", "status": "error", "error": str(e)[:500]}
+        _tag(ev, corr_id, session_id)
+        cp.post_event(ev)
 
 
 def main() -> None:
@@ -197,14 +217,14 @@ def main() -> None:
                 assert pod_job.request is not None
                 request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
                 boot_reported = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
-                                           yunet_path, boot_reported)
+                                           yunet_path, boot_reported, corr_id=pod_job.corr_id)
             elif pod_job.type == "ops":
                 assert pod_job.chain is not None
-                _run_ops(pod_job.chain, cp)
+                _run_ops(pod_job.chain, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
             else:
                 assert pod_job.spec is not None
                 spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
-                _run_render(spec_raw, cp)
+                _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
         except requests.RequestException as e:
             _log(f"control-plane request failed: {e}")
             time.sleep(5)

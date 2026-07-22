@@ -1,0 +1,12 @@
+{
+  "infer_version": 5,
+  "job_id": "job_9f2c1a",
+  "kind": "align",
+  "status": "ok",
+  "result_key": "o/31337.npz",
+  "corr_id": "9c3f5b2e8d1a4f60b7c8d9e0f1a2b3c4",
+  "timing": {
+    "infer_s": 3.7,
+    "boot_s": 58.2
+  }
+}

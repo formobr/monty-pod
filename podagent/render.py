@@ -479,8 +479,11 @@ def _gpu_available() -> bool:
     return _GPU
 
 
-def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
-    """Fetch inputs, run the single encode pass, PUT every non-cache output, report the event."""
+def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
+                session_id: str | None = None) -> None:
+    """Fetch inputs, run the single encode pass, PUT every non-cache output, report the event.
+
+    corr_id/session_id are echoed from the claimed envelope onto the terminal (pool result demux)."""
     if spec.mode == "final" and spec.overlays is not None and spec.overlays.trims:
         raise NotImplementedError("final overlay(s) not yet composited on the pod: ['trims']")
 
@@ -580,9 +583,14 @@ def render_spec(spec: RenderSpec, cp: ControlPlane) -> None:
             upload(master, o.put_url, "video/mp4")
             done.append(o.id)
 
-    cp.post_event({
+    terminal = {
         "job_id": spec.job_id,
         "stage": "render",
         "status": "done",
         "outputs": done,
-    })
+    }
+    if corr_id is not None:
+        terminal["corr_id"] = corr_id
+    if session_id is not None:
+        terminal["session_id"] = session_id
+    cp.post_event(terminal)

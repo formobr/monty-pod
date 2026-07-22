@@ -19,6 +19,16 @@
     "chain": {
       "description": "Present iff type=ops. Opaque here — each step's params are validated against that op's own schema fragment in ops/<op>.json, read by BOTH sides. Deliberately not expanded inline: a per-op block here would be exactly the hand-mirrored surface the op registry exists to abolish.",
       "type": "object"
+    },
+    "session_id": {
+      "description": "Optional pod-lane key (=tenant/session). One warm pod per session serves all its jobs; the pod echoes it on terminals. Missing → Go falls back to job_id (rollout back-compat).",
+      "type": "string",
+      "minLength": 1
+    },
+    "corr_id": {
+      "description": "Optional per-request correlation id (uuid4 hex) set by the worker at enqueue. The pod ECHOES it verbatim on every result/terminal it posts, so results demux on the shared session FIFO. Missing → FIFO-positional await.",
+      "type": "string",
+      "minLength": 1
     }
   },
   "allOf": [
