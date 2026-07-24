@@ -69,8 +69,8 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
 
 def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path,
                    bundle_ref=None) -> list[dict]:
-    """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch; each Bespoke
-    (LLM .tsx delivered + staged by the brain) via its own per-job entry. A missing bespoke entry = skip loud."""
+    """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch. A Bespoke section
+    rides its DELIVERED alpha .mov (rendered once at resolve) — falling back to a staged .tsx entry, else skip loud."""
     rd = remotion_dir(bundle_ref, tmp)
     _stage_public(input_paths, rd)
     tok = (brand or {}).get("tokens")
@@ -84,16 +84,22 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
             p["brandFonts"] = fnt
         return p
 
-    cat_items, cat_metas, bespoke = [], [], []
+    cat_items, cat_metas, bespoke, delivered = [], [], [], []
     for i, sec in enumerate(sections):
         seqdir = tmp / f"seq{i}"
         seqdir.mkdir(parents=True, exist_ok=True)
         meta = {"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass)}
         item = {"comp": sec.comp, "props": _props(sec), "seqdir": str(seqdir)}
         if sec.comp.startswith("Bespoke"):
+            if (mov := input_paths.get(f"bespoke/{sec.comp}.mov")) is not None:
+                from .render import _probe_dur   # local: render imports THIS module at import time
+                delivered.append({"mov": str(mov), "start": float(sec.start),
+                                  "dur": _probe_dur(Path(mov)), "glass": bool(sec.glass)})
+                continue
             entry = f"src/index.bespoke.{sec.comp}.tsx"
             if not (rd / entry).is_file():
-                print(f"mograph: SKIP {sec.comp} @ {sec.start}s — no delivered entry", file=sys.stderr)
+                print(f"mograph: SKIP {sec.comp} @ {sec.start}s — no delivered .mov and no delivered entry",
+                      file=sys.stderr)
                 continue
             bespoke.append((entry, item, meta))
         else:
@@ -107,7 +113,7 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
     for n, (entry, item, meta) in enumerate(bespoke):
         _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
         metas.append(meta)
-    return _pack(metas, tmp)
+    return _pack(metas, tmp) + delivered
 
 
 def overlay_filtergraph(layers: list[dict]) -> tuple[str, str]:
