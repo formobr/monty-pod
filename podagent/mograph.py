@@ -51,7 +51,14 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
     if entry_point:
         body["entryPoint"] = entry_point
     spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
-    subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, check=True, capture_output=True)
+    try:
+        subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        # a bare CalledProcessError reports only the signal — Chrome's own reason (OOM, /dev/shm, a comp
+        # throwing) lives in the captured streams, and without it a SIGABRT is undiagnosable from the job log
+        tail = ((exc.stderr or b"") + (exc.stdout or b""))[-3000:].decode("utf-8", "replace")
+        comps = ", ".join(str(i.get("comp")) for i in items)
+        raise RuntimeError(f"render_batch({comps}) exited {exc.returncode}: {tail}") from exc
 
 
 def _pack(metas: list[dict], tmp: Path) -> list[dict]:
