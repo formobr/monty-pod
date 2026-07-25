@@ -188,12 +188,29 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str | None = None,
         cp.post_event(ev)
 
 
+def _report_boot(cp: ControlPlane) -> None:
+    """One event before the first poll. A keyless pod that cannot reach the CP has NO other voice: the box
+    boots, bills and stays silent, which reads exactly like a dead host. This beacon turns that into a
+    fact on the wire — its presence proves the pod reached us, its absence indicts the network."""
+    try:
+        import torch
+        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no-cuda"
+    except Exception:  # noqa: BLE001 — the beacon must never be what kills a boot
+        gpu = "no-torch"
+    try:
+        cp.post_event({"stage": "boot", "status": "step",
+                       "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s"})
+    except requests.RequestException as e:
+        _log(f"boot beacon failed (the CP is unreachable from this host): {e}")
+
+
 def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
     cp = ControlPlane(cp_url, job_token)
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
+    _report_boot(cp)
 
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
     align_cache: dict[str, "AlignService"] = {}
