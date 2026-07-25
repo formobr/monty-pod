@@ -37,10 +37,9 @@ def model_dir(root: Path) -> Path:
     return min(hits, key=lambda p: len(p.relative_to(root).parts))
 
 
-def ensure(ref: WeightsRef, model_id: str = "") -> Path:
-    """Return a local directory holding the model, fetching it only if this exact content is not cached.
-
-    Idempotent and safe to call per job: a warm pod pays the transfer exactly once per checkpoint.
-    """
+def ensure(ref: WeightsRef, model_id: str = "",
+           progress: "artifact.Progress | None" = None) -> Path:
+    """Local directory holding the model, fetched only on a content miss.
+    Idempotent per job: a warm pod pays the transfer exactly once per checkpoint."""
     label = f"weights {model_id or ref.sha256[:12]}"
-    return model_dir(artifact.ensure_tree(ref, cache_root(), label))
+    return model_dir(artifact.ensure_tree(ref, cache_root(), label, progress))

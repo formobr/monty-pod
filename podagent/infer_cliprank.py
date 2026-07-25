@@ -9,6 +9,7 @@ from __future__ import annotations
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 from .cp import download, upload
 from .models import ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload
@@ -36,15 +37,25 @@ class ClipRankService:
             str(weights_dir), dtype=self.dtype, local_files_only=True).to(self.device).eval()
         self.proc = AutoProcessor.from_pretrained(str(weights_dir), local_files_only=True)
 
-    def run(self, params: ClipRankParams, put_url: str) -> float:
+    def run(self, params: ClipRankParams, put_url: str,
+            progress: "Callable[[str], None] | None" = None) -> float:
         """Returns wall seconds spent on inference (reported in InferResult.timing)."""
         t0 = time.monotonic()
+        n = len(params.groups)
         with tempfile.TemporaryDirectory() as td:
-            groups = [self._run_group(g, Path(td) / f"g{i}") for i, g in enumerate(params.groups)]
+            groups = []
+            for i, g in enumerate(params.groups):
+                # Per-GROUP, not per-batch: a coalesced batch is many beats × many tiles over third-party
+                # CDNs, and "which group was it on" is the whole diagnosis when one wedges.
+                if progress is not None:
+                    progress(f"clip_rank group {i + 1}/{n} ({len(g.image_urls)} tiles)")
+                groups.append(self._run_group(g, Path(td) / f"g{i}"))
             payload = ClipRankPayload(model=self.model_id, groups=groups)
             out = Path(td) / "clip_rank.json"
             out.write_text(payload.model_dump_json())
             infer_s = time.monotonic() - t0
+            if progress is not None:
+                progress(f"clip_rank {n} groups done in {infer_s:.0f}s, uploading")
             upload(out, put_url, "application/json")
         return infer_s
 

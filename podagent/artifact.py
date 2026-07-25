@@ -25,12 +25,17 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 import requests
 
 _CHUNK = 8 << 20
 DONE = ".complete"
+_PROGRESS_EVERY_S = 20.0
+
+# Where a long fetch reports to. Default is stderr only, which is invisible from the control plane — the
+# 4.3 GB weights pull is the one place a pod can be alive and mute for ten minutes.
+Progress = Callable[[str], None]
 
 
 class TarRef(Protocol):
@@ -95,16 +100,24 @@ def url_to_path(url: str) -> Path:
     return Path(unquote(urlparse(url).path))
 
 
-def download_verified(ref: TarRef, dst: Path) -> int:
+def download_verified(ref: TarRef, dst: Path, progress: "Progress | None" = None,
+                      label: str = "") -> int:
     """Stream the tar to `dst`, hashing as we go. A digest mismatch raises — we never extract unverified
     bytes, so a truncated or swapped object fails here instead of surfacing as mystery-bad output."""
     digest = hashlib.sha256()
     total = 0
+    t0 = last = time.monotonic()
     with dst.open("wb") as fh:
         for chunk in _chunks(ref.url):
             digest.update(chunk)
             fh.write(chunk)
             total += len(chunk)
+            now = time.monotonic()
+            if progress is not None and now - last >= _PROGRESS_EVERY_S:
+                last = now
+                pct = f" ({100 * total / ref.size:.0f}%)" if ref.size else ""
+                progress(f"{label or 'artifact'} fetch {total / 1e6:.0f} MB{pct} · "
+                         f"{total / 1e6 / max(now - t0, 1e-6):.1f} MB/s")
     got = digest.hexdigest()
     if got != ref.sha256:
         raise ValueError(f"sha256 mismatch: expected {ref.sha256}, got {got} ({total} bytes)")
@@ -113,7 +126,7 @@ def download_verified(ref: TarRef, dst: Path) -> int:
     return total
 
 
-def ensure_tree(ref: TarRef, root: Path, label: str = "") -> Path:
+def ensure_tree(ref: TarRef, root: Path, label: str = "", progress: "Progress | None" = None) -> Path:
     """Return the local directory holding this exact content, fetching only on a miss.
 
     Idempotent and safe to call per job: a warm pod pays the transfer exactly once per distinct artifact.
@@ -128,15 +141,19 @@ def ensure_tree(ref: TarRef, root: Path, label: str = "") -> Path:
 
     root.mkdir(parents=True, exist_ok=True)
     log(f"{what} — cache MISS, fetching {ref.size or '?'} bytes")
+    if progress is not None:
+        progress(f"{what} — cache MISS, fetching {(ref.size or 0) / 1e6:.0f} MB")
     t0 = time.monotonic()
     # Stage into a sibling temp dir and rename: a concurrent or killed fetch can never publish a partial
     # tree under the content hash.
     staging = Path(tempfile.mkdtemp(dir=root, prefix=f".{ref.sha256[:12]}-"))
     try:
         tar_path = staging / "artifact.tar"
-        total = download_verified(ref, tar_path)
+        total = download_verified(ref, tar_path, progress, what)
         unpacked = staging / "d"
         unpacked.mkdir()
+        if progress is not None:
+            progress(f"{what} — {total / 1e6:.0f} MB verified, extracting")
         safe_extract(tar_path, unpacked)
         tar_path.unlink()
         (unpacked / DONE).write_text(ref.sha256)
@@ -154,6 +171,8 @@ def ensure_tree(ref: TarRef, root: Path, label: str = "") -> Path:
         dt = time.monotonic() - t0
         log(f"{what} ready in {dt:.1f}s ({total / 1e6:.0f} MB, "
             f"{total / 1e6 / max(dt, 1e-6):.1f} MB/s) → {dest}")
+        if progress is not None:
+            progress(f"{what} ready in {dt:.0f}s ({total / 1e6:.0f} MB)")
         return dest
     finally:
         shutil.rmtree(staging, ignore_errors=True)

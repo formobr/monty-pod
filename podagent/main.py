@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -88,6 +89,15 @@ def _run_infer(
     corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
+    # The brain awaits by result_key, and a status=error result is forbidden to carry one — so keep it here
+    # to route the last-resort event, which is otherwise unclaimable and starves the awaiter anyway.
+    wake_key = urlparse(str(raw.get("put_url", ""))).path.lstrip("/") or None
+
+    def note(step: str) -> None:
+        ev: dict[str, Any] = {"job_id": str(job_id), "stage": "infer", "status": "step", "step": step}
+        cp.note(_tag(ev, corr_id, None))
+
+    note(f"claimed {kind}")
     try:
         req = InferRequest.model_validate(raw)
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
@@ -100,7 +110,8 @@ def _run_infer(
             assert req.align is not None and req.weights is not None
             align_svc = align_cache.get(req.weights.sha256)
             if align_svc is None:
-                wdir = ensure(req.weights, req.model)
+                wdir = ensure(req.weights, req.model, note)
+                note(f"loading {req.model}")
                 align_svc = align_cache[req.weights.sha256] = AlignService(req.model, wdir)
             infer_s = align_svc.run(req.align, req.put_url)
         elif req.kind == "clip_rank":
@@ -110,9 +121,10 @@ def _run_infer(
             assert req.clip_rank is not None and req.weights is not None
             rank_svc = rank_cache.get(req.weights.sha256)
             if rank_svc is None:
-                wdir = ensure(req.weights, req.model)
+                wdir = ensure(req.weights, req.model, note)
+                note(f"loading {req.model}")
                 rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
-            infer_s = rank_svc.run(req.clip_rank, req.put_url)
+            infer_s = rank_svc.run(req.clip_rank, req.put_url, note)
         else:
             from .infer_probe import ProbeService
 
@@ -133,19 +145,24 @@ def _run_infer(
             corr_id=corr_id,
             timing=InferTiming(infer_s=infer_s, boot_s=boot_s),
         )
-        cp.post_infer_result(result.model_dump(exclude_none=True))
+        cp.report_infer_result(result.model_dump(exclude_none=True))
         return True
-    except Exception as e:
-        _log(f"infer job {job_id} failed: {e}")
+    # BaseException, not Exception: a CUDA abort, a SystemExit or an interrupted download must still leave a
+    # terminal behind — an unreported one strands the brain for INFER_TIMEOUT_S and reads as a dead host.
+    except BaseException as e:
+        _log(f"infer job {job_id} failed: {type(e).__name__}: {e}")
+        traceback.print_exc(file=sys.stderr)
         error_result = InferResult(
             infer_version=SPEC_VERSION,
             job_id=str(job_id),
             kind=kind,
             status="error",
             corr_id=corr_id,
-            error=str(e)[:500],
+            error=f"{type(e).__name__}: {e}"[:500],
         )
-        cp.post_infer_result(error_result.model_dump(exclude_none=True))
+        cp.report_infer_result(error_result.model_dump(exclude_none=True), wake_key)
+        if not isinstance(e, Exception):
+            raise
         return boot_reported
 
 
@@ -197,11 +214,8 @@ def _report_boot(cp: ControlPlane) -> None:
         gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no-cuda"
     except Exception:  # noqa: BLE001 — the beacon must never be what kills a boot
         gpu = "no-torch"
-    try:
-        cp.post_event({"stage": "boot", "status": "step",
-                       "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s"})
-    except requests.RequestException as e:
-        _log(f"boot beacon failed (the CP is unreachable from this host): {e}")
+    cp.note({"stage": "boot", "status": "step",
+             "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s"})
 
 
 def main() -> None:
@@ -244,6 +258,13 @@ def main() -> None:
                 _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
         except requests.RequestException as e:
             _log(f"control-plane request failed: {e}")
+            time.sleep(5)
+        # Anything else used to unwind main() and end the process with the claimed job unreported: the pod
+        # stayed rented, the brain waited out its timeout, and nothing on the wire said why.
+        except Exception as e:
+            _log(f"dispatch failed: {type(e).__name__}: {e}")
+            traceback.print_exc(file=sys.stderr)
+            cp.note({"stage": "dispatch", "status": "error", "error": f"{type(e).__name__}: {e}"[:500]})
             time.sleep(5)
 
 

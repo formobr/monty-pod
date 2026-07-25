@@ -4,6 +4,7 @@ on this machine."""
 from __future__ import annotations
 
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,19 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 _TIMEOUT = 30
 _CHUNK = 1 << 20
+# How long a terminal report keeps trying before the pod gives up on being heard. A result nobody receives
+# is the same to the brain as a pod that died, so this is worth far more patience than an ordinary call.
+_REPORT_ATTEMPTS = 6
+_REPORT_BACKOFF_S = 5.0
+
+
+def _log(msg: str) -> None:
+    print(f"[podagent] {msg}", file=sys.stderr, flush=True)
 
 
 def _file_path(url: str) -> str | None:
@@ -30,6 +41,13 @@ class ControlPlane:
         self.base = base_url.rstrip("/")
         self.sess = requests.Session()
         self.sess.headers["Authorization"] = f"Bearer {job_token}"
+        # Minutes of work between calls ⇒ the pooled socket is always dead by the terminal POST, and urllib3
+        # will not replay an unsafe method: that POST never reaches the server and leaves no access-log line.
+        retry = Retry(total=5, connect=5, read=0, status=3, status_forcelist=(502, 503, 504),
+                      allowed_methods=False, backoff_factor=0.5, raise_on_status=False)
+        adapter = HTTPAdapter(max_retries=retry)
+        self.sess.mount("http://", adapter)
+        self.sess.mount("https://", adapter)
 
     def poll_job(self) -> dict[str, Any] | None:
         """One long-poll for work. Returns the job envelope or None on timeout/no-work."""
@@ -44,6 +62,40 @@ class ControlPlane:
 
     def post_infer_result(self, payload: dict[str, Any]) -> None:
         self.sess.post(f"{self.base}/pod/infer-result", json=payload, timeout=_TIMEOUT).raise_for_status()
+
+    def note(self, payload: dict[str, Any]) -> None:
+        """Best-effort progress event; never raises — a pod must not die of saying what it is doing."""
+        try:
+            self.post_event(payload)
+        except Exception as e:  # noqa: BLE001 — a progress ping is never worth failing a job over
+            _log(f"progress event dropped ({payload.get('step', '')!r}): {e}")
+
+    def report_infer_result(self, payload: dict[str, Any], wake_key: str | None = None) -> bool:
+        """Deliver a terminal InferResult, retrying, then fall back to an error event. Never raises.
+        It is the brain's ONLY wake-up: undelivered, it costs a full INFER_TIMEOUT_S of billed silence."""
+        for attempt in range(_REPORT_ATTEMPTS):
+            try:
+                self.post_infer_result(payload)
+                return True
+            except Exception as e:  # noqa: BLE001 — every failure mode here is retryable from our side
+                _log(f"infer-result post failed (attempt {attempt + 1}/{_REPORT_ATTEMPTS}): {e}")
+                if attempt + 1 < _REPORT_ATTEMPTS:
+                    time.sleep(_REPORT_BACKOFF_S * (attempt + 1))
+        # corr_id carries the awaited result_key: the CP echoes it onto the terminal it synthesizes from a
+        # chain-level error event, which is what lets this reach the keyed awaiter instead of just a log.
+        ev: dict[str, Any] = {
+            "job_id": payload.get("job_id", "unknown"), "stage": "infer", "status": "error",
+            "error": f"result undeliverable: {str(payload.get('error') or payload)[:400]}"}
+        key = payload.get("result_key") or payload.get("corr_id") or wake_key
+        if key:
+            ev["corr_id"] = key
+        try:
+            self.post_event(ev)
+        except Exception as e:  # noqa: BLE001 — nothing left to try; stderr is the last channel
+            _log(f"FATAL both /pod/infer-result and /pod/event are unreachable: {e}")
+            return False
+        _log("infer-result undeliverable — reported as a /pod/event instead")
+        return True
 
 
 def download(url: str, dest: Path) -> Path:
