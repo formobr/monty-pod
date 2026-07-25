@@ -20,6 +20,22 @@ def test_overlay_filtergraph_shifts_and_gates() -> None:
     assert "gblur=sigma=22:enable='between(t,12.0,15.0)'" in fc   # glass layer blurs the frame behind it
 
 
+def test_overlay_filtergraph_slides_the_head_below_its_layer() -> None:
+    layers = [{"start": 5.0, "dur": 4.0, "glass": False, "head_below": True}]
+    fc, last = mograph.overlay_filtergraph(layers)
+    assert last == "v0"
+    assert "[0:v]split[ha0][hb0]" in fc                       # the base head is split for the slide copy
+    assert "trim=start=5.0:end=9.0" in fc                     # the copy is windowed to the beat
+    assert "overlay=y='0.33*H*clip(" in fc                    # slides down 0.33*H by the glide progress
+    assert "[hbv0][o0]overlay=enable='between(t,5.0,9.0)'" in fc  # the layer's picture then rides over the top
+
+
+def test_overlay_filtergraph_has_no_head_slide_by_default() -> None:
+    # a plain layer must NOT split/slide the base head — only an explicit head_below does
+    fc, _ = mograph.overlay_filtergraph([{"start": 1.0, "dur": 2.0, "glass": False}])
+    assert "split" not in fc and "0.33*H" not in fc
+
+
 def test_stage_public_copies_by_prefix(tmp_path: Path) -> None:
     rd = tmp_path / "remotion"
     (rd / "public").mkdir(parents=True)
