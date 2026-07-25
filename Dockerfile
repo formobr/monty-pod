@@ -14,6 +14,11 @@ FROM nvidia/cuda:12.8.1-base-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+# The base declares cuda>=12.8, which nvidia-container-runtime enforces against the HOST driver — and that
+# refusal costs a rent: the box boots, bills, never starts the container. Nothing here needs 12.8 (torch
+# carries its own cu128 runtime, minor-version-compatible back to the R525/12.0 driver family), so declare
+# what we actually need. A host too old for the kernels we load fails loudly in the boot beacon instead.
+ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
 
 # --- system: python3.11 (via deadsnakes, ubuntu22.04 ships 3.10) + headless-chrome's runtime deps
 # (standard puppeteer list). fontconfig stays: libass resolves caption fonts through it. ------------
