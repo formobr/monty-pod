@@ -66,8 +66,21 @@ def _stage_public(input_paths: dict, rd: Path) -> None:
             shutil.copy2(path, dest)
 
 
+def _render_concurrency() -> int:
+    """Chrome tabs to run in parallel. Fixed at 4 this box's size never mattered: a 28-core host idled at 14%
+    while a 2-core one thrashed. Each tab needs ~2 GB, so RAM caps it as hard as cores do."""
+    cores = os.cpu_count() or 4
+    ram_gb = 0.0
+    try:
+        ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30)
+    except (ValueError, OSError):
+        pass
+    by_ram = int(ram_gb // 2) if ram_gb else cores
+    return max(2, min(cores - 2, by_ram, 16))
+
+
 def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) -> None:
-    body = {"concurrency": 4, "items": items}
+    body = {"concurrency": _render_concurrency(), "items": items}
     if entry_point:
         body["entryPoint"] = entry_point
     spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")

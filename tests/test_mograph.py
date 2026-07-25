@@ -75,3 +75,18 @@ def test_batch_with_a_missing_sequence_still_fails_loud(tmp_path: Path, monkeypa
                         lambda *a, **k: subprocess.CompletedProcess(a[0], -6, b"", b"boom"))
     with pytest.raises(RuntimeError, match="no frames for Compare, Bars"):
         mograph._run_batch(rd, items, tmp_path / "spec.json", None)
+
+
+def test_render_concurrency_follows_the_box(monkeypatch) -> None:
+    """Fixed at 4, a 28-core host idled while a 2-core one thrashed — and Remotion time IS the final render."""
+    from podagent import mograph
+    monkeypatch.setattr(mograph.os, "cpu_count", lambda: 28)
+    monkeypatch.setattr(mograph.os, "sysconf", lambda k: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 16 * (1 << 30) // 4096}[k])
+    assert mograph._render_concurrency() == 8      # 16 GB RAM caps it below the 26 cores allow
+
+    monkeypatch.setattr(mograph.os, "cpu_count", lambda: 2)
+    assert mograph._render_concurrency() == 2      # never below 2, never (cores-2)=0
+
+    monkeypatch.setattr(mograph.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(mograph.os, "sysconf", lambda k: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 256 * (1 << 30) // 4096}[k])
+    assert mograph._render_concurrency() == 16     # hard ceiling: Chrome stops scaling long before 62
