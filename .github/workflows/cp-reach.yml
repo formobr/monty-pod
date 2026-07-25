@@ -1,0 +1,24 @@
+# Can a rented datacenter box reach the control plane at all? A pod that cannot has no voice — it boots,
+# bills and stays silent — so this answers it from a third-party network without renting anything.
+name: cp-reach
+on:
+  workflow_dispatch:
+    inputs:
+      cp_url:
+        description: control-plane base URL
+        default: https://api.monty.fast
+
+jobs:
+  reach:
+    runs-on: ubuntu-latest
+    steps:
+      - name: GET /pod/job (no token — 401 proves the route is alive and reachable)
+        run: |
+          set -x
+          curl -sS -D- -o /dev/null --max-time 20 "${{ inputs.cp_url }}/pod/job" || echo "curl exit=$?"
+          curl -sS -D- -o /dev/null --max-time 20 -H "Authorization: Bearer bogus" "${{ inputs.cp_url }}/pod/job" || echo "curl exit=$?"
+      - name: TLS + DNS detail
+        run: |
+          getent hosts "$(echo '${{ inputs.cp_url }}' | sed -E 's#https?://##')" || true
+          curl -sS -o /dev/null -w 'connect=%{time_connect}s tls=%{time_appconnect}s status=%{http_code}\n' \
+            --max-time 20 "${{ inputs.cp_url }}/pod/job" || echo "curl exit=$?"
