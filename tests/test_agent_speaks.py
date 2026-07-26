@@ -62,6 +62,11 @@ def test_the_agent_announces_the_claim_before_it_can_die():
     steps = [e["step"] for e in cp.events if e.get("status") == "step"]
     assert any("claimed clip_rank" in s for s in steps), (
         "without a claim event a pod that dies mid-job looks like one that never got the job")
+    # The CP authorizes an event by the TOKEN's lane and 403s a body naming a different job — and an infer
+    # request's job_id is a per-request id, not that lane. Every progress event was being rejected.
+    assert all("job_id" not in e for e in cp.events if e.get("status") == "step"), (
+        "a progress event carrying the infer job_id is 403'd by the control plane")
+    assert any("j1" in s for s in steps), "the request id still has to be readable in the step text"
 
 
 def test_a_dropped_terminal_is_retried_not_lost(monkeypatch):

@@ -94,7 +94,9 @@ def _run_infer(
     wake_key = urlparse(str(raw.get("put_url", ""))).path.lstrip("/") or None
 
     def note(step: str) -> None:
-        ev: dict[str, Any] = {"job_id": str(job_id), "stage": "infer", "status": "step", "step": step}
+        # No job_id: an infer request's job_id is a per-request id, NOT the token's lane, so sending it made
+        # the CP's spoof guard 403 every progress event. Omitted → attributed to the token's own job.
+        ev: dict[str, Any] = {"stage": "infer", "status": "step", "step": f"{job_id}: {step}"}
         cp.note(_tag(ev, corr_id, None))
 
     note(f"claimed {kind}")
