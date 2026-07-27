@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 from urllib.request import url2pathname
 
 import requests
@@ -98,8 +98,39 @@ class ControlPlane:
         return True
 
 
+class UrlNotAllowed(ValueError):
+    """A url the transport may not dereference — it is neither local nor a capability we minted."""
+
+
+# A presigned GET carries its signature in the query, whichever object store minted it (SigV4 prefixes,
+# plus SigV2's bare pair). This is what tells "our own R2" from "somewhere on the internet".
+_SIGNED_PREFIXES = ("x-amz-", "x-goog-", "x-ms-", "x-obs-")
+_SIGNED_NAMES = frozenset({"signature", "awsaccesskeyid", "expires", "token"})
+
+
+def _is_presigned(url: str) -> bool:
+    names = {n.lower() for n, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)}
+    return any(n.startswith(_SIGNED_PREFIXES) or n in _SIGNED_NAMES for n in names)
+
+
+def assert_fetchable(url: str) -> str:
+    """THE transport allowlist. A presigned url is a CAPABILITY — one object, expiring, minted by the
+    control plane; a bare url is an address the pod was merely told to visit, and this pod is RENTED on
+    somebody else's network where `http://169.254.169.254/...` is one string away."""
+    if _file_path(url) is not None or _is_presigned(url):
+        return url
+    parts = urlparse(url)
+    raise UrlNotAllowed(
+        f"REFUSED to fetch {parts.scheme}://{parts.hostname or ''}{parts.path}: it is neither a file:// "
+        f"path nor a PRESIGNED url. The pod dereferences capabilities the control plane minted, not "
+        f"addresses it was handed. An ORIGIN url (a stock CDN) belongs in an op's params, where the ops "
+        f"pack checks it against its own host allowlist (montyops.stock_hosts) — not in a binding, where "
+        f"this transport would fetch whatever a third party's search response happened to contain.")
+
+
 def download(url: str, dest: Path) -> Path:
     """Presigned GET → file, streamed. A file:// url copies from local disk (local backend)."""
+    assert_fetchable(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
     local = _file_path(url)
     if local is not None:

@@ -1,0 +1,51 @@
+{
+  "op": "media.filmstrip",
+  "version": 1,
+  "summary": "Sample frames of a clip at given fractions of its own duration, fit each into one cell and hstack them into a single image. Geometry in, one picture out.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "One ffmpeg invocation whose argv is a pure function of (params, measured duration), decoding the same input bytes on a pinned build — the same condition media.scale states. tests/test_op_media_filmstrip.py asserts the argv directly, so a tuning drift shows as an argv diff instead of as a different picture in front of a judge. No `flags=` is set on the scaler ON PURPOSE: the strip is read by a vision model, and its pixels must not change on the day the work moved off the box. FAILURE: `strip` is OPTIONAL — a frame that will not render leaves no file rather than raising, because one chain carries a whole batch and a raising handler would let one unreadable clip kill every sibling. A malformed PARAM still raises, in milliseconds."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "strip", "kind": "image", "durable": true, "optional": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["positions", "width", "height"],
+    "properties": {
+      "positions": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 12,
+        "items": {"type": "number", "minimum": 0, "maximum": 1},
+        "description": "Where to sample, as fractions of the clip's OWN duration. A GEOMETRY, the same class of fact as `width` — and the hard line of this op: no frame-SELECTION rule may ever appear in these params. Nothing here may say 'pick the most dynamic frame', 'sample denser near the in-point', or carry a motion threshold; anything of that shape is computed on the brain and arrives already collapsed into numbers. There is no separate `count`: the number of cells IS len(positions), and a second source for it would be a drift surface, not a convenience."
+      },
+      "width": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 1024,
+        "multipleOf": 2,
+        "description": "Cell width in pixels. The image is width x len(positions) wide."
+      },
+      "height": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 2048,
+        "multipleOf": 2,
+        "description": "Cell height in pixels. Width:height is also the crop aspect under fit=cover."
+      },
+      "fit": {
+        "enum": ["cover", "contain"],
+        "default": "cover",
+        "description": "How a frame meets the cell. `cover` centre-crops to the cell aspect — the real full-bleed framing a viewer sees. `contain` letterboxes on the pad colour. Geometry, not intent: WHICH one an asset gets is decided on the brain and crosses as one enum value, never as the rule that produced it."
+      }
+    }
+  },
+  "handler": "montyops.media_filmstrip:run"
+}

@@ -33,6 +33,29 @@
       "audio": {
         "enum": ["copy", "drop"],
         "default": "copy"
+      },
+      "seek": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 86400,
+        "description": "Start this many seconds into the source. GEOMETRY on the source's own axis, the same class of fact as `height` — nothing here says which beat chose it or why. Absent (or 0) = from the start, byte-for-byte the pre-window argv. Without it a cutaway proxy encodes the WHOLE master: measured 10.1 s per ref against ~4 s for the window that is actually played."
+      },
+      "duration": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 86400,
+        "description": "Encode only this many seconds from `seek`. Geometry, paired with `seek`; absent = to the end."
+      },
+      "fps": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 240,
+        "description": "Resample to this constant frame rate. Stock lands at 23.976 or 25 and a player left to retime it live JUDDERS. Same spelling and same range as media.normalize.fps — one vocabulary. Absent = the source's own rate, unchanged."
+      },
+      "tonemap": {
+        "enum": ["none", "hlg", "pq", "auto"],
+        "default": "none",
+        "description": "Source HDR transfer to tonemap SDR→bt709. The enum and the zscale+tonemap=hable chain are media.normalize's, imported rather than respelled, so ingest and a preview cannot disagree about what HLG becomes. `auto` MEASURES the source's transfer in the handler — the only place the file exists on the pod contour, and the same polarity as media.filmstrip measuring duration instead of being told it. Without this an HLG stock cutaway previews washed out."
       }
     }
   },
