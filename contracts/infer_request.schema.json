@@ -33,6 +33,13 @@
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/span" }
+        },
+        "keep_ids": {
+          "description": "OPTIONAL column projection for the returned emissions: the sorted, de-duplicated set of vocab indices the caller's CTC forced alignment will read (its target ids plus blank). Present → the pod PUTs emissions_<i> with exactly these columns, in this order, and echoes keep_ids in the npz meta; absent → the full vocab width, byte-identical to before. It is an ALPHABET, not text: no word, no order and no count crosses with it, and nothing here decides anything — the alignment itself stays on the planner.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0 }
         }
       }
     },

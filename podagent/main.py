@@ -115,7 +115,7 @@ def _run_infer(
                 wdir = ensure(req.weights, req.model, note)
                 note(f"loading {req.model}")
                 align_svc = align_cache[req.weights.sha256] = AlignService(req.model, wdir)
-            infer_s = align_svc.run(req.align, req.put_url)
+            infer_s = align_svc.run(req.align, req.put_url, note)
         elif req.kind == "clip_rank":
             from .infer_cliprank import ClipRankService
             from .weights import ensure

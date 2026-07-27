@@ -1,0 +1,25 @@
+{
+  "infer_version": 5,
+  "job_id": "job_9f2c1c",
+  "kind": "align",
+  "model": "voidful/wav2vec2-xlsr-multilingual-56",
+  "put_url": "https://storage.example/o/62957.npz?sig=PUT",
+  "weights": {
+    "url": "https://r2.example/models/wav2vec2-xlsr-multilingual-56.tar?X-Amz-Signature=deadbeef",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "align": {
+    "audio_url": "https://storage.example/o/92583.wav?sig=GET",
+    "windows": [
+      [
+        0.0,
+        20.0
+      ]
+    ],
+    "keep_ids": [
+      1021,
+      12,
+      12
+    ]
+  }
+}

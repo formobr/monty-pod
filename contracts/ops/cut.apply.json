@@ -1,24 +1,40 @@
 {
   "op": "cut.apply",
-  "version": 1,
+  "version": 2,
   "summary": "Apply an already-decided EDL keep-list to the source: the frame-quantized trim/setpts/atempo per-segment render + video-only concat + room-tone crossfade audio graph that turns a decided cut into the spliced film. Mechanics only — WHICH spans to keep and the per-segment speed are decided on the brain and cross as data.",
-  "needs": ["video_encode"],
+  "needs": [
+    "video_encode"
+  ],
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "The per-segment trim=start/end_frame + setpts + atempo filtergraph, the video-only concat and the room-tone acrossfade audio graph are PURE functions of (keep, speed F, fps_grid, xfade) — all of which are DECISIONS made by the cut brain and arriving as params. libx264 at the pinned preset/crf over identical input frames emits identical output bytes; the byte-exact proof forces libx264 (make check-cut, both hermetic synthetic grid incl. a speed-change segment + a crossfade join, and a real ear-approved corpus spot-check) since NVENC — the fast default — is not byte-reproducible run-to-run like every encoder op. The caller's render DIRECTIVES (crf quality, thread cap, cpu/hwaccel selection) cross because they affect the bytes and must reproduce for every caller; the ffmpeg flag construction (preset p6/medium, -tune, -hwaccel, the encoder arg strings) stays in the handler. NO cut DECISION is in these params by construction: the keep-list is the already-composed cut, not a threshold; the whole ASR→Director→dedup→pause/retake removal that PRODUCES it stays on the control plane."
+    "note": "The per-segment trim=start/end_frame + setpts + atempo filtergraph, the video-only concat and the room-tone acrossfade audio graph are PURE functions of (keep, speed F, fps_grid, xfade, max_h) — all of which are DECISIONS made by the cut brain and arriving as params. `max_h` scales, it never re-times: nf=round(dur*fps_grid) frames per segment and every audio boundary are unchanged by it, so the EDIT (where the cut falls) is identical at every tier and only the pixel grid differs. libx264 at the pinned preset/crf over identical input frames emits identical output bytes; the byte-exact proof forces libx264 (make check-cut, both hermetic synthetic grid incl. a speed-change segment + a crossfade join, and a real ear-approved corpus spot-check) since NVENC — the fast default — is not byte-reproducible run-to-run like every encoder op. The caller's render DIRECTIVES (crf quality, thread cap, cpu/hwaccel selection) cross because they affect the bytes and must reproduce for every caller; the ffmpeg flag construction (preset p6/medium, -tune, -hwaccel, the encoder arg strings) stays in the handler. NO cut DECISION is in these params by construction: the keep-list is the already-composed cut, not a threshold; the whole ASR→Director→dedup→pause/retake removal that PRODUCES it stays on the control plane."
   },
   "inputs": [
-    {"id": "src", "kind": "video"}
+    {
+      "id": "src",
+      "kind": "video"
+    }
   ],
   "outputs": [
-    {"id": "dst", "kind": "video", "durable": true},
-    {"id": "durs", "kind": "json", "durable": false}
+    {
+      "id": "dst",
+      "kind": "video",
+      "durable": true
+    },
+    {
+      "id": "durs",
+      "kind": "json",
+      "durable": false
+    }
   ],
   "params": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["keep", "fps_grid"],
+    "required": [
+      "keep",
+      "fps_grid"
+    ],
     "properties": {
       "keep": {
         "type": "array",
@@ -28,7 +44,10 @@
           "type": "array",
           "minItems": 2,
           "maxItems": 2,
-          "items": {"type": "number", "minimum": 0}
+          "items": {
+            "type": "number",
+            "minimum": 0
+          }
         }
       },
       "fps_grid": {
@@ -74,6 +93,13 @@
         "type": "boolean",
         "default": false,
         "description": "Disable NVDEC hardware decode of the source (decode-only, quality-neutral; off on the cpu path anyway)."
+      },
+      "max_h": {
+        "type": "integer",
+        "minimum": 120,
+        "maximum": 4320,
+        "multipleOf": 2,
+        "description": "Cap the output height at this many pixels, source ASPECT preserved (scale=-2:max_h), never upscaling. A render DIRECTIVE from the caller's render_tier, not encoder flags: the preview tier caps the cut at the browser height so the 4K film never crosses the wire, the final tier omits the key entirely and the cut stays native (the master's camera bake cover-scales it, so a cap there would upscale). Absent = today's byte-identical native render."
       }
     }
   },

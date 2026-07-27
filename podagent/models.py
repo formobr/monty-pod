@@ -413,10 +413,17 @@ class AlignParams(BaseModel):
 
     audio_url: str = Field(min_length=1)
     windows: list[SpanT] = Field(min_length=1)
+    # Emission COLUMNS to ship back; a sorted id SET is an alphabet, never text (no word/order/count crosses).
+    keep_ids: list[int] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _windows_ok(self) -> "AlignParams":
         _spans_ok(self.windows, "windows")
+        if self.keep_ids is not None:
+            if any(b <= a for a, b in zip(self.keep_ids, self.keep_ids[1:])):
+                raise ValueError("keep_ids must be sorted and unique (it is a column SET, not a sequence)")
+            if self.keep_ids[0] < 0:
+                raise ValueError("keep_ids must be non-negative vocab indices")
         return self
 
 

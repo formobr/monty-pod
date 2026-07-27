@@ -69,12 +69,20 @@ to the tail; it is uploaded only when a `finalize` block actually ran.
 
 ## align payload (binary, not JSON-schema'd)
 
-The pod PUTs a single `.npz`:
+The pod PUTs a single `.npz`, **STORED (uncompressed)**: log-softmax float32 is near-incompressible
+(measured 316.9 MB → 274.8 MB) and deflating it costs ~12 s of pod CPU per call for 13%.
 
 - `emissions_<i>`: float32 `[frames, vocab]` — log-softmax CTC emissions for `windows[i]`.
 - `meta.json` (stored as an npz string entry): `{"model": "<hf id>", "sr": 16000,
   "frame_stride_s": 0.02, "vocab": ["<pad>", ...]}` — `vocab` pins the checkpoint's token order so
   alignment targets can never silently shift against a re-delivered checkpoint.
+
+**Column projection (`align.keep_ids`).** A CTC forced alignment reads only the target ids and blank, so
+at multi56's 9913-token union vocab a 159 s source ships 316.9 MB where 1.7 MB carries the same answer.
+When the request sets `keep_ids`, `emissions_<i>` has exactly those columns **in that order** and `meta`
+echoes `keep_ids`; the caller scatters them back (or re-indexes its targets) and the alignment is
+unchanged — the values at the columns it reads are the same floats. Absent → full vocab width, exactly as
+before. `keep_ids` is a sorted, de-duplicated **set**: an alphabet, never text.
 
 ## clip_rank payload (JSON, `clip_rank.schema.json`)
 
