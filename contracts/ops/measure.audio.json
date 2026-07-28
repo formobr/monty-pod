@@ -1,0 +1,24 @@
+{
+  "op": "measure.audio",
+  "version": 1,
+  "summary": "Measure a source's audio SIGNAL — a per-window [t, flat_factor, peak_dB] envelope on a fixed analysis grid over the whole file (ffmpeg astats), plus noise floor and mean/max volume over the leading window. Values only; which windows count as CLIPPED, what a verdict is and which voice treatment follows are all the brain's.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "numeric",
+    "tol": 0.5,
+    "note": "astats/volumedetect report the same values for identical input bytes on a pinned build, with sub-dB jitter across ffmpeg minors — well under any band the brain applies. NO THRESHOLD crosses, and the SHAPE is why: an op returning `clipped_pct` would have to carry the flat-factor cutoff and the silence gate, publishing part of the quality algorithm onto a rented box. It returns the ENVELOPE instead, and check_clipping.verdict() applies FLAT_THRESH / the -1 dB silence gate / the 5%-and-15 bands on the brain, while audio_triage keeps NOISE_FLOOR_THRESHOLD, SNR_MIN_DB, NOISE_HEAVY_DB, QUIET_MEAN_DB and the whole denoiser selector. The analysis GRID is fixed in the handler rather than taken as a param precisely so no caller can shape it into a decision."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "measured", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "handler": "montyops.measure_audio:run"
+}

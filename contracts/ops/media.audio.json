@@ -1,0 +1,45 @@
+{
+  "op": "media.audio",
+  "version": 1,
+  "summary": "Demux a container's audio track to a mono mp3 at a named sample rate and VBR quality. Audio is interleaved in the container, so it cannot be range-fetched: producing this small payload meant a FULL decode of the recording, and until now that decode ran on the control-plane box.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "THE OUTPUT BYTES ARE A CACHE KEY on the control plane: a transcript is frozen by the sha1 of this file, so an encode differing by one byte silently invalidates every cached transcript and changes what the brain reads, with no error anywhere. The argv is therefore a PURE function of the params (sample_rate, channels, quality); the engine's suite pins it as a string against the command this replaced, then renders both arms over one input and sha256-compares. libmp3lame is deterministic for identical input bytes and settings, and the Xing/LAME header tag is a property of the BUILD — so bit-exactness is pinned by the image, exactly as media.normalize's libx264 claim is. `needs: video_encode` is an honest OVER-declaration: the closed vocabulary has no audio verb, and no video-encoder argv is constructed here."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "mp3", "kind": "audio", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "sample_rate": {
+        "type": "integer",
+        "minimum": 8000,
+        "maximum": 48000,
+        "default": 16000,
+        "description": "Output sample rate in Hz. Absent = 16000, what this payload has always been."
+      },
+      "channels": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2,
+        "default": 1,
+        "description": "Output channel count. Absent = 1 (mono): the payload is speech, and stereo would double the bytes for nothing."
+      },
+      "quality": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9,
+        "default": 5,
+        "description": "libmp3lame VBR quality (-q:a), 0 best .. 9 worst. Absent = 5. Changing it changes the OUTPUT BYTES and therefore the cache key described in parity.note."
+      }
+    }
+  },
+  "handler": "montyops.media_audio:run"
+}
