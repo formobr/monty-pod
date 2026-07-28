@@ -1,0 +1,39 @@
+{
+  "op": "media.pcm",
+  "version": 1,
+  "summary": "Decode a container's audio track to single-channel linear PCM (32-bit float) at a named sample rate, in a wav container, plus a JSON sidecar carrying the EXACT decoded frame count and a digest of the samples. Audio is interleaved in the container, so it cannot be range-fetched: producing this payload meant a full decode of the whole recording, and until now that decode ran on the control-plane box, which then uploaded the samples it had just produced back out to the machine that consumes them.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "SAMPLE-FOR-SAMPLE, because the consumer is a model forward whose outputs are pinned by golden fixtures: a changed sample changes the forward, and a changed forward can move a boundary in what is produced from it, with no error anywhere. The argv is therefore a PURE function of the params (sample_rate, channels); the engine's suite pins it as a string against the command this replaced, then runs both transports over one input and sha256-compares the decoded samples — which is what the `sha256` field of the sidecar makes cheap to compare at runtime too. Only the SINK moved: the decode/downmix/resample chain is character-for-character the earlier one, and a raw f32le pipe became a wav container carrying those same floats. libswresample is deterministic for identical input bytes and settings, so bit-exactness is a property of a PINNED image, exactly as media.audio's libmp3lame claim is. 32-bit float is not a size knob — quantising to 16-bit would change every sample. `needs: video_encode` is an honest OVER-declaration: the closed vocabulary has no audio verb, and no video-encoder argv is constructed here. The `frames` field exists because the caller tiles the samples into fixed windows whose LAST window is partial, and a count derived from container duration metadata is approximate: a window that stops short would silently drop the tail."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "pcm", "kind": "audio", "durable": true},
+    {"id": "meta", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "sample_rate": {
+        "type": "integer",
+        "minimum": 8000,
+        "maximum": 48000,
+        "default": 16000,
+        "description": "Output sample rate in Hz. Absent = 16000, what this payload has always been."
+      },
+      "channels": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2,
+        "default": 1,
+        "description": "Output channel count. Absent = 1 (mono): the payload is speech, and a second channel would double the bytes for nothing."
+      }
+    }
+  },
+  "handler": "montyops.media_pcm:run"
+}
