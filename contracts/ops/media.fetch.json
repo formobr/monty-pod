@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "The whole-file path writes the origin's bytes verbatim, so it is bit_exact by construction. The windowed path is an ffmpeg `-c copy` remux — no re-encode, no scaler, no rate control — and is deterministic for a fixed ffmpeg build, the same condition media.scale states: the pinned BUILD, not the box. tests/test_op_media_fetch.py asserts the argv is a pure function of (url, path, seconds), so a drift shows as an argv diff in milliseconds rather than as different bytes after a fetch. FAILURE: `dst` is OPTIONAL — a dead origin leaves no file instead of raising, because one chain carries a whole batch of candidates and a raising handler would let one dead url kill every sibling. The CALLER decides whether a missing file is fatal: fetch_broll.fetch_clip raises for a master, the rank lane tops the row up."
+    "note": "The whole-file path writes the origin's bytes verbatim, so it is bit_exact by construction. The windowed path is an ffmpeg `-c copy` remux — no re-encode, no scaler, no rate control — and is deterministic for a fixed ffmpeg build, the same condition media.scale states: the pinned BUILD, not the box. tests/test_op_media_fetch.py asserts the argv is a pure function of (url, path, seconds), so a drift shows as an argv diff in milliseconds rather than as different bytes after a fetch. FAILURE: `dst` is OPTIONAL — a dead origin leaves no file instead of raising, because one chain carries a whole batch of candidates and a raising handler would let one dead url kill every sibling. The CALLER decides whether a missing file is fatal; a batch of siblings must not die for one dead address."
   },
   "inputs": [],
   "outputs": [
