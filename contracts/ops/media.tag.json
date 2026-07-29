@@ -1,0 +1,38 @@
+{
+  "op": "media.tag",
+  "version": 1,
+  "summary": "Write a finished deliverable's container metadata (title/artist/copyright/comment/creation_time) by stream-copy remux, from a tag set decided by the caller.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "`-c copy` — the elementary streams are re-muxed, never re-encoded, so the video bitstream is byte-identical on either transport (tests/test_deliverable_metadata_parity.py md5s the copied video stream before and after). The argv is a pure function of (paths, tags) and is pinned string-equal to the origin's own copy, so the two lanes cannot drift into different tags."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["tags"],
+    "properties": {
+      "tags": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title"],
+        "description": "The finished tag set. It is DECIDED by the caller: whose brand owns artist/copyright, which plan tier pays in an attribution line and what the canonical platform-neutral title is are facts of a brand profile and a tenant record, neither of which a rented box holds. The key set is CLOSED to the standard container keys — the mp4 muxer silently drops unmapped ones, and buying them with `-movflags use_metadata_tags` writes raw udta instead of ©nam/©ART, after which players and platform ingest stop seeing the title.",
+        "properties": {
+          "title": {"type": "string", "minLength": 1, "description": "Canonical and platform-NEUTRAL: one file goes to YouTube, IG, TikTok and VK, so no per-network title may own the tag."},
+          "artist": {"type": "string", "minLength": 1, "description": "The TENANT's brand, never the product."},
+          "copyright": {"type": "string", "minLength": 1, "description": "The TENANT's brand. Our copyright in a customer's video would be a claim on their rights."},
+          "comment": {"type": "string", "minLength": 1, "description": "The brand's funnel link, plus the product attribution line on the tier that pays in attribution."},
+          "creation_time": {"type": "string", "minLength": 1, "description": "UTC render time. A value the file already carries wins over this one — restamping must not re-date a deliverable to its delivery."}
+        }
+      }
+    }
+  },
+  "handler": "montyops.media_tag:run"
+}
