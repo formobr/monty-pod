@@ -21,10 +21,13 @@ ENV PYTHONUNBUFFERED=1
 ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
 
 # --- system: python3.11 (via deadsnakes, ubuntu22.04 ships 3.10) + headless-chrome's runtime deps
-# (standard puppeteer list). fontconfig stays: libass resolves caption fonts through it. ------------
+# (standard puppeteer list). fontconfig stays: libass resolves caption fonts through it. librsvg2-bin is
+# the SVG rasteriser media.still needs: without one on the box, every vector artwork fails to materialise
+# and the job ships a black card instead — a failure nothing errors on. ~2 MB on top of the cairo/pango
+# libraries chrome already pulls in. ------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common curl xz-utils ca-certificates gnupg \
-        fonts-dejavu-core fontconfig \
+        fonts-dejavu-core fontconfig librsvg2-bin \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3.11-distutils \

@@ -1,0 +1,37 @@
+{
+  "op": "media.still",
+  "version": 1,
+  "summary": "Finish a still where its bytes already are: rasterise a vector at a target WIDTH (the height follows the file's own aspect, so a non-square drawing cannot be stretched), then CONTAIN it — fitted and letterboxed, never cropped — centred on a square backplate whose tone is picked from the artwork's own mean luminance. Plus a JSON sidecar carrying what was MEASURED (source pixel size, vector, real transparency) and what happened (whether a plate was applied, and which rasteriser produced the pixels). Flat art has a tone, and a dark drawing composited on a dark surface is invisible: it encodes, it plays, nothing errors, and the viewer sees a rectangle.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "perceptual",
+    "note": "PERCEPTUAL and not bit_exact, for one honest reason: the rasteriser is PROBED per host rather than pinned, because no single one is present everywhere (librsvg, cairo, inkscape and ImageMagick each render the same file with their own antialiasing). What IS identical on every host is the part that can be silently wrong: the plate tone is a pure function of the source's alpha-weighted mean luminance, the fit is contain-only at a fixed fraction of the canvas, and the composite argv is a pure function of (width, tone) — pinned as a string by the caller's suite, then run on both transports over the same input and compared as PIXELS, not as 'a file appeared'. So a rasteriser swap moves edge antialiasing; it cannot move the mark's position, its aspect, or the plate underneath it. Width-only is not a size knob: constraining both axes forces the pixel box and stretches a drawing that is not square. FAILURE: `dst` is OPTIONAL — a host with no rasteriser at all, or art that needed no plate, leaves no file rather than raising, and `meta` (never optional) is the verdict that tells the caller which of those happened. A caller that only saw a missing file could not tell 'this host cannot' from 'the source had nothing', and those two must never be confused. A MALFORMED param still raises: that is a contract violation and must fail in milliseconds."
+  },
+  "inputs": [
+    {"id": "src", "kind": "image"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "image", "durable": true, "optional": true},
+    {"id": "meta", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "width": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 8192,
+        "default": 1080,
+        "description": "The finished square canvas edge in pixels, and the width a vector is rasterised at. GEOMETRY, the same class of fact as media.scale's `height`. The height is never sent: it follows the source's own aspect, which is what makes a stretched drawing unrepresentable rather than merely unlikely."
+      },
+      "plate": {
+        "enum": ["always", "if_transparent"],
+        "default": "always",
+        "description": "When to composite onto the backplate. A pixel CONDITION, never an editorial rule: `if_transparent` plates only art the pixels say is genuinely see-through (an opaque photograph is left alone and no `dst` is written), `always` plates whatever arrives. A vector is finished either way, because it has no pixels until it has been rasterised. Which value a given asset gets is decided upstream and crosses as one enum, exactly as media.filmstrip's `fit` does — the rule that chose it does not cross."
+      }
+    }
+  },
+  "handler": "montyops.media_still:run"
+}

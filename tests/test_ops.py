@@ -288,3 +288,41 @@ def test_ops_envelope_golden_round_trips_through_the_model():
     assert job.type == "ops" and job.chain is not None
     assert job.chain.steps[0].op == "media.scale"
     registry.validate_params(job.chain.steps[0].op, job.chain.steps[0].params)
+
+
+# ── an OPTIONAL output is a verdict the runner must let through ──────────────────────────────────
+
+def test_a_missing_optional_output_is_allowed_and_a_missing_required_one_is_not(tmp_path, monkeypatch):
+    """The runner enforces the port's own `optional` flag, and an op that reports through a sidecar depends
+    on BOTH halves of that. NEGATIVE: drop the `optional` check in runner._run_step and a handler that
+    legitimately produced nothing (a host that cannot do the work, art that needed none) kills the chain
+    instead of returning the verdict that says which — and a caller that is only told 'no file' cannot tell
+    'this host cannot' from 'there was nothing to do'.
+    """
+    from podagent.ops import runner
+
+    op = next(o for o in registry.all_ops().values()
+              if any(p.optional for p in o.outputs) and any(not p.optional for p in o.outputs))
+    required = next(p.id for p in op.outputs if not p.optional)
+    optional = next(p.id for p in op.outputs if p.optional)
+
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"x")
+    step = type("S", (), {
+        "id": "s", "op": op.op, "params": {}, "needs": [],
+        "inputs": [type("B", (), {"port": p.id, "url": None, "from_step": None, "path": str(src)})()
+                   for p in op.inputs],
+        "outputs": [type("B", (), {"port": required, "url": None})()]})()
+    ws = runner.Workspace(tmp_path)
+
+    def _handler(*, params, inputs, outputs):
+        outputs[required].write_text("{}")            # the optional one deliberately stays absent
+
+    monkeypatch.setattr(runner.registry, "validate_params", lambda *a, **k: None)
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler)
+    out = runner._run_step(step, ws, {})
+    assert not out[optional].exists(), "the optional port must be allowed to stay empty"
+
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: (lambda **kw: None))
+    with pytest.raises(runner.ChainError, match=required):
+        runner._run_step(step, runner.Workspace(tmp_path / "second"), {})
