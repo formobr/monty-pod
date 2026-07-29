@@ -1,0 +1,64 @@
+{
+  "op": "cut.audio",
+  "version": 1,
+  "summary": "Compose an already-decided keep-list into ONE audio track: the same frame-quantized per-segment trim/fade/atempo as the picture cut, joined by the same room-tone crossfade, with no video encode at all. The product is a coarse DECISION axis — the dead-air, pace and tempo passes all read audio, so rendering pixels for them was waste — and it is produced beside the recording because composing it meant decoding the raw container once per kept span. Mechanics only: WHICH spans to keep, at which speed, on which frame grid, are decided elsewhere and arrive as data.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "The per-segment aresample/atrim/afade/atempo graph and the acrossfade-or-concat join graph are PURE functions of (keep, speed F, fps_grid, xfade) — all decided by the caller and arriving as params. The join geometry is not respelled here: it is the SAME function the picture cut uses, so the two renders cannot disagree about where a join falls or how long it is, which matters because the durations this op returns are the timeline every later remap rides. AAC at the pinned bitrate over identical input samples emits identical bytes for a given build, so bit-exactness is a property of a PINNED image, exactly as media.audio's libmp3lame claim is; the caller's suite pins the argv as a string against the command this replaced and then renders both transports over one input and compares the decoded samples. Each segment is cut to nf=round(dur*fps_grid) frames' worth of audio, the same count the picture render uses, so a track composed here still lines up sample-for-sample with a picture cut of the same keep-list. `needs: video_encode` is an honest OVER-declaration: the capability vocabulary is closed and has no audio verb, and no video-encoder argv is constructed here. NO decision is representable in these params by construction — the keep-list is an already-composed cut, never a threshold."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "audio", "durable": true},
+    {"id": "durs", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["keep", "fps_grid"],
+    "properties": {
+      "keep": {
+        "type": "array",
+        "minItems": 1,
+        "description": "The [start, end] source-time spans to KEEP, in order — the already-composed, frame-snapped cut. WHICH spans is the editorial decision and it arrives as data; how they become a trim-and-join is the handler's. These are spans to keep, never a threshold.",
+        "items": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "number", "minimum": 0}
+        }
+      },
+      "fps_grid": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 240,
+        "description": "The source video frame rate the keep boundaries were snapped to. Each segment is cut to exactly nf=round(dur*fps_grid) frames' worth of audio — a video grid, in an audio-only op, on purpose: the offsets this produces are compared against a picture cut of the same keep-list, and a track measured on its own clock would drift from it."
+      },
+      "speed": {
+        "type": "number",
+        "minimum": 0.5,
+        "maximum": 2.0,
+        "default": 1.0,
+        "description": "The tempo factor F folded in per segment (atempo=F). DECIDED by the caller; 1.0 = off, byte-identical to the un-sped path. Bounded to atempo's single-stage range."
+      },
+      "xfade": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1.0,
+        "default": 0.07,
+        "description": "Equal-power room-tone crossfade at every join (s). 0 = butt-concat. Bounded to the trimmed gap and to under half of each adjacent range, so the pre-handle is room tone and no speech onset is faded."
+      },
+      "threads": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 64,
+        "default": 4,
+        "description": "ffmpeg CPU thread cap. Keeps the compose gentle on a shared host; crosses because it is the caller's directive, like every other render directive."
+      }
+    }
+  },
+  "handler": "montyops.cut_audio:run"
+}

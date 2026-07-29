@@ -1,13 +1,13 @@
 {
   "op": "measure.source",
-  "version": 1,
-  "summary": "Measure a RAW recording's ingest NUMBERS — dimensions, rotation, SAR, avg/r frame rate, codec, pix_fmt, colour tags and audio channel count (ffprobe), plus sampled signalstats scalars (YAVG/YMIN/YMAX/SATAVG/UAVG/VAVG + frame count) taken through the source's own HDR tonemap. Numbers only; whether the source needs normalizing, what the target dims are, and the bounded autograde CORRECTION are all the brain's.",
+  "version": 2,
+  "summary": "Measure a RAW recording's ingest NUMBERS — dimensions, rotation, SAR, avg/r frame rate, codec, pix_fmt, colour tags, audio channel count and the container LENGTH (ffprobe), plus sampled signalstats scalars (YAVG/YMIN/YMAX/SATAVG/UAVG/VAVG + frame count) taken through the source's own HDR tonemap. Numbers only; whether the source needs normalizing, what the target dims are, and the bounded autograde CORRECTION are all the brain's.",
   "needs": ["video_encode"],
   "judgement": false,
   "parity": {
     "mode": "numeric",
     "tol": 0.5,
-    "note": "ffprobe metadata is exact for identical input bytes; the signalstats scalars are averages over seek-decoded frames, where a decoder minor can shift a sub-LSB value. numeric(0.5) is far below every dead-zone autograde.plan() compares against (the narrowest, SAT_LO..SAT_HI, is 56 units wide) so a fractional drift can never flip a plan. NO THRESHOLD is measured here: the op returns raw scalars and autograde.plan() on the brain — reading its own ±8% cap, YAVG/SATAVG dead-zones and EPS — turns them into brightness/contrast/saturation. Shaped like measure.master: numbers cross, judgement does not. It MUST bind the raw recording (op_backend prefer_normalized_source=False); an intermediate AAC/h264 destroys the signature the plan is measured on."
+    "note": "ffprobe metadata is exact for identical input bytes; the signalstats scalars are averages over seek-decoded frames, where a decoder minor can shift a sub-LSB value. numeric(0.5) is far below every dead-zone autograde.plan() compares against (the narrowest, SAT_LO..SAT_HI, is 56 units wide) so a fractional drift can never flip a plan. NO THRESHOLD is measured here: the op returns raw scalars and autograde.plan() on the brain — reading its own ±8% cap, YAVG/SATAVG dead-zones and EPS — turns them into brightness/contrast/saturation. Shaped like measure.master: numbers cross, judgement does not. It MUST bind the raw recording (op_backend prefer_normalized_source=False); an intermediate AAC/h264 destroys the signature the plan is measured on. The LENGTH is emitted because it was already computed and then thrown away: the sampler spaces its seeks by it, and a caller that could not read it back had to open the recording a second time just to learn how long it is — which is the whole class of read this op exists to remove. It is the container's own `format=duration`, exact for identical input bytes like every other header field here, and ABSENT rather than guessed when the probe cannot answer, so a consumer meets a missing number instead of a wrong one."
   },
   "inputs": [
     {"id": "src", "kind": "video"}

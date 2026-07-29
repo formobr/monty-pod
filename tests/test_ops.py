@@ -326,3 +326,36 @@ def test_a_missing_optional_output_is_allowed_and_a_missing_required_one_is_not(
     monkeypatch.setattr(runner.pack, "resolve", lambda h: (lambda **kw: None))
     with pytest.raises(runner.ChainError, match=required):
         runner._run_step(step, runner.Workspace(tmp_path / "second"), {})
+
+
+# ── one keep-list, two renders, one timeline ─────────────────────────────────────────────────────
+
+def test_the_two_cut_renders_agree_on_every_param_they_share():
+    """`cut.audio` composes the decision axis and `cut.apply` composes the picture — from the SAME keep-list,
+    on the SAME frame grid, with the SAME joins. Every offset measured on the audio is later compared against
+    the picture, so the two declarations may not disagree about what a param means or is allowed to be.
+
+    NEGATIVE: let one side widen `xfade`, or default `speed` differently, and one keep-list renders two
+    timelines that differ by a fade. Nothing errors — the caller simply measures its cut on a clock the film
+    does not use, and every remap that rides those offsets lands late.
+    """
+    def props(name: str) -> dict:
+        return json.loads((CONTRACTS / "ops" / name).read_text())["params"]["properties"]
+
+    audio, picture = props("cut.audio.json"), props("cut.apply.json")
+    shared = set(audio) & set(picture)
+    assert {"keep", "fps_grid", "speed", "xfade"} <= shared, \
+        "the two renders must share the keep-list, the grid and the joins"
+    for key in sorted(shared):
+        strip = lambda d: {k: v for k, v in d.items() if k != "description"}   # noqa: E731
+        assert strip(audio[key]) == strip(picture[key]), f"the two cut renders disagree about {key!r}"
+    # the audio axis carries no pixels, so a picture-only knob there would be a knob on nothing
+    assert not ({"crf", "cpu", "no_hwaccel", "max_h"} & set(audio))
+
+
+def test_neither_cut_render_may_claim_judgement():
+    """Both take an ALREADY-COMPOSED keep-list. A cut op that declared judgement would be refused the pod by
+    assert_pod_safe — and the mechanics genuinely belong beside the bytes; it is the list that must not."""
+    ops = registry.all_ops()
+    for name in ("cut.audio", "cut.apply"):
+        assert ops[name].judgement is False, f"{name} decides nothing; it applies a decision"
