@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
 INFER_KINDS = ("align", "face_probe", "clip_rank")
 
+# /pod/job is a LONG poll: an empty answer is supposed to cost the server-side block, not a round trip. When
+# it does not (CP restart, a short block, a 204 storm) a bare `continue` hammers the control plane from a
+# RENTED box at an unbounded rate. Floor one poll per second; a real long-poll never notices it.
+_MIN_POLL_INTERVAL_S = 1.0
+
 BOOT_T0 = time.monotonic()
 
 
@@ -236,8 +241,12 @@ def main() -> None:
 
     while True:
         try:
+            t_poll = time.monotonic()
             job = cp.poll_job()
             if job is None:
+                idle = time.monotonic() - t_poll
+                if idle < _MIN_POLL_INTERVAL_S:
+                    time.sleep(_MIN_POLL_INTERVAL_S - idle)
                 continue
 
             try:

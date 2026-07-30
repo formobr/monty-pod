@@ -17,6 +17,22 @@ from urllib3.util.retry import Retry
 
 _TIMEOUT = 30
 _CHUNK = 1 << 20
+_XFER_ATTEMPTS = 3
+
+# `timeout=` is PER-READ: an origin that drips one byte inside every window never trips it, so a stalled
+# transfer's only real bound is the job lease — of RENTED time. This is the wall-clock ceiling on ONE
+# transfer attempt. Arithmetic: the largest legitimate object is a ~1 GB master; at the ~25 MB/s we measure
+# that is 40 s, and at a 4 MB/s floor (6x worse than observed, still a working link) it is ~256 s. 300 s is
+# a generous round-up over that floor, leaves room for all 3 attempts inside a render lease, and cuts a
+# dripping origin off well before the ops timeout would.
+_XFER_DEADLINE_S = 300.0
+
+# The object store is a DIFFERENT host with DIFFERENT auth (each presigned url carries its own signature),
+# so it gets its own keep-alive session — the CP's Bearer token must never travel to a third party. No
+# urllib3 Retry on it: the retry/resume policy below is body-aware, urllib3's is not.
+_store = requests.Session()
+_store.mount("http://", HTTPAdapter(pool_maxsize=4))
+_store.mount("https://", HTTPAdapter(pool_maxsize=4))
 # How long a terminal report keeps trying before the pod gives up on being heard. A result nobody receives
 # is the same to the brain as a pod that died, so this is worth far more patience than an ordinary call.
 _REPORT_ATTEMPTS = 6
@@ -128,41 +144,117 @@ def assert_fetchable(url: str) -> str:
         f"this transport would fetch whatever a third party's search response happened to contain.")
 
 
+class TransferTimeout(requests.RequestException):
+    """A transfer attempt outlived its wall-clock deadline. A RequestException so the retry loops around it
+    treat a stalled origin exactly like a dropped one."""
+
+
+def _pump(resp: Any, fh: Any, already: int) -> int:
+    """Stream a response body to an open file under the wall-clock deadline. Returns bytes written."""
+    t0 = time.monotonic()
+    moved = 0
+    for chunk in resp.iter_content(_CHUNK):
+        if not chunk:
+            continue
+        fh.write(chunk)
+        moved += len(chunk)
+        elapsed = time.monotonic() - t0
+        if elapsed > _XFER_DEADLINE_S:
+            raise TransferTimeout(
+                f"download stalled: aborted after {elapsed:.1f}s (deadline {_XFER_DEADLINE_S:.0f}s) with "
+                f"{moved} bytes moved this attempt, {already + moved} on disk")
+    return moved
+
+
+class _DeadlineBody:
+    """A file read as chunks under the same wall-clock deadline. `__len__` keeps requests on Content-Length —
+    a presigned PUT is signed for a plain body, not for chunked transfer-encoding."""
+
+    def __init__(self, fh: Any, size: int) -> None:
+        self._fh, self._size = fh, size
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __iter__(self) -> Any:
+        t0 = time.monotonic()
+        sent = 0
+        while True:
+            chunk = self._fh.read(_CHUNK)
+            if not chunk:
+                return
+            yield chunk
+            sent += len(chunk)
+            elapsed = time.monotonic() - t0
+            if elapsed > _XFER_DEADLINE_S:
+                raise TransferTimeout(
+                    f"upload stalled: aborted after {elapsed:.1f}s (deadline {_XFER_DEADLINE_S:.0f}s) with "
+                    f"{sent} of {self._size} bytes sent")
+
+
 def download(url: str, dest: Path) -> Path:
-    """Presigned GET → file, streamed. A file:// url copies from local disk (local backend)."""
+    """Presigned GET → file, streamed, 3 attempts, RESUMING via Range. A file:// url copies from local disk.
+
+    A fetch that raises unwinds through the whole step chain and discards every sibling step's finished work,
+    so a dropped connection must cost the remaining bytes, never the job."""
     assert_fetchable(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
     local = _file_path(url)
     if local is not None:
         shutil.copyfile(local, dest)
         return dest
-    with requests.get(url, stream=True, timeout=_TIMEOUT) as r:
-        r.raise_for_status()
-        with dest.open("wb") as f:
-            for chunk in r.iter_content(_CHUNK):
-                f.write(chunk)
+    for attempt in range(_XFER_ATTEMPTS):
+        # attempt 0 always truncates: only bytes THIS call wrote are known to belong to this object.
+        have = dest.stat().st_size if attempt and dest.exists() else 0
+        headers = {"Range": f"bytes={have}-"} if have else {}
+        try:
+            with _store.get(url, stream=True, timeout=_TIMEOUT, headers=headers) as r:
+                r.raise_for_status()
+                resumed = bool(have) and r.status_code == 206
+                if have and not resumed:
+                    _log(f"download: server ignored Range (status {r.status_code}) — restarting from 0, "
+                         f"{have} bytes discarded")
+                    have = 0
+                with dest.open("ab" if resumed else "wb") as f:
+                    _pump(r, f, have)
+            return dest
+        except requests.RequestException as e:
+            if attempt + 1 == _XFER_ATTEMPTS:
+                raise
+            _log(f"download failed (attempt {attempt + 1}/{_XFER_ATTEMPTS}): {e} — resuming from "
+                 f"{dest.stat().st_size if dest.exists() else 0} bytes")
+            time.sleep(2**attempt)
     return dest
 
 
 def upload(src: Path, put_url: str, content_type: str = "application/octet-stream") -> None:
-    """Presigned PUT ← file, streamed, 3 attempts. A file:// url copies to local disk (local backend)."""
+    """Presigned PUT ← file, streamed, 3 attempts. A file:// url copies to local disk (local backend).
+
+    A retry re-sends the object FROM BYTE 0 — a presigned PUT is one signed request and has no resume. The
+    real fix is presigned MULTIPART (the brain mints an uploadId plus per-part urls), which makes a reset
+    cost one part instead of the object; until that mint exists the waste is at least MEASURED, not unknown."""
     local = _file_path(put_url)
     if local is not None:
         Path(local).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, local)
         return
     size = src.stat().st_size
-    for attempt in range(3):
+    resent = 0
+    for attempt in range(_XFER_ATTEMPTS):
+        if attempt:
+            resent += size
+            _log(f"upload retry {attempt + 1}/{_XFER_ATTEMPTS} for {src.name}: re-sending all {size} bytes "
+                 f"from 0 ({resent} bytes re-sent so far, no resume on a presigned PUT)")
         try:
             with src.open("rb") as f:
-                r = requests.put(
-                    put_url, data=f,
+                r = _store.put(
+                    put_url, data=_DeadlineBody(f, size),
                     headers={"Content-Type": content_type, "Content-Length": str(size)},
                     timeout=max(_TIMEOUT, size // (1 << 20)),
                 )
             r.raise_for_status()
             return
         except requests.RequestException:
-            if attempt == 2:
+            if attempt + 1 == _XFER_ATTEMPTS:
                 raise
             time.sleep(2**attempt)
