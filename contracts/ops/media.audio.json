@@ -1,7 +1,7 @@
 {
   "op": "media.audio",
   "version": 1,
-  "summary": "Demux a container's audio track to a mono mp3 at a named sample rate and VBR quality. Audio is interleaved in the container, so it cannot be range-fetched: producing this small payload meant a FULL decode of the recording, and until now that decode ran on the control-plane box.",
+  "summary": "Demux a container's audio track to a mono mp3 at a named sample rate and VBR quality, plus a JSON sidecar carrying the sha1 and byte count of that mp3. Audio is interleaved in the container, so it cannot be range-fetched: producing this small payload meant a FULL decode of the recording, and until now that decode ran on the control-plane box. The mp3 is handed to the audio-LLM BY REFERENCE (a presigned GET the provider fetches), so the caller never holds it and the sidecar is the only way it can still key its transcript cache on the audio's own bytes.",
   "needs": ["video_encode"],
   "judgement": false,
   "parity": {
@@ -12,7 +12,8 @@
     {"id": "src", "kind": "video"}
   ],
   "outputs": [
-    {"id": "mp3", "kind": "audio", "durable": true}
+    {"id": "mp3", "kind": "audio", "durable": true},
+    {"id": "meta", "kind": "json", "durable": true}
   ],
   "params": {
     "type": "object",
