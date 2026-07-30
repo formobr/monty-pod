@@ -1,0 +1,117 @@
+{
+  "op": "opener.build",
+  "version": 1,
+  "summary": "Assemble the cold-open as a standalone prepend clip: a Ken-Burns or solid base per format, an optional Remotion title/split composited over it (with an ffmpeg drawtext/two-up fallback when that one comp fails), then the soundscape beds, the fetched concept sounds and the resolved accent cues mixed on top. Everything editorial has already been decided: the format, the copy and its row break, which picture is which panel, which sound plays when, and which music bed carries it all arrive as data. This turns that data into one mp4 and knows nothing about why any of it was chosen.",
+  "needs": ["browser", "video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "perceptual",
+    "note": "TWO paths with different honest answers, and the mode is the weaker of them. The ffmpeg SKELETON — Ken-Burns zoompan, the solid backplate, the teaser concat, the drawtext title, the two-up stack, the composite overlay and both audio mixes — is argv-identical to the code it was moved from and encodes with libx264 at a fixed crf, so on one host it is REPRODUCIBLE: run the old path and this op over the same inputs and the mp4s hash the same (pinned as argv in tests/test_op_opener_build.py, measured as bytes in its docstring). The moment a comp renders, headless Chrome is in the picture and bit_exact would be a lie for the same reason mograph.render says so — rasterisation is not reproducible across GPU/driver/font-hinting. What IS exact either way: canvas, fps, frame count and the overlay's placement on the base timeline, because those are what the weld downstream depends on. FAILURE: a comp that will not render degrades to drawtext and the clip still ships; a MISSING Remotion toolchain raises, because an opener in ffmpeg's default font renders, plays, looks deliberate and would ship unnoticed."
+  },
+  "inputs": [
+    {"id": "img0", "kind": "image", "optional": true},
+    {"id": "img1", "kind": "image", "optional": true},
+    {"id": "img2", "kind": "image", "optional": true},
+    {"id": "img3", "kind": "image", "optional": true},
+    {"id": "snd0", "kind": "audio", "optional": true},
+    {"id": "snd1", "kind": "audio", "optional": true},
+    {"id": "snd2", "kind": "audio", "optional": true},
+    {"id": "snd3", "kind": "audio", "optional": true},
+    {"id": "snd4", "kind": "audio", "optional": true},
+    {"id": "snd5", "kind": "audio", "optional": true},
+    {"id": "snd6", "kind": "audio", "optional": true},
+    {"id": "snd7", "kind": "audio", "optional": true},
+    {"id": "bundle", "kind": "dir", "optional": true}
+  ],
+  "outputs": [
+    {"id": "video", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["format", "dur", "w", "h", "fps"],
+    "properties": {
+      "format": {
+        "enum": ["question", "contrast", "teaser", "before_after"],
+        "description": "Which shape stages the hook. The Director CHOSE it (hook_seed.json); by the time it arrives it is layout, not judgement."
+      },
+      "dur": {"type": "number", "minimum": 0.2, "maximum": 30, "description": "Clip length in seconds, decided per format on the brain."},
+      "w": {"type": "integer", "minimum": 16, "maximum": 8192},
+      "h": {"type": "integer", "minimum": 16, "maximum": 8192},
+      "fps": {"type": "string", "minLength": 1, "description": "Frame rate as an ffmpeg rational (`60000/1001`), sent as the STRING the filtergraph uses so no rounding happens on the way."},
+      "comp_fps": {"type": "integer", "minimum": 1, "maximum": 120, "default": 30, "description": "Frame rate the Remotion comp rasterises at, independent of the clip's own rate — the overlay is time-shifted onto the base, not conformed to it."},
+      "bg": {"type": "string", "description": "Backplate colour for a beat with no picture (brand dark). A brand fact, resolved upstream."},
+      "lime": {"type": "string", "description": "The brand's hot accent, used by the fallback title's last row and the contrast divider."},
+      "photos": {
+        "type": "array",
+        "maxItems": 4,
+        "items": {"enum": ["img0", "img1", "img2", "img3"]},
+        "description": "Input PORT ids, in order, naming the stills this opener stages. Ports and not paths: the brain binds the bytes, and a keyless pod is never handed a location on someone else's disk. The enum is the declared port set — a free string array here would be argv wearing a hat."
+      },
+      "cuts": {
+        "type": "array",
+        "items": {"type": ["integer", "null"]},
+        "description": "teaser only — one entry per cut, indexing `photos` (or null for a solid beat). The CYCLE is computed on the brain so `n` cuts always exist even when fewer pictures were fetched."
+      },
+      "labels": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "contrast only — the two punch labels, used by the ffmpeg fallback when the split comp does not render. NAMED and not a list: there are exactly two panels, and the top one is not the bottom one.",
+        "properties": {"top": {"type": "string"}, "bottom": {"type": "string"}}
+      },
+      "title": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["comp", "props", "rows"],
+        "description": "The Remotion title layer, or omitted when the hook carries no usable copy. `props` already carries brandTokens/brandFonts — a comp rendered without them falls back to the engine default and ships off-brand looking deliberate.",
+        "properties": {
+          "comp": {"type": "string", "minLength": 1},
+          "props": {"type": "object"},
+          "rows": {"type": "array", "items": {"type": "string"}, "description": "The same copy, already broken into rows, for the drawtext fallback."},
+          "stage": {"type": "object", "additionalProperties": {"type": "string"}, "description": "port -> the public-relative name that port's file must be staged under inside the bundle, so staticFile() finds it. Computed by mograph_assets.stage_photo_props, the same walk that stages a local photo for the in-repo renderer."}
+        }
+      },
+      "split": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["comp", "props"],
+        "description": "contrast only — the full-frame SplitScreen layer, same rules as `title`.",
+        "properties": {
+          "comp": {"type": "string", "minLength": 1},
+          "props": {"type": "object"},
+          "rows": {"type": "array", "items": {"type": "string"}},
+          "stage": {"type": "object", "additionalProperties": {"type": "string"}}
+        }
+      },
+      "audio": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Every sound, already CHOSEN: which file, how loud, and at what second. add_whoosh.plan_cues made the kind->file decision on the brain with the sfx registry in hand; nothing here resolves an intent.",
+        "properties": {
+          "beds": {"type": "array", "items": {
+            "type": "object", "additionalProperties": false, "required": ["port", "volume"],
+            "properties": {"port": {"type": "string"}, "volume": {"type": "number", "minimum": 0, "maximum": 4},
+                           "seek": {"type": "number", "minimum": 0, "description": "Start offset into the bed — the music selector's own in-point."}}}},
+          "direct": {"type": "array", "items": {
+            "type": "object", "additionalProperties": false, "required": ["port", "at", "volume"],
+            "properties": {"port": {"type": "string"}, "at": {"type": "number", "minimum": 0},
+                           "volume": {"type": "number", "minimum": 0, "maximum": 4}}}},
+          "cues": {"type": "array", "items": {
+            "type": "object", "additionalProperties": false, "required": ["port", "play", "gain"],
+            "properties": {"port": {"type": "string"}, "play": {"type": "number", "minimum": 0},
+                           "gain": {"type": "number", "minimum": 0, "maximum": 4}}}}
+        }
+      },
+      "encode": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "The composite's h264 ladder. CPU/crf by default ON PURPOSE: a three-second clip gains nothing from NVENC and loses byte-reproducibility, which is the only thing that makes this migration checkable.",
+        "properties": {
+          "cpu": {"type": "boolean", "default": true},
+          "cq": {"type": "integer", "minimum": 0, "maximum": 51, "default": 18}
+        }
+      }
+    }
+  },
+  "handler": "montyops.opener_build:run"
+}
