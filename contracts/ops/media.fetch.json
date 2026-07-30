@@ -1,7 +1,7 @@
 {
   "op": "media.fetch",
   "version": 1,
-  "summary": "GET one https url and write the bytes to the output, optionally only its first N seconds. The host must be one the ops pack names; the url is checked again on every redirect hop.",
+  "summary": "GET one https url and write the bytes to the output, optionally only a window of it. The host must be one the ops pack names; the url is checked again on every redirect hop.",
   "needs": ["net", "video_encode"],
   "judgement": false,
   "parity": {
@@ -23,11 +23,17 @@
         "maxLength": 4096,
         "description": "The ORIGIN to fetch. A LOCATION, never a decision: it carries no threshold and no editorial rule, and this op has no vocabulary for what the bytes are for. It is a param rather than an input binding so that the host allowlist can live in the ops pack, at the one place a third-party url is dereferenced — an input url is fetched by the runner before any handler exists, which would push the check into podagent/cp.py (submodule commit, image rebuild) and hide `needs: [net]` from the placement gate. The brain refuses to bind a credential-carrying url (op_backend.assert_bindable_origin); the pod refuses to fetch an unlisted host (montyops.stock_hosts). Both, on purpose."
       },
-      "prefix_seconds": {
+      "window_seconds": {
         "type": "number",
         "exclusiveMinimum": 0,
         "maximum": 600,
-        "description": "Pull only [0, N] of the file. A BYTE WINDOW on the file's own axis — a PREFIX, never a mid-clip seek and never a choice of moment, so it cannot disclose where in a clip anything is cut. Omit for the whole file. Measured on both keyed providers: ftyp+moov sit at the front and the CDNs serve Range, so a pexels 4K/57s master costs 12.6 MB for 5 s instead of 137.3 MB."
+        "description": "Pull only N seconds of the file, starting at `seek_seconds` (default 0). A BYTE WINDOW on the file's own axis. Omit for the whole file. Measured on both keyed providers: ftyp+moov sit at the front and the CDNs serve Range, so a pexels 4K/57s master costs 12.6 MB for 5 s instead of 137.3 MB."
+      },
+      "seek_seconds": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 3600,
+        "description": "Where the window STARTS on the file's own axis. Was refused on the grounds that a prefix cannot disclose where in a clip anything is cut — and that refusal cost whole masters: 30 winners on one fixture are 1642 MB to play 2.4 s each (839 s fetched, ~72 s used, 11.7x). What it discloses is ONE number: somebody wanted this url starting around here. No intent, no score, no threshold, no rank, no beat, nothing that says a moment was CHOSEN or that distinguishes a winner from a candidate — the same class of fact as a duration or a geometry, arriving already collapsed into a number. No selection RULE crosses. The handler guarantees the delivered file PRESENTS from this offset (input `-ss` + mp4 edit list; a degrade re-trims locally rather than silently shipping a file that starts at 0), because the caller records it as the clip's origin and seeks relative to it."
       }
     }
   },
