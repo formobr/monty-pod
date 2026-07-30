@@ -20,7 +20,16 @@
   "params": {
     "type": "object",
     "additionalProperties": false,
+    "required": ["master_lufs", "master_tp"],
     "properties": {
+      "master_lufs": {
+        "type": "number",
+        "description": "Integrated loudness (LUFS) the cold-open is matched to — the DELIVERY target the brand declares (brand.yaml audio.master_lufs). Required, never defaulted: a keyless pod holds no brand profile, and a guessed level welds the seam at a loudness that jumps against the master."
+      },
+      "master_tp": {
+        "type": "number",
+        "description": "True-peak ceiling (dB) for that match — brand.yaml audio.master_tp. Required for the same reason as master_lufs."
+      },
       "cold_trim": {
         "type": "number",
         "minimum": 0,
