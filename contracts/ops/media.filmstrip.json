@@ -1,6 +1,6 @@
 {
   "op": "media.filmstrip",
-  "version": 1,
+  "version": 2,
   "summary": "Sample frames of a clip at given fractions of its own duration, fit each into one cell and hstack them into a single image. Geometry in, one picture out.",
   "needs": ["video_encode"],
   "judgement": false,
@@ -41,9 +41,9 @@
         "description": "Cell height in pixels. Width:height is also the crop aspect under fit=cover."
       },
       "fit": {
-        "enum": ["cover", "contain"],
+        "enum": ["cover", "contain", "contain_alpha"],
         "default": "cover",
-        "description": "How a frame meets the cell. `cover` centre-crops to the cell aspect — the real full-bleed framing a viewer sees. `contain` letterboxes on the pad colour. Geometry, not intent: WHICH one an asset gets is decided on the brain and crosses as one enum value, never as the rule that produced it."
+        "description": "How a frame meets the cell. `cover` centre-crops to the cell aspect — the real full-bleed framing a viewer sees. `contain` letterboxes on the pad colour. `contain_alpha` letterboxes on TRANSPARENCY, for art whose backplate cannot be chosen here: ffmpeg cannot read the art's luminance, so a tone baked into the pad forces one polarity on every mark and a dark mark on a dark pad is an empty cell. Geometry, not intent: WHICH one an asset gets is decided on the brain and crosses as one enum value, never as the rule that produced it."
       }
     }
   },
