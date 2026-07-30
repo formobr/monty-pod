@@ -13,6 +13,7 @@ split is what makes adding a tool cost two files instead of a release.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -105,10 +106,17 @@ def all_ops() -> dict[str, Op]:
     return ops
 
 
+def image_tag() -> str:
+    """WHICH BUILD is answering. Baked by the Dockerfile from the CI tag (`POD_IMAGE_TAG`); "unknown" for a
+    hand-built or locally-run agent. An `unknown op` refusal is unactionable without it — the caller's next
+    question is always "which image is this?", and a registry listing alone cannot answer it."""
+    return os.environ.get("POD_IMAGE_TAG", "").strip() or "unknown (POD_IMAGE_TAG unset)"
+
+
 def get(name: str) -> Op:
     ops = all_ops()
     if name not in ops:
-        raise OpError(f"unknown op {name!r}; registry holds {sorted(ops)}")
+        raise OpError(f"unknown op {name!r} in image {image_tag()}; registry holds {sorted(ops)}")
     return ops[name]
 
 

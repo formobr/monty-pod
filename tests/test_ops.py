@@ -359,3 +359,72 @@ def test_neither_cut_render_may_claim_judgement():
     ops = registry.all_ops()
     for name in ("cut.audio", "cut.apply"):
         assert ops[name].judgement is False, f"{name} decides nothing; it applies a decision"
+
+
+# ── the claim: an unrunnable chain must cost NOTHING but the claim ───────────────────────────────
+
+def _older_image(monkeypatch, without: str):
+    """The registry of an image that predates `without` — the exact state of the box in the incident."""
+    kept = {k: v for k, v in registry.all_ops().items() if k != without}
+    monkeypatch.setattr(registry, "all_ops", lambda: kept)
+    return kept
+
+
+def test_an_op_this_image_lacks_is_refused_before_any_step_runs(monkeypatch):
+    """THE INCIDENT. A chain whose LAST step names an op this image does not carry ran its earlier steps
+    first — 236 s of transcode on a rented box — and only then reported `unknown op 'media.audio'`.
+
+    NEGATIVE: drop `preflight_chain` from run_chain and the first handler below runs, which is the whole
+    cost this refusal exists to avoid. Everything knowable at claim is decided at claim.
+    """
+    from podagent.ops import runner
+
+    _older_image(monkeypatch, "media.audio")
+    ran: list[str] = []
+    monkeypatch.setattr(runner.pack, "activate", lambda p: ran.append("pack"))
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: (lambda **kw: ran.append("handler")))
+    chain = OpChain(job_id="j", pack=_PACK, steps=[
+        _step("scale"),
+        _step("audio", op="media.audio", needs=["scale"], params={},
+              outputs=[{"port": "mp3", "url": "https://x/a.mp3"}])])
+
+    cp = type("CP", (), {"post_event": staticmethod(lambda _ev: None)})()
+    with pytest.raises(runner.ChainError, match="media.audio"):
+        runner.run_chain(chain, cp=cp)
+    assert ran == [], "nothing may be fetched, decoded or even unpacked for a chain this image cannot run"
+
+
+def test_the_refusal_names_the_image_and_what_it_does_hold(monkeypatch):
+    """`unknown op X` alone is unactionable: the reader's next question is always WHICH IMAGE is this, and
+    the answer decides whether to bump the pin or ship the op."""
+    from podagent.ops import runner
+
+    kept = _older_image(monkeypatch, "media.audio")
+    monkeypatch.setenv("POD_IMAGE_TAG", "v0.6.0")
+    chain = OpChain(job_id="j", pack=_PACK, steps=[_step("a", op="media.audio", params={},
+                                                         outputs=[{"port": "mp3", "url": "https://x/a.mp3"}])])
+    with pytest.raises(runner.ChainError) as e:
+        runner.preflight_chain(chain)
+    said = str(e.value)
+    assert "v0.6.0" in said and "media.audio" in said
+    assert str(sorted(kept)) in said, "the registry it DOES hold is what tells you which side moved"
+
+
+def test_bad_params_are_refused_at_claim_too(monkeypatch):
+    """Same principle, one layer down: a param the declaration forbids is knowable before the first byte
+    moves, so it may not be discovered by the step that finally validates it."""
+    from podagent.ops import runner
+
+    pytest.importorskip("jsonschema")
+    chain = OpChain(job_id="j", pack=_PACK, steps=[
+        _step("a"), _step("b", needs=["a"], params={"height": 960, "encode_profile": "not-a-profile"})])
+    with pytest.raises(registry.OpError, match="invalid params"):
+        runner.preflight_chain(chain)
+
+
+def test_a_chain_this_image_can_run_passes_preflight():
+    """The gate must not be a wall: every op the shipped chains name is in this image, so preflight is a
+    no-op on a correct pairing."""
+    from podagent.ops import runner
+
+    runner.preflight_chain(OpChain(job_id="j", pack=_PACK, steps=[_step("a"), _step("b", needs=["a"])]))

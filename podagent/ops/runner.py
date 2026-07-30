@@ -158,6 +158,30 @@ def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Path]]) ->
     return outputs
 
 
+def preflight_chain(chain: Any) -> None:
+    """Refuse a chain this IMAGE cannot run — before the first step, not when the doomed step is reached.
+
+    The pod's registry is the ground truth about what this build carries: the control plane pins a tag, but
+    only the box that booted it knows what is actually in it. Checking per-step (which is where these same
+    three checks also live, deliberately) means the chain runs until it REACHES the unknown op — a real run
+    spent 236 s transcoding and then died on `unknown op 'media.audio'`, having paid the rent, the pull and
+    the decode to learn a fact that was true before the first byte moved. Every step's op, placement and
+    params are knowable at claim, so they are decided at claim.
+    """
+    known = registry.all_ops()
+    missing = sorted({s.op for s in chain.steps} - set(known))
+    if missing:
+        raise ChainError(
+            f"image {registry.image_tag()} does not carry op(s) {missing} named by this chain — refusing "
+            f"the WHOLE chain before any step runs (nothing was fetched, decoded or encoded).\n"
+            f"  this image's registry holds: {sorted(known)}\n"
+            f"  the control plane is ahead of the image: ship the op, tag+build the image, bump the pin, "
+            f"and restart the provisioner so it rents the new tag.")
+    for step in chain.steps:
+        registry.assert_pod_safe(step.op)
+        registry.validate_params(step.op, step.params)
+
+
 def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
               session_id: str | None = None) -> dict[str, Any]:
     """Execute the whole chain. Returns {step_id: {port: str(path)}} for the caller to inspect.
@@ -171,6 +195,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
             payload["session_id"] = session_id
         cp.post_event(payload)
 
+    preflight_chain(chain)      # FIRST: an unrunnable chain must cost nothing but the claim
     pack.activate(chain.pack)
 
     tmp = Path(tempfile.mkdtemp(prefix="opchain_"))

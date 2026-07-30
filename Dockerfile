@@ -103,4 +103,11 @@ RUN python3 -m pip install --no-cache-dir --no-deps .
 # contract refuses sections without a bundle, so a mis-deployed pod fails loud instead of quietly
 # publishing a video with no motion graphics in it. See docs/POD_RUNBOOK.md §2a.
 
+# WHICH BUILD IS THIS. A pod that refuses an op ("this image does not carry media.audio") is unactionable
+# unless it can also say which image it is — the control plane pins a tag, but only the running box knows
+# what it actually booted. Set from the CI tag; "unknown" on a hand-built image, which is itself the answer.
+# Last layer: it changes on every tag and must invalidate nothing above it.
+ARG IMAGE_TAG=dev
+ENV POD_IMAGE_TAG=${IMAGE_TAG}
+
 ENTRYPOINT ["python3", "-m", "podagent.main"]
