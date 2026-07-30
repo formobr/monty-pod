@@ -1,0 +1,55 @@
+{
+  "op": "measure.silence",
+  "version": 1,
+  "summary": "Measure WHERE an audio track is quiet, as numbers: ffmpeg silencedetect [start, end] spans at the (noise floor, minimum duration) instrument settings the caller names, the per-hop RMS level envelope in dB, and the container duration. Values only. What a quiet span MEANS — which of them matter, what should happen to them, how far an edit boundary may move and what counts as speech — is decided by the caller, and no threshold of that kind is representable here.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "numeric",
+    "tol": 0.01,
+    "note": "silencedetect reports the same crossings for identical input bytes on a pinned build; the envelope is a plain RMS-over-a-fixed-hop of the same decoded samples, rounded to 3 dp. The stated tolerance is 10 ms — ONE envelope hop, and finer than any boundary the caller acts on. The caller's suite measures one input through the pre-migration implementation and through this handler and compares span-for-span and run-for-run. WHAT DOES NOT CROSS: the noise floor and the minimum duration are the INSTRUMENT's sensitivity, the same class of fact as media.scale's `height` — they say what registers, never what to do about it. The threshold that turns a level into SPEECH is not among them and is not applied here: the caller derives it from this envelope's own percentiles and builds its own regions from it, which is why the output is a raw envelope and not a region list. Everything the caller does with these numbers — which quiet spans are worth removing, by how much, how far an edit boundary may be nudged and what must be preserved whole — is decided on the caller's own machine, and none of it is spellable in these params."
+  },
+  "inputs": [
+    {"id": "src", "kind": "audio"}
+  ],
+  "outputs": [
+    {"id": "measured", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["probes"],
+    "properties": {
+      "probes": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 8,
+        "description": "The instrument settings to read the track at, one result per entry. A list rather than one setting because the caller needs several readings of the SAME file (a low floor and a high floor to size a speaker's onset ramp, a fine floor to place a drop edge, a coarse one for the pause trim) and N envelopes would be N round trips over the same bytes.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["noise", "min_d"],
+          "properties": {
+            "noise": {
+              "type": "string",
+              "pattern": "^-?[0-9]+(\\.[0-9]+)?dB$",
+              "description": "silencedetect's noise floor, e.g. \"-34dB\". The microphone's sensitivity for this reading, not a verdict: nothing downstream of it is decided here."
+            },
+            "min_d": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 5,
+              "description": "The shortest quiet run this reading reports (s). A filter on what is worth returning; a run below it is simply not measured, never 'kept' or 'cut'."
+            }
+          }
+        }
+      },
+      "envelope": {
+        "type": "boolean",
+        "default": true,
+        "description": "Also return the per-hop RMS dB envelope of the whole track. Off when the caller only needs the spans, so a reading does not pay a full decode it will not read. The hop and the decode rate are FIXED in the handler rather than taken here, precisely so no caller can shape the analysis grid into a decision."
+      }
+    }
+  },
+  "handler": "montyops.measure_silence:run"
+}
