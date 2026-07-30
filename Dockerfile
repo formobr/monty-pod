@@ -97,8 +97,12 @@ ENV REMOTION_CHROME_EXECUTABLE=/usr/bin/google-chrome-stable \
     REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
 
 # --- ffmpeg: BtbN static build (NVENC + libplacebo, not in ubuntu22.04 apt) -
-RUN curl -L -o /tmp/ffmpeg.tar.xz \
-        https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz \
+# `/releases/download/latest/`, NOT `/releases/latest/download/`: the second means "the newest release",
+# which on any day BtbN cuts a dated autobuild is NOT the rolling `latest` release and carries only
+# version-stamped asset names — the URL 404s, curl without --fail writes the error page, and tar dies with
+# "File format not recognized" three lines later. `--fail` so the next such day dies at the fetch.
+RUN curl -fL -o /tmp/ffmpeg.tar.xz \
+        https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
     && mkdir -p /tmp/ffmpeg && tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 \
     && install -m 0755 /tmp/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg \
     && install -m 0755 /tmp/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe \
