@@ -432,7 +432,31 @@ def build_command(
     return cmd
 
 
-def _burn_captions(caps, src: Path, input_paths: dict, out_path: Path, gpu: bool,
+# Body colour when NOTHING branded crossed. Deliberately pure white: a tenant's own off-white here reads as
+# correct on that tenant's videos and silently brands everyone else's — the exact bug this fallback replaces.
+_NEUTRAL_FG = "#ffffff"
+
+
+def _caption_colours(caps, motion_plan) -> tuple[str, str]:
+    """(fg, accent) for the burn, from the DATA that crossed — never a literal palette.
+
+    accent is a declared spec field the brain always fills; missing it means the brand did not cross at all,
+    and burning a guessed lime onto a delivered master is worse than failing here."""
+    tokens = (motion_plan.brand.tokens if motion_plan is not None and motion_plan.brand else {}) or {}
+    colors = tokens.get("color") or {}
+    accent = caps.accent or colors.get("accent")
+    if not accent:
+        raise RuntimeError("captions carry no accent colour and no brand tokens crossed — refusing to burn "
+                           "captions in a guessed palette (see motion_plan.captions.accent / .brand.tokens)")
+    fg = colors.get("fg")
+    if not fg:
+        fg = _NEUTRAL_FG
+        print("[render] captions: no brand fg crossed (motion_plan.brand absent) — burning neutral "
+              f"{_NEUTRAL_FG}, NOT a brand off-white", file=sys.stderr)
+    return fg, accent
+
+
+def _burn_captions(caps, motion_plan, src: Path, input_paths: dict, out_path: Path, gpu: bool,
                    w: int, h: int, enc) -> None:
     """Burn the subtitle track onto `src` via libass (one re-encode, audio copied through)."""
     from .captions import build_ass
@@ -440,8 +464,9 @@ def _burn_captions(caps, src: Path, input_paths: dict, out_path: Path, gpu: bool
         raise RuntimeError("captions present but no resolved font input on the spec")
     font = input_paths[caps.font]
     words = [wd.model_dump() for wd in caps.words]
+    fg, accent = _caption_colours(caps, motion_plan)
     ass = out_path.parent / "captions.ass"
-    ass.write_text(build_ass(words, font=font, w=w, h=h, accent=caps.accent or "#d6ff3a",
+    ass.write_text(build_ass(words, font=font, w=w, h=h, fg=fg, accent=accent,
                              center_y=caps.centerY if caps.centerY is not None else 0.76,
                              style=caps.style or "oneword"), encoding="utf-8")
     cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(src),
@@ -538,7 +563,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         caps = _mp.captions if _mp is not None else None
         if caps is not None and caps.words:
             captioned = tmp / "render_caps.mp4"
-            _burn_captions(caps, master, input_paths, captioned, gpu,
+            _burn_captions(caps, _mp, master, input_paths, captioned, gpu,
                            spec.timeline.width, spec.timeline.height, spec.encode)
             master = captioned
 

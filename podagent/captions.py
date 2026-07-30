@@ -1,6 +1,11 @@
 """Subtitle track via libass (no browser): brand-neutral ASS builder for three looks
 (oneword/phrase/phrase_jump). The brain bakes words+accent+centerY into the spec; the pod draws
-them with a delivered TTF."""
+them with a delivered TTF.
+
+NO COLOUR LITERAL LIVES IN THIS FILE. `fg` and `accent` are REQUIRED arguments: this module used to spell
+one tenant's warm white and one tenant's lime as defaults, and since the pod is the FINAL renderer every
+delivered video burned them — a second tenant's captions came out in the first one's palette with every
+test green. The caller resolves both from the crossing brand data (render._burn_captions)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +19,6 @@ FADE_IN_MS = 83
 RISE_PX = 16
 RISE_MS = 120
 HOLD_AFTER = 0.8    # keep a word up this long past its end if no next word
-FG = "#f2f2f0"
 
 PHRASE_SIZE = 70
 PHRASE_PX = round(PHRASE_SIZE * 64 / 92)   # libass Fontsize → on-screen px (measure/layout in THIS)
@@ -83,13 +87,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
-def build_ass(words: list[dict], *, font: Path, w: int, h: int, accent: str = "#d6ff3a",
+def build_ass(words: list[dict], *, font: Path, w: int, h: int, fg: str, accent: str,
               center_y: float = 0.76, style: str = "oneword",
               window_ms: int = PHRASE_WINDOW_MS) -> str:
-    """words = [{text,start,end,hot?}, …] → ASS text; `style` picks oneword/phrase/phrase_jump."""
+    """words = [{text,start,end,hot?}, …] → ASS text; `style` picks oneword/phrase/phrase_jump.
+
+    `fg` (body colour) and `accent` (hot-word colour) are required — see the module docstring."""
     if style in ("phrase", "phrase_jump"):
-        return _build_ass_phrase(words, font, w, h, accent, center_y, window_ms, kind=style)
-    white = _ac(FG)
+        return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind=style)
+    white = _ac(fg)
     lime = _ac(accent)
     center_y = _clamp_cy(center_y, TITLE // 2 + RISE_PX, w, h)
     ymid = round(h / 2 + (center_y - 0.5) * h)
@@ -146,10 +152,10 @@ def _group_blocks(words, fnt, spc, window_ms, w):
     return blocks
 
 
-def _build_ass_phrase(words, font, w, h, accent, center_y, window_ms, *, kind):
+def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kind):
     """Stable, centred ≤2-line block pinned at a fixed y (never jumps); kind = phrase | phrase_jump."""
-    white = _ac(FG)
-    white_c = _inline_c(FG)
+    white = _ac(fg)
+    white_c = _inline_c(fg)
     accent_c = _inline_c(accent)
     fnt = _phrase_font(font)
     spc = fnt.getlength(" ")

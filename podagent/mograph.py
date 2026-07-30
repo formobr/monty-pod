@@ -18,8 +18,10 @@ _STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/
 
 # HEAD BELOW (any media riding over a slid-down head): the live head slides DOWN so its face clears the top-band
 # picture/video, reversing at the beat end. Closed form of MontagePreview.headSettle (GLIDE spring) → master == preview.
-HB_DROP_FRAC = 0.33          # frame-fraction the face travels down (== MontagePreview HB_DROP_PCT/100) → seats at 0.75
-HEAD_SETTLE_SEC = 0.4        # settle window at beat start; reversed at beat end (== MontagePreview HEAD_SETTLE_SEC)
+# Bound COPIES of the SSOT in remotion/src/MontagePreview.tsx (HB_DROP_FRAC / HEAD_SETTLE_SEC) — the pod
+# renders ffmpeg, not TS. The engine's tests/test_head_settle_ssot.py text-reads this file and reddens on drift.
+HB_DROP_FRAC = 0.33          # frame-fraction the face travels down → seats at 0.75
+HEAD_SETTLE_SEC = 0.4        # settle window at beat start; reversed at beat end
 _HB_ZW0 = 15 / (2 * 0.9)     # GLIDE {damping:15, mass:0.9, stiffness:140} underdamped closed form (== engine)
 _HB_WD = (140 / 0.9) ** 0.5 * (1 - (15 / (2 * (140 * 0.9) ** 0.5)) ** 2) ** 0.5
 _HB_B = _HB_ZW0 / _HB_WD
