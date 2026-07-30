@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 FPS = 30
@@ -107,7 +108,8 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-framerate", str(FPS), "-pattern_type", "glob",
                         "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", str(mov)], check=True)
         layers.append({"mov": str(mov), "start": m["start"], "dur": len(pngs) / FPS,
-                       "glass": m["glass"], "head_below": m.get("head_below", False)})
+                       "glass": m["glass"], "head_below": m.get("head_below", False),
+                       "backing": m.get("backing")})
     return layers
 
 
@@ -133,7 +135,8 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
         seqdir = tmp / f"seq{i}"
         seqdir.mkdir(parents=True, exist_ok=True)
         meta = {"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass),
-                "head_below": bool((sec.props or {}).get("headBelow"))}
+                "head_below": bool((sec.props or {}).get("headBelow")),
+                "backing": (sec.props or {}).get("backing")}
         item = {"comp": sec.comp, "props": _props(sec), "seqdir": str(seqdir)}
         if sec.comp.startswith("Bespoke"):
             entry = f"src/index.bespoke.{sec.comp}.tsx"
@@ -155,6 +158,70 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
     return _pack(metas, tmp)
 
 
+# ── MARK BACKING (the final half) ────────────────────────────────────────────────────────────────────────
+# A brand mark gets its background under ITSELF, not under the whole frame: frosted glass
+# scoped to the mark's box, or a shadow when the mark is light enough to read alone. The rect is NOT computed
+# here — the planner bakes keyframes and both tiers interpolate them (anim_expr here, the same
+# piecewise-linear rule in the browser), so the panel and the mark cannot land in different places.
+# These are the ENGINE glass numbers reused verbatim (see the full-frame branch below) — one look, not a third.
+_MARK_GLASS = {"sigma": 22, "brightness": -0.05}
+
+
+# anim_expr reads only `.t` and `.rect`, and this rect is NOT models.MotionKeyframe's: a camera crop lives
+# inside the frame (rect >= 0), while a mark ARRIVES from off-frame, so its x is negative for half a second.
+_KF = namedtuple("_KF", "t rect")
+
+
+def _kfs(backing: dict, start: float) -> list:
+    return [_KF(float(k["t"]) + float(start), tuple(float(v) for v in k["rect"]))
+            for k in (backing.get("motion") or [])]
+
+
+def _esc(expr: str) -> str:
+    """Commas inside a filter-arg expression must not be read as argument separators."""
+    return expr.replace(",", "\\,")
+
+
+def mark_glass_filters(i: int, src: str, backing: dict, start: float, end: float) -> tuple[list[str], str]:
+    """Blur+darken ONLY the mark's own box, following it, gated to [start+from, end].
+
+    Blur the whole frame once (gated to the window, so it costs nothing outside it), CROP the mark's moving box
+    out of the blurred copy, and overlay that one box back onto the sharp frame at the same moving position.
+    `from` is when the box has finished arriving on screen: a panel parked at the frame edge waiting for a mark
+    that is still off-screen is the bug this avoids, and the browser gates on the very same number.
+
+    The box SIZE is a constant of the backing (only its position animates) and is emitted as one — crop
+    evaluates w/h once at configuration time, so an expression there would silently freeze at t=0 anyway."""
+    from .render import anim_expr
+
+    kfs = _kfs(backing, start)
+    if not kfs:
+        return [], src
+    bw, bh = kfs[0].rect[2], kfs[0].rect[3]
+    on = float(start) + float(backing.get("from") or 0.0)
+    win = f"between(t,{on},{end})"
+    # crop's box is in SOURCE pixels (in_w/in_h); overlay's in main-frame pixels (W/H). Same numbers, two
+    # vocabularies — anim_expr takes the dimension expr, so each gets its own rather than a string rewrite.
+    cx = _esc(f"clip({anim_expr(kfs, 0, 'linear', 'in_w')},0,in_w-out_w)")
+    cy = _esc(f"clip({anim_expr(kfs, 1, 'linear', 'in_h')},0,in_h-out_h)")
+    ox = _esc(f"clip({anim_expr(kfs, 0, 'linear', 'W')},0,W-w)")
+    oy = _esc(f"clip({anim_expr(kfs, 1, 'linear', 'H')},0,H-h)")
+    return ([f"[{src}]split[mk{i}a][mk{i}b]",
+             f"[mk{i}b]gblur=sigma={_MARK_GLASS['sigma']}:enable='{win}',"
+             f"eq=brightness={_MARK_GLASS['brightness']}:enable='{win}',"
+             f"crop=w='in_w*{bw}':h='in_h*{bh}':x='{cx}':y='{cy}'[mk{i}c]",
+             f"[mk{i}a][mk{i}c]overlay=x='{ox}':y='{oy}':enable='{win}'[mk{i}v]"], f"mk{i}v")
+
+
+# The DISPATCH TABLE this tier draws a mark backing through. `None` = nothing to draw HERE because the shared
+# Photo component already drew it into the alpha layer (a shadow follows the mark's silhouette and needs no
+# knowledge of the frame behind it). The keys are the parity contract: the engine's gate demands they equal
+# the player's table and the planner's vocabulary, so no treatment can be one-sided. Declared after the
+# builder so the table holds the function object, not a name.
+_MARK_BACKING = {"glass": lambda i, src, b, s, e: mark_glass_filters(i, src, b, s, e),
+                 "shadow": None}
+
+
 def overlay_filtergraph(layers: list[dict]) -> tuple[str, str]:
     """Pure: (-filter_complex string, final video label) compositing alpha layers onto [0:v]. Each layer is
     shifted to its start and gated to [start,start+dur]; a glass layer blurs+darkens the frame behind it; a
@@ -167,6 +234,10 @@ def overlay_filtergraph(layers: list[dict]) -> tuple[str, str]:
             filters.append(f"[{src}]gblur=sigma=22:enable='between(t,{s},{e})',"
                            f"eq=brightness=-0.05:enable='between(t,{s},{e})'[g{i}]")
             src = f"g{i}"
+        backing = lay.get("backing") or None
+        if backing and _MARK_BACKING.get(str(backing.get("treatment"))) is not None:
+            add, src = _MARK_BACKING[str(backing["treatment"])](i, src, backing, s, e)
+            filters += add
         if lay.get("head_below"):
             # slide a copy of the base head DOWN over its window; the layer (SplitScreen alpha, overlaid next)
             # then covers the cleared top band. Mirrors MontagePreview / the retired engine _composite.
