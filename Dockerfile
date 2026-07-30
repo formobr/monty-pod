@@ -5,12 +5,19 @@
 #
 # Layers ordered cheap-to-expensive, code copied LAST (it churns the most,
 # everything above it is cache-stable across normal commits).
+#
+# LAYER SHAPE IS COLD-START TIME. This lane has no persistent volume, so every rent pulls the whole image
+# from scratch, and docker pulls layers CONCURRENTLY (3 by default). One 4.16 GB blob is therefore one TCP
+# stream at an ordinary single-connection rate — the python stack below is split into buckets so the pull
+# runs several streams instead of one. Nothing is added or removed by the split; it is the same bytes in
+# more pieces. Keep every bucket under ~1 GB and keep them roughly EQUAL: three streams finish together
+# only if no single layer is a straggler.
 # CUDA 12.8 + torch cu128 = ONE universal image: sm_75..sm_120 (Ada 4090 AND Blackwell RTX 50xx). cu124
 # had no sm_120 kernels, so align crashed on 50xx hosts (NVENC is ffmpeg, arch-independent, so it kept working).
 # `-base`, NOT `-runtime`: -runtime adds 2.06 GB of cuda-libraries (cublas/cufft/cusolver/cusparse/nccl)
 # that NOTHING here links — torch ships its own copies in site-packages/nvidia/*, and the ffmpeg GPU path is
 # Vulkan/libplacebo + NVENC, which come from the driver the container runtime injects.
-FROM nvidia/cuda:12.8.1-base-ubuntu22.04
+FROM nvidia/cuda:12.8.1-base-ubuntu22.04 AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -38,6 +45,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
+# ── builder: resolve the python stack ONCE, then park it in per-bucket staging roots ──────────────────
+# pip resolves the versions (no hand-pinned nvidia wheel list to drift from torch's own requirements), and
+# the bucketing MOVES the trees apart, never copies them: a bucket that left a file behind would ship it
+# twice, and a duplicated 900 MB library is exactly the defect this stage exists to remove.
+#
+# Install and bucket in ONE layer on purpose: a second RUN would write the whole 7.25 GB tree a second time
+# into the builder's snapshot, and a CI runner's disk is not free. Nothing wants them cached apart anyway —
+# a dependency edit invalidates both.
+#
+# Buckets sized off the MEASURED tree (uncompressed / gzip MB): cudnn 951/658 · cublas 830/594 ·
+# cusparselt+cusolver 818/554 · nccl+cusparse 754/584 · rest of nvidia 947/535 · libtorch_cuda.so 871/586 ·
+# rest of torch 761/243 · triton 641/188 · everything else 682/190. Nine pieces, a multiple of the three
+# concurrent downloads, and the biggest is 658 MB where the single blob was 4163.
+# The last bucket is a SWEEP, not a list: a new dependency lands there instead of silently not shipping.
+FROM base AS pydeps
+RUN set -eux; \
+    python3 -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128; \
+    # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
+    # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
+    # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
+    # transformers ships a get_image_features that returns a BaseModelOutputWithPooling → clip_rank crash.
+    python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema; \
+    SP=/usr/local/lib/python3.11/dist-packages; \
+    bucket() { n="$1"; shift; for p in "$@"; do d="/stage/$n/$(dirname "$p")"; mkdir -p "$d"; mv "$SP/$p" "$d/"; done; }; \
+    bucket 01 nvidia/cudnn; \
+    bucket 02 nvidia/cublas; \
+    bucket 03 nvidia/cusparselt nvidia/cusolver; \
+    bucket 04 nvidia/nccl nvidia/cusparse; \
+    bucket 05 nvidia; \
+    bucket 06 torch/lib/libtorch_cuda.so; \
+    bucket 07 torch; \
+    bucket 08 triton; \
+    mkdir -p /stage/09; find "$SP" -mindepth 1 -maxdepth 1 -exec mv -t /stage/09/ {} +
+
+# ── the shipped image ────────────────────────────────────────────────────────────────────────────────
+FROM base
+
 # --- node 20 + chrome stable: the RUNTIME for mograph. ~243 MB, and unlike the bundle it is genuinely
 # image-shaped — it is a binary toolchain, not content, so it neither churns with our code nor differs
 # per brand. The bundle it executes (node_modules + src, 506 MB) is NOT here: that arrives per job as a
@@ -60,14 +104,20 @@ RUN curl -L -o /tmp/ffmpeg.tar.xz \
     && install -m 0755 /tmp/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe \
     && rm -rf /tmp/ffmpeg /tmp/ffmpeg.tar.xz
 
-# --- python deps: torch/torchaudio (cu128 wheel, the huge one) first, then
-# the rest. This is the ONE unavoidably heavy layer: it is the runtime, not an input. ------
-RUN python3 -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128 \
-    # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
-    # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
-    # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
-    # transformers ships a get_image_features that returns a BaseModelOutputWithPooling → clip_rank crash.
-    && python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema
+# --- python deps, one layer per bucket. Same tree the builder resolved, reassembled in place: the
+# destination is one directory, so the union of the buckets IS site-packages and no bucket overlaps another.
+COPY --from=pydeps /stage/01/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/02/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/03/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/04/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/05/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/06/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/07/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/08/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=pydeps /stage/09/ /usr/local/lib/python3.11/dist-packages/
+# console scripts the wheels installed (torchrun, transformers-cli): nothing here calls them, but leaving
+# an installed distribution half-present is the kind of difference that surfaces as a mystery on a paid box.
+COPY --from=pydeps /usr/local/bin/ /usr/local/bin/
 
 # Weights are NOT baked and the pod holds no HF credential — it never dials HF. Every heavy checkpoint
 # arrives as a presigned tar the CP hands it (podagent/weights.py), cached under WEIGHTS_CACHE by content
