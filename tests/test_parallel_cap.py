@@ -61,3 +61,38 @@ def test_floor_holds_at_one():
     assert runner._cap_from(cores=8, mem_avail=None, env_raw="0")[0] == 4
     assert runner._cap_from(cores=8, mem_avail=None, env_raw="not-a-number")[0] == 4
     assert runner._cap_from(cores=8, mem_avail=None, env_raw="-3")[0] == 4
+
+
+# ── the budget is BOX-wide, not chain-wide ───────────────────────────────────────────────────────
+
+def test_concurrent_chains_share_one_step_budget(monkeypatch):
+    """The agent now drains several ops envelopes at once. A cap applied per chain multiplies with them —
+    4 chains × cap 8 is 32 ffmpegs on a box sized for 8, which is the swap thrashing MEM_PER_STEP_BYTES
+    exists to prevent. Watched fail with `step_slots()` removed from `_run_step`."""
+    import threading
+
+    monkeypatch.setattr(runner, "parallel_cap", lambda: (2, "test"))
+    runner._reset_step_slots()
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+    gate = threading.Event()
+
+    def _step(step, ws, produced):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        gate.wait(timeout=0.3)
+        with lock:
+            live -= 1
+        return {}
+
+    monkeypatch.setattr(runner, "_run_step_inner", _step)
+    threads = [threading.Thread(target=runner._run_step, args=(None, None, None)) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    runner._reset_step_slots()
+    assert peak <= 2, f"{peak} steps ran at once against a box budget of 2"

@@ -3,6 +3,7 @@ JOB_TOKEN) — everything else this process does arrives as data from the contro
 Run: python -m podagent.main"""
 from __future__ import annotations
 
+import concurrent.futures as cf
 import os
 import sys
 import time
@@ -29,7 +30,25 @@ INFER_KINDS = ("align", "face_probe", "clip_rank")
 # RENTED box at an unbounded rate. Floor one poll per second; a real long-poll never notices it.
 _MIN_POLL_INTERVAL_S = 1.0
 
+# The claim loop DISPATCHES; it does not execute. It used to run each envelope inline, which made this box the
+# one place the whole pipeline serialises: the brain fans b-roll ranking out ≤6 rank chains wide and awaits
+# them by corr_id (op_backend deliberately dropped its per-jid lane lock for exactly this), and every one of
+# them then queued behind the previous chain here. Ops go to a pool bounded by OPS_MAX_CHAINS, whose real
+# budget is the runner's box-wide step semaphore; render/infer keep a pool of ONE, so the GPU and the weight
+# caches stay single-threaded as before while a long render no longer blocks the CLAIM of an ops chain.
+_OPS_MAX_CHAINS_ENV = "OPS_MAX_CHAINS"
+_OPS_MAX_CHAINS_DEFAULT = 8
+
 BOOT_T0 = time.monotonic()
+
+
+def ops_chain_pool_size() -> int:
+    """How many ops chains may be IN FLIGHT. Not a work budget — the runner's step slots are that; this only
+    bounds how many workspaces (tmpdirs, in-flight fetches) exist at once."""
+    try:
+        return max(1, int(os.environ.get(_OPS_MAX_CHAINS_ENV, "") or _OPS_MAX_CHAINS_DEFAULT))
+    except ValueError:
+        return _OPS_MAX_CHAINS_DEFAULT
 
 
 def _log(msg: str) -> None:
@@ -225,6 +244,17 @@ def _report_boot(cp: ControlPlane) -> None:
              "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s"})
 
 
+def _guarded(fn: Any, cp: ControlPlane) -> None:
+    """Run a dispatched envelope, reporting instead of dying. Off the claim loop the old outer `except` no
+    longer covers these, and a worker thread that raises is a job the brain waits out in silence."""
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 — a worker must never take the agent down
+        _log(f"dispatch failed: {type(e).__name__}: {e}")
+        traceback.print_exc(file=sys.stderr)
+        cp.note({"stage": "dispatch", "status": "error", "error": f"{type(e).__name__}: {e}"[:500]})
+
+
 def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
@@ -237,8 +267,27 @@ def main() -> None:
     align_cache: dict[str, "AlignService"] = {}
     probe_cache: dict[tuple[Path, str], "ProbeService"] = {}
     rank_cache: dict[str, "ClipRankService"] = {}
-    boot_reported = False
+    boot: list[bool] = [False]   # a 1-wide pool owns this, so the flag stays effectively single-threaded
 
+    def _heavy(pod_job: PodJob) -> None:
+        if pod_job.type == "infer":
+            assert pod_job.request is not None
+            request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
+            boot[0] = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
+                                 yunet_path, boot[0], corr_id=pod_job.corr_id)
+        else:
+            assert pod_job.spec is not None
+            spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
+            _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
+
+    with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
+            cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool:
+        _dispatch_loop(cp, ops_pool, heavy_pool, _heavy)
+
+
+def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, heavy: Any,
+                   once: bool = False) -> None:
+    """Claim envelopes and hand them to a pool. `once` is the test seam — the production loop never returns."""
     while True:
         try:
             t_poll = time.monotonic()
@@ -247,26 +296,27 @@ def main() -> None:
                 idle = time.monotonic() - t_poll
                 if idle < _MIN_POLL_INTERVAL_S:
                     time.sleep(_MIN_POLL_INTERVAL_S - idle)
+                if once:
+                    return
                 continue
 
             try:
                 pod_job = PodJob.model_validate(job)
             except ValidationError as e:
                 cp.post_event({"stage": "dispatch", "status": "error", "error": str(e)[:500]})
+                if once:
+                    return
                 continue
 
-            if pod_job.type == "infer":
-                assert pod_job.request is not None
-                request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
-                boot_reported = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
-                                           yunet_path, boot_reported, corr_id=pod_job.corr_id)
-            elif pod_job.type == "ops":
+            if pod_job.type == "ops":
                 assert pod_job.chain is not None
-                _run_ops(pod_job.chain, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
+                chain, corr, sid = pod_job.chain, pod_job.corr_id, pod_job.session_id
+                ops_pool.submit(_guarded,
+                                lambda c=chain, r=corr, s=sid: _run_ops(c, cp, corr_id=r, session_id=s), cp)
             else:
-                assert pod_job.spec is not None
-                spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
-                _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
+                heavy_pool.submit(_guarded, lambda j=pod_job: heavy(j), cp)
+            if once:
+                return
         except requests.RequestException as e:
             _log(f"control-plane request failed: {e}")
             time.sleep(5)
@@ -277,6 +327,8 @@ def main() -> None:
             traceback.print_exc(file=sys.stderr)
             cp.note({"stage": "dispatch", "status": "error", "error": f"{type(e).__name__}: {e}"[:500]})
             time.sleep(5)
+        if once:
+            return
 
 
 if __name__ == "__main__":

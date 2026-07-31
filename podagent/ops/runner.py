@@ -101,6 +101,31 @@ def parallel_cap() -> tuple[int, str]:
     return _cap_from(os.cpu_count(), _mem_available_bytes(), os.environ.get(MAX_PARALLEL_ENV))
 
 
+_slots: threading.Semaphore | None = None
+_slots_lock = threading.Lock()
+
+
+def step_slots() -> threading.Semaphore:
+    """ONE box-wide budget of concurrently RUNNING steps, shared by every chain in flight.
+
+    parallel_cap() answers "how wide may this box go", and a per-chain executor sized by it is right for one
+    chain and wrong for four: the agent now drains several ops envelopes at once, and four chains × cap 8 is
+    how a 16-core box ends up 32 ffmpegs deep and swapping — the exact failure MEM_PER_STEP_BYTES exists to
+    prevent. One chain alone still gets the whole cap, so nothing about single-chain behaviour moves."""
+    global _slots
+    with _slots_lock:
+        if _slots is None:
+            _slots = threading.Semaphore(parallel_cap()[0])
+        return _slots
+
+
+def _reset_step_slots() -> None:
+    """Tests only: re-derive the budget after monkeypatching the cap."""
+    global _slots
+    with _slots_lock:
+        _slots = None
+
+
 class ChainError(RuntimeError):
     pass
 
@@ -188,6 +213,14 @@ def _bind_inputs(step: Any, op: registry.Op, ws: Workspace, produced: dict[str, 
 
 
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Path]]) -> dict[str, Path]:
+    # The box-wide slot is taken for the WHOLE step, binding included: a fetch is transport this box pays for
+    # too, and letting N chains bind concurrently outside the budget is how the disk, not the CPU, becomes
+    # the bound nobody sized.
+    with step_slots():
+        return _run_step_inner(step, ws, produced)
+
+
+def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Path]]) -> dict[str, Path]:
     op = registry.get(step.op)
     # Refuse a judgement op HERE, on the executing box, before anything is fetched or run. Redundant with
     # the control plane's placement check by design: a check that lives only where the routing decision is
