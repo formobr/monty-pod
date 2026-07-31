@@ -27,9 +27,9 @@
         "description": "The finished square canvas edge in pixels, and the width a vector is rasterised at. GEOMETRY, the same class of fact as media.scale's `height`. The height is never sent: it follows the source's own aspect, which is what makes a stretched drawing unrepresentable rather than merely unlikely."
       },
       "plate": {
-        "enum": ["always", "if_transparent"],
+        "enum": ["always", "if_transparent", "none"],
         "default": "always",
-        "description": "When to composite onto the backplate. A pixel CONDITION, never an editorial rule: `if_transparent` plates only art the pixels say is genuinely see-through (an opaque photograph is left alone and no `dst` is written), `always` plates whatever arrives. A vector is finished either way, because it has no pixels until it has been rasterised. Which value a given asset gets is decided upstream and crosses as one enum, exactly as media.filmstrip's `fit` does — the rule that chose it does not cross."
+        "description": "When to composite onto the backplate. A pixel CONDITION, never an editorial rule: `if_transparent` plates only art the pixels say is genuinely see-through (an opaque photograph is left alone and no `dst` is written), `always` plates whatever arrives, `none` finishes the bytes (rasterises) and bakes NO plate — a MARK keeps its alpha and gets its backing at composite time (scripts/mark_backing.py). A vector is finished either way, because it has no pixels until it has been rasterised. Which value a given asset gets is decided upstream and crosses as one enum, exactly as media.filmstrip's `fit` does — the rule that chose it does not cross."
       }
     }
   },
