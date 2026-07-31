@@ -140,8 +140,8 @@ def assert_fetchable(url: str) -> str:
         f"REFUSED to fetch {parts.scheme}://{parts.hostname or ''}{parts.path}: it is neither a file:// "
         f"path nor a PRESIGNED url. The pod dereferences capabilities the control plane minted, not "
         f"addresses it was handed. An ORIGIN url (a stock CDN) belongs in an op's params, where the ops "
-        f"pack checks it against its own host allowlist (montyops.stock_hosts) — not in a binding, where "
-        f"this transport would fetch whatever a third party's search response happened to contain.")
+        f"pack runs its own fetch guard on it (montyops.stock_hosts) — not in a binding, where this "
+        f"transport would fetch whatever a third party's search response happened to contain.")
 
 
 class TransferTimeout(requests.RequestException):

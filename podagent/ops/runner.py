@@ -31,6 +31,75 @@ from . import pack, registry
 
 MAX_PARALLEL_ENV = "OPS_MAX_PARALLEL"
 
+# ── how wide the chain runs ──────────────────────────────────────────────────────────────────────
+#
+# A fan-out stage is ~51 independent `media.scale` steps, so the cap IS the wall clock: a flat 8 left
+# most of a rented 32-core box idle. But cores alone is the wrong bound — measured on a 12-thread /
+# 31 GB dev box, five concurrent 4K ffmpeg encodes sat at ~1 GB RSS EACH and pushed the machine into
+# 11 GB of swap, and swapping encodes finish later than fewer non-swapping ones. So the cap is the
+# smaller of what the cores can schedule and what the RAM can hold.
+
+# Bytes of resident memory to reserve per concurrent step. Gates how many steps may run at once when
+# memory, not cores, is the scarce side. Anchored on the ~1 GB RSS a 4K ffmpeg encode was measured to
+# hold on the dev box above, rounded up to 1.5 GiB so the arithmetic leaves room for the decode-side
+# buffers and page cache that made that box swap rather than merely fill.
+MEM_PER_STEP_BYTES = 1536 * 1024 * 1024
+
+# Cores per concurrent step. Not 1: ffmpeg is internally multithreaded, so one process per core
+# oversubscribes the scheduler and each encode gets slower without the box doing more work.
+CORES_PER_STEP = 2
+
+_CPU_FALLBACK = 4  # os.cpu_count() may return None in a container with no affinity mask
+
+
+def _mem_available_bytes() -> int | None:
+    """Memory the box can hand out RIGHT NOW, or None if this kernel will not say.
+
+    MemAvailable is the honest number (it counts reclaimable page cache, which MemFree does not); the
+    sysconf pair is the portable fallback. Unreadable is not fatal — the cap just falls back to cores.
+    """
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _cap_from(cores: int | None, mem_avail: int | None, env_raw: str | None) -> tuple[int, str]:
+    """Pure cap arithmetic, so the decision is testable without a box to introspect.
+
+    Returns (cap, reason) — the reason is logged, because a scheduling choice nobody can see is how a
+    rented box ends up half idle for months.
+    """
+    env_cap = 0
+    if env_raw:
+        try:
+            env_cap = int(env_raw)
+        except ValueError:
+            env_cap = 0
+
+    n = cores if cores and cores > 0 else _CPU_FALLBACK
+    core_bound = max(1, n // CORES_PER_STEP)
+    mem_bound = max(1, mem_avail // MEM_PER_STEP_BYTES) if mem_avail and mem_avail > 0 else None
+
+    derived = core_bound if mem_bound is None else min(core_bound, mem_bound)
+    cap = env_cap if env_cap > 0 else derived
+    cap = max(1, cap)
+    reason = (f"cores={n}, core-bound={core_bound}, "
+              f"mem-bound={'unknown' if mem_bound is None else mem_bound}, "
+              f"env={env_cap if env_cap > 0 else 'unset'}")
+    return cap, reason
+
+
+def parallel_cap() -> tuple[int, str]:
+    """The cap this box gets, read from this box."""
+    return _cap_from(os.cpu_count(), _mem_available_bytes(), os.environ.get(MAX_PARALLEL_ENV))
+
 
 class ChainError(RuntimeError):
     pass
@@ -204,9 +273,29 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
     by_id = {s.id: s for s in chain.steps}
     deps = {s.id: set(s.needs) | {b.from_step for b in s.inputs if b.from_step} for s in chain.steps}
     pending = set(by_id)
+    failed: set[str] = set()
     lock = threading.Lock()
 
-    cap = int(os.environ.get(MAX_PARALLEL_ENV) or 0) or min(8, (os.cpu_count() or 4))
+    def _drop_dependents_of_failed() -> None:
+        """A step whose producer failed can never run. If it is OPTIONAL it is dropped with a diagnostic; if
+        it is not, the chain has lost work it was required to deliver and says so — the alternative is the
+        runner sitting on an unrunnable step until the stall check calls it a deadlock."""
+        while True:
+            doomed = [sid for sid in sorted(pending) if deps[sid] & failed]
+            if not doomed:
+                return
+            for sid in doomed:
+                if not by_id[sid].optional:
+                    raise ChainError(
+                        f"step {sid!r} ({by_id[sid].op}) needs failed step(s) "
+                        f"{sorted(deps[sid] & failed)} and is not optional")
+                pending.discard(sid)
+                failed.add(sid)
+                _event(job_id=chain.job_id, stage="ops", status="step", step=sid, optional=True,
+                       error=f"{by_id[sid].op}: skipped, needs failed step(s) {sorted(deps[sid] & failed)}")
+
+    cap, why = parallel_cap()
+    log(f"ops parallel cap={cap} ({why})")
     try:
         with cf.ThreadPoolExecutor(max_workers=cap) as ex:
             running: dict[cf.Future[Any], str] = {}
@@ -226,6 +315,16 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                 try:
                     outs = fut.result()
                 except Exception as e:
+                    if by_id[sid].optional:
+                        # ONE arm of a fan-out, not the chain: a 403 from one candidate's host must not
+                        # discard the twelve siblings that were fetching fine. Status stays inside the pod
+                        # wire vocabulary (done|ok|step|error) and NON-terminal — an "error" here would be
+                        # read as the chain's own, and a word outside it would 422 and abort the chain.
+                        _event(job_id=chain.job_id, stage="ops", status="step", step=sid, optional=True,
+                               error=f"{by_id[sid].op}: {e}"[:500])
+                        failed.add(sid)
+                        _drop_dependents_of_failed()
+                        continue
                     _event(job_id=chain.job_id, stage="ops", status="error",
                            step=sid, error=f"{by_id[sid].op}: {e}"[:500])
                     raise
@@ -233,7 +332,8 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     produced[sid] = outs
                 _event(job_id=chain.job_id, stage="ops", status="step",
                        step=sid, op=by_id[sid].op)
-        _event(job_id=chain.job_id, stage="ops", status="ok", steps=sorted(produced))
+        _event(job_id=chain.job_id, stage="ops", status="ok", steps=sorted(produced),
+               skipped=sorted(failed))
         return {sid: {p: str(v) for p, v in outs.items()} for sid, outs in produced.items()}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

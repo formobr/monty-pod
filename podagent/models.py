@@ -632,6 +632,11 @@ class OpStep(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     inputs: list[OpBinding] = Field(default_factory=list)
     outputs: list[OpBinding] = Field(default_factory=list)
+    # A FAN-OUT chain does the same independent work N times — one preview per candidate — and the failure
+    # of one arm says nothing about the other N-1. Marked optional, a step's failure costs that step and the
+    # steps that read it, and the chain runs on; unmarked (the default), any failure is the chain's, which is
+    # what a render pipeline needs. The caller decides which arms actually delivered by looking at outputs.
+    optional: bool = False
 
     @model_validator(mode="after")
     def _ports_unique(self) -> "OpStep":
