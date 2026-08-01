@@ -1,0 +1,51 @@
+{
+  "op": "measure.framediff",
+  "version": 1,
+  "summary": "Decode a clip ONCE and return the per-frame visual difference (YAVG of a frame-to-frame diff on a downscaled grey copy) over a run of frames around each supplied boundary, plus the median and MAD of the clip's own non-zero diff distribution. Numbers only; the outlier multiplier, the local-dominance ratio and whether a boundary moves at all are the brain's.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "numeric",
+    "tol": 0.5,
+    "note": "One ffmpeg invocation whose filter chain is a pure function of nothing but the input — format=gray,scale=160:-2,tblend=all_mode=difference,signalstats — so it is deterministic for identical input bytes on a pinned build, with sub-LSB jitter across decoder minors. numeric(0.5) cannot move a boundary: both consumers are scale-RELATIVE (an argmax inside a window, and a floor derived from this clip's own median/MAD), so a fractional drift changes which frame wins only where two candidate frames were already within half a unit of each other, and either of those is the same visual join. NO THRESHOLD crosses: the op returns the raw run of values and the raw distribution, and head_motion.snap_boundaries — reading its own K, its own local-dominance ratio and its own monotonic clamp — turns them into a moved boundary. Shaped like measure.source: numbers cross, judgement does not. The DECODE IS ONE PASS by construction — a per-boundary seek would re-decode the clip once per join, which is the cost this op exists to pay only once."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "measured", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["boundaries", "span", "fps", "frames"],
+    "properties": {
+      "boundaries": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 512,
+        "items": {"type": "integer", "minimum": 0},
+        "description": "Frame indices to report around. Discovered on the brain from the cut's own segments (mechanical arithmetic on times already decided), exactly as measure.boundary's joins are. The hard line of this op: nothing here may say WHY a frame is interesting or what would make it a real cut — no spike floor, no dominance ratio, no 'snap if'. Those are computed on the brain from what comes back."
+      },
+      "span": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3600,
+        "description": "Half-width IN FRAMES of the run returned around each boundary. A GEOMETRY, the same class of fact as media.filmstrip's `positions` — how far to look, never what to look for. The caller sends the widest span it will read, so the whole array it needs arrives once."
+      },
+      "fps": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 1000,
+        "description": "The frame grid `boundaries` and `span` are counted on, measured on the brain (media_clock) and passed in rather than re-probed here — the caller's indices and this op's must name the SAME frame, and two independent probes of a container are two chances to disagree."
+      },
+      "frames": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2000000,
+        "description": "How long the clip is on that grid; the upper bound a returned run is clipped to. Same polarity as `fps`: the caller already measured it, and a second answer here could only differ."
+      }
+    }
+  },
+  "handler": "montyops.measure_framediff:run"
+}

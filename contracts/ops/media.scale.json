@@ -1,6 +1,6 @@
 {
   "op": "media.scale",
-  "version": 1,
+  "version": 2,
   "summary": "Downscale a video to a target height, preserving aspect, and re-encode at a named profile.",
   "needs": ["video_encode"],
   "judgement": false,
@@ -25,6 +25,11 @@
         "maximum": 4320,
         "multipleOf": 2,
         "description": "Target height in pixels. Width follows from the source aspect (-2 = nearest even). The DECISION is 'how big'; how it is scaled is the handler's."
+      },
+      "height_mode": {
+        "enum": ["exact", "at_most"],
+        "default": "exact",
+        "description": "How `height` meets the source. `exact` scales to it in either direction — today's behaviour, the default, and byte-for-byte the argv a chain built by an older engine has always produced. `at_most` clamps to min(height, source height): the pod already holds the file open, so 'do not upscale' is decided where the number lives instead of costing the caller one header probe per candidate — ~50 of them on a real palette, and on a box that may hold no media not a probe it can make at all. GEOMETRY either way, and still the caller's `height`: nothing here says which tier chose it. Same polarity as `tonemap: auto` and as media.filmstrip measuring duration instead of being told it."
       },
       "encode_profile": {
         "enum": ["proxy", "preview", "final"],
