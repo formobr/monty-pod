@@ -13,6 +13,7 @@ from urllib.request import url2pathname
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import ReadTimeoutError
 from urllib3.util.retry import Retry
 
 _TIMEOUT = 30
@@ -38,9 +39,29 @@ _store.mount("https://", HTTPAdapter(pool_maxsize=4))
 _REPORT_ATTEMPTS = 6
 _REPORT_BACKOFF_S = 5.0
 
+# The CP transport's replay budget. Read at ControlPlane() construction, so a test can shrink the wait
+# without shrinking what it proves.
+_CP_RETRY_TOTAL = 5
+_CP_RETRY_BACKOFF_S = 0.5
+
 
 def _log(msg: str) -> None:
     print(f"[podagent] {msg}", file=sys.stderr, flush=True)
+
+
+class _LoudRetry(Retry):
+    """Replay a request whose CONNECTION died — announced, bounded, and never one that may have RUN."""
+
+    def increment(self, method: Any = None, url: Any = None, response: Any = None, error: Any = None,
+                  _pool: Any = None, _stacktrace: Any = None) -> Any:
+        # A drop means the server never answered. A read TIMEOUT means it may be inside the handler right
+        # now, and a replayed chain terminal puts a SECOND result on a FIFO key that carries exactly one.
+        if isinstance(error, ReadTimeoutError) and str(method).upper() == "POST":
+            raise error
+        cause = f"{type(error).__name__}: {error}" if error is not None else \
+                f"HTTP {getattr(response, 'status', '?')}"
+        _log(f"cp transport: replaying {method} {url} — {cause}")
+        return super().increment(method, url, response, error, _pool, _stacktrace)
 
 
 def _file_path(url: str) -> str | None:
@@ -57,10 +78,12 @@ class ControlPlane:
         self.base = base_url.rstrip("/")
         self.sess = requests.Session()
         self.sess.headers["Authorization"] = f"Bearer {job_token}"
-        # Minutes of work between calls ⇒ the pooled socket is always dead by the terminal POST, and urllib3
-        # will not replay an unsafe method: that POST never reaches the server and leaves no access-log line.
-        retry = Retry(total=5, connect=5, read=0, status=3, status_forcelist=(502, 503, 504),
-                      allowed_methods=False, backoff_factor=0.5, raise_on_status=False)
+        # Minutes of work between calls ⇒ the pooled socket is dead by the next POST, and urllib3 files that
+        # RemoteDisconnected under `read` — which at 0 refused the replay and failed the whole op chain.
+        retry = _LoudRetry(total=_CP_RETRY_TOTAL, connect=3, read=3, status=3,
+                           # "any verb": safety here is the FAILURE mode, which only increment can see
+                           status_forcelist=(502, 503, 504), allowed_methods=None,
+                           backoff_factor=_CP_RETRY_BACKOFF_S, raise_on_status=False)
         adapter = HTTPAdapter(max_retries=retry)
         self.sess.mount("http://", adapter)
         self.sess.mount("https://", adapter)
