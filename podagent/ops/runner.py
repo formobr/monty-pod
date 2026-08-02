@@ -190,14 +190,15 @@ def _bind_inputs(step: Any, op: registry.Op, ws: Workspace, produced: dict[str, 
             raise ChainError(f"step {step.id!r}: op {op.op} declares no input port {b.port!r}")
         if b.from_step is not None:
             src = produced.get(b.from_step, {})
-            if b.port not in src and len(src) == 1:
+            want = b.from_port or b.port
+            if b.from_port is None and want not in src and len(src) == 1:
                 # single-output producer: bind it positionally, the common chain shape
                 bound[b.port] = next(iter(src.values()))
                 continue
-            if b.port not in src:
+            if want not in src:
                 raise ChainError(
-                    f"step {step.id!r}: {b.from_step!r} produced {sorted(src)}, not {b.port!r}")
-            bound[b.port] = src[b.port]
+                    f"step {step.id!r}: {b.from_step!r} produced {sorted(src)}, not {want!r}")
+            bound[b.port] = src[want]
         elif b.path is not None:
             p = Path(b.path)
             if not p.exists():
@@ -279,9 +280,20 @@ def preflight_chain(chain: Any) -> None:
             f"  this image's registry holds: {sorted(known)}\n"
             f"  the control plane is ahead of the image: ship the op, tag+build the image, bump the pin, "
             f"and restart the provisioner so it rents the new tag.")
+    op_of = {s.id: s.op for s in chain.steps}
     for step in chain.steps:
         registry.assert_pod_safe(step.op)
         registry.validate_params(step.op, step.params)
+        for b in step.inputs:
+            if b.from_port is None:
+                continue
+            # a hand-off that names a port its producer does not declare is knowable now, and knowing it
+            # after the producing encode has run costs that encode
+            ports = {p.id for p in registry.get(op_of[b.from_step]).outputs}
+            if b.from_port not in ports:
+                raise ChainError(
+                    f"step {step.id!r}: input {b.port!r} reads {b.from_step!r}.{b.from_port!r}, but "
+                    f"{op_of[b.from_step]} declares outputs {sorted(ports)}")
 
 
 def run_chain(chain: Any, cp: Any, corr_id: str | None = None,

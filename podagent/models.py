@@ -590,6 +590,7 @@ class OpBinding(BaseModel):
 
       url       — crosses R2. A presigned GET (input) or PUT (output). Costs a round trip.
       from_step — the output of an earlier step in THIS chain, on THIS box. Costs a path lookup.
+                  `from_port` picks WHICH of that step's outputs when the two ports are not named alike.
       path      — a working-set path already hydrated on the box.
 
     `from_step` is the whole point. docs/RENDER_FLEET_AND_4MIN_BUDGET.md measured a pipeline that runs
@@ -606,6 +607,9 @@ class OpBinding(BaseModel):
     port: str = Field(min_length=1)
     url: str | None = Field(default=None, min_length=1)
     from_step: str | None = Field(default=None, min_length=1)
+    # WHICH output of the producer, when the two ports are not named alike — a producer with >1 declared
+    # output is otherwise unreadable (the runner only guesses a name for a single-output step).
+    from_port: str | None = Field(default=None, min_length=1)
     path: str | None = Field(default=None, min_length=1)
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
@@ -615,6 +619,8 @@ class OpBinding(BaseModel):
                 if v is not None]
         if len(set_) != 1:
             raise ValueError(f"binding {self.port!r} must set exactly one of url/from_step/path, got {set_}")
+        if self.from_port is not None and self.from_step is None:
+            raise ValueError(f"binding {self.port!r} names from_port with no from_step to read it from")
         return self
 
 
@@ -645,8 +651,8 @@ class OpStep(BaseModel):
             if len(set(names)) != len(names):
                 raise ValueError(f"step {self.id!r}: duplicate {side} port")
         for b in self.outputs:
-            if b.from_step is not None:
-                raise ValueError(f"step {self.id!r}: an output cannot bind from_step")
+            if b.from_step is not None or b.from_port is not None:
+                raise ValueError(f"step {self.id!r}: an output cannot bind from_step/from_port")
         return self
 
 
