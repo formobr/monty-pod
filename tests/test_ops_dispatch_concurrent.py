@@ -44,9 +44,9 @@ class _CP:
         self.events.append(payload)
 
 
-def _pump(cp, ops_pool, heavy_pool, heavy, n):
+def _pump(cp, ops_pool, heavy_pool, heavy, n, rank_pool=None):
     for _ in range(n):
-        agent_main._dispatch_loop(cp, ops_pool, heavy_pool, heavy, once=True)
+        agent_main._dispatch_loop(cp, ops_pool, heavy_pool, rank_pool or heavy_pool, heavy, once=True)
 
 
 def test_two_ops_chains_run_at_once(monkeypatch):

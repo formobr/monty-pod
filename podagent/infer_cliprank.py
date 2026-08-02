@@ -3,10 +3,19 @@ relevance + L2-normalized image embeddings, packed as clip_rank.schema.json and 
 presigned URL. Nothing is ranked here — the reorder, the relevance floor and the MMR dedup stay upstream.
 
 The cosine runs HERE, inside the same fp16/no_grad block as the towers, so one forward yields both
-numbers the planner needs and only the numbers cross back."""
+numbers the planner needs and only the numbers cross back.
+
+THE ENVELOPE IS NOT GPU WORK — IT IS A DOWNLOAD WITH A FORWARD ON THE END (see LANE_SIZING_WHY): tiles go to
+one BOX-wide fetch pool (latency-bound, wide), the towers stay on the lane (VRAM-bound, narrow), so group k
+forwards while k+1.. are still on the wire."""
 from __future__ import annotations
 
+import concurrent.futures as cf
+import os
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -16,6 +25,144 @@ from .models import ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRank
 
 _MISS = -1.0   # unreadable image, or an embed-only group where a score has nothing to mean
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
+
+# Chunk the image tower so ONE lane's VRAM is a known number, not a function of a beat's candidate count —
+# the cap engine vram_budget.SIGLIP_TILE_BATCH declares and this arm had dropped (per-image embeds are same).
+TILE_BATCH = 12
+
+LANE_SIZING_WHY = """
+THE clip_rank ENVELOPE IS ~80% NETWORK, AND IT WAS QUEUED AS IF IT WERE A RENDER.
+
+Everything model-shaped went through ONE pod-side worker: align, face_probe, clip_rank AND render. Measured,
+the SigLIP forward is 0.847 s for 14 tiles on an RTX 2060, while pulling those 14 tiles costs ~14 × 211 ms of
+round-trip latency (the prod box's measured per-tile transfer) — and the fetch ran tile-by-tile INSIDE each
+group's turn, so the card idled through most of the envelope. A one-worker GPU queue was protecting VRAM
+against work that barely touches the card, and a render blocked every ranking envelope of a b-roll wave.
+
+TWO PHASES, TWO WIDTHS. Tiles are latency-bound, so their width is a count of round trips in flight
+(_FETCH_WORKERS_DEFAULT, the same 8 the engine's tile PUTs use). ONE pool for the whole process: a
+per-envelope pool would multiply with the lanes, which is the box-wide-budget lesson ops/runner.step_slots()
+already learned. The towers are VRAM-bound and keep their own narrow lane.
+
+THE LANE WIDTH IS DERIVED FROM THE CARD THIS AGENT BOOTED ON, NEVER FROM A CONSTANT. The weights load ONCE
+and every lane shares them (main.py caches the service by weights hash), so they are a fixed toll, not a
+per-lane cost; what a lane costs is one capped forward's activations. Both numbers are measured on an RTX
+2060 with nvidia-smi and declared in the engine's vram_budget.py: 2322 MiB for the fp16 weights + CUDA
+context, then 2736 MiB at 12 tiles, 3144 at 24, 3782 at 48 — ~34 MiB per tile, so one TILE_BATCH chunk is
+2736 − 2322 = 414 MiB. The dev 2060 (3254 MiB free under a desktop) therefore gets exactly 1 lane, which is
+the truth about that card and not a regression.
+
+THE SECOND BOUND IS THE HOST AND IT IS NOT MEASURED — say so rather than hide it. A lane decodes and
+preprocesses its own tiles on the CPU (PIL + the processor's resize/normalize) before anything reaches the
+card, so past one lane per hardware thread the box is the bottleneck and the VRAM headroom buys nothing. It
+is also what stops a 48 GB card from being handed 100 lanes on evidence that measured none of them.
+
+A CARD THAT REPORTS NOTHING GETS 1, NOT A CPU. No nvidia-smi, no parse, no number => run the towers NARROW,
+on the GPU, and say so. Ranking on the CPU because a QUERY failed would move the work across the placement
+axis, which is the fallback the ruling forbids.
+"""
+
+_VRAM_WEIGHTS_MB = 2322.0
+_VRAM_PER_LANE_MB = 414.0
+_VRAM_RESERVE_MB = 512.0
+_LANES_ENV = "CLIP_RANK_LANES"
+_FETCH_WORKERS_ENV = "CLIP_RANK_FETCH_WORKERS"
+_FETCH_WORKERS_DEFAULT = 8
+
+
+def _log(msg: str) -> None:
+    print(f"[clip_rank] {msg}", file=sys.stderr, flush=True)
+
+
+def _free_vram_mb() -> float | None:
+    """Free VRAM on the card the towers will run on, or None if this machine cannot say."""
+    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    vals = [float(ln.strip()) for ln in r.stdout.splitlines() if ln.strip().replace(".", "", 1).isdigit()]
+    return max(vals) if vals else None
+
+
+def _host_threads() -> int:
+    """Hardware threads this process may use — a lane also decodes and preprocesses its tiles on the CPU."""
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4)
+
+
+def _width_from(free_mb: float | None, threads: int, env_raw: str | None) -> tuple[int, str]:
+    """The lane width and the sentence that explains it (LANE_SIZING_WHY). Pure — readings are injected."""
+    if env_raw:
+        try:
+            return max(1, int(env_raw)), f"env={env_raw}"
+        except ValueError:
+            # A typo in an operator's env may not kill a box that is already being billed: be loud, derive.
+            _log(f"⚠ {_LANES_ENV}={env_raw!r} is not an integer — ignoring it and sizing from the card")
+    if free_mb is None:
+        return 1, "the card reports no free VRAM — one lane, still the GPU, never the CPU"
+    by_vram = max(1, int((free_mb - _VRAM_RESERVE_MB - _VRAM_WEIGHTS_MB) // _VRAM_PER_LANE_MB))
+    return min(by_vram, max(1, threads)), (f"{free_mb:.0f} MiB free − {_VRAM_RESERVE_MB:.0f} reserve − "
+                                           f"{_VRAM_WEIGHTS_MB:.0f} weights → vram-bound={by_vram} "
+                                           f"({_VRAM_PER_LANE_MB:.0f} MiB per lane), host-bound={threads}")
+
+
+def lane_width() -> int:
+    """How many clip_rank envelopes may run at once on THIS card. An operator's number still wins."""
+    env_raw = os.environ.get(_LANES_ENV)
+    try:
+        free = None if env_raw else _free_vram_mb()
+    except (OSError, ValueError) as e:
+        _log(f"⚠ could not ask the card for free VRAM ({type(e).__name__}: {e}) — one lane, still the GPU")
+        return 1
+    n, why = _width_from(free, _host_threads(), env_raw)
+    _log(f"{n} concurrent clip_rank lane(s): {why}")
+    return n
+
+
+_fetch_pool_lock = threading.Lock()
+_FETCH_POOL: "cf.ThreadPoolExecutor | None" = None
+
+
+def _fetch_pool() -> "cf.ThreadPoolExecutor":
+    """The ONE tile-fetch pool of this process — per-envelope pools would multiply with the lanes."""
+    global _FETCH_POOL
+    with _fetch_pool_lock:
+        if _FETCH_POOL is None:
+            try:
+                n = max(1, int(os.environ.get(_FETCH_WORKERS_ENV, "") or _FETCH_WORKERS_DEFAULT))
+            except ValueError:
+                n = _FETCH_WORKERS_DEFAULT
+            _FETCH_POOL = cf.ThreadPoolExecutor(max_workers=n, thread_name_prefix="tile")
+        return _FETCH_POOL
+
+
+def _fetch_tile(url: str, dest: Path):
+    """One tile: presigned GET → decode, or None. A url that will not fetch or decode is data, not a fault —
+    one dead tile must not fail a whole batch of beats."""
+    from PIL import Image
+
+    try:
+        return Image.open(download(url, dest)).convert("RGB")
+    except Exception:  # noqa: BLE001 — a broken tile is data, not a fault
+        return None
+
+
+def _submit_tiles(urls: list[str], workdir: Path) -> list:
+    """Put every tile on the wire NOW. Submitting FLAT — never a pool task that itself submits — is what
+    keeps a bounded shared pool from deadlocking on its own children."""
+    pool = _fetch_pool()
+    return [pool.submit(_fetch_tile, u, workdir / f"{i}.img") for i, u in enumerate(urls)]
+
+
+def _gather(futs: list) -> tuple[list, list[int]]:
+    """The decoded images and their REQUEST indices — a tile that came back None is dropped here."""
+    images: list = []
+    ok: list[int] = []
+    for i, f in enumerate(futs):
+        img = f.result()
+        if img is not None:
+            images.append(img)
+            ok.append(i)
+    return images, ok
 
 
 class ClipRankService:
@@ -43,13 +190,16 @@ class ClipRankService:
         t0 = time.monotonic()
         n = len(params.groups)
         with tempfile.TemporaryDirectory() as td:
+            # Every tile of every group goes on the wire before the FIRST forward, so the card never waits on
+            # a download it could already have had; group k is still forwarded in request order.
+            pending = [_submit_tiles(g.image_urls, Path(td) / f"g{i}") for i, g in enumerate(params.groups)]
             groups = []
             for i, g in enumerate(params.groups):
                 # Per-GROUP, not per-batch: a coalesced batch is many beats × many tiles over third-party
                 # CDNs, and "which group was it on" is the whole diagnosis when one wedges.
                 if progress is not None:
                     progress(f"clip_rank group {i + 1}/{n} ({len(g.image_urls)} tiles)")
-                groups.append(self._run_group(g, Path(td) / f"g{i}"))
+                groups.append(self._score(g, *_gather(pending[i])))
             payload = ClipRankPayload(model=self.model_id, groups=groups)
             out = Path(td) / "clip_rank.json"
             out.write_text(payload.model_dump_json())
@@ -60,7 +210,10 @@ class ClipRankService:
         return infer_s
 
     def _run_group(self, group: ClipRankGroup, workdir: Path) -> ClipRankGroupResult:
-        images, ok = self._fetch(group.image_urls, workdir)
+        """One group, both phases — run() pipelines them instead, so the fetch of k+1 overlaps k's forward."""
+        return self._score(group, *self._fetch(group.image_urls, workdir))
+
+    def _score(self, group: ClipRankGroup, images: list, ok: list[int]) -> ClipRankGroupResult:
         n = len(group.image_urls)
         if not images:
             return ClipRankGroupResult(scores=[_MISS] * n, embeds=[None] * n)
@@ -83,12 +236,23 @@ class ClipRankService:
         `pip install --no-deps .` once shipped an unpinned one past the pyproject pin, so guard in code too."""
         return out.pooler_output if hasattr(out, "pooler_output") else out
 
+    def _image_features(self, images: list):
+        """L2-normalized image vectors, CHUNKED at TILE_BATCH — one forward over a whole sheet made a lane's
+        VRAM a function of a beat's candidate count, which is not a number a lane can be sized against. The
+        chunks are concatenated on the DEVICE so the cosine below is bit-for-bit the one-forward answer."""
+        torch = self.torch
+        chunks = []
+        for a in range(0, len(images), TILE_BATCH):
+            iin = self.proc(images=images[a:a + TILE_BATCH], return_tensors="pt").to(self.device)
+            iin = {k: (v.to(self.dtype) if v.dtype == torch.float32 else v) for k, v in iin.items()}
+            chunks.append(torch.nn.functional.normalize(
+                self._feat(self.model.get_image_features(**iin)), dim=-1))
+        return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+
     def _forward(self, intent: str, images: list) -> tuple[list[float], list[list[float]]]:
         torch = self.torch
         with torch.no_grad():
-            iin = self.proc(images=images, return_tensors="pt").to(self.device)
-            iin = {k: (v.to(self.dtype) if v.dtype == torch.float32 else v) for k, v in iin.items()}
-            ie = torch.nn.functional.normalize(self._feat(self.model.get_image_features(**iin)), dim=-1)
+            ie = self._image_features(images)
             embeds = [[round(x, _DP) for x in e] for e in ie.float().cpu().tolist()]
             # NO intent = an embed-only caller (the image tower is text-independent). Bailing here would hand it
             # Nones and silently blind the dedup/MMR that asked ONLY for embeddings.
@@ -101,17 +265,5 @@ class ClipRankService:
 
     @staticmethod
     def _fetch(urls: list[str], workdir: Path) -> tuple[list, list[int]]:
-        """Download+decode each url; returns the decoded images and their REQUEST indices. A url that will
-        not fetch or decode is dropped here and scored -1.0/None by the caller, never raised — one dead tile
-        must not fail a whole batch of beats."""
-        from PIL import Image
-
-        images, ok = [], []
-        for i, url in enumerate(urls):
-            try:
-                path = download(url, workdir / f"{i}.img")
-                images.append(Image.open(path).convert("RGB"))
-                ok.append(i)
-            except Exception:  # noqa: BLE001 — a broken tile is data, not a fault
-                continue
-        return images, ok
+        """Download+decode every url CONCURRENTLY; returns the decoded images and their REQUEST indices."""
+        return _gather(_submit_tiles(urls, workdir))

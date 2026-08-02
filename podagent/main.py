@@ -6,6 +6,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import os
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -34,10 +35,14 @@ _MIN_POLL_INTERVAL_S = 1.0
 # one place the whole pipeline serialises: the brain fans b-roll ranking out ≤6 rank chains wide and awaits
 # them by corr_id (op_backend deliberately dropped its per-jid lane lock for exactly this), and every one of
 # them then queued behind the previous chain here. Ops go to a pool bounded by OPS_MAX_CHAINS, whose real
-# budget is the runner's box-wide step semaphore; render/infer keep a pool of ONE, so the GPU and the weight
-# caches stay single-threaded as before while a long render no longer blocks the CLAIM of an ops chain.
+# budget is the runner's box-wide step semaphore; clip_rank gets its OWN card-sized lane (~80% network, and
+# it queued behind renders — infer_cliprank.LANE_SIZING_WHY); align/face_probe/render keep the pool of ONE.
 _OPS_MAX_CHAINS_ENV = "OPS_MAX_CHAINS"
 _OPS_MAX_CHAINS_DEFAULT = 8
+
+# Two pools now run infer and both can miss the SAME weights hash at the same instant — a second 4.6 GB
+# SigLIP is an OOM, not a cache miss.
+_SVC_LOAD_LOCK = threading.Lock()
 
 BOOT_T0 = time.monotonic()
 
@@ -147,9 +152,13 @@ def _run_infer(
             assert req.clip_rank is not None and req.weights is not None
             rank_svc = rank_cache.get(req.weights.sha256)
             if rank_svc is None:
-                wdir = ensure(req.weights, req.model, note)
-                note(f"loading {req.model}")
-                rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
+                # Lanes race here; the SECOND one must wait for the load, not start its own.
+                with _SVC_LOAD_LOCK:
+                    rank_svc = rank_cache.get(req.weights.sha256)
+                    if rank_svc is None:
+                        wdir = ensure(req.weights, req.model, note)
+                        note(f"loading {req.model}")
+                        rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
             infer_s = rank_svc.run(req.clip_rank, req.put_url, note)
         else:
             from .infer_probe import ProbeService
@@ -267,25 +276,43 @@ def main() -> None:
     align_cache: dict[str, "AlignService"] = {}
     probe_cache: dict[tuple[Path, str], "ProbeService"] = {}
     rank_cache: dict[str, "ClipRankService"] = {}
-    boot: list[bool] = [False]   # a 1-wide pool owns this, so the flag stays effectively single-threaded
+    boot: list[bool] = [False]
+    boot_lock = threading.Lock()
+
+    def _claim_boot(taken: bool = True) -> bool:
+        # boot_s is BILLED once, so two lanes racing the first result may not both carry it — nor may an
+        # envelope that ERRORED keep a report it never sent.
+        with boot_lock:
+            first, boot[0] = not boot[0], taken
+            return first
 
     def _heavy(pod_job: PodJob) -> None:
         if pod_job.type == "infer":
             assert pod_job.request is not None
             request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
-            boot[0] = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
-                                 yunet_path, boot[0], corr_id=pod_job.corr_id)
+            mine = _claim_boot()
+            if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
+                              yunet_path, not mine, corr_id=pod_job.corr_id) and mine:
+                _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None
             spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
             _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
 
+    from .infer_cliprank import lane_width
+
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
-            cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool:
-        _dispatch_loop(cp, ops_pool, heavy_pool, _heavy)
+            cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool, \
+            cf.ThreadPoolExecutor(max_workers=lane_width(), thread_name_prefix="rank") as rank_pool:
+        _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy)
 
 
-def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, heavy: Any,
+def _is_clip_rank(pod_job: PodJob) -> bool:
+    """Does this envelope belong on the rank lane? Kind, never type — an `align` is weights on the card."""
+    return pod_job.type == "infer" and pod_job.request is not None and pod_job.request.kind == "clip_rank"
+
+
+def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: Any, heavy: Any,
                    once: bool = False) -> None:
     """Claim envelopes and hand them to a pool. `once` is the test seam — the production loop never returns."""
     while True:
@@ -314,7 +341,8 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, heavy: Any,
                 ops_pool.submit(_guarded,
                                 lambda c=chain, r=corr, s=sid: _run_ops(c, cp, corr_id=r, session_id=s), cp)
             else:
-                heavy_pool.submit(_guarded, lambda j=pod_job: heavy(j), cp)
+                pool = rank_pool if _is_clip_rank(pod_job) else heavy_pool
+                pool.submit(_guarded, lambda j=pod_job: heavy(j), cp)
             if once:
                 return
         except requests.RequestException as e:
