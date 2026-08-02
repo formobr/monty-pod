@@ -97,12 +97,18 @@ ENV REMOTION_CHROME_EXECUTABLE=/usr/bin/google-chrome-stable \
     REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
 
 # --- ffmpeg: BtbN static build (NVENC + libplacebo, not in ubuntu22.04 apt) -
-# `/releases/download/latest/`, NOT `/releases/latest/download/`: the second means "the newest release",
-# which on any day BtbN cuts a dated autobuild is NOT the rolling `latest` release and carries only
-# version-stamped asset names — the URL 404s, curl without --fail writes the error page, and tar dies with
-# "File format not recognized" three lines later. `--fail` so the next such day dies at the fetch.
+# PINNED to a dated autobuild's RELEASE-BRANCH asset, not the rolling `master-latest`. Master is built against
+# whatever nvenc SDK is current: the 2026-08-02 rebuild picked up SDK 13.1, which refuses to open h264_nvenc
+# under driver <610.00 — newer than any host our providers rent, so that image could not encode at all and
+# every render died. A moving ffmpeg is a supply chain, and this one has to be pinned like any other.
+# Bumping it: verify the new build opens h264_nvenc against the fleet's driver BEFORE publishing an image pin.
+ARG FFMPEG_BUILD=autobuild-2026-08-01-13-21
+ARG FFMPEG_ASSET=ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1.tar.xz
+# `/releases/download/<tag>/`, NOT `/releases/latest/download/`: the second means "the newest release",
+# which on any day BtbN cuts a dated autobuild carries only version-stamped asset names — the URL 404s, curl
+# without --fail writes the error page, and tar dies with "File format not recognized" three lines later.
 RUN curl -fL -o /tmp/ffmpeg.tar.xz \
-        https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_BUILD}/${FFMPEG_ASSET}" \
     && mkdir -p /tmp/ffmpeg && tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 \
     && install -m 0755 /tmp/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg \
     && install -m 0755 /tmp/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe \

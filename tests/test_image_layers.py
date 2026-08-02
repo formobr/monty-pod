@@ -84,3 +84,20 @@ def test_the_last_bucket_is_a_sweep():
     builder = dict(_stages())["pydeps"]
     assert any("find" in ln and "-maxdepth 1" in ln and "mv" in ln for ln in builder), (
         "no sweep bucket — a dependency added later would silently not be copied into the image")
+
+
+def test_ffmpeg_is_pinned_and_not_the_rolling_master():
+    """NEGATIVE: point this back at `master-latest` and it reddens. BtbN's master is built against whatever
+    nvenc SDK is current — the 2026-08-02 rebuild took SDK 13.1, which refuses h264_nvenc under driver
+    <610.00, so the image could not encode a single frame on any host our providers rent."""
+    text = "\n".join(ln for ln in DOCKERFILE.read_text().splitlines() if not ln.strip().startswith("#"))
+    assert "master-latest" not in text, (
+        "the image pulls BtbN's rolling master build — an unpinned encoder is a supply chain, and this one "
+        "shipped an ffmpeg needing a driver newer than the fleet has")
+    assert re.search(r"ARG FFMPEG_BUILD=autobuild-\d{4}-\d{2}-\d{2}", text), (
+        "no dated FFMPEG_BUILD tag — without one the URL follows whatever BtbN published last")
+    asset = re.search(r"ARG FFMPEG_ASSET=(\S+)", text)
+    assert asset, "no FFMPEG_ASSET pin"
+    assert re.search(r"-gpl-\d+\.\d+\.tar\.xz$", asset.group(1)), (
+        f"FFMPEG_ASSET {asset.group(1)!r} is not a release-branch build (…-gpl-<n.n>.tar.xz) — only the "
+        "release branches were verified to open h264_nvenc on the fleet's driver")

@@ -103,6 +103,32 @@ def _log_gpu_status() -> None:
         _log(f"WARNING GPU status check failed: {e}")
 
 
+def _nvenc_or_refuse(cp: "ControlPlane") -> None:
+    """Encode ONE frame before claiming anything, and die loudly if the card will not take it. The driver the
+    provider boots is not ours to choose, so a working encoder is a per-POD fact, not an image-build one."""
+    import subprocess
+    probe = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", "color=c=black:s=256x256:d=0.1", "-c:v", "h264_nvenc", "-preset", "p5",
+             "-frames:v", "1", "-f", "null", "-"]
+    try:
+        r = subprocess.run(probe, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        detail = f"{type(e).__name__}: {e}"
+    else:
+        if r.returncode == 0:
+            _log("nvenc probe OK — h264_nvenc opens on this host")
+            return
+        detail = f"exit {r.returncode}: {(r.stderr or b'')[-600:].decode('utf-8', 'replace').strip()}"
+    # Refused HERE or discovered 157 s into ingest, with b-roll already paid for on the same run.
+    msg = f"REFUSING work: h264_nvenc will not open on this pod — {detail}"
+    _log(msg)
+    try:
+        cp.note({"stage": "boot", "status": "error", "step": msg})
+    except Exception:  # noqa: BLE001 — the refusal stands whether or not the beacon lands
+        pass
+    sys.exit(3)
+
+
 def _run_infer(
     raw: dict[str, Any],
     cp: ControlPlane,
@@ -271,6 +297,7 @@ def main() -> None:
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
     _report_boot(cp)
+    _nvenc_or_refuse(cp)   # after the beacon, so a refusal reaches the box instead of dying mute
 
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
     align_cache: dict[str, "AlignService"] = {}
