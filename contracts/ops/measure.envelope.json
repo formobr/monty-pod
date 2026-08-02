@@ -1,0 +1,43 @@
+{
+  "op": "measure.envelope",
+  "version": 1,
+  "summary": "Measure a track's LEVEL CONTOUR as numbers: the per-frame RMS in dB, plus each frame's centre time, over a sliding window whose length, step and decode rate the caller names. Values only, unrounded. Audio is interleaved in the container, so this cannot be a range fetch — producing the contour means a full decode, and until now that decode ran wherever the READER ran rather than where the bytes are. What a level MEANS — what counts as loud enough, how near a level a boundary may be placed, what is a pause and what is one sound inside a word — is decided entirely by the caller and none of it is representable here.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "FRAME FOR FRAME, because the frames ARE the boundaries: the caller places an edit at a frame time, so a level that differs in the last place can move where a recording is cut, silently and irreversibly. Nothing is rounded — a float goes out through repr and comes back the same float. The decode is a PURE function of (sample_rate) and is the argv the reader shelled before this op, character for character, down to the 16-bit wav intermediate: a float32 pipe would carry different samples (no quantisation), hence a different contour. The framing is a plain sliding RMS with no library between it and the samples. libswresample is deterministic for identical input bytes and settings, so exactness is a property of a PINNED image, exactly as the mp3 encoder's claim is. The caller's suite decodes and frames one input through the pre-migration in-reader implementation and through this handler and compares the resulting EDIT BOUNDARIES for equality, not closeness. `needs: video_encode` is an honest OVER-declaration: the closed vocabulary has no audio verb and no video-encoder argv is constructed here. WHAT DOES NOT CROSS: window, step and rate are the INSTRUMENT's resolution — what is resolvable, the same class of fact as an image op's height — never what to do about it. No pad, no minimum gap, no level that means speech, no notion of a word; the threshold this contour is compared against is built by the caller from the contour's own percentiles, on the caller's machine, which is why the output is a raw contour and not a list of regions. WHY THIS IS NOT A MODE OF THE SILENCE READING: that op's envelope frames NON-overlapping at a rate it fixes internally and rounds for transport, and both are right THERE — its consumer re-derives a floor from the same rounded numbers, so the rounding cancels on both sides of the comparison, and a caller-chosen grid would let a caller shape that derivation. Neither holds here. This window slides, at four times the resolution, and its consumer compares unrounded levels against a threshold built from unrounded percentiles, where a rounding is a coin flip on a frame and half the time resolution is a moved boundary. Widening that op to cover both would put a second algorithm behind a parameter and delete the guard that keeps its grid out of a caller's hands; two declarations that share a word cost one file."
+  },
+  "inputs": [
+    {"id": "src", "kind": "audio"}
+  ],
+  "outputs": [
+    {"id": "measured", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["sample_rate", "win", "hop"],
+    "properties": {
+      "sample_rate": {
+        "type": "integer",
+        "minimum": 8000,
+        "maximum": 48000,
+        "description": "Decode rate in Hz. Required, with no default: a rate assumed here rather than named by the caller would resample the very signal being measured, and the caller could not tell."
+      },
+      "win": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 1,
+        "description": "Analysis window length in seconds. How much signal each level averages — the instrument's integration time. Required, with no default, for the same reason as the rate: the grid belongs to whoever reads the contour, and a default here is a second spelling of it."
+      },
+      "hop": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 1,
+        "description": "Step between consecutive windows in seconds, which is the contour's TIME RESOLUTION and therefore the finest distance any consumer of it can resolve. Required, with no default. It says what is resolvable, never what is worth acting on."
+      }
+    }
+  },
+  "handler": "montyops.measure_envelope:run"
+}
