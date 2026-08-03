@@ -96,8 +96,17 @@ def test_an_unknown_param_is_refused_whole_which_is_why_the_engine_gates():
         registry.validate_params("media.scale", {**_SCALE, "no_upscale": True})
 
 
+def test_the_browser_encode_profile_is_accepted_and_a_made_up_one_is_not():
+    """The lane that only a player reads may be cheap; the lane the face detector reads may not, so the two
+    are separate NAMES the pod validates — a typo must die here, not ship a preview at master cost."""
+    pytest.importorskip("jsonschema")
+    registry.validate_params("media.scale", {**_SCALE, "encode_profile": "browser"})
+    with pytest.raises(registry.OpError, match="invalid params"):
+        registry.validate_params("media.scale", {**_SCALE, "encode_profile": "cheap"})
+
+
 def test_the_op_version_moved_but_the_envelope_did_not():
     """A param added to an existing op bumps THAT op; `contracts/VERSION` pins the envelope and stays put —
     the split that makes a new tool cost two files instead of a release."""
-    assert _decl("media.scale")["version"] == 2
+    assert _decl("media.scale")["version"] == 3
     assert (CONTRACTS / "VERSION").read_text().strip() == "5"
