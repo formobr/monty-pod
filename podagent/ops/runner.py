@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 
 from ..artifact import log
 from ..cp import download, upload
-from . import pack, registry
+from . import inputcache, pack, registry
 
 MAX_PARALLEL_ENV = "OPS_MAX_PARALLEL"
 
@@ -150,11 +150,16 @@ class Workspace:
         return d
 
     def fetch(self, url: str) -> Path:
-        """Download once per distinct URL, however many steps bind it."""
+        """Download once per distinct OBJECT, however many steps — or chains — bind it."""
         with self._lock:
             hit = self._downloads.get(url)
         if hit is not None:
             return hit
+        # keyed by the object, so it survives the chain and a re-minted presign
+        shared = inputcache.get(url, download, log=log)
+        if shared is not None:
+            with self._lock:
+                return self._downloads.setdefault(url, shared)
         dest = self.root / "_in" / f"{abs(hash(url)):016x}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         # Two steps racing the same URL both download; the loser's copy is byte-identical and discarded.
