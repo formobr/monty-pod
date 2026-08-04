@@ -80,6 +80,11 @@
         "id": {"type": "string", "minLength": 1},
         "kind": {"enum": ["video", "audio", "image", "font", "code", "json", "dir"]},
         "optional": {"type": "boolean", "default": false},
+        "many": {
+          "type": "boolean",
+          "default": false,
+          "description": "Output only. True = this port is a LIST of files — one per element the params ask for — and the step binds `urls` (one address per element, in the same order) instead of `url`. It exists because ONE decode can answer N questions about the same input while one output per step forces N decodes: the runner hands the handler N destination paths and moves each one that was written. Without it the arity of a step is the arity of its transport, which is a property of the wire, not of the work."
+        },
         "durable": {
           "type": "boolean",
           "default": false,

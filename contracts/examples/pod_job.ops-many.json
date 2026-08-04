@@ -1,0 +1,39 @@
+{
+  "type": "ops",
+  "chain": {
+    "chain_version": 1,
+    "job_id": "demo-job",
+    "pack": {
+      "url": "https://r2.example/ops-pack/6b1f0c8a.tar?X-Amz-Signature=redacted",
+      "sha256": "6b1f0c8a2d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8",
+      "size": 20480
+    },
+    "steps": [
+      {
+        "id": "fetch",
+        "op": "media.fetch",
+        "needs": [],
+        "params": { "url": "https://cdn.example/clip.mp4" },
+        "inputs": [],
+        "outputs": []
+      },
+      {
+        "id": "frames",
+        "op": "media.frames",
+        "needs": ["fetch"],
+        "params": { "positions": [0.0, 0.25, 0.5], "width": 384, "height": 384, "fit": "cover" },
+        "inputs": [{ "port": "src", "from_step": "fetch" }],
+        "outputs": [
+          {
+            "port": "frames",
+            "urls": [
+              "https://r2.example/work/demo/g000.png?X-Amz-Signature=redacted",
+              "https://r2.example/work/demo/g001.png?X-Amz-Signature=redacted",
+              "https://r2.example/work/demo/g002.png?X-Amz-Signature=redacted"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

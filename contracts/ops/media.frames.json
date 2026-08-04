@@ -1,0 +1,51 @@
+{
+  "op": "media.frames",
+  "version": 1,
+  "summary": "Sample frames of a clip at given fractions of its own duration and write each one as its own image, one file per fraction. Geometry in, N pictures out.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "SAME PIXELS AS ONE SEEK PER FRAME, which is the whole reason this op exists rather than a loop. Asking a container for N frames one accurate seek at a time re-decodes the run-up to each of them and pays a process each time; here ONE linear decode passes every requested frame through the same crop and scale. The frames are therefore the frames the per-seek form produces, byte for byte — tests/test_op_media_frames.py decodes a real clip both ways and compares the bytes rather than reasoning about them. When the single pass cannot answer (a source with no duration to take fractions of, or two fractions landing on one frame, so the count that comes back is not the count that was asked for) the handler falls back to exactly that per-seek form, so the slow path and the fast path are the same picture and only the cost differs. No `flags=` is set on the scaler ON PURPOSE: these frames are read by a vision model, and their pixels must not change on the day the work moved off the box. FAILURE: `frames` is OPTIONAL and per element — a frame that will not render leaves no file rather than raising, because one chain carries a whole batch and a raising handler would let one unreadable clip kill every sibling. A malformed PARAM still raises, in milliseconds."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "frames", "kind": "image", "durable": true, "optional": true, "many": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["positions", "width", "height"],
+    "properties": {
+      "positions": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 64,
+        "items": {"type": "number", "minimum": 0, "maximum": 1},
+        "description": "Where to sample, as fractions of the clip's OWN duration, one per bound address and in the same order. A GEOMETRY, the same class of fact as `width` — and the hard line of this op: no frame-SELECTION rule may ever appear in these params. Nothing here may say 'pick the most dynamic frame', 'sample denser where something happens', or carry a motion threshold; anything of that shape is computed by the caller and arrives already collapsed into numbers. There is no separate `count`: the number of images IS len(positions), and a second source for it would be a drift surface, not a convenience."
+      },
+      "width": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 1024,
+        "multipleOf": 2,
+        "description": "Cell width in pixels. Every image is width x height."
+      },
+      "height": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 2048,
+        "multipleOf": 2,
+        "description": "Cell height in pixels. Width:height is also the crop aspect under fit=cover."
+      },
+      "fit": {
+        "enum": ["cover", "contain", "contain_alpha"],
+        "default": "cover",
+        "description": "How a frame meets the cell. `cover` centre-crops to the cell aspect — the real full-bleed framing a viewer sees. `contain` letterboxes on the pad colour. `contain_alpha` letterboxes on TRANSPARENCY, for art whose backplate cannot be chosen here. Geometry, not intent: WHICH one an asset gets is decided by the caller and crosses as one enum value, never as the rule that produced it."
+      }
+    }
+  },
+  "handler": "montyops.media_frames:run"
+}

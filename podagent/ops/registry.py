@@ -38,6 +38,8 @@ class Port:
     kind: str
     optional: bool = False
     durable: bool = False
+    # A LIST port: the step binds `urls` and the handler is handed one destination path per element.
+    many: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,7 +66,8 @@ class Op:
 def _port(raw: dict[str, Any]) -> Port:
     return Port(id=raw["id"], kind=raw["kind"],
                 optional=bool(raw.get("optional", False)),
-                durable=bool(raw.get("durable", False)))
+                durable=bool(raw.get("durable", False)),
+                many=bool(raw.get("many", False)))
 
 
 def _load_one(path: Path) -> Op:
@@ -80,6 +83,11 @@ def _load_one(path: Path) -> Op:
         raise OpError(f"{path.name}: parity.mode must be one of {sorted(PARITY_MODES)}")
     if raw["op"] != path.stem:
         raise OpError(f"{path.name}: declares op={raw['op']!r} but is filed as {path.stem!r}")
+    # `many` and `durable` are OUTPUT words; the port $def is shared, so the polarity is checked here.
+    for p in raw.get("inputs", []):
+        if p.get("many") or p.get("durable"):
+            raise OpError(f"{path.name}: input port {p['id']!r} declares an output-only flag "
+                          f"(many/durable) — an input is one file the caller already addressed")
     ps = raw["params"]
     if ps.get("type") != "object" or ps.get("additionalProperties") is not False:
         # An open params bag is argv wearing a hat: it re-admits code across the seam, re-publishes the

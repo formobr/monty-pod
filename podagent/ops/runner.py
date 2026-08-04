@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlparse
 
 from ..artifact import log
@@ -187,7 +187,37 @@ def _ext(binding: Any, port: registry.Port) -> str:
     return _KIND_EXT.get(port.kind, "")
 
 
-def _bind_inputs(step: Any, op: registry.Op, ws: Workspace, produced: dict[str, dict[str, Path]]) -> dict[str, Path]:
+ARITY_WHY: Final[str] = """
+ONE STEP MAY PRODUCE N ADDRESSABLE FILES. A port the registry declares `many` is bound with `urls` — one
+address per element — and the handler is handed a LIST of destination paths under the step's directory
+instead of a single one. Everything else about that port is unchanged: the same existence check, the same
+uploads, the same first-failure-raises polarity a step with two ports already had.
+
+WHY IT IS THE PORT, NOT THE STEP, THAT GREW. The step is the unit of scheduling and of failure, and neither
+of those wants to be N — a fan-out of N steps is already expressible and is the right shape when the N pieces
+of work are independent. This is the other case: N results that one pass over one input produces together,
+where splitting them into N steps means N passes. Reading the same input N times to write N files is a cost
+the transport was imposing on the work.
+
+A `many` PORT IS WRITE-ONLY WITHIN THE CHAIN: `from_step` may not read one, because "which of the N" is a
+question a binding cannot ask today, and guessing is how a later step silently composites the wrong file.
+
+THE FAILURE POLARITY IS THE ONE A TWO-PORT STEP ALREADY HAD. `upload` retries three times per object and
+then raises, and the raise ends the STEP — exactly as a step whose second port will not move loses its
+first. Elements past the failure are not attempted: an address the store has refused three times with
+backoff will refuse the next one too, and a rented box may not spend its lease proving that. What already
+landed STAYS landed, so a caller that addresses its files by content re-cuts only the holes. An element the
+handler chose not to write is not a failure at all — the port carries its own `optional`, and a missing
+element simply has nothing to move.
+"""
+
+
+def _many_dir(out_dir: Path, port: str) -> Path:
+    return out_dir / f"_{port}"
+
+
+def _bind_inputs(step: Any, op: registry.Op, ws: Workspace,
+                 produced: dict[str, dict[str, Any]]) -> dict[str, Path]:
     declared = {p.id: p for p in op.inputs}
     bound: dict[str, Path] = {}
     for b in step.inputs:
@@ -198,11 +228,18 @@ def _bind_inputs(step: Any, op: registry.Op, ws: Workspace, produced: dict[str, 
             want = b.from_port or b.port
             if b.from_port is None and want not in src and len(src) == 1:
                 # single-output producer: bind it positionally, the common chain shape
-                bound[b.port] = next(iter(src.values()))
+                only = next(iter(src.values()))
+                if isinstance(only, list):
+                    raise ChainError(f"step {step.id!r}: {b.from_step!r} produced a LIST port; a binding "
+                                     f"cannot say which of its {len(only)} files to read (ARITY_WHY)")
+                bound[b.port] = only
                 continue
             if want not in src:
                 raise ChainError(
                     f"step {step.id!r}: {b.from_step!r} produced {sorted(src)}, not {want!r}")
+            if isinstance(src[want], list):
+                raise ChainError(f"step {step.id!r}: {b.from_step!r}.{want!r} is a LIST port; a binding "
+                                 f"cannot say which of its {len(src[want])} files to read (ARITY_WHY)")
             bound[b.port] = src[want]
         elif b.path is not None:
             p = Path(b.path)
@@ -218,7 +255,46 @@ def _bind_inputs(step: Any, op: registry.Op, ws: Workspace, produced: dict[str, 
     return bound
 
 
-def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Path]]) -> dict[str, Path]:
+def assert_output_arity(step: Any, op: registry.Op) -> None:
+    """Do the step's output bindings agree with the arity the op declares (ARITY_WHY)? Pure — no disk."""
+    declared = {p.id: p for p in op.outputs}
+    bound = {b.port for b in step.outputs}
+    for b in step.outputs:
+        if b.port not in declared:
+            raise ChainError(f"step {step.id!r}: op {op.op} declares no output port {b.port!r}")
+        if declared[b.port].many and b.urls is None:
+            raise ChainError(f"step {step.id!r}: output {b.port!r} is a LIST port and must bind `urls`; "
+                             f"a single `url` cannot address its files")
+        if b.urls is not None and not declared[b.port].many:
+            raise ChainError(f"step {step.id!r}: output {b.port!r} binds `urls`, but {op.op} declares it as "
+                             f"ONE file — the addresses would have nothing to name")
+    for p in op.outputs:
+        # Unbound, so nobody said how many. A LIST port nothing addresses is a decode nothing reads.
+        if p.many and p.id not in bound:
+            raise ChainError(f"step {step.id!r}: op {op.op} declares LIST output {p.id!r}, which must be "
+                             f"bound with `urls` — its arity is the binding's, not the handler's")
+
+
+def _bind_outputs(step: Any, op: registry.Op, out_dir: Path) -> dict[str, Any]:
+    """Destination paths per declared output port: one Path, or a LIST of them for a `many` port."""
+    assert_output_arity(step, op)
+    declared = {p.id: p for p in op.outputs}
+    outputs: dict[str, Any] = {}
+    for b in step.outputs:
+        port = declared[b.port]
+        if port.many:
+            d = _many_dir(out_dir, b.port)
+            d.mkdir(parents=True, exist_ok=True)
+            outputs[b.port] = [d / f"{i:04d}{_ext(b, port)}" for i in range(len(b.urls))]
+        else:
+            outputs[b.port] = out_dir / (b.port + _ext(b, port))
+    for p in op.outputs:
+        if not p.many:
+            outputs.setdefault(p.id, out_dir / (p.id + _ext(None, p)))
+    return outputs
+
+
+def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]]) -> dict[str, Any]:
     # The box-wide slot is taken for the WHOLE step, binding included: a fetch is transport this box pays for
     # too, and letting N chains bind concurrently outside the budget is how the disk, not the CPU, becomes
     # the bound nobody sized.
@@ -226,7 +302,7 @@ def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Path]]) ->
         return _run_step_inner(step, ws, produced)
 
 
-def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Path]]) -> dict[str, Path]:
+def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]]) -> dict[str, Any]:
     op = registry.get(step.op)
     # Refuse a judgement op HERE, on the executing box, before anything is fetched or run. Redundant with
     # the control plane's placement check by design: a check that lives only where the routing decision is
@@ -237,13 +313,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Path
     inputs = _bind_inputs(step, op, ws, produced)
     out_dir = ws.step_dir(step.id)
     declared_out = {p.id: p for p in op.outputs}
-    outputs: dict[str, Path] = {}
-    for b in step.outputs:
-        if b.port not in declared_out:
-            raise ChainError(f"step {step.id!r}: op {op.op} declares no output port {b.port!r}")
-        outputs[b.port] = out_dir / (b.port + _ext(b, declared_out[b.port]))
-    for p in op.outputs:
-        outputs.setdefault(p.id, out_dir / (p.id + _ext(None, p)))
+    outputs = _bind_outputs(step, op, out_dir)
 
     fn = pack.resolve(op.handler)
     t0 = time.monotonic()
@@ -255,15 +325,30 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Path
     dt = time.monotonic() - t0
 
     for port, path in outputs.items():
-        if not path.exists() and not declared_out[port].optional:
-            raise ChainError(f"step {step.id!r}: handler produced no {port!r} at {path}")
+        for one in (path if isinstance(path, list) else [path]):
+            if not one.exists() and not declared_out[port].optional:
+                raise ChainError(f"step {step.id!r}: handler produced no {port!r} at {one}")
     log(f"op {step.op} [{step.id}] ok in {dt:.1f}s")
 
     # Only NOW does anything leave the box, and only for bindings that named a url.
     for b in step.outputs:
         if b.url is not None and outputs[b.port].exists():
             upload(outputs[b.port], b.url)
+        elif b.urls is not None:
+            _upload_many(step, b, outputs[b.port])
     return outputs
+
+
+def _upload_many(step: Any, b: Any, paths: list[Path]) -> None:
+    """A LIST port's files to the addresses that named them, index by index (ARITY_WHY)."""
+    for i, (path, url) in enumerate(zip(paths, b.urls)):
+        if not path.exists():
+            continue
+        try:
+            upload(path, url)
+        except Exception as e:
+            raise ChainError(f"step {step.id!r}: output {b.port!r}[{i}] of {len(b.urls)} would not upload "
+                             f"({type(e).__name__}: {e}); {i} element(s) before it did land") from e
 
 
 def preflight_chain(chain: Any) -> None:
@@ -289,16 +374,23 @@ def preflight_chain(chain: Any) -> None:
     for step in chain.steps:
         registry.assert_pod_safe(step.op)
         registry.validate_params(step.op, step.params)
+        # arity is knowable now too: N addresses against a port that yields one file is a chain that cannot
+        # be run, and learning it after the decode costs the decode
+        assert_output_arity(step, registry.get(step.op))
         for b in step.inputs:
             if b.from_port is None:
                 continue
             # a hand-off that names a port its producer does not declare is knowable now, and knowing it
             # after the producing encode has run costs that encode
-            ports = {p.id for p in registry.get(op_of[b.from_step]).outputs}
-            if b.from_port not in ports:
+            out_ports = {p.id: p for p in registry.get(op_of[b.from_step]).outputs}
+            if b.from_port not in out_ports:
                 raise ChainError(
                     f"step {step.id!r}: input {b.port!r} reads {b.from_step!r}.{b.from_port!r}, but "
-                    f"{op_of[b.from_step]} declares outputs {sorted(ports)}")
+                    f"{op_of[b.from_step]} declares outputs {sorted(out_ports)}")
+            if out_ports[b.from_port].many:
+                raise ChainError(
+                    f"step {step.id!r}: input {b.port!r} reads {b.from_step!r}.{b.from_port!r}, which is a "
+                    f"LIST port — a binding cannot say which of its files to read (ARITY_WHY)")
 
 
 def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
@@ -319,7 +411,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
 
     tmp = Path(tempfile.mkdtemp(prefix="opchain_"))
     ws = Workspace(tmp)
-    produced: dict[str, dict[str, Path]] = {}
+    produced: dict[str, dict[str, Any]] = {}
     by_id = {s.id: s for s in chain.steps}
     deps = {s.id: set(s.needs) | {b.from_step for b in s.inputs if b.from_step} for s in chain.steps}
     pending = set(by_id)
@@ -384,6 +476,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                        step=sid, op=by_id[sid].op)
         _event(job_id=chain.job_id, stage="ops", status="ok", steps=sorted(produced),
                skipped=sorted(failed))
-        return {sid: {p: str(v) for p, v in outs.items()} for sid, outs in produced.items()}
+        return {sid: {p: ([str(x) for x in v] if isinstance(v, list) else str(v))
+                      for p, v in outs.items()} for sid, outs in produced.items()}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

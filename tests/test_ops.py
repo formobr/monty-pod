@@ -312,7 +312,7 @@ def test_a_missing_optional_output_is_allowed_and_a_missing_required_one_is_not(
         "id": "s", "op": op.op, "params": {}, "needs": [],
         "inputs": [type("B", (), {"port": p.id, "url": None, "from_step": None, "path": str(src)})()
                    for p in op.inputs],
-        "outputs": [type("B", (), {"port": required, "url": None})()]})()
+        "outputs": [type("B", (), {"port": required, "url": None, "urls": None})()]})()
     ws = runner.Workspace(tmp_path)
 
     def _handler(*, params, inputs, outputs):
@@ -428,3 +428,161 @@ def test_a_chain_this_image_can_run_passes_preflight():
     from podagent.ops import runner
 
     runner.preflight_chain(OpChain(job_id="j", pack=_PACK, steps=[_step("a"), _step("b", needs=["a"])]))
+
+
+# ── ONE step, N addressable outputs (runner.ARITY_WHY) ───────────────────────────────────────────
+
+def _frames_step(sid="g", n=3, **kw):
+    base = {"id": sid, "op": "media.frames", "needs": [],
+            "params": {"positions": [i / n for i in range(n)], "width": 384, "height": 384},
+            "inputs": [{"port": "src", "url": "https://x/in.mp4"}],
+            "outputs": [{"port": "frames", "urls": [f"https://x/g{i}.png" for i in range(n)]}]}
+    base.update(kw)
+    return base
+
+
+def test_a_list_port_binds_one_address_per_file():
+    """The arity of a step was the arity of its transport: one path per declared port, so N frames of ONE
+    decode needed N steps and therefore N decodes. NEGATIVE: bind `urls` to a port the op declares as ONE
+    file and the addresses name nothing — that must be refused, not silently truncated to the first."""
+    from podagent.ops import runner
+
+    chain = OpChain(job_id="j", pack=_PACK, steps=[_frames_step()])
+    runner.preflight_chain(chain)
+
+    single = OpChain(job_id="j", pack=_PACK, steps=[
+        _step("a", outputs=[{"port": "dst", "urls": ["https://x/1.mp4", "https://x/2.mp4"]}])])
+    with pytest.raises(runner.ChainError, match="ONE file"):
+        runner.preflight_chain(single)
+
+
+def test_a_list_port_bound_with_a_single_url_is_refused_at_claim():
+    """NEGATIVE, and the reason it is at claim: the count of files comes from the BINDING, so a `url` where
+    `urls` belongs is a decode whose results have nowhere to go — knowable before the fetch."""
+    from podagent.ops import runner
+
+    chain = OpChain(job_id="j", pack=_PACK, steps=[
+        _frames_step(outputs=[{"port": "frames", "url": "https://x/one.png"}])])
+    with pytest.raises(runner.ChainError, match="must bind `urls`"):
+        runner.preflight_chain(chain)
+
+
+def test_a_list_port_nobody_addressed_is_refused():
+    """NEGATIVE: unbound, nothing says HOW MANY — and a decode whose output nothing reads is rent spent on
+    nothing. The arity is the binding's, never the handler's guess."""
+    from podagent.ops import runner
+
+    chain = OpChain(job_id="j", pack=_PACK, steps=[_frames_step(outputs=[])])
+    with pytest.raises(runner.ChainError, match="must be bound with `urls`"):
+        runner.preflight_chain(chain)
+
+
+def test_a_later_step_may_not_read_a_list_port():
+    """NEGATIVE: `from_step` names a port, not an element, so 'which of the N' is a question the binding
+    cannot ask — and a runner that guessed would hand a later step the wrong picture, silently."""
+    from podagent.ops import runner
+
+    chain = OpChain(job_id="j", pack=_PACK, steps=[
+        _frames_step("g"),
+        _step("s", needs=["g"], op="media.sheet",
+              params={"cols": 1, "cell_w": 384, "cell_h": 384, "gap": 0, "head": 0, "caption_h": 0,
+                      "plate": True, "bg": [18, 18, 18], "captions": [[]]},
+              inputs=[{"port": "tile0", "from_step": "g", "from_port": "frames"}],
+              outputs=[{"port": "sheet", "url": "https://x/s.png"}])])
+    with pytest.raises(runner.ChainError, match="LIST port"):
+        runner.preflight_chain(chain)
+
+
+def test_an_input_may_not_bind_urls():
+    """An input is ONE file: N addresses on one input port have no defined order to be read in, and the
+    runner would have to invent one. N inputs are N ports."""
+    with pytest.raises(ValidationError, match="only an output may"):
+        OpChain(job_id="j", pack=_PACK, steps=[
+            _step("a", inputs=[{"port": "src", "urls": ["https://x/1.mp4", "https://x/2.mp4"]}])])
+
+
+def test_a_binding_still_names_exactly_one_source():
+    with pytest.raises(ValidationError, match="exactly one of url/urls/from_step/path"):
+        OpChain(job_id="j", pack=_PACK, steps=[
+            _step("a", outputs=[{"port": "dst", "url": "https://x/1.mp4", "urls": ["https://x/2.mp4"]}])])
+
+
+def test_every_element_of_a_list_port_is_moved_to_its_own_address(tmp_path, monkeypatch):
+    """The whole point, end to end through the runner: ONE handler call, N destination paths, N uploads —
+    index i to address i. NEGATIVE: hand the handler a single path and the step can deliver one frame."""
+    from podagent.ops import runner
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(runner, "upload", lambda src, url: sent.append((src.name, url)))
+    monkeypatch.setattr(runner.registry, "validate_params", lambda *a, **k: None)
+
+    seen: dict = {}
+
+    def _handler(*, params, inputs, outputs):
+        seen["paths"] = list(outputs["frames"])
+        for i, p in enumerate(outputs["frames"]):
+            p.write_text(f"frame {i}")
+
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler)
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"x")
+    step = OpChain(job_id="j", pack=_PACK, steps=[
+        _frames_step(n=4, inputs=[{"port": "src", "path": str(src)}])]).steps[0]
+
+    out = runner._run_step(step, runner.Workspace(tmp_path / "ws"), {})
+    assert len(seen["paths"]) == 4 and len(set(seen["paths"])) == 4, "the handler got one path per address"
+    assert [u for _n, u in sent] == [f"https://x/g{i}.png" for i in range(4)]
+    assert [Path(p).read_text() for p in out["frames"]] == [f"frame {i}" for i in range(4)]
+
+
+def test_an_element_the_handler_did_not_write_is_simply_not_moved(tmp_path, monkeypatch):
+    """`frames` is optional PER ELEMENT: one frame that will not render must cost that frame, not the batch
+    — the same polarity the single-file strip already had. NEGATIVE: require every element and one dead
+    position takes its siblings down."""
+    from podagent.ops import runner
+
+    sent: list[str] = []
+    monkeypatch.setattr(runner, "upload", lambda src, url: sent.append(url))
+    monkeypatch.setattr(runner.registry, "validate_params", lambda *a, **k: None)
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: (
+        lambda *, params, inputs, outputs: [p.write_text("f") for i, p in enumerate(outputs["frames"])
+                                            if i != 1]))
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"x")
+    step = OpChain(job_id="j", pack=_PACK, steps=[
+        _frames_step(n=3, inputs=[{"port": "src", "path": str(src)}])]).steps[0]
+
+    out = runner._run_step(step, runner.Workspace(tmp_path / "ws"), {})
+    assert sent == ["https://x/g0.png", "https://x/g2.png"], "a missing element must not raise, and must "\
+                                                             "not shift the addresses of the others"
+    assert not Path(out["frames"][1]).exists()
+
+
+def test_an_element_that_will_not_upload_fails_the_step_and_names_which(tmp_path, monkeypatch):
+    """The failure polarity a two-port step already had: `upload` retries and then raises, and the raise ends
+    the STEP. NEGATIVE — the two halves that matter: (1) what already landed STAYS landed, so a caller that
+    addresses its files by content re-cuts only the holes; (2) elements after the failure are NOT attempted,
+    because an address the store refused three times with backoff will refuse the next one too and a rented
+    box may not spend its lease proving it."""
+    from podagent.ops import runner
+
+    sent: list[str] = []
+
+    def _upload(src, url):
+        if url.endswith("g2.png"):
+            raise RuntimeError("503 from the store")
+        sent.append(url)
+
+    monkeypatch.setattr(runner, "upload", _upload)
+    monkeypatch.setattr(runner.registry, "validate_params", lambda *a, **k: None)
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: (
+        lambda *, params, inputs, outputs: [p.write_text("f") for p in outputs["frames"]]))
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"x")
+    step = OpChain(job_id="j", pack=_PACK, steps=[
+        _frames_step(n=5, inputs=[{"port": "src", "path": str(src)}])]).steps[0]
+
+    with pytest.raises(runner.ChainError, match=r"frames'\[2\] of 5"):
+        runner._run_step(step, runner.Workspace(tmp_path / "ws"), {})
+    assert sent == ["https://x/g0.png", "https://x/g1.png"], "what landed before the failure must stay, and "\
+                                                             "nothing after it may be attempted"
