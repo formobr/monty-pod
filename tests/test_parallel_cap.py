@@ -78,7 +78,7 @@ def test_concurrent_chains_share_one_step_budget(monkeypatch):
     lock = threading.Lock()
     gate = threading.Event()
 
-    def _step(step, ws, produced):
+    def _step(step, ws, produced, sink=None):
         nonlocal live, peak
         with lock:
             live += 1

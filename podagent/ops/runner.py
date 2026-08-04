@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
 from urllib.parse import urlparse
@@ -294,15 +295,100 @@ def _bind_outputs(step: Any, op: registry.Op, out_dir: Path) -> dict[str, Any]:
     return outputs
 
 
-def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]]) -> dict[str, Any]:
+STEP_TIMING_WHY: Final[str] = """
+THE BOX BOOKED ONE NUMBER PER CHAIN AND COULD NOT SAY WHAT IT BOUGHT.
+
+Measured 2026-08-04/05: a b-roll fetch leg cost 4.13 s at the median and 33.61 s at the slowest one that
+DELIVERED, for the same ~5-7 MB interior window of a 4K master. 7 MB in 33 s is 0.2 MB/s, which no CDN does.
+The box could not tell a slow origin from a long GOP walk from its own transport losing the terminal over
+finished work, because one span covered the enqueue, the claim, every step and the trip home.
+
+THIS BOX IS THE ONLY PLACE THE SPLIT EXISTS, so this is where it is measured and it rides home on the
+terminal. Three legs the runner itself can always see, for EVERY op:
+
+  · `bind`  — pulling this step's inputs into the workspace. Real transport, paid before any frame decodes,
+              and free on a `from_step` hand-off (which is the whole point of the local-disk chain).
+  · `run`   — the handler call. What the op actually costs on this hardware.
+  · `put`   — the outputs leaving for their durable address. The other half of the transport.
+
+...plus whatever the HANDLER can see inside `run`, through the pack's optional recorder (pack.LEGS_MODULE).
+`media.fetch` is the case that motivated all of this: its origin GET happens INSIDE the handler, so the
+runner's three legs would place the whole 33 s in `run` and answer nothing.
+
+ADDITIVE IN BOTH DIRECTIONS. An older pack has no recorder and the handler legs are simply absent; an older
+control plane drops the whole `timings` key and answers 202. Nothing here may ever be load-bearing for the
+work — a measurement that can fail the job it measures is worse than no measurement.
+"""
+
+
+@dataclass
+class StepTiming:
+    """What one step cost, split the only three ways this process can always see it (STEP_TIMING_WHY)."""
+    step_id: str
+    op: str
+    bind_s: float = 0.0
+    run_s: float = 0.0
+    put_s: float = 0.0
+    nbytes: int = 0
+    legs: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def seconds(self) -> float:
+        return round(self.bind_s + self.run_s + self.put_s, 3)
+
+    def wire(self) -> dict[str, Any]:
+        """The shape that crosses the seam. `legs` merges the runner's three with the handler's, and the
+        runner's win a name collision: a handler cannot know what its own binding cost.
+
+        The three are ALWAYS present, zero included. A `bind` of 0.0 is a measurement, not an absence — it
+        says this step's input was a `from_step` hand-off on local disk and crossed no network, which is the
+        performance contract at the top of this file being kept. Dropping it would make "free" and "never
+        measured" the same reading, which is the class of error this whole change exists to remove."""
+        legs = {**{k: round(v, 3) for k, v in self.legs.items()},
+                "bind": round(self.bind_s, 3), "run": round(self.run_s, 3), "put": round(self.put_s, 3)}
+        out: dict[str, Any] = {"id": self.step_id, "op": self.op, "seconds": self.seconds, "legs": legs}
+        if self.nbytes:
+            out["bytes"] = self.nbytes
+        return out
+
+
+def _collect_legs(recorder: Any) -> dict[str, float]:
+    """Whatever the pack's recorder gathered for the call that just returned. Best-effort by contract: a
+    recorder that raises loses its legs and never the step."""
+    if recorder is None:
+        return {}
+    try:
+        got = recorder.collect()
+    except Exception as e:  # noqa: BLE001 — announced; a stopwatch may not break the work it times
+        log(f"ops: leg recorder failed ({type(e).__name__}: {e}) — step timed without handler legs")
+        return {}
+    return {str(k): float(v) for k, v in dict(got or {}).items()}
+
+
+def _moved_bytes(outputs: dict[str, Any]) -> int:
+    """What this step actually wrote. Seconds without bytes name no defect — 33 s is a mood, 7 MB in 33 s is
+    a diagnosis — and this box is the only side that can weigh the files."""
+    total = 0
+    for path in outputs.values():
+        for one in (path if isinstance(path, list) else [path]):
+            try:
+                total += one.stat().st_size
+            except OSError:
+                continue      # an optional port nothing wrote weighs nothing; that is not an error
+    return total
+
+
+def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
+              sink: list[StepTiming] | None = None) -> dict[str, Any]:
     # The box-wide slot is taken for the WHOLE step, binding included: a fetch is transport this box pays for
     # too, and letting N chains bind concurrently outside the budget is how the disk, not the CPU, becomes
     # the bound nobody sized.
     with step_slots():
-        return _run_step_inner(step, ws, produced)
+        return _run_step_inner(step, ws, produced, sink)
 
 
-def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
+                    sink: list[StepTiming] | None = None) -> dict[str, Any]:
     op = registry.get(step.op)
     # Refuse a judgement op HERE, on the executing box, before anything is fetched or run. Redundant with
     # the control plane's placement check by design: a check that lives only where the routing decision is
@@ -310,32 +396,49 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     registry.assert_pod_safe(step.op)
     registry.validate_params(step.op, step.params)
 
+    timing = StepTiming(step_id=str(step.id), op=str(step.op))
+    t_bind = time.monotonic()
     inputs = _bind_inputs(step, op, ws, produced)
+    timing.bind_s = time.monotonic() - t_bind
     out_dir = ws.step_dir(step.id)
     declared_out = {p.id: p for p in op.outputs}
     outputs = _bind_outputs(step, op, out_dir)
 
     fn = pack.resolve(op.handler)
+    recorder = pack.legs()
     t0 = time.monotonic()
     # THE handler call. `LocalBackend` makes this exact call in-process on the origin machine; here the
     # pod makes it. ONE handler, two transports — parity is structural, not tested into existence. Note
     # what the handler is NOT given: no URL, no credential, no control-plane handle. It sees typed params
     # and local paths, so it cannot depend on where it is running.
-    fn(params=step.params, inputs=inputs, outputs=outputs)
+    if recorder is not None:
+        with recorder.recording():
+            fn(params=step.params, inputs=inputs, outputs=outputs)
+        timing.legs = _collect_legs(recorder)
+    else:
+        fn(params=step.params, inputs=inputs, outputs=outputs)
     dt = time.monotonic() - t0
+    timing.run_s = dt
 
     for port, path in outputs.items():
         for one in (path if isinstance(path, list) else [path]):
             if not one.exists() and not declared_out[port].optional:
                 raise ChainError(f"step {step.id!r}: handler produced no {port!r} at {one}")
     log(f"op {step.op} [{step.id}] ok in {dt:.1f}s")
+    timing.nbytes = _moved_bytes(outputs)
 
     # Only NOW does anything leave the box, and only for bindings that named a url.
+    t_put = time.monotonic()
     for b in step.outputs:
         if b.url is not None and outputs[b.port].exists():
             upload(outputs[b.port], b.url)
         elif b.urls is not None:
             _upload_many(step, b, outputs[b.port])
+    timing.put_s = time.monotonic() - t_put
+    # LAST, and only on the success road: a step that raised delivered nothing, and a duration booked for
+    # work that did not land is the kind of number that makes a ledger worse than none.
+    if sink is not None:
+        sink.append(timing)
     return outputs
 
 
@@ -406,6 +509,13 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
             payload["session_id"] = session_id
         cp.post_event(payload)
 
+    # The clock the box cannot read. Started BEFORE preflight and the pack fetch on purpose: everything from
+    # here to the terminal is the pod's own, and what the box's wall holds beyond it is transport and queue
+    # (STEP_TIMING_WHY). `timings` on every list.append below is safe unlocked — `append` is atomic under the
+    # GIL, and a lock here would be a wait with no deadline anyone could state.
+    t_chain = time.monotonic()
+    timings: list[StepTiming] = []
+
     preflight_chain(chain)      # FIRST: an unrunnable chain must cost nothing but the claim
     pack.activate(chain.pack)
 
@@ -447,7 +557,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     ready = [sid for sid in pending if not (deps[sid] - done_ids)]
                 for sid in ready:
                     pending.discard(sid)
-                    running[ex.submit(_run_step, by_id[sid], ws, produced)] = sid
+                    running[ex.submit(_run_step, by_id[sid], ws, produced, timings)] = sid
                 if not running:
                     # pending non-empty with nothing runnable cannot happen (OpChain rejects cycles at
                     # validation) — but a deadlock on a rented box is expensive enough to name explicitly.
@@ -474,8 +584,15 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     produced[sid] = outs
                 _event(job_id=chain.job_id, stage="ops", status="step",
                        step=sid, op=by_id[sid].op)
+        # PER-STEP SECONDS RIDE THE TERMINAL, in one additive key. Not folded into `steps` (a list of ids
+        # that both sides already know the shape of) — a new key is dropped by an older control plane with a
+        # 202 and ignored by an older box, while a changed element type would be a break on a field that
+        # already crosses. `chain_s` is the pod's OWN wall: the box subtracts it from its own to get the
+        # transport it has never been able to see (STEP_TIMING_WHY).
         _event(job_id=chain.job_id, stage="ops", status="ok", steps=sorted(produced),
-               skipped=sorted(failed))
+               skipped=sorted(failed),
+               timings={"chain_s": round(time.monotonic() - t_chain, 3),
+                        "steps": [t.wire() for t in list(timings)]})
         return {sid: {p: ([str(x) for x in v] if isinstance(v, list) else str(v))
                       for p, v in outs.items()} for sid, outs in produced.items()}
     finally:

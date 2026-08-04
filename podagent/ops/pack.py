@@ -94,6 +94,26 @@ def resolve(handler: str) -> Callable[..., Any]:
     return fn
 
 
+LEGS_MODULE = "montyops.legs"
+"""The pack's OPTIONAL leg stopwatch. A handler is handed typed params and local paths and returns nothing —
+deliberately, so it cannot depend on where it runs — which leaves the runner able to time the WHOLE call and
+nothing inside it. For a fetch that is the difference between "the CDN was slow" and "ffmpeg walked a long
+GOP to reach the key frame", and those have different owners and different fixes.
+
+So the pack may carry a recorder and the handlers may name their own legs through it. It is discovered by
+NAME, never imported at module scope: this agent must run an older pack that has no such module (degrading to
+the three legs the runner itself can see) exactly as happily as a newer one."""
+
+
+def legs() -> Any | None:
+    """The activated pack's leg recorder, or None when this pack predates it. Never raises: a measurement
+    that cannot be taken may not cost the work it was measuring."""
+    try:
+        return importlib.import_module(LEGS_MODULE)
+    except ImportError:
+        return None
+
+
 def reset_for_tests() -> None:
     """Drop the one-pack-per-process latch. Tests activate several fixture packs in one interpreter; prod
     never calls this."""
