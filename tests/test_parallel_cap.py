@@ -65,20 +65,17 @@ def test_floor_holds_at_one():
 
 # ── the budget is BOX-wide, not chain-wide ───────────────────────────────────────────────────────
 
-def test_concurrent_chains_share_one_step_budget(monkeypatch):
-    """The agent now drains several ops envelopes at once. A cap applied per chain multiplies with them —
-    4 chains × cap 8 is 32 ffmpegs on a box sized for 8, which is the swap thrashing MEM_PER_STEP_BYTES
-    exists to prevent. Watched fail with `step_slots()` removed from `_run_step`."""
+def _budget_probe(monkeypatch, cap, frame):
+    """Drive `frame` from six threads at once and report the peak it ever ran concurrently."""
     import threading
 
-    monkeypatch.setattr(runner, "parallel_cap", lambda: (2, "test"))
+    monkeypatch.setattr(runner, "parallel_cap", lambda: (cap, "test"))
     runner._reset_step_slots()
-    live = 0
-    peak = 0
+    live = peak = 0
     lock = threading.Lock()
     gate = threading.Event()
 
-    def _step(step, ws, produced, sink=None):
+    def _work():
         nonlocal live, peak
         with lock:
             live += 1
@@ -86,13 +83,50 @@ def test_concurrent_chains_share_one_step_budget(monkeypatch):
         gate.wait(timeout=0.3)
         with lock:
             live -= 1
-        return {}
 
-    monkeypatch.setattr(runner, "_run_step_inner", _step)
-    threads = [threading.Thread(target=runner._run_step, args=(None, None, None)) for _ in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5)
+    threads = [threading.Thread(target=frame, args=(_work,)) for _ in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=5)
     runner._reset_step_slots()
-    assert peak <= 2, f"{peak} steps ran at once against a box budget of 2"
+    return peak
+
+
+def test_concurrent_chains_share_one_cpu_budget(monkeypatch):
+    """The agent drains several ops envelopes at once. A cap applied per chain multiplies with them —
+    4 chains x cap 8 is 32 ffmpegs on a box sized for 8, which is the swap thrashing MEM_PER_STEP_BYTES
+    exists to prevent. The budget wraps the HANDLER CALL now (TRANSPORT_BUDGET_WHY), which is the frame
+    those two constants are statements about; it is still ONE counter for the whole box."""
+    def frame(work):
+        with runner.step_slots():
+            work()
+
+    assert _budget_probe(monkeypatch, 2, frame) <= 2
+
+
+def test_a_transfer_does_not_take_a_slot_sized_for_an_encode(monkeypatch):
+    """THE ONE THIS SPLIT EXISTS FOR. `put 208.1 s` of `375.7 s` of b-roll step time was objects going to
+    R2 — no core burned, and a one-step `media.fetch` starved behind fifteen-step chains for it. Transport
+    is bounded (the disk and the socket count are real), but by its OWN counter, wider than the CPU one."""
+    def frame(work):
+        with runner.transport_slots():
+            work()
+
+    peak = _budget_probe(monkeypatch, 2, frame)
+    assert peak > 2, f"transport still capped at the CPU budget ({peak})"
+    assert peak <= runner.transport_cap()[0]
+
+
+def test_the_transport_budget_is_derived_from_the_cpu_one_and_overridable(monkeypatch):
+    """It has to scale with the box like the CPU cap does — and an operator who has measured their own link
+    may say so. An unreadable knob is not a bound: the derivation stands and the number stays sane."""
+    monkeypatch.setattr(runner, "parallel_cap", lambda: (4, "test"))
+    monkeypatch.delenv(runner.TRANSPORT_MAX_ENV, raising=False)
+    assert runner.transport_cap()[0] == 4 * runner.TRANSFERS_PER_STEP
+    monkeypatch.setenv(runner.TRANSPORT_MAX_ENV, "3")
+    assert runner.transport_cap()[0] == 3
+    monkeypatch.setenv(runner.TRANSPORT_MAX_ENV, "not-a-number")
+    assert runner.transport_cap()[0] == 4 * runner.TRANSFERS_PER_STEP
+    monkeypatch.setenv(runner.TRANSPORT_MAX_ENV, "0")
+    assert runner.transport_cap()[0] == 4 * runner.TRANSFERS_PER_STEP

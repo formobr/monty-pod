@@ -52,6 +52,37 @@ CORES_PER_STEP = 2
 
 _CPU_FALLBACK = 4  # os.cpu_count() may return None in a container with no affinity mask
 
+TRANSPORT_BUDGET_WHY = """
+ONE BUDGET WAS SIZED BY CORES AND SPENT ON THE NETWORK.
+
+The step slot used to cover the WHOLE step — bind, run and put — and the reason given for that was the DISK:
+"letting N chains bind concurrently outside the budget is how the disk, not the CPU, becomes the bound nobody
+sized". That reason is real and it is not the CPU's. Two different physical limits were being rationed by one
+counter, and the counter was derived from `cores // 2`.
+
+WHAT IT COST, MEASURED. On the b-roll fan-out of a warm prod run: `put 208.1 s` of `375.7 s` of total step
+time across `media.fetch` + `media.filmstrip` + `media.sheet`. More than half the budget of a 32-core pod was
+held by objects being uploaded to R2 — work that burns no core and finishes no sooner for having one. The
+visible consequence was a ONE-step `media.fetch` (the opener's photo) submitted at run-offset 64.7 s that
+never got a slot before its caller's 120 s subprocess timeout killed it, while fifteen-step chains held the
+budget for 192 and 199 seconds.
+
+SO THERE ARE TWO COUNTERS, EACH DERIVED FROM THE THING IT ACTUALLY PROTECTS. The CPU budget wraps the HANDLER
+CALL only — that is where ffmpeg runs and where `MEM_PER_STEP_BYTES` and `CORES_PER_STEP` mean something.
+Transport gets its own, wider counter: bind and put are bounded so a fan-out cannot open unlimited sockets
+and unlimited partial files, but they no longer consume a slot sized for an encode.
+
+WHY THE TRANSPORT WIDTH IS A MULTIPLE AND NOT A CONSTANT. It has to scale with the box like the CPU one does,
+and it is bounded by sockets and disk head, not by cores — a transfer spends its time waiting. The multiple
+is deliberately modest: the failure it still has to prevent is the one the original comment names, N chains
+binding at once and filling the disk.
+"""
+
+# Concurrent transfers per CPU slot (TRANSPORT_BUDGET_WHY). 4x: a transfer measured at 0.3 s of latency for
+# ~170 KB is ~90% wait, so four of them overlap inside one slot's worth of wall without contending for it.
+TRANSFERS_PER_STEP = 4
+TRANSPORT_MAX_ENV = "OPS_MAX_TRANSFERS"
+
 
 def _mem_available_bytes() -> int | None:
     """Memory the box can hand out RIGHT NOW, or None if this kernel will not say.
@@ -104,6 +135,7 @@ def parallel_cap() -> tuple[int, str]:
 
 _slots: threading.Semaphore | None = None
 _slots_lock = threading.Lock()
+_xfer: threading.Semaphore | None = None
 
 
 def step_slots() -> threading.Semaphore:
@@ -120,11 +152,34 @@ def step_slots() -> threading.Semaphore:
         return _slots
 
 
+def transport_cap() -> tuple[int, str]:
+    """How many BINDS and PUTS may be in flight at once (TRANSPORT_BUDGET_WHY)."""
+    raw = (os.environ.get(TRANSPORT_MAX_ENV) or "").strip()
+    if raw:
+        try:
+            if (n := int(raw)) > 0:
+                return n, f"{TRANSPORT_MAX_ENV}={n}"
+        except ValueError:
+            pass                       # an unreadable knob is not a bound; the derivation stands and says so
+    cap, why = parallel_cap()
+    return max(1, cap * TRANSFERS_PER_STEP), f"{TRANSFERS_PER_STEP}x the step cap ({why})"
+
+
+def transport_slots() -> threading.Semaphore:
+    """The transfer budget, separate from the CPU one because it protects a different thing."""
+    global _xfer
+    with _slots_lock:
+        if _xfer is None:
+            _xfer = threading.Semaphore(transport_cap()[0])
+        return _xfer
+
+
 def _reset_step_slots() -> None:
-    """Tests only: re-derive the budget after monkeypatching the cap."""
-    global _slots
+    """Tests only: re-derive both budgets after monkeypatching the cap."""
+    global _slots, _xfer
     with _slots_lock:
         _slots = None
+        _xfer = None
 
 
 class ChainError(RuntimeError):
@@ -380,11 +435,10 @@ def _moved_bytes(outputs: dict[str, Any]) -> int:
 
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
               sink: list[StepTiming] | None = None) -> dict[str, Any]:
-    # The box-wide slot is taken for the WHOLE step, binding included: a fetch is transport this box pays for
-    # too, and letting N chains bind concurrently outside the budget is how the disk, not the CPU, becomes
-    # the bound nobody sized.
-    with step_slots():
-        return _run_step_inner(step, ws, produced, sink)
+    # The CPU slot is taken around the HANDLER ONLY (TRANSPORT_BUDGET_WHY) — see `_run_step_inner`. The disk
+    # and socket bound the original comment was really protecting is now its own counter, which is what lets
+    # a one-step fetch through while fifteen-step chains are encoding.
+    return _run_step_inner(step, ws, produced, sink)
 
 
 def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
@@ -398,7 +452,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
 
     timing = StepTiming(step_id=str(step.id), op=str(step.op))
     t_bind = time.monotonic()
-    inputs = _bind_inputs(step, op, ws, produced)
+    with transport_slots():
+        inputs = _bind_inputs(step, op, ws, produced)
     timing.bind_s = time.monotonic() - t_bind
     out_dir = ws.step_dir(step.id)
     declared_out = {p.id: p for p in op.outputs}
@@ -411,12 +466,15 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     # pod makes it. ONE handler, two transports — parity is structural, not tested into existence. Note
     # what the handler is NOT given: no URL, no credential, no control-plane handle. It sees typed params
     # and local paths, so it cannot depend on where it is running.
-    if recorder is not None:
-        with recorder.recording():
+    # THE CPU BUDGET, and only here: this call is the ffmpeg, and `CORES_PER_STEP` / `MEM_PER_STEP_BYTES`
+    # are statements about exactly this frame (TRANSPORT_BUDGET_WHY).
+    with step_slots():
+        if recorder is not None:
+            with recorder.recording():
+                fn(params=step.params, inputs=inputs, outputs=outputs)
+            timing.legs = _collect_legs(recorder)
+        else:
             fn(params=step.params, inputs=inputs, outputs=outputs)
-        timing.legs = _collect_legs(recorder)
-    else:
-        fn(params=step.params, inputs=inputs, outputs=outputs)
     dt = time.monotonic() - t0
     timing.run_s = dt
 
@@ -429,11 +487,12 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
 
     # Only NOW does anything leave the box, and only for bindings that named a url.
     t_put = time.monotonic()
-    for b in step.outputs:
-        if b.url is not None and outputs[b.port].exists():
-            upload(outputs[b.port], b.url)
-        elif b.urls is not None:
-            _upload_many(step, b, outputs[b.port])
+    with transport_slots():
+        for b in step.outputs:
+            if b.url is not None and outputs[b.port].exists():
+                upload(outputs[b.port], b.url)
+            elif b.urls is not None:
+                _upload_many(step, b, outputs[b.port])
     timing.put_s = time.monotonic() - t_put
     # LAST, and only on the success road: a step that raised delivered nothing, and a duration booked for
     # work that did not land is the kind of number that makes a ledger worse than none.
@@ -547,7 +606,11 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                        error=f"{by_id[sid].op}: skipped, needs failed step(s) {sorted(deps[sid] & failed)}")
 
     cap, why = parallel_cap()
-    log(f"ops parallel cap={cap} ({why})")
+    xcap, xwhy = transport_cap()
+    # NOT sent as an event: `/pod/event` DROPS unknown fields at the Go seam (docs/gen/SEAM_ATLAS.md), so a
+    # capacity event would arrive carrying nothing. The box does not need to be told anyway — it ASSIGNS both
+    # numbers from the offer it rented (broker.pod_lane.pod_step_width) and can say so on its own side.
+    log(f"ops parallel cap={cap} ({why}) · transport cap={xcap} ({xwhy})")
     try:
         with cf.ThreadPoolExecutor(max_workers=cap) as ex:
             running: dict[cf.Future[Any], str] = {}
