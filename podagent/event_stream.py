@@ -124,8 +124,8 @@ class EventStream:
         try:
             if self._conn is not None:
                 self._conn.close()
-        except Exception:                         # noqa: BLE001 - closing a dead socket is not an error
-            pass
+        except Exception as e:                    # noqa: BLE001 - closing a dead socket is not an error
+            _log(f"close of an already-dead socket raised ({type(e).__name__}: {e}) — ignored")
         self._conn = None
 
     # ── one frame ─────────────────────────────────────────────────────────────────────────────────────
@@ -140,6 +140,10 @@ class EventStream:
             self._conn.send(json.dumps({"seq": seq, **payload}))
             raw = self._conn.recv(timeout=FRAME_WALL_S)
         except Exception as e:                    # noqa: BLE001 - transport, not content
+            # LOUD IN THE HANDLER ITSELF, not only inside `_drop`. The absorption gate reads this block and
+            # cannot follow a call to decide whether anyone was told — and it is right to refuse: a returned
+            # False whose announcement lives one frame away is one refactor from being silent.
+            _log(f"frame seq={seq} lost the socket ({type(e).__name__}: {e}) — it stays in the outbox")
             self._drop(f"{type(e).__name__}: {e}")
             return False
         try:
