@@ -251,3 +251,33 @@ def test_the_leg_module_is_discovered_by_name_and_never_imported():
     and the name is DECLARED so the pack and the agent cannot drift into two spellings."""
     assert pack.LEGS_MODULE == "montyops.legs"
     assert pack.legs() is None, "no ops pack is active in this test process, so there is nothing to find"
+
+
+# ── the store pool may not be narrower than the transfers that use it (cp.STORE_POOL_WHY) ────────────────
+def test_the_store_pool_is_as_wide_as_the_transfers_the_box_assigned(monkeypatch):
+    """MEASURED, and it is the churn we make ourselves: `pool_maxsize` was 4 while up to 64 binds and puts
+    ran at once. urllib3 does not WAIT for a slot with `pool_block=False` — it mints a connection, uses it and
+    throws it away, so 60 of every 64 puts paid a fresh TCP+TLS handshake and left a socket in TIME_WAIT.
+    595 media steps a run, 391 of them putting: ~400 short-lived connections to one host, from a rented
+    container whose SYNs then go unanswered for 45 s while the box gets a clean RST in 0.4 s."""
+    import importlib
+
+    from podagent import cp
+
+    monkeypatch.setenv("OPS_MAX_TRANSFERS", "64")
+    assert cp._store_pool() == 64
+    monkeypatch.setenv("OPS_MAX_TRANSFERS", "")
+    assert cp._store_pool() == 16, "an unset width must not fall back to the 4 that caused this"
+    monkeypatch.setenv("OPS_MAX_TRANSFERS", "not-a-number")
+    assert cp._store_pool() == 16
+    monkeypatch.setenv("OPS_MAX_TRANSFERS", "1")
+    assert cp._store_pool() >= 4, "a floor keeps a typo from serialising every transfer"
+    importlib.reload  # noqa: B018 — the module-level session is built once; this test pins the sizer
+
+
+def test_the_store_session_actually_mounts_that_pool():
+    """A sizer nothing reads is a comment. The adapter must carry the number."""
+    from podagent import cp
+
+    ad = cp._store.get_adapter("https://x/")
+    assert ad._pool_maxsize >= 16, f"the store session still mounts a narrow pool: {ad._pool_maxsize}"

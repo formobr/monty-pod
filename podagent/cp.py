@@ -3,6 +3,7 @@ via presigned URLs. Auth = the single job token from the environment; no other c
 on this machine."""
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import time
@@ -31,9 +32,44 @@ _XFER_DEADLINE_S = 300.0
 # The object store is a DIFFERENT host with DIFFERENT auth (each presigned url carries its own signature),
 # so it gets its own keep-alive session — the CP's Bearer token must never travel to a third party. No
 # urllib3 Retry on it: the retry/resume policy below is body-aware, urllib3's is not.
+STORE_POOL_WHY = """
+A CONNECTION POOL SMALLER THAN THE CONCURRENCY THAT USES IT IS NOT A POOL — IT IS A CHURN ENGINE.
+
+`pool_maxsize` was 4 while the runner ran up to `OPS_MAX_PARALLEL` (16 on the rented box) steps at once, and
+after the transport split up to `OPS_MAX_TRANSFERS` (64) binds and puts. urllib3 does not WAIT for a free
+slot when `pool_block` is false — it mints a connection, uses it, and throws it away. So 12 of every 16 puts,
+and later 60 of every 64, paid a fresh TCP+TLS handshake and left a socket in TIME_WAIT.
+
+WHY THAT IS NOT MERELY WASTE. Measured 2026-08-06: 595 media steps in one run, 391 of them putting an object.
+On a RENTED container that is ~400 short-lived connections per run against one host, and the failure it
+produces is the one we could not explain — the box fails a busy connection FAST (`ConnectionError` in 0.4 s,
+a RST), while the pod goes SILENT for 45 s. Silence means the SYN got no answer at all: packets DROPPED, not
+refused, which is what a full conntrack/NAT table does. The same urls answer in 0.1-0.6 s when asked alone.
+
+SO THE POOL IS SIZED BY THE SAME NUMBER THE BOX ASSIGNS FOR TRANSFERS. One source of truth
+(`broker.pod_lane.OPS_MAX_TRANSFERS_VAR`), so widening the transport can never again silently outgrow the
+pool that serves it. `pool_block` stays FALSE — a step waiting on a connection slot would be an undeclared
+wait — and it now has nothing to fall back to, because the pool is as wide as the callers.
+
+NOT PROVEN TO BE THE WHOLE DISEASE. The hang is consistent with conntrack exhaustion and this removes the
+churn we ourselves create; whether the rented network drops for other reasons as well is a question the
+`connect` leg answers on the next run, now that it fails in 10 s instead of going quiet for 45.
+"""
+
+
+def _store_pool() -> int:
+    """As wide as the transfers this pod was told it may run (STORE_POOL_WHY)."""
+    raw = (os.environ.get("OPS_MAX_TRANSFERS") or "").strip()
+    try:
+        return max(4, int(raw))
+    except ValueError:
+        return 16      # the step cap this image ships with; never the old 4
+
+
 _store = requests.Session()
-_store.mount("http://", HTTPAdapter(pool_maxsize=4))
-_store.mount("https://", HTTPAdapter(pool_maxsize=4))
+for _scheme in ("http://", "https://"):
+    _store.mount(_scheme, HTTPAdapter(pool_connections=_store_pool(), pool_maxsize=_store_pool(),
+                                      pool_block=False))
 # How long a terminal report keeps trying before the pod gives up on being heard. A result nobody receives
 # is the same to the brain as a pod that died, so this is worth far more patience than an ordinary call.
 _REPORT_ATTEMPTS = 6
