@@ -80,7 +80,10 @@ def test_post_event_survives_one_dropped_connection(instant_backoff: None) -> No
     server = _FlakyCP(drops=1)
     try:
         plane = cp.ControlPlane(server.base, "job-token")
-        plane.post_event({"stage": "ops", "status": "step", "step": "probe"})
+        # THE POST LANE ON PURPOSE. `post_event` prefers the socket now (podagent.event_stream); this file is
+        # about urllib3's replay of a dropped HTTP connection, so it drives the lane it is testing. A socket
+        # attempt here would also count against this server's hits and make the assertion below a lie.
+        plane._post_event_http({"stage": "ops", "status": "step", "step": "probe"})
     finally:
         server.close()
     assert server.hits == 2, "one drop must cost a socket, not the run behind it"
@@ -93,7 +96,7 @@ def test_a_control_plane_that_always_hangs_up_still_fails(instant_backoff: None,
     try:
         plane = cp.ControlPlane(server.base, "job-token")
         with pytest.raises(requests.RequestException):
-            plane.post_event({"stage": "ops", "status": "error", "error": "boom"})
+            plane._post_event_http({"stage": "ops", "status": "error", "error": "boom"})
     finally:
         server.close()
     assert server.hits == 3, "bounded by _CP_RETRY_TOTAL — a dead endpoint is never an infinite wait"
@@ -120,3 +123,19 @@ def test_a_read_timeout_on_the_long_poll_is_replayable() -> None:
     retry = cp._LoudRetry(total=3, read=3, allowed_methods=None)
     err = ReadTimeoutError(None, "/pod/job", "read timed out")  # type: ignore[arg-type]
     assert retry.increment("GET", "/pod/job", error=err).total == 2
+
+
+def test_post_event_falls_back_to_the_POST_lane_when_the_socket_is_off(instant_backoff: None,
+                                                                      monkeypatch: Any) -> None:
+    """The two lanes are one method to every caller. With the socket disabled, `post_event` must still be a
+    POST — otherwise POD_STREAM=0 would silence the pod instead of reverting it."""
+    from podagent import event_stream
+
+    monkeypatch.setattr(event_stream, "DISABLED", True)
+    server = _FlakyCP(drops=0)
+    try:
+        plane = cp.ControlPlane(server.base, "job-token")
+        plane.post_event({"stage": "ops", "status": "step", "step": "probe"})
+    finally:
+        server.close()
+    assert server.hits == 1, "the event must reach the control plane by the old lane, exactly once"

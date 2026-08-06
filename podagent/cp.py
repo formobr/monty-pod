@@ -17,6 +17,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.exceptions import ReadTimeoutError
 from urllib3.util.retry import Retry
 
+from podagent import event_stream
+
 _TIMEOUT = 30
 _CHUNK = 1 << 20
 _XFER_ATTEMPTS = 3
@@ -123,6 +125,10 @@ class ControlPlane:
         adapter = HTTPAdapter(max_retries=retry)
         self.sess.mount("http://", adapter)
         self.sess.mount("https://", adapter)
+        # ONE SOCKET INSTEAD OF ONE POST PER STEP (event_stream.EventStream). The fallback below is the same
+        # POST this method has always made, so a control plane that does not know `/pod/stream` costs nothing
+        # but one refused upgrade. Built lazily-per-instance rather than globally: the token is per job.
+        self._stream_send = event_stream.make(self.base, job_token, self._post_event_http)
 
     def poll_job(self) -> dict[str, Any] | None:
         """One long-poll for work. Returns the job envelope or None on timeout/no-work."""
@@ -133,7 +139,17 @@ class ControlPlane:
         return r.json()  # type: ignore[no-any-return]
 
     def post_event(self, payload: dict[str, Any]) -> None:
+        """Report one event. Over the socket where there is one, by POST where there is not — the CALLERS do
+        not know which, and must not: this is the only place the two lanes differ (event_stream WHY)."""
+        self._stream_send(payload)
+
+    def _post_event_http(self, payload: dict[str, Any]) -> None:
+        """The original lane, unchanged, and still the one every failure falls back to."""
         self.sess.post(f"{self.base}/pod/event", json=payload, timeout=_TIMEOUT).raise_for_status()
+
+    def close_stream(self) -> None:
+        """Say out loud what was never acknowledged, and let the socket go."""
+        getattr(self._stream_send, "stream", None) and self._stream_send.stream.close()  # type: ignore[attr-defined]
 
     def post_infer_result(self, payload: dict[str, Any]) -> None:
         self.sess.post(f"{self.base}/pod/infer-result", json=payload, timeout=_TIMEOUT).raise_for_status()

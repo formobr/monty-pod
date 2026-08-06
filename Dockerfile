@@ -66,7 +66,11 @@ RUN set -eux; \
     # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
     # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
     # transformers ships a get_image_features that returns a BaseModelOutputWithPooling → clip_rank crash.
-    python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema; \
+    # `websockets` is the EVENT LANE (podagent.event_stream): one socket instead of one POST per step.
+    # It belongs on THIS line and not only in pyproject for the reason stated above — the app is
+    # installed --no-deps, so a pyproject dependency never reaches the image. The module degrades to
+    # POST out loud when the import fails, which is what keeps an older image running.
+    python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema websockets; \
     SP=/usr/local/lib/python3.11/dist-packages; \
     bucket() { n="$1"; shift; for p in "$@"; do d="/stage/$n/$(dirname "$p")"; mkdir -p "$d"; mv "$SP/$p" "$d/"; done; }; \
     bucket 01 nvidia/cudnn; \
