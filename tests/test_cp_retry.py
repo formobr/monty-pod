@@ -80,10 +80,9 @@ def test_post_event_survives_one_dropped_connection(instant_backoff: None) -> No
     server = _FlakyCP(drops=1)
     try:
         plane = cp.ControlPlane(server.base, "job-token")
-        # THE POST LANE ON PURPOSE. `post_event` prefers the socket now (podagent.event_stream); this file is
-        # about urllib3's replay of a dropped HTTP connection, so it drives the lane it is testing. A socket
-        # attempt here would also count against this server's hits and make the assertion below a lie.
-        plane._post_event_http({"stage": "ops", "status": "step", "step": "probe"})
+        # `post_infer_result` IS the HTTP lane now — events and claims both moved to the socket, and this
+        # file is about urllib3's replay of a dropped connection, so it drives what still uses it.
+        plane.post_infer_result({"job_id": "j", "status": "ok"})
     finally:
         server.close()
     assert server.hits == 2, "one drop must cost a socket, not the run behind it"
@@ -96,20 +95,11 @@ def test_a_control_plane_that_always_hangs_up_still_fails(instant_backoff: None,
     try:
         plane = cp.ControlPlane(server.base, "job-token")
         with pytest.raises(requests.RequestException):
-            plane._post_event_http({"stage": "ops", "status": "error", "error": "boom"})
+            plane.post_infer_result({"job_id": "j", "status": "error"})
     finally:
         server.close()
     assert server.hits == 3, "bounded by _CP_RETRY_TOTAL — a dead endpoint is never an infinite wait"
 
-
-def test_poll_job_survives_one_dropped_connection(instant_backoff: None) -> None:
-    server = _FlakyCP(drops=1)
-    try:
-        plane = cp.ControlPlane(server.base, "job-token")
-        assert plane.poll_job() == {"ok": True}
-    finally:
-        server.close()
-    assert server.hits == 2
 
 
 def test_a_post_that_may_have_run_is_never_replayed() -> None:
@@ -125,17 +115,12 @@ def test_a_read_timeout_on_the_long_poll_is_replayable() -> None:
     assert retry.increment("GET", "/pod/job", error=err).total == 2
 
 
-def test_post_event_falls_back_to_the_POST_lane_when_the_socket_is_off(instant_backoff: None,
-                                                                      monkeypatch: Any) -> None:
-    """The two lanes are one method to every caller. With the socket disabled, `post_event` must still be a
-    POST — otherwise POD_STREAM=0 would silence the pod instead of reverting it."""
-    from podagent import event_stream
-
-    monkeypatch.setattr(event_stream, "DISABLED", True)
-    server = _FlakyCP(drops=0)
-    try:
-        plane = cp.ControlPlane(server.base, "job-token")
-        plane.post_event({"stage": "ops", "status": "step", "step": "probe"})
-    finally:
-        server.close()
-    assert server.hits == 1, "the event must reach the control plane by the old lane, exactly once"
+def test_an_undeliverable_event_is_LOUD_because_there_is_no_second_lane(monkeypatch: Any,
+                                                                       capsys: Any) -> None:
+    """THE NEGATIVE TEST for removing the fallback. There is no POST lane to quietly absorb a report any
+    more, so a socket that cannot carry one must SAY so — a swallowed event here is a step nobody can prove
+    happened, which is the whole failure class this transport was rebuilt to remove."""
+    plane = cp.ControlPlane("http://127.0.0.1:1", "job-token")
+    plane.post_event({"stage": "ops", "status": "step", "step": "probe"})
+    said = capsys.readouterr().err
+    assert "NOT DELIVERED" in said and "no second lane" in said

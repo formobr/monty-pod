@@ -26,9 +26,10 @@ if TYPE_CHECKING:
 
 INFER_KINDS = ("align", "face_probe", "clip_rank")
 
-# /pod/job is a LONG poll: an empty answer is supposed to cost the server-side block, not a round trip. When
-# it does not (CP restart, a short block, a 204 storm) a bare `continue` hammers the control plane from a
-# RENTED box at an unbounded rate. Floor one poll per second; a real long-poll never notices it.
+# THERE IS NO POLL ANY MORE. Work arrives on the socket the pod already holds (podagent.event_stream); the
+# floor below survives it for one reason only — a socket that will NOT open returns immediately, and a bare
+# `continue` around that would spin a rented box at an unbounded rate against a control plane that is down.
+# On a healthy connection nothing ever waits here: the claim itself blocks on the wire.
 _MIN_POLL_INTERVAL_S = 1.0
 
 # The claim loop DISPATCHES; it does not execute. It used to run each envelope inline, which made this box the
@@ -345,7 +346,7 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
     while True:
         try:
             t_poll = time.monotonic()
-            job = cp.poll_job()
+            job = cp.poll_job()          # a wait on the live socket, not a request (cp.poll_job WHY)
             if job is None:
                 idle = time.monotonic() - t_poll
                 if idle < _MIN_POLL_INTERVAL_S:

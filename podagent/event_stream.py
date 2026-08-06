@@ -22,9 +22,14 @@ A socket that dies takes nothing with it — the unacked frames are re-sent on t
 That is the class of failure this replaces: a pod that finished its work, could not deliver the terminal,
 and threw the work away.
 
-FALLING BACK IS LOUD AND IS NOT A FAILURE. A control plane that does not know `/pod/stream` answers 404 to
-the upgrade; the pod says so once and uses POST for the rest of its life. Silence here would make a stale
-control plane look like a fast one.
+THERE IS NO FALLBACK, AND THAT IS DELIBERATE. An earlier version kept POST as a second lane. Two mechanisms
+for one job is how they drift — and the poll that briefly survived beside the socket promptly showed up in
+the control plane's access log as 32 fifty-second requests nobody wanted. A socket that will not open is a
+FAILURE, said out loud, not a quiet degrade into the shape we were leaving.
+
+AND THE SAME SOCKET CARRIES THE WORK. `GET /pod/job` is deleted: the control plane claims from the session
+lane and pushes `{"type":"job"}` frames down this connection. The at-most-once exposure did not change with
+the move — the poll ALREADY took the envelope off the queue with a BRPOP before writing its response.
 """
 from __future__ import annotations
 
@@ -53,6 +58,10 @@ OPEN_WALL_S = float(os.environ.get("POD_STREAM_OPEN_WALL_S", "10"))
 # dropped connection is ordinary, a second in a row means the lane is not there.
 MAX_REOPENS = int(os.environ.get("POD_STREAM_MAX_REOPENS", "2"))
 
+# POD_STREAM=0 USED TO MEAN "fall back to POST". There is no POST lane any more, so it now means "this pod
+# reports and claims NOTHING" — which is only ever useful to a test that wants the dead-lane path without a
+# server. It is deliberately NOT an operational revert: reverting a transport by silencing the pod would
+# hide the very failures the transport exists to deliver.
 DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 
 
@@ -67,7 +76,7 @@ class EventStream:
     caller must fall back to POST — which is what `cp.post_event` does with it.
     """
 
-    def __init__(self, base_url: str, job_token: str) -> None:
+    def __init__(self, base_url: str, job_token: str) -> None:  # noqa: D107 - documented on the class
         self._url = base_url.rstrip("/").replace("https://", "wss://", 1).replace("http://", "ws://", 1) \
             + "/pod/stream"
         self._token = job_token
@@ -75,12 +84,17 @@ class EventStream:
         self._conn: Any = None
         self._seq = 0
         self._outbox: list[tuple[int, dict[str, Any]]] = []   # frames sent but not yet acknowledged
+        # WORK ARRIVES ON THE SAME WIRE AS ACKS, so a job frame read while waiting for an ack is parked here
+        # rather than dropped. Dropping it would lose an envelope the control plane has already BRPOP'd off
+        # the queue — the one loss this transport can still cause, and it must not be caused by US.
+        self._jobs: list[dict[str, Any]] = []
         self._reopens = 0
         self._dead = DISABLED or _ws_client is None
         if DISABLED:
-            _log("POD_STREAM=0 — the socket lane is off by request; every event goes by POST")
+            _log("POD_STREAM=0 — this pod will neither report nor claim. There is no second lane.")
         elif _ws_client is None:
-            _log(f"websockets is not importable ({_WS_IMPORT_ERROR}) — this image reports by POST")
+            _log(f"websockets is not importable ({_WS_IMPORT_ERROR}) — this pod CANNOT reach the control "
+                 f"plane at all, because the socket is the only lane. Rebuild the image.")
 
     # ── connection ────────────────────────────────────────────────────────────────────────────────────
     def _open(self) -> bool:
@@ -129,35 +143,70 @@ class EventStream:
         self._conn = None
 
     # ── one frame ─────────────────────────────────────────────────────────────────────────────────────
-    def _write_and_ack(self, seq: int, payload: dict[str, Any]) -> bool:
-        """Write one frame and wait for its ack. Returns False if the SOCKET failed (caller reopens).
+    def _recv(self, wall: float) -> dict[str, Any] | None:
+        """One decoded frame, or None if the SOCKET failed (the caller reopens). Job frames are parked, never
+        returned here: work and acknowledgements share this wire and only `claim` may consume the first."""
+        try:
+            raw = self._conn.recv(timeout=wall)
+        except Exception as e:                    # noqa: BLE001 - transport, not content
+            _log(f"socket read failed ({type(e).__name__}: {e}) — {len(self._outbox)} frame(s) unacknowledged")
+            self._drop(f"{type(e).__name__}: {e}")
+            return None
+        try:
+            return dict(json.loads(raw))
+        except (ValueError, TypeError):
+            _log("the control plane sent a frame that is not a JSON object — dropping this socket")
+            self._drop("undecodable frame")
+            return None
 
-        A frame the control plane REFUSES (a 4xx status in the ack) is not a socket failure: it is the same
-        answer the POST lane gave, it is said out loud, and the frame is retired — re-sending a report the
-        control plane has already judged malformed would loop forever.
+    def _write_and_ack(self, seq: int, payload: dict[str, Any]) -> bool:
+        """Write one frame and wait for ITS ack. Returns False if the SOCKET failed (caller reopens).
+
+        A frame the control plane REFUSES (a 4xx in the ack) is not a socket failure: it is a verdict on the
+        content, it is said out loud, and the frame is retired — asking again earns the same verdict forever.
         """
         try:
             self._conn.send(json.dumps({"seq": seq, **payload}))
-            raw = self._conn.recv(timeout=FRAME_WALL_S)
         except Exception as e:                    # noqa: BLE001 - transport, not content
-            # LOUD IN THE HANDLER ITSELF, not only inside `_drop`. The absorption gate reads this block and
-            # cannot follow a call to decide whether anyone was told — and it is right to refuse: a returned
-            # False whose announcement lives one frame away is one refactor from being silent.
-            _log(f"frame seq={seq} lost the socket ({type(e).__name__}: {e}) — it stays in the outbox")
+            _log(f"frame seq={seq} lost the socket on write ({type(e).__name__}: {e}) — it stays in the outbox")
             self._drop(f"{type(e).__name__}: {e}")
             return False
-        try:
-            ack = json.loads(raw)
-        except ValueError:
-            self._drop("the control plane sent a frame that is not JSON")
-            return False
-        status = int(ack.get("status") or 0)
-        if status != 202:
-            _log(f"frame seq={seq} REFUSED status={status} reason={str(ack.get('error'))[:200]}")
-        # RETIRED EITHER WAY. A 202 is delivery; a 4xx is the control plane's VERDICT on the content, and a
-        # second copy earns the same verdict — re-sending it would loop until the pod died.
-        self._outbox = [(s, p) for s, p in self._outbox if s != seq]
-        return True
+        while True:
+            frame = self._recv(FRAME_WALL_S)
+            if frame is None:
+                return False
+            if str(frame.get("type")) == "job":
+                # WORK, arriving while we waited for an ack. Park it: the control plane has already taken it
+                # off the queue, so dropping it here is the one envelope loss this transport can still cause.
+                self._jobs.append(frame)
+                continue
+            status = int(frame.get("status") or 0)
+            if status != 202:
+                _log(f"frame seq={seq} REFUSED status={status} reason={str(frame.get('error'))[:200]}")
+            # RETIRED EITHER WAY (a 202 is delivery, a 4xx is a verdict) — see the docstring.
+            self._outbox = [(s, p) for s, p in self._outbox if s != seq]
+            return True
+
+    def claim(self, wall: float) -> dict[str, Any] | None:
+        """One envelope of work, or None if none arrived inside `wall`. NEVER raises.
+
+        This replaces `GET /pod/job` entirely. A parked frame is served first — it was already delivered and
+        waiting for it again would strand it behind a socket that may never speak.
+        """
+        if self._dead:
+            return None
+        with self._lock:
+            if self._jobs:
+                return self._jobs.pop(0).get("job")
+            if self._conn is None and not self._open():
+                return None
+            frame = self._recv(wall)
+            if frame is None:
+                return None
+            if str(frame.get("type")) == "job":
+                return frame.get("job")
+            # An ack for a frame we already retired (a re-send that crossed with its own acknowledgement).
+            return None
 
     def send(self, payload: dict[str, Any]) -> bool:
         """Deliver one event over the socket. False ⇒ the caller must POST it instead. Never raises."""

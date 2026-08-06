@@ -20,6 +20,11 @@ from urllib3.util.retry import Retry
 from podagent import event_stream
 
 _TIMEOUT = 30
+
+# How long ONE claim waits on the live socket before the dispatch loop comes round again. It is not a poll
+# interval — nothing is spent while it waits — so it is sized to keep the loop responsive to shutdown, not to
+# ration round trips the way `_MIN_POLL_INTERVAL_S` had to.
+_CLAIM_WALL_S = 30.0
 _CHUNK = 1 << 20
 _XFER_ATTEMPTS = 3
 
@@ -125,31 +130,30 @@ class ControlPlane:
         adapter = HTTPAdapter(max_retries=retry)
         self.sess.mount("http://", adapter)
         self.sess.mount("https://", adapter)
-        # ONE SOCKET INSTEAD OF ONE POST PER STEP (event_stream.EventStream). The fallback below is the same
-        # POST this method has always made, so a control plane that does not know `/pod/stream` costs nothing
-        # but one refused upgrade. Built lazily-per-instance rather than globally: the token is per job.
-        self._stream_send = event_stream.make(self.base, job_token, self._post_event_http)
+        # THE SOCKET IS THE ONLY LANE, both directions (event_stream WHY). No POST fallback and no poll: two
+        # mechanisms for one job is how they drift, and the poll that briefly survived beside the socket
+        # showed up in the control plane's access log as 32 fifty-second requests nobody wanted.
+        self._stream = event_stream.EventStream(self.base, job_token)
 
     def poll_job(self) -> dict[str, Any] | None:
-        """One long-poll for work. Returns the job envelope or None on timeout/no-work."""
-        r = self.sess.get(f"{self.base}/pod/job", timeout=_TIMEOUT + 35)
-        if r.status_code == 204:
-            return None
-        r.raise_for_status()
-        return r.json()  # type: ignore[no-any-return]
+        """One envelope of work, or None if none arrived inside the wall.
+
+        NOT a poll any more, despite the name the call sites still use: the control plane claims from the
+        session lane and pushes the envelope down the socket this pod already holds. `GET /pod/job` is
+        deleted. The name stays so the dispatch loop reads the same; what it does is wait on a live wire.
+        """
+        return self._stream.claim(_CLAIM_WALL_S)
 
     def post_event(self, payload: dict[str, Any]) -> None:
-        """Report one event. Over the socket where there is one, by POST where there is not — the CALLERS do
-        not know which, and must not: this is the only place the two lanes differ (event_stream WHY)."""
-        self._stream_send(payload)
-
-    def _post_event_http(self, payload: dict[str, Any]) -> None:
-        """The original lane, unchanged, and still the one every failure falls back to."""
-        self.sess.post(f"{self.base}/pod/event", json=payload, timeout=_TIMEOUT).raise_for_status()
+        """Report one event over the socket. A socket that will not carry it is a FAILURE, said out loud —
+        there is nowhere else to put it, and pretending otherwise is what the removed POST lane did."""
+        if not self._stream.send(payload):
+            print(f"[cp] event NOT DELIVERED (stage={payload.get('stage')} status={payload.get('status')}) "
+                  f"— the socket is down and there is no second lane", file=sys.stderr, flush=True)
 
     def close_stream(self) -> None:
         """Say out loud what was never acknowledged, and let the socket go."""
-        getattr(self._stream_send, "stream", None) and self._stream_send.stream.close()  # type: ignore[attr-defined]
+        self._stream.close()
 
     def post_infer_result(self, payload: dict[str, Any]) -> None:
         self.sess.post(f"{self.base}/pod/infer-result", json=payload, timeout=_TIMEOUT).raise_for_status()
