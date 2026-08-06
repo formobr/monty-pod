@@ -65,6 +65,11 @@ MAX_REOPENS = int(os.environ.get("POD_STREAM_MAX_REOPENS", "2"))
 DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 
 
+# Returned by `_recv` when the wall expired with nothing to read. A distinct object rather than None so a
+# QUIET wire can never be mistaken for a DEAD one — that mistake cost a re-connect every 30 seconds.
+_QUIET: dict[str, Any] = {}
+
+
 def _log(msg: str) -> None:
     print(f"[pod-stream] {msg}", file=sys.stderr, flush=True)
 
@@ -144,10 +149,17 @@ class EventStream:
 
     # ── one frame ─────────────────────────────────────────────────────────────────────────────────────
     def _recv(self, wall: float) -> dict[str, Any] | None:
-        """One decoded frame, or None if the SOCKET failed (the caller reopens). Job frames are parked, never
-        returned here: work and acknowledgements share this wire and only `claim` may consume the first."""
+        """One decoded frame, `_QUIET` if nothing arrived in time, or None if the SOCKET failed.
+
+        A READ THAT TIMED OUT IS NOT A BROKEN SOCKET, and conflating the two is not a style question: the
+        first version dropped the connection on every expiry, so a pod waiting for work re-opened its socket
+        every 30 s. The control plane's own log said so — `CLOSED … open_s=30.0` over and over, which is the
+        per-connection churn this transport exists to remove, reintroduced by its own claim loop.
+        """
         try:
             raw = self._conn.recv(timeout=wall)
+        except TimeoutError:
+            return _QUIET                          # nothing to read yet; the connection is fine
         except Exception as e:                    # noqa: BLE001 - transport, not content
             _log(f"socket read failed ({type(e).__name__}: {e}) — {len(self._outbox)} frame(s) unacknowledged")
             self._drop(f"{type(e).__name__}: {e}")
@@ -175,6 +187,12 @@ class EventStream:
             frame = self._recv(FRAME_WALL_S)
             if frame is None:
                 return False
+            if frame is _QUIET:
+                # An ack that never came inside its own wall IS a fault: the control plane answers every
+                # frame, so silence here means the peer is gone even though the socket still looks open.
+                _log(f"frame seq={seq} went unacknowledged for {FRAME_WALL_S}s — dropping this socket")
+                self._drop("ack timeout")
+                return False
             if str(frame.get("type")) == "job":
                 # WORK, arriving while we waited for an ack. Park it: the control plane has already taken it
                 # off the queue, so dropping it here is the one envelope loss this transport can still cause.
@@ -201,8 +219,8 @@ class EventStream:
             if self._conn is None and not self._open():
                 return None
             frame = self._recv(wall)
-            if frame is None:
-                return None
+            if frame is None or frame is _QUIET:
+                return None                        # no work this window; the socket stays up either way
             if str(frame.get("type")) == "job":
                 return frame.get("job")
             # An ack for a frame we already retired (a re-send that crossed with its own acknowledgement).
