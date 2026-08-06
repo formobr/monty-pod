@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -159,11 +160,25 @@ class ControlPlane:
         self.sess.post(f"{self.base}/pod/infer-result", json=payload, timeout=_TIMEOUT).raise_for_status()
 
     def note(self, payload: dict[str, Any]) -> None:
-        """Best-effort progress event; never raises — a pod must not die of saying what it is doing."""
-        try:
-            self.post_event(payload)
-        except Exception as e:  # noqa: BLE001 — a progress ping is never worth failing a job over
-            _log(f"progress event dropped ({payload.get('step', '')!r}): {e}")
+        """Best-effort progress event, sent OFF the caller's thread. Never raises.
+
+        WHY IT LEFT THE CALLER'S THREAD. `artifact.download_verified` calls its progress hook from INSIDE the
+        chunk loop, so whatever that hook costs is paid out of the transfer's own bandwidth. That was free
+        when an event was a fire-and-forget POST (measured p50 0.5 ms on /pod/event). It stopped being free
+        the moment events moved to a socket that waits for an acknowledgement under a lock: a progress ping
+        could then hold the download for as long as an ack takes, which is the opposite of what a progress
+        ping is for. A REPORT MAY NEVER COST THE WORK IT IS REPORTING ON.
+        """
+        # A CLOSURE, not a method: `note` is borrowed by objects that are not ControlPlane instances (the
+        # agent's own fakes bind it directly), and a helper method would make this the one call that demands
+        # they be one.
+        def _send() -> None:
+            try:
+                self.post_event(payload)
+            except Exception as e:  # noqa: BLE001 — a progress ping is never worth failing a job over
+                _log(f"progress event dropped ({payload.get('step', '')!r}): {e}")
+
+        threading.Thread(target=_send, name="cp-note", daemon=True).start()
 
     def report_infer_result(self, payload: dict[str, Any], wake_key: str | None = None) -> bool:
         """Deliver a terminal InferResult, retrying, then fall back to an error event. Never raises.

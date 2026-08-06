@@ -33,9 +33,37 @@ _CHUNK = 8 << 20
 DONE = ".complete"
 _PROGRESS_EVERY_S = 20.0
 
+STALL_WHY = """
+A TRANSFER THAT CRAWLS IS NOT A TRANSFER THAT IS WORKING.
+
+Measured 2026-08-06 on a warm-up that never finished: the 3 GB weights pull ran at 101 MB/s for its first
+minute and then decayed — 75, 34, 25, 20, and finally 17 MB/s AVERAGE, which is 9 MB moved in the last eight
+minutes. Nothing here stopped it. The only thing that did was the caller's 600 s checkpoint wall, from
+outside, which cannot say WHY it gave up and cannot try a different host.
+
+So progress alone was never the health signal: a stream delivering 20 KB/s is still "making progress" and
+will hold a rented box until someone else's deadline fires. The floor below turns that into a named, fast
+failure the caller can act on — the provisioner already knows how to blacklist an offer and take another one,
+but only if something tells it this one is bad.
+
+THE FLOOR IS DELIBERATELY FAR BELOW ANY HEALTHY LINK. Observed good pulls sit at 50-100 MB/s; this refuses
+only at three orders of magnitude below that, so a merely slow provider still completes and only a stalled
+one dies. It is measured over a WINDOW, not from the start, because an average is dragged down by the very
+stall it is supposed to detect — by the time a from-the-start average looks bad, the minutes are already gone.
+"""
+
+# Bytes per second, averaged over the window between two progress ticks, under which the transfer is declared
+# stalled (STALL_WHY). Env-overridable because the right number is a property of the link, not of this code.
+_MIN_BYTES_PER_S = float(os.environ.get("ARTIFACT_MIN_BYTES_PER_S", str(256 * 1024)))
+
 # Where a long fetch reports to. Default is stderr only, which is invisible from the control plane — the
 # 4.3 GB weights pull is the one place a pod can be alive and mute for ten minutes.
 Progress = Callable[[str], None]
+
+
+class TransferStalled(RuntimeError):
+    """The source stopped delivering at a usable rate (STALL_WHY). A distinct type so a caller can tell
+    "this HOST is bad, take another" from "this artifact is bad, do not retry it anywhere"."""
 
 
 class TarRef(Protocol):
@@ -107,17 +135,31 @@ def download_verified(ref: TarRef, dst: Path, progress: "Progress | None" = None
     digest = hashlib.sha256()
     total = 0
     t0 = last = time.monotonic()
+    at_last = 0                                   # bytes at the previous tick, for the WINDOW rate
     with dst.open("wb") as fh:
         for chunk in _chunks(ref.url):
             digest.update(chunk)
             fh.write(chunk)
             total += len(chunk)
             now = time.monotonic()
-            if progress is not None and now - last >= _PROGRESS_EVERY_S:
-                last = now
-                pct = f" ({100 * total / ref.size:.0f}%)" if ref.size else ""
-                progress(f"{label or 'artifact'} fetch {total / 1e6:.0f} MB{pct} · "
-                         f"{total / 1e6 / max(now - t0, 1e-6):.1f} MB/s")
+            if now - last >= _PROGRESS_EVERY_S:
+                window_s = now - last
+                window_rate = (total - at_last) / max(window_s, 1e-6)
+                last, at_last = now, total
+                if window_rate < _MIN_BYTES_PER_S:
+                    # LOUD AND FAST, so the caller can drop this host and take another instead of holding a
+                    # rented box until somebody else's deadline (STALL_WHY).
+                    raise TransferStalled(
+                        f"{label or 'artifact'} moved {window_rate / 1e6:.2f} MB/s over the last "
+                        f"{window_s:.0f}s ({total / 1e6:.0f} MB so far) — below the "
+                        f"{_MIN_BYTES_PER_S / 1e6:.2f} MB/s floor; the source has stalled")
+                if progress is not None:
+                    pct = f" ({100 * total / ref.size:.0f}%)" if ref.size else ""
+                    # AVERAGE for the human, WINDOW for the decision — the average is what hid this stall for
+                    # eight minutes, because it decays instead of dropping.
+                    progress(f"{label or 'artifact'} fetch {total / 1e6:.0f} MB{pct} · "
+                             f"{total / 1e6 / max(now - t0, 1e-6):.1f} MB/s avg · "
+                             f"{window_rate / 1e6:.1f} MB/s now")
     got = digest.hexdigest()
     if got != ref.sha256:
         raise ValueError(f"sha256 mismatch: expected {ref.sha256}, got {got} ({total} bytes)")
