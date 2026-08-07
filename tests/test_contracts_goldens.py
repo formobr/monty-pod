@@ -23,6 +23,7 @@ from podagent.models import (
     PodJob,
     RenderSpec,
 )
+from podagent.stream_models import PodStreamFrame, PodStreamServerFrame
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
 EXAMPLES = CONTRACTS / "examples"
@@ -36,10 +37,13 @@ MODELS = {
     "face_probe": FaceProbePayload,
     "clip_rank": ClipRankPayload,
     "pod_job": PodJob,
+    "pod_stream": PodStreamFrame,
+    "pod_stream_server": PodStreamServerFrame,
 }
 
 VALID_EXAMPLES = sorted(EXAMPLES.glob("*.json"))
 INVALID_EXAMPLES = sorted((EXAMPLES / "invalid").glob("*.json"))
+MODEL_INVALID_EXAMPLES = sorted((EXAMPLES / "model-invalid").glob("*.json"))
 
 
 def _prefix(path: Path) -> str:
@@ -84,8 +88,20 @@ def test_invalid_example_rejected_by_schema_and_model(path: Path) -> None:
         model_cls.model_validate(data)
 
 
+@pytest.mark.parametrize("path", MODEL_INVALID_EXAMPLES, ids=lambda p: p.name)
+def test_model_cross_field_invalid_example_rejected(path: Path) -> None:
+    data = json.loads(path.read_text())
+    prefix = _prefix(path)
+    assert next(_validator(prefix).iter_errors(data), None) is None, (
+        f"{path.name}: this fixture documents a cross-field invariant beyond JSON Schema")
+    with pytest.raises(ValidationError):
+        MODELS[prefix].model_validate(data)
+
+
 def test_top_level_required_parity() -> None:
     for prefix, model_cls in MODELS.items():
+        if prefix.startswith("pod_stream"):
+            continue  # both stream schemas are closed tagged unions; required fields live in each branch
         model_required = {
             (field.alias or name)
             for name, field in model_cls.model_fields.items()

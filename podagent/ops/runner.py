@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 from ..artifact import log
 from ..cp import download, upload
+from ..sanitize import safe_error
 from . import inputcache, pack, registry
 
 MAX_PARALLEL_ENV = "OPS_MAX_PARALLEL"
@@ -434,15 +435,15 @@ def _moved_bytes(outputs: dict[str, Any]) -> int:
 
 
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
-              sink: list[StepTiming] | None = None) -> dict[str, Any]:
+              sink: list[StepTiming] | None = None, emit: Any = None) -> dict[str, Any]:
     # The CPU slot is taken around the HANDLER ONLY (TRANSPORT_BUDGET_WHY) — see `_run_step_inner`. The disk
     # and socket bound the original comment was really protecting is now its own counter, which is what lets
     # a one-step fetch through while fifteen-step chains are encoding.
-    return _run_step_inner(step, ws, produced, sink)
+    return _run_step_inner(step, ws, produced, sink, emit)
 
 
 def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
-                    sink: list[StepTiming] | None = None) -> dict[str, Any]:
+                    sink: list[StepTiming] | None = None, emit: Any = None) -> dict[str, Any]:
     op = registry.get(step.op)
     # Refuse a judgement op HERE, on the executing box, before anything is fetched or run. Redundant with
     # the control plane's placement check by design: a check that lives only where the routing decision is
@@ -451,9 +452,33 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     registry.validate_params(step.op, step.params)
 
     timing = StepTiming(step_id=str(step.id), op=str(step.op))
+
+    def phase(name: str, state: str, started: float, exc: BaseException | None = None) -> None:
+        if emit is None:
+            return
+        payload: dict[str, Any] = {
+            "status": "step",
+            "step": str(step.id),
+            "op": str(step.op),
+            "phase": f"{name}_{state}",
+        }
+        if state != "started":
+            payload["timings"] = {"phase_s": round(time.monotonic() - started, 3)}
+            payload["outcome"] = "error" if exc is not None else "ok"
+        if exc is not None:
+            payload["error_type"] = type(exc).__name__
+            payload["error"] = safe_error(exc)
+        emit(**payload)
+
     t_bind = time.monotonic()
-    with transport_slots():
-        inputs = _bind_inputs(step, op, ws, produced)
+    phase("bind", "started", t_bind)
+    try:
+        with transport_slots():
+            inputs = _bind_inputs(step, op, ws, produced)
+    except BaseException as exc:
+        phase("bind", "error", t_bind, exc)
+        raise
+    phase("bind", "finished", t_bind)
     timing.bind_s = time.monotonic() - t_bind
     out_dir = ws.step_dir(step.id)
     declared_out = {p.id: p for p in op.outputs}
@@ -462,19 +487,25 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     fn = pack.resolve(op.handler)
     recorder = pack.legs()
     t0 = time.monotonic()
+    phase("run", "started", t0)
     # THE handler call. `LocalBackend` makes this exact call in-process on the origin machine; here the
     # pod makes it. ONE handler, two transports — parity is structural, not tested into existence. Note
     # what the handler is NOT given: no URL, no credential, no control-plane handle. It sees typed params
     # and local paths, so it cannot depend on where it is running.
     # THE CPU BUDGET, and only here: this call is the ffmpeg, and `CORES_PER_STEP` / `MEM_PER_STEP_BYTES`
     # are statements about exactly this frame (TRANSPORT_BUDGET_WHY).
-    with step_slots():
-        if recorder is not None:
-            with recorder.recording():
+    try:
+        with step_slots():
+            if recorder is not None:
+                with recorder.recording():
+                    fn(params=step.params, inputs=inputs, outputs=outputs)
+                timing.legs = _collect_legs(recorder)
+            else:
                 fn(params=step.params, inputs=inputs, outputs=outputs)
-            timing.legs = _collect_legs(recorder)
-        else:
-            fn(params=step.params, inputs=inputs, outputs=outputs)
+    except BaseException as exc:
+        phase("run", "error", t0, exc)
+        raise
+    phase("run", "finished", t0)
     dt = time.monotonic() - t0
     timing.run_s = dt
 
@@ -487,12 +518,18 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
 
     # Only NOW does anything leave the box, and only for bindings that named a url.
     t_put = time.monotonic()
-    with transport_slots():
-        for b in step.outputs:
-            if b.url is not None and outputs[b.port].exists():
-                upload(outputs[b.port], b.url)
-            elif b.urls is not None:
-                _upload_many(step, b, outputs[b.port])
+    phase("upload", "started", t_put)
+    try:
+        with transport_slots():
+            for b in step.outputs:
+                if b.url is not None and outputs[b.port].exists():
+                    upload(outputs[b.port], b.url)
+                elif b.urls is not None:
+                    _upload_many(step, b, outputs[b.port])
+    except BaseException as exc:
+        phase("upload", "error", t_put, exc)
+        raise
+    phase("upload", "finished", t_put)
     timing.put_s = time.monotonic() - t_put
     # LAST, and only on the success road: a step that raised delivered nothing, and a duration booked for
     # work that did not land is the kind of number that makes a ledger worse than none.
@@ -510,7 +547,7 @@ def _upload_many(step: Any, b: Any, paths: list[Path]) -> None:
             upload(path, url)
         except Exception as e:
             raise ChainError(f"step {step.id!r}: output {b.port!r}[{i}] of {len(b.urls)} would not upload "
-                             f"({type(e).__name__}: {e}); {i} element(s) before it did land") from e
+                             f"({safe_error(e)}); {i} element(s) before it did land") from e
 
 
 def preflight_chain(chain: Any) -> None:
@@ -562,6 +599,8 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
     corr_id/session_id are echoed from the claimed envelope onto every event/terminal (pool demux)."""
 
     def _event(**payload: Any) -> None:
+        payload.setdefault("job_id", chain.job_id)
+        payload.setdefault("stage", "ops")
         if corr_id is not None:
             payload["corr_id"] = corr_id
         if session_id is not None:
@@ -619,7 +658,8 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     ready = [sid for sid in pending if not (deps[sid] - done_ids)]
                 for sid in ready:
                     pending.discard(sid)
-                    running[ex.submit(_run_step, by_id[sid], ws, produced, timings)] = sid
+                    running[ex.submit(
+                        _run_step, by_id[sid], ws, produced, timings, _event)] = sid
                 if not running:
                     # pending non-empty with nothing runnable cannot happen (OpChain rejects cycles at
                     # validation) — but a deadlock on a rented box is expensive enough to name explicitly.
@@ -635,12 +675,12 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                         # wire vocabulary (done|ok|step|error) and NON-terminal — an "error" here would be
                         # read as the chain's own, and a word outside it would 422 and abort the chain.
                         _event(job_id=chain.job_id, stage="ops", status="step", step=sid, optional=True,
-                               error=f"{by_id[sid].op}: {e}"[:500])
+                               error=f"{by_id[sid].op}: {safe_error(e)}"[:500])
                         failed.add(sid)
                         _drop_dependents_of_failed()
                         continue
                     _event(job_id=chain.job_id, stage="ops", status="error",
-                           step=sid, error=f"{by_id[sid].op}: {e}"[:500])
+                           step=sid, error=f"{by_id[sid].op}: {safe_error(e)}"[:500])
                     raise
                 with lock:
                     produced[sid] = outs

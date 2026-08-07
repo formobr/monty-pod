@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from .cp import download, upload
 from .models import AlignParams
+from .sanitize import safe_error
 
 _SR = 16000
 
@@ -53,7 +54,7 @@ class AlignService:
         except RuntimeError as e:
             if self.device == "cpu":
                 raise
-            print(f"[podagent] WARNING align CUDA failed ({str(e)[:120]}) → CPU fallback (SLOW)",
+            print(f"[podagent] WARNING align CUDA failed ({safe_error(e, 120)}) → CPU fallback (SLOW)",
                   file=sys.stderr, flush=True)
             self.device = "cpu"
             self.model = self.model.to("cpu")

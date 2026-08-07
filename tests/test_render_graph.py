@@ -124,3 +124,41 @@ def test_multi_source_input_order() -> None:
     cmd = render.build_command(spec, ipaths, Path("/work/out.mp4"), gpu=False)
     i_paths = [cmd[n + 1] for n, a in enumerate(cmd) if a == "-i"]
     assert i_paths == ["/work/src", "/work/src2"]
+
+
+def test_render_download_ffmpeg_upload_boundaries_are_structured(monkeypatch, tmp_path) -> None:
+    spec = _spec("spec.preview.json")
+    events: list[dict] = []
+    results: list[dict] = []
+
+    class _CP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            events.append(payload)
+            return True
+
+        def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+            results.append(payload)
+            return True
+
+    def fake_download(_url: str, dest: Path) -> Path:
+        dest.write_bytes(b"media")
+        return dest
+
+    class _Done:
+        returncode = 0
+        stderr = b""
+
+    monkeypatch.setattr(render, "download", fake_download)
+    monkeypatch.setattr(render, "upload", lambda *_a, **_kw: None)
+    monkeypatch.setattr(render, "_gpu_available", lambda: False)
+    monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: _Done())
+    render.render_spec(spec, _CP(), corr_id="c", session_id="s")
+
+    phases = [e for e in events if e.get("op") in {"download", "ffmpeg", "upload"}]
+    assert [e["phase"] for e in phases] == [
+        "download_started", "download_finished",
+        "ffmpeg_started", "ffmpeg_finished",
+        "upload_started", "upload_finished",
+    ]
+    assert all(e["corr_id"] == "c" and e["session_id"] == "s" for e in phases)
+    assert results and results[0]["session_id"] == "s"

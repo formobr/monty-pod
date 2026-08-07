@@ -9,10 +9,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
 from .cp import ControlPlane, download, upload
+from .sanitize import safe_error
 from .models import MotionKeyframe, RenderSpec, SpecBrollClip, SpecTransition
 
 _P_STYLE = re.compile(r"p\d+")  # NVENC preset names (p1..p7); libx264 can't take these
@@ -511,6 +513,42 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
 
     corr_id/session_id are echoed from the claimed envelope onto the terminal (pool result demux)."""
     work_started = time.monotonic()
+
+    @contextmanager
+    def phase(op: str):
+        base = {
+            "job_id": spec.job_id,
+            "session_id": session_id,
+            "corr_id": corr_id,
+            "stage": "render",
+            "status": "step",
+            "op": op,
+        }
+        cp.send_event({k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
+        started = time.monotonic()
+        try:
+            yield
+        except BaseException as exc:
+            cp.send_event({
+                k: v for k, v in {
+                    **base,
+                    "phase": f"{op}_error",
+                    "outcome": "error",
+                    "error_type": type(exc).__name__,
+                    "error": safe_error(exc),
+                    "timings": {"phase_s": round(time.monotonic() - started, 3)},
+                }.items() if v is not None
+            })
+            raise
+        else:
+            cp.send_event({
+                k: v for k, v in {
+                    **base,
+                    "phase": f"{op}_finished",
+                    "outcome": "ok",
+                    "timings": {"phase_s": round(time.monotonic() - started, 3)},
+                }.items() if v is not None
+            })
     if spec.mode == "final" and spec.overlays is not None and spec.overlays.trims:
         raise NotImplementedError("final overlay(s) not yet composited on the pod: ['trims']")
 
@@ -521,9 +559,10 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        input_paths = {
-            inp.id: download(inp.url, tmp / inp.id.replace("/", "__")) for inp in spec.inputs
-        }
+        with phase("download"):
+            input_paths = {
+                inp.id: download(inp.url, tmp / inp.id.replace("/", "__")) for inp in spec.inputs
+            }
         # music: pre-measure the voice loudnorm + pre-render the -33 LUFS bed (own ffmpeg passes), then
         # the main pass mixes voice+bed instead of copying segment audio (locked add_music.sh chain).
         extra_inputs: tuple[Path, ...] = ()
@@ -547,68 +586,85 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                               clean=clean, vln=vln, dur=dur, sfx=sfx_tuples)
         out = tmp / "render.mp4"
         cmd = build_command(spec, input_paths, out, gpu, extra_inputs, audio)
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as exc:
-            tail = (exc.stderr or b"")[-2000:]
-            detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
-            raise RuntimeError(f"ffmpeg exited {exc.returncode}: {detail}") from exc
+        with phase("ffmpeg"):
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as exc:
+                tail = (exc.stderr or b"")[-2000:]
+                detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
+                raise RuntimeError(
+                    f"ffmpeg exited {exc.returncode}: {safe_error(RuntimeError(detail))}") from exc
 
         master = out
         _mp = spec.overlays.motion_plan if (spec.mode == "final" and spec.overlays is not None) else None
         # mograph overlays first (under the captions), then captions, then the cover weld.
         if _mp is not None and _mp.sections:
             from .mograph import composite
-            master = composite(_mp, master, input_paths, tmp / "render_mograph.mp4", gpu, spec.encode, tmp)
+            with phase("mograph"):
+                master = composite(
+                    _mp, master, input_paths, tmp / "render_mograph.mp4", gpu, spec.encode, tmp)
 
         # captions burn (libass) BEFORE the cover weld — the subtitle track covers the whole body.
         caps = _mp.captions if _mp is not None else None
         if caps is not None and caps.words:
             captioned = tmp / "render_caps.mp4"
-            _burn_captions(caps, _mp, master, input_paths, captioned, gpu,
-                           spec.timeline.width, spec.timeline.height, spec.encode)
+            with phase("captions"):
+                _burn_captions(caps, _mp, master, input_paths, captioned, gpu,
+                               spec.timeline.width, spec.timeline.height, spec.encode)
             master = captioned
 
         # cover is the LAST step: extract the base frame, compose the still, weld it onto the master tail.
         cover = spec.overlays.cover if (spec.mode == "final" and spec.overlays is not None) else None
         cover_png: Path | None = None
-        if cover is not None:
-            from .cover import render_cover
-            welded = tmp / "render_cover.mp4"
-            # keep the composed still when a cover output is declared — the deliverable = the welded end-card's pixels.
-            cover_png = (tmp / "cover.png") if any(o.kind == "cover" for o in spec.outputs) else None
-            render_cover(cover.model_dump(by_alias=True), input_paths[spec.timeline.segments[0].src],
-                         master, input_paths, welded, gpu, spec.timeline.width, spec.timeline.height,
-                         png_out=cover_png)
-            master = welded
+        fin = spec.overlays.finalize if (spec.mode == "final" and spec.overlays is not None) else None
+        if cover is not None or fin is not None:
+            with phase("finalize"):
+                if cover is not None:
+                    from .cover import render_cover
+                    welded = tmp / "render_cover.mp4"
+                    cover_png = (
+                        tmp / "cover.png") if any(o.kind == "cover" for o in spec.outputs) else None
+                    render_cover(
+                        cover.model_dump(by_alias=True),
+                        input_paths[spec.timeline.segments[0].src],
+                        master,
+                        input_paths,
+                        welded,
+                        gpu,
+                        spec.timeline.width,
+                        spec.timeline.height,
+                        png_out=cover_png,
+                    )
+                    master = welded
+                # Pin the completed composite before the delivery tail can change A/V sync.
+                presync = master
+                if fin is not None:
+                    from .finalize import finalize
+                    master = finalize(fin, master, input_paths, tmp, gpu)
+        else:
+            presync = master
 
         # The COMPOSITE is complete here; everything below is the delivery tail. `presync` pins this
         # exact frame: it is the video-identical reference the origin's A/V-sync guard measures the
         # finished master against, so the guard can attribute any drift to the tail and nothing else.
-        presync = master
-        fin = spec.overlays.finalize if (spec.mode == "final" and spec.overlays is not None) else None
-        if fin is not None:
-            from .finalize import finalize
-            master = finalize(fin, master, input_paths, tmp, gpu)
-
         done: list[str] = []
-        for o in spec.outputs:
-            if o.kind == "cache":
-                print(f"cache output {o.id!r} skipped (v1)", file=sys.stderr)
-                continue
-            if o.kind == "presync":
-                # only meaningful when a tail ran; without one the master IS the composite
-                if fin is not None:
-                    upload(presync, o.put_url, "video/mp4")
-                    done.append(o.id)
-                continue
-            if o.kind == "cover":
-                if cover_png is not None and cover_png.is_file():
-                    upload(cover_png, o.put_url, "image/png")
-                    done.append(o.id)
-                continue
-            upload(master, o.put_url, "video/mp4")
-            done.append(o.id)
+        with phase("upload"):
+            for o in spec.outputs:
+                if o.kind == "cache":
+                    print(f"cache output {o.id!r} skipped (v1)", file=sys.stderr)
+                    continue
+                if o.kind == "presync":
+                    if fin is not None:
+                        upload(presync, o.put_url, "video/mp4")
+                        done.append(o.id)
+                    continue
+                if o.kind == "cover":
+                    if cover_png is not None and cover_png.is_file():
+                        upload(cover_png, o.put_url, "image/png")
+                        done.append(o.id)
+                    continue
+                upload(master, o.put_url, "video/mp4")
+                done.append(o.id)
 
     terminal = {
         "job_id": spec.job_id,

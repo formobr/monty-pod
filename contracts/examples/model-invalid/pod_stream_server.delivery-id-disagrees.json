@@ -1,0 +1,22 @@
+{
+  "type": "job",
+  "delivery_id": "wrong-corr",
+  "job": {
+    "type": "infer",
+    "session_id": "session-demo-1",
+    "corr_id": "infer-demo-1",
+    "request": {
+      "infer_version": 5,
+      "job_id": "job-1",
+      "kind": "face_probe",
+      "model": "yunet",
+      "put_url": "https://storage.example/out?sig=x",
+      "face_probe": {
+        "video_url": "https://storage.example/in?sig=x",
+        "shots": [[0.0, 1.0]],
+        "stride": 1,
+        "frame_diff": false
+      }
+    }
+  }
+}

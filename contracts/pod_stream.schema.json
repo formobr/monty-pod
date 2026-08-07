@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://monty.fast/contracts/pod_stream.schema.json",
+  "title": "PodStreamClientFrame",
+  "description": "Strict pod->control-plane frame on the sole pod transport. Exactly one typed payload rides each durable delivery identity.",
+  "x-contract-version": 9,
+  "oneOf": [
+    {"$ref": "#/$defs/eventFrame"},
+    {"$ref": "#/$defs/resultFrame"}
+  ],
+  "$defs": {
+    "streamId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "description": "Fresh for one pod process, stable across reconnects."
+    },
+    "eventFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "stream_id", "seq", "event"],
+      "properties": {
+        "type": {"const": "event"},
+        "stream_id": {"$ref": "#/$defs/streamId"},
+        "seq": {"type": "integer", "minimum": 1},
+        "event": {"$ref": "#/$defs/podEvent"}
+      }
+    },
+    "resultFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "stream_id", "seq", "result"],
+      "properties": {
+        "type": {"const": "result"},
+        "stream_id": {"$ref": "#/$defs/streamId"},
+        "seq": {"type": "integer", "minimum": 1},
+        "result": {"$ref": "#/$defs/podResult"}
+      }
+    },
+    "podEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "status"],
+      "properties": {
+        "job_id": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "corr_id": {"type": "string", "minLength": 1},
+        "stage": {"type": "string", "minLength": 1},
+        "status": {"enum": ["done", "ok", "step", "error"]},
+        "step": {"type": "string", "minLength": 1},
+        "op": {"type": "string", "minLength": 1},
+        "phase": {"type": "string", "minLength": 1},
+        "outcome": {"enum": ["ok", "error"]},
+        "error_type": {"type": "string", "minLength": 1},
+        "optional": {"type": "boolean"},
+        "steps": {"type": "array", "items": {"type": "string"}},
+        "skipped": {"type": "array", "items": {"type": "string"}},
+        "outputs": {},
+        "error": {"type": "string"},
+        "timings": {"type": "object"},
+        "capacity": {"type": "object"},
+        "ts": {"type": "string", "format": "date-time"}
+      }
+    },
+    "podResult": {
+      "type": "object",
+      "required": ["job_id", "session_id", "corr_id", "status"],
+      "allOf": [
+        {"oneOf": [{"required": ["kind"]}, {"required": ["stage"]}]},
+        {"not": {"required": ["timing", "timings"]}}
+      ],
+      "properties": {
+        "job_id": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "corr_id": {"type": "string", "minLength": 1},
+        "result_key": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "stage": {"type": "string", "minLength": 1},
+        "status": {"enum": ["ok", "error"]},
+        "timing": {"type": "object"},
+        "timings": {"type": "object"}
+      },
+      "additionalProperties": true
+    }
+  }
+}

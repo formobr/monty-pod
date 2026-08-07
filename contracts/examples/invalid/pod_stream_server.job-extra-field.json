@@ -1,0 +1,6 @@
+{
+  "type": "job",
+  "delivery_id": "c",
+  "job": {"type": "ops", "session_id": "s", "corr_id": "c", "chain": {}},
+  "seq": 17
+}

@@ -116,6 +116,22 @@ def test_the_terminal_carries_one_timing_per_step(monkeypatch, wired, tmp_path, 
                                                                 "body", "seek_decode", "encode"}, got
 
 
+def test_bind_run_upload_boundaries_are_structured_events(monkeypatch, wired, op):
+    src, required = wired
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
+    cp = _CP()
+    runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp, corr_id="c", session_id="s")
+    phases = [e for e in cp.events if e.get("step") == "s1" and e.get("phase")]
+    assert [e["phase"] for e in phases] == [
+        "bind_started", "bind_finished",
+        "run_started", "run_finished",
+        "upload_started", "upload_finished",
+    ]
+    assert all(e["stage"] == "ops" and e["corr_id"] == "c" and e["session_id"] == "s"
+               for e in phases)
+    assert all("phase_s" in e["timings"] for e in phases if e["phase"].endswith("_finished"))
+
+
 def test_the_step_weighs_what_it_wrote(monkeypatch, wired, tmp_path, op):
     """Seconds without bytes name no defect: 33 s is a mood, 7 MB in 33 s is a diagnosis. This box is the
     only side that can weigh the file, so it does.

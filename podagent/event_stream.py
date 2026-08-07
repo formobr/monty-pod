@@ -20,12 +20,16 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from .sanitize import safe_endpoint, safe_error, safe_text
+from .stream_models import StreamAck, StreamJob, event_payload, result_payload
 
 try:  # pragma: no cover - import shape is exercised through the no-module branch
     import websockets.sync.client as _ws_client
@@ -39,12 +43,11 @@ FRAME_WALL_S = float(os.environ.get("POD_STREAM_FRAME_WALL_S", "10"))
 OPEN_WALL_S = float(os.environ.get("POD_STREAM_OPEN_WALL_S", "10"))
 MAX_REOPENS = int(os.environ.get("POD_STREAM_MAX_REOPENS", "2"))
 REOPEN_BACKOFF_S = float(os.environ.get("POD_STREAM_REOPEN_BACKOFF_S", "0.25"))
+BACKGROUND_RETRY_S = float(os.environ.get("POD_STREAM_BACKGROUND_RETRY_S", "5"))
 DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
-_STATE_VERSION = 1
-
-_ACK_KEYS = frozenset({"type", "stream_id", "seq", "status", "duplicate", "error"})
-_JOB_KEYS = frozenset({"type", "job"})
+_STATE_VERSION = 2
+_ADMISSION_WAKE = object()
 
 
 def _delivery_wall_s() -> float:
@@ -54,21 +57,29 @@ def _delivery_wall_s() -> float:
 
 
 def _log(msg: str) -> None:
-    print(f"[pod-stream] {msg}", file=sys.stderr, flush=True)
+    print(f"[pod-stream] {safe_text(msg)}", file=sys.stderr, flush=True)
 
 
 class ProtocolError(ValueError):
     """The peer sent a frame that cannot safely drive this state machine."""
 
 
-class FrameRejected(RuntimeError):
+class TransportUnhealthy(RuntimeError):
+    """The pod must not admit more paid work while its durable voice is unhealthy."""
+
+
+class DeliveryPending(TransportUnhealthy):
+    """A bounded delivery cycle ended ambiguously; the durable sender keeps retrying."""
+
+
+class FrameRejected(TransportUnhealthy):
     """The control plane made a deterministic 4xx verdict on one client frame."""
 
     def __init__(self, frame: dict[str, Any], ack: dict[str, Any]) -> None:
         self.frame, self.ack = frame, ack
         super().__init__(
             f"{frame['type']} frame {frame['stream_id']}:{frame['seq']} rejected "
-            f"with {ack['status']}: {ack.get('error') or 'no reason'}")
+            f"with {ack['status']}: {safe_text(ack.get('error') or 'no reason', 300)}")
 
 
 class EventStream:
@@ -88,17 +99,25 @@ class EventStream:
         self._conn: Any = None
         self._reader: threading.Thread | None = None
         self._stop = False
-        self._paused = False
-        self._jobs: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._jobs: "queue.Queue[str | object]" = queue.Queue()
+        self._queued_ids: set[str] = set()
+        self._claimed_ids: set[str] = set()
         self._ack_waiters: dict[tuple[str, int], threading.Event] = {}
         self._acks: dict[tuple[str, int], dict[str, Any]] = {}
         self._delivery_waiters: dict[tuple[str, int], threading.Event] = {}
         self._delivery_outcomes: dict[tuple[str, int], bool | BaseException] = {}
+        self._admission_error: TransportUnhealthy | None = None
+        self._storage_error: TransportUnhealthy | None = None
 
         # A process incarnation owns one new stream id. Frames restored from disk keep THEIR original id/seq;
         # mixing an old identity into the new stream makes server-side dedupe unable to identify a replay.
         self._stream_id, self._next_seq = uuid.uuid4().hex, 1
-        self._outbox, self._rejected = self._load()
+        self._outbox, self._rejected, self._inbox = self._load()
+        if self._rejected:
+            self._admission_error = TransportUnhealthy(
+                "a deterministic rejected verdict remains in durable dead-letter")
+        elif self._outbox:
+            self._admission_error = DeliveryPending("startup replay must clear before admitting work")
         # Establish durability at construction, before claiming work. Discovering an unwritable volume only
         # after a paid job finishes would recreate the silent-terminal failure in a different layer.
         with self._state:
@@ -111,6 +130,10 @@ class EventStream:
 
         self._sender = threading.Thread(target=self._sender_loop, name="pod-stream-sender", daemon=True)
         self._sender.start()
+        with self._work:
+            for delivery_id in self._inbox:
+                self._queued_ids.add(delivery_id)
+                self._jobs.put(delivery_id)
         if self._outbox:
             _log(f"startup replay: {len(self._outbox)} durable frame(s), "
                  f"new_stream={self._stream_id}")
@@ -129,30 +152,34 @@ class EventStream:
         keys = {"type", "stream_id", "seq", kind}
         if set(frame) != keys:
             raise ProtocolError(f"{kind} frame keys must be {sorted(keys)}, got {sorted(frame)}")
-        if not isinstance(frame.get("stream_id"), str) or not frame["stream_id"]:
+        if (not isinstance(frame.get("stream_id"), str) or not frame["stream_id"]
+                or len(frame["stream_id"]) > 128
+                or re.fullmatch(r"[A-Za-z0-9_.-]+", frame["stream_id"]) is None):
             raise ProtocolError("outbox frame carries no stream_id")
         seq = frame.get("seq")
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
             raise ProtocolError(f"outbox seq must be a positive integer, got {seq!r}")
-        if not isinstance(frame.get(kind), dict):
-            raise ProtocolError(f"{kind} payload must be an object")
-        return dict(frame)
+        checked = dict(frame)
+        checked[kind] = event_payload(frame.get(kind)) if kind == "event" else result_payload(frame.get(kind))
+        return checked
 
-    def _load(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _load(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
         try:
             raw = json.loads(self._path.read_text())
         except FileNotFoundError:
-            return [], []
+            return [], [], {}
         except (OSError, ValueError) as e:
-            raise RuntimeError(f"durable pod outbox {self._path} is unreadable; refusing to discard it: {e}") from e
-        if not isinstance(raw, dict) or set(raw) != {"version", "frames", "rejected"}:
+            raise RuntimeError(
+                f"durable pod state {self._path} is unreadable; refusing to discard it: {safe_error(e)}") from e
+        if not isinstance(raw, dict) or set(raw) != {"version", "frames", "rejected", "inbox"}:
             raise RuntimeError(f"durable pod outbox {self._path} has an unknown shape; refusing to discard it")
         if raw.get("version") != _STATE_VERSION:
             raise RuntimeError(f"durable pod outbox version {raw.get('version')!r} is unsupported")
         frames = raw.get("frames")
         rejected = raw.get("rejected")
-        if not isinstance(frames, list) or not isinstance(rejected, list):
-            raise RuntimeError("durable pod outbox frames is not a list")
+        inbox = raw.get("inbox")
+        if not isinstance(frames, list) or not isinstance(rejected, list) or not isinstance(inbox, dict):
+            raise RuntimeError("durable pod state frames/rejected/inbox have invalid container types")
         checked = [self._validate_client_frame(f) for f in frames]
         identities = [(str(f["stream_id"]), int(f["seq"])) for f in checked]
         if len(identities) != len(set(identities)):
@@ -161,7 +188,22 @@ class EventStream:
             if not isinstance(row, dict) or not isinstance(row.get("frame"), dict):
                 raise RuntimeError("durable pod dead-letter carries a malformed row")
             self._validate_client_frame(row["frame"])
-        return checked, list(rejected)
+        checked_inbox: dict[str, dict[str, Any]] = {}
+        for delivery_id, job in inbox.items():
+            decoded = StreamJob.model_validate(
+                {"type": "job", "delivery_id": delivery_id, "job": job})
+            checked_inbox[delivery_id] = decoded.job.model_dump(exclude_none=True, mode="json")
+        result_corrs = {
+            str(f["result"]["corr_id"]) for f in checked if f["type"] == "result"
+        } | {
+            str(row["frame"]["result"]["corr_id"])
+            for row in rejected if row["frame"]["type"] == "result"
+        }
+        overlap = set(checked_inbox) & result_corrs
+        if overlap:
+            raise RuntimeError(
+                f"durable pod state repeats completed delivery identity: {sorted(overlap)}")
+        return checked, list(rejected), checked_inbox
 
     def _persist_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,6 +211,7 @@ class EventStream:
             "version": _STATE_VERSION,
             "frames": self._outbox,
             "rejected": self._rejected,
+            "inbox": self._inbox,
         }
         tmp = self._path.with_name(f".{self._path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
@@ -190,21 +233,63 @@ class EventStream:
             except OSError:
                 pass
 
+    def _latch_locked(self, error: TransportUnhealthy, *, storage: bool = False) -> None:
+        before = self._admission_error
+        if self._admission_error is None or not isinstance(error, DeliveryPending):
+            self._admission_error = error
+        if storage:
+            self._storage_error = self._storage_error or error
+        if self._admission_error is not before or storage:
+            self._jobs.put(_ADMISSION_WAKE)
+        self._work.notify_all()
+
+    def _result_corrs_locked(self) -> set[str]:
+        return {
+            str(f["result"]["corr_id"]) for f in self._outbox if f["type"] == "result"
+        } | {
+            str(row["frame"]["result"]["corr_id"])
+            for row in self._rejected if row["frame"]["type"] == "result"
+        }
+
     def _append(self, kind: str, payload: dict[str, Any], *, wait: bool) -> tuple[int, threading.Event | None]:
-        if kind == "result" and not (str(payload.get("corr_id") or "").strip()
-                                     or str(payload.get("result_key") or "").strip()):
-            raise ValueError("result frame requires corr_id or result_key")
+        try:
+            normalized = event_payload(payload) if kind == "event" else result_payload(payload)
+        except BaseException as e:
+            error = TransportUnhealthy(f"invalid {kind} payload: {safe_error(e)}")
+            with self._work:
+                self._latch_locked(error)
+            raise error from e
         with self._work:
+            if self._storage_error is not None:
+                raise self._storage_error
+            corr_id = str(normalized.get("corr_id") or "")
+            if kind == "result" and corr_id in self._result_corrs_locked():
+                error = TransportUnhealthy(f"result corr_id {corr_id!r} already pending or rejected")
+                self._latch_locked(error)
+                raise error
             seq = self._next_seq
-            frame = {"type": kind, "stream_id": self._stream_id, "seq": seq, kind: dict(payload)}
+            frame = {"type": kind, "stream_id": self._stream_id, "seq": seq, kind: normalized}
             self._validate_client_frame(frame)
             self._outbox.append(frame)
             self._next_seq += 1
-            self._persist_locked()  # append-before-send: the write below cannot race ahead of durability
             waiter = threading.Event() if wait else None
             if waiter is not None:
                 self._delivery_waiters[(self._stream_id, seq)] = waiter
-            self._paused = False
+            removed_job = self._inbox.pop(corr_id, None) if kind == "result" else None
+            try:
+                self._persist_locked()  # append and matching inbox retirement are ONE durable transition
+            except BaseException as e:
+                if removed_job is not None:
+                    self._inbox[corr_id] = removed_job
+                self._outbox.pop()
+                self._next_seq -= 1
+                self._delivery_waiters.pop((self._stream_id, seq), None)
+                error = TransportUnhealthy(f"durable append failed: {safe_error(e)}")
+                self._latch_locked(error, storage=True)
+                raise error from e
+            if kind == "result":
+                self._queued_ids.discard(corr_id)
+                self._claimed_ids.discard(corr_id)
             self._work.notify_all()
             return seq, waiter
 
@@ -229,7 +314,13 @@ class EventStream:
         # unexpected persistence failure inside the daemon, so a terminal caller itself cannot wait forever.
         if not waiter.wait(_delivery_wall_s()):
             with self._state:
-                self._delivery_waiters.pop((stream_id, seq), None)
+                key = (stream_id, seq)
+                self._delivery_waiters.pop(key, None)
+                raced = self._delivery_outcomes.pop(key, None)
+            if isinstance(raced, BaseException):
+                raise raced
+            if raced is not None:
+                return bool(raced)
             _log(f"frame seq={seq} sender exceeded derived delivery wall {_delivery_wall_s():.2f}s; "
                  "frame remains durable")
             return False
@@ -246,7 +337,7 @@ class EventStream:
     def _sender_loop(self) -> None:
         while True:
             with self._work:
-                self._work.wait_for(lambda: self._stop or (self._outbox and not self._paused))
+                self._work.wait_for(lambda: self._stop or self._outbox)
                 if self._stop:
                     return
                 frame = dict(self._outbox[0])
@@ -254,16 +345,20 @@ class EventStream:
                 delivery_started = time.monotonic()
                 disposition, ack = self._deliver(frame)
                 self._settle(frame, disposition, ack, time.monotonic() - delivery_started)
+                if disposition == "pending":
+                    with self._work:
+                        self._work.wait(timeout=BACKGROUND_RETRY_S)
             except BaseException as e:  # noqa: BLE001 - sender death would strand a synchronous terminal
                 key = (str(frame["stream_id"]), int(frame["seq"]))
                 _log(f"sender failed while settling {key[0]}:{key[1]} "
-                     f"({type(e).__name__}: {e}); frame remains durable")
+                     f"({safe_error(e)}); frame remains durable")
                 with self._work:
-                    self._paused = True
+                    error = TransportUnhealthy(f"sender settlement failed: {safe_error(e)}")
+                    self._latch_locked(error, storage=True)
                     if (waiter := self._delivery_waiters.get(key)) is not None:
-                        self._delivery_outcomes[key] = e
+                        self._delivery_outcomes[key] = error
                         waiter.set()
-                    self._work.notify_all()
+                    self._work.wait(timeout=BACKGROUND_RETRY_S)
 
     def _result_acked_frame(self, frame: dict[str, Any], delivery_s: float) -> dict[str, Any]:
         result = frame["result"]
@@ -306,13 +401,17 @@ class EventStream:
                         self._next_seq += 1
                     try:
                         self._persist_locked()
-                    except BaseException:
+                    except BaseException as e:
                         if acked is not None:
                             self._outbox.pop()
                             self._next_seq -= 1
                         self._outbox.insert(0, popped)
-                        raise
+                        raise TransportUnhealthy(
+                            f"durable retire failed: {safe_error(e)}") from e
                 outcome = True
+                if (isinstance(self._admission_error, DeliveryPending)
+                        and not self._outbox and self._storage_error is None):
+                    self._admission_error = None
             elif disposition == "rejected":
                 if self._outbox and (str(self._outbox[0]["stream_id"]),
                                      int(self._outbox[0]["seq"])) == key:
@@ -325,16 +424,19 @@ class EventStream:
                     self._rejected.append(rejected)
                     try:
                         self._persist_locked()
-                    except BaseException:
+                    except BaseException as e:
                         self._rejected.pop()
                         self._outbox.insert(0, popped)
-                        raise
+                        raise TransportUnhealthy(
+                            f"durable dead-letter move failed: {safe_error(e)}") from e
                 outcome = FrameRejected(frame, ack or {})
+                self._latch_locked(outcome)
             else:
-                # Retry exhaustion is not a verdict. Keep the frame durably at the head and pause until
-                # a later send/claim/startup explicitly kicks the lane again.
-                self._paused = True
-                outcome = False
+                # Retry exhaustion is not a verdict. Keep the frame durably at the head and continue bounded
+                # background attempts, but close admission until the ordered voice catches up.
+                outcome = DeliveryPending(
+                    f"{frame['type']} frame {frame['stream_id']}:{frame['seq']} remains unacknowledged")
+                self._latch_locked(outcome)
             if (waiter := self._delivery_waiters.get(key)) is not None:
                 self._delivery_outcomes[key] = outcome
                 waiter.set()
@@ -358,7 +460,7 @@ class EventStream:
                 return "accepted", ack
             if 400 <= status < 500:
                 _log(f"frame seq={frame['seq']} REJECTED status={status} "
-                     f"reason={str(ack.get('error') or '')[:200]} — moved to durable dead-letter")
+                     f"reason={safe_text(ack.get('error') or '', 200)} — moved to durable dead-letter")
                 return "rejected", ack
             # A 5xx did not judge content. Retry like a timeout/socket ambiguity, retaining the same identity.
             if attempt < MAX_REOPENS:
@@ -381,10 +483,10 @@ class EventStream:
             with self._write_lock:
                 conn.send(json.dumps(frame, ensure_ascii=False, separators=(",", ":")))
         except Exception as e:  # noqa: BLE001 - transport, frame stays durable
-            _log(f"frame seq={seq} write failed ({type(e).__name__}: {e})")
+            _log(f"frame seq={seq} write failed ({safe_error(e)})")
             with self._state:
                 self._ack_waiters.pop(key, None)
-            self._fail_connection(conn, f"write: {type(e).__name__}: {e}")
+            self._fail_connection(conn, f"write: {safe_error(e)}")
             return None
         got = ready.wait(FRAME_WALL_S)
         with self._state:
@@ -399,32 +501,47 @@ class EventStream:
     # ── strict server frames ───────────────────────────────────────────────────────────────────────
 
     def _validate_ack(self, frame: dict[str, Any]) -> dict[str, Any]:
-        if not set(frame) <= _ACK_KEYS or not {"type", "stream_id", "seq", "status"} <= set(frame):
-            raise ProtocolError(f"ACK keys are invalid: {sorted(frame)}")
-        if frame.get("type") != "ack":
-            raise ProtocolError(f"expected type=ack, got {frame.get('type')!r}")
-        seq, status = frame.get("seq"), frame.get("status")
-        stream_id = frame.get("stream_id")
-        if not isinstance(stream_id, str) or not stream_id:
-            raise ProtocolError("ACK stream_id is empty")
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
-            raise ProtocolError("ACK seq is not a positive integer")
-        if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
-            raise ProtocolError("ACK status is not an HTTP status integer")
-        if "duplicate" in frame and not isinstance(frame["duplicate"], bool):
-            raise ProtocolError("ACK duplicate is not boolean")
-        if "error" in frame and not isinstance(frame["error"], str):
-            raise ProtocolError("ACK error is not a string")
+        checked = StreamAck.model_validate(frame).model_dump(exclude_none=True, mode="json")
+        stream_id, seq = checked["stream_id"], checked["seq"]
         with self._state:
             if (stream_id, seq) not in self._ack_waiters:
                 raise ProtocolError(f"ACK {stream_id}:{seq} has no in-flight frame")
-        return frame
+        return checked
 
-    @staticmethod
-    def _validate_job(frame: dict[str, Any]) -> dict[str, Any]:
-        if set(frame) != _JOB_KEYS or frame.get("type") != "job" or not isinstance(frame.get("job"), dict):
-            raise ProtocolError("job frame must be exactly {type:'job', job:object}")
-        return dict(frame["job"])
+    def _accept_job(self, frame: dict[str, Any]) -> None:
+        try:
+            checked = StreamJob.model_validate(frame)
+        except BaseException as e:
+            error = TransportUnhealthy(f"invalid server job frame: {safe_error(e)}")
+            with self._work:
+                self._latch_locked(error)
+            raise error from e
+        delivery_id = checked.delivery_id
+        job = checked.job.model_dump(exclude_none=True, mode="json")
+        with self._work:
+            if delivery_id in self._result_corrs_locked():
+                _log(f"job delivery={delivery_id} deduplicated: durable result already exists")
+                return
+            if delivery_id in self._inbox:
+                if self._inbox[delivery_id] != job:
+                    raise ProtocolError(f"job delivery_id {delivery_id!r} was reused with different content")
+                return
+            # Go replays retained inflight jobs before ACKing our replayed terminal. Ambiguous delivery
+            # closes claim admission, not the reader: accepting/deduping the replay keeps the socket alive.
+            if (self._admission_error is not None
+                    and not isinstance(self._admission_error, DeliveryPending)):
+                raise self._admission_error
+            self._inbox[delivery_id] = job
+            try:
+                self._persist_locked()
+            except BaseException as e:
+                self._inbox.pop(delivery_id, None)
+                error = TransportUnhealthy(f"durable job inbox append failed: {safe_error(e)}")
+                self._latch_locked(error, storage=True)
+                raise error from e
+            self._queued_ids.add(delivery_id)
+            self._jobs.put(delivery_id)
+            self._work.notify_all()
 
     def _read_loop(self, conn: Any) -> None:
         while True:
@@ -435,14 +552,14 @@ class EventStream:
                     raise ProtocolError("server frame is not an object")
                 kind = decoded.get("type")
                 if kind == "job":
-                    self._jobs.put(self._validate_job(decoded))
+                    self._accept_job(decoded)
                     continue
                 if kind != "ack":
                     raise ProtocolError(f"unknown server frame type {kind!r}")
                 ack = self._validate_ack(decoded)
             except Exception as e:  # noqa: BLE001 - malformed peer means connection is unsafe
-                _log(f"reader rejected server frame ({type(e).__name__}: {e})")
-                self._fail_connection(conn, f"{type(e).__name__}: {e}")
+                _log(f"reader rejected server frame ({safe_error(e)})")
+                self._fail_connection(conn, safe_error(e))
                 return
             seq = int(ack["seq"])
             key = (str(ack["stream_id"]), seq)
@@ -470,14 +587,14 @@ class EventStream:
                     max_size=1 << 20,
                 )
             except Exception as e:  # noqa: BLE001 - only lane unavailable
-                _log(f"open failed ({type(e).__name__}: {e})")
+                _log(f"open failed endpoint={safe_endpoint(self._url)} ({safe_error(e)})")
                 return False
             with self._state:
                 self._conn = conn
             self._reader = threading.Thread(
                 target=self._read_loop, args=(conn,), name="pod-stream-reader", daemon=True)
             self._reader.start()
-            _log(f"open ✓ {self._url} stream={self._stream_id}")
+            _log(f"open ✓ endpoint={safe_endpoint(self._url)} stream={self._stream_id}")
             return True
 
     def _fail_connection(self, conn: Any, why: str) -> None:
@@ -491,19 +608,39 @@ class EventStream:
             pass
         for waiter in waiters:
             waiter.set()
-        _log(f"socket closed ({why}); {self.pending_count()} durable frame(s) pending")
+        _log(f"socket closed ({safe_text(why)}); {self.pending_count()} durable frame(s) pending")
 
     def claim(self, wall: float) -> dict[str, Any] | None:
         """Return one strictly typed job, or None inside the caller's deadline."""
         with self._work:
-            self._paused = False
-            self._work.notify_all()
+            if self._admission_error is not None:
+                raise self._admission_error
         if not self._ensure_open():
-            return None
-        try:
-            return self._jobs.get(timeout=wall)
-        except queue.Empty:
-            return None
+            with self._work:
+                error = DeliveryPending("control-plane EventStream cannot open; refusing job admission")
+                self._latch_locked(error)
+            raise error
+        deadline = time.monotonic() + wall
+        while True:
+            try:
+                item = self._jobs.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                return None
+            with self._work:
+                if item is _ADMISSION_WAKE:
+                    if self._admission_error is not None:
+                        raise self._admission_error
+                    continue
+                delivery_id = str(item)
+                if self._admission_error is not None:
+                    self._jobs.put(delivery_id)
+                    raise self._admission_error
+                job = self._inbox.get(delivery_id)
+                if job is None:
+                    continue
+                self._queued_ids.discard(delivery_id)
+                self._claimed_ids.add(delivery_id)
+                return dict(job)
 
     def close(self) -> None:
         with self._work:

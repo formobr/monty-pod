@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://monty.fast/contracts/pod_stream_server.schema.json",
+  "title": "PodStreamServerFrame",
+  "description": "Strict control-plane->pod frame on the sole pod transport.",
+  "x-contract-version": 9,
+  "oneOf": [
+    {"$ref": "#/$defs/ackFrame"},
+    {"$ref": "#/$defs/jobFrame"}
+  ],
+  "$defs": {
+    "streamId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "ackFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "stream_id", "seq", "status"],
+      "properties": {
+        "type": {"const": "ack"},
+        "stream_id": {"$ref": "#/$defs/streamId"},
+        "seq": {"type": "integer", "minimum": 1},
+        "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "duplicate": {"type": "boolean"},
+        "error": {"type": "string"}
+      }
+    },
+    "jobFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "delivery_id", "job"],
+      "properties": {
+        "type": {"const": "job"},
+        "delivery_id": {"type": "string", "minLength": 1},
+        "job": {"$ref": "#/$defs/podJob"}
+      }
+    },
+    "podJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "session_id", "corr_id"],
+      "properties": {
+        "type": {"enum": ["infer", "render", "ops"]},
+        "session_id": {"type": "string", "minLength": 1},
+        "corr_id": {"type": "string", "minLength": 1},
+        "request": {"type": "object"},
+        "spec": {"type": "object"},
+        "chain": {"type": "object"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"const": "infer"}}},
+          "then": {"required": ["request"], "not": {"anyOf": [{"required": ["spec"]}, {"required": ["chain"]}]}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "render"}}},
+          "then": {"required": ["spec"], "not": {"anyOf": [{"required": ["request"]}, {"required": ["chain"]}]}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "ops"}}},
+          "then": {"required": ["chain"], "not": {"anyOf": [{"required": ["request"]}, {"required": ["spec"]}]}}
+        }
+      ]
+    }
+  }
+}

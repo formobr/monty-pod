@@ -1,0 +1,15 @@
+{
+  "type": "result",
+  "stream_id": "pod-boot-7",
+  "seq": 42,
+  "result": {
+    "infer_version": 5,
+    "job_id": "job-1",
+    "session_id": "fleet-preview",
+    "kind": "clip_rank",
+    "status": "ok",
+    "result_key": "work/t/run/rank-1.json",
+    "corr_id": "work/t/run/rank-1.json",
+    "timing": {"infer_s": 1.2}
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "type": "ack",
+  "stream_id": "pod-boot-42",
+  "seq": 17,
+  "status": 202,
+  "duplicate": true
+}

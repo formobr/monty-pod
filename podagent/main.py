@@ -9,7 +9,6 @@ import signal
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -18,8 +17,9 @@ import requests
 from pydantic import ValidationError
 
 from .cp import ControlPlane
-from .event_stream import FrameRejected
+from .event_stream import TransportUnhealthy
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
+from .sanitize import safe_error, safe_text, safe_traceback
 
 if TYPE_CHECKING:
     from .infer_align import AlignService
@@ -60,7 +60,7 @@ def ops_chain_pool_size() -> int:
 
 
 def _log(msg: str) -> None:
-    print(f"[podagent] {msg}", file=sys.stderr, flush=True)
+    print(f"[podagent] {safe_text(msg)}", file=sys.stderr, flush=True)
 
 
 def _lifecycle(cp: "ControlPlane", *, phase: str, job_id: str = "unknown",
@@ -112,10 +112,18 @@ def _with_lifecycle(cp: "ControlPlane", meta: dict[str, str | None],
             timings={"work_s": time.monotonic() - started},
             outcome="error",
             error_type=type(e).__name__,
-            error=str(e)[:500],
+            error=safe_error(e),
             **meta,
         )
         raise
+    else:
+        _lifecycle(
+            cp,
+            phase="work_finished",
+            timings={"work_s": time.monotonic() - started},
+            outcome="ok",
+            **meta,
+        )
 
 
 def _env_or_exit(name: str) -> str:
@@ -282,14 +290,16 @@ def _run_infer(
             corr_id=corr_id,
             timing=InferTiming(infer_s=infer_s, boot_s=boot_s),
         )
-        cp.report_infer_result(result.model_dump(exclude_none=True))
+        wire_result = result.model_dump(exclude_none=True)
+        wire_result["session_id"] = session_id
+        cp.report_infer_result(wire_result)
         return True
     # BaseException, not Exception: a CUDA abort, a SystemExit or an interrupted download must still leave a
     # terminal behind — an unreported one strands the brain for INFER_TIMEOUT_S and reads as a dead host.
     except BaseException as e:
-        _log(f"infer job {job_id} failed: {type(e).__name__}: {e}")
-        traceback.print_exc(file=sys.stderr)
-        if isinstance(e, FrameRejected):
+        _log(f"infer job {job_id} failed: {safe_error(e)}")
+        print(safe_traceback(e), file=sys.stderr, flush=True)
+        if isinstance(e, TransportUnhealthy):
             raise
         _lifecycle(
             cp,
@@ -302,7 +312,7 @@ def _run_infer(
             timings={"work_s": time.monotonic() - work_started},
             outcome="error",
             error_type=type(e).__name__,
-            error=str(e)[:500],
+            error=safe_error(e),
         )
         error_result = InferResult(
             infer_version=SPEC_VERSION,
@@ -310,9 +320,11 @@ def _run_infer(
             kind=kind,
             status="error",
             corr_id=corr_id,
-            error=f"{type(e).__name__}: {e}"[:500],
+            error=safe_error(e),
         )
-        cp.report_infer_result(error_result.model_dump(exclude_none=True))
+        wire_error = error_result.model_dump(exclude_none=True)
+        wire_error["session_id"] = session_id
+        cp.report_infer_result(wire_error)
         if not isinstance(e, Exception):
             raise
         return boot_reported
@@ -326,9 +338,9 @@ def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id:
 
         render_spec(spec, cp, corr_id=corr_id, session_id=session_id)
     except Exception as e:
-        if isinstance(e, FrameRejected):
+        if isinstance(e, TransportUnhealthy):
             raise
-        ev = {"job_id": job_id, "stage": "render", "status": "error", "error": str(e)[:500]}
+        ev = {"job_id": job_id, "stage": "render", "status": "error", "error": safe_error(e)}
         _tag(ev, corr_id, session_id)
         ev.update({"phase": "work_finished", "outcome": "error", "error_type": type(e).__name__})
         cp.send_event(ev)
@@ -337,7 +349,7 @@ def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id:
             "stage": "render",
             "status": "error",
             "corr_id": corr_id,
-            "error": str(e)[:500],
+            "error": safe_error(e),
             **({"session_id": session_id} if session_id is not None else {}),
         })
 
@@ -361,9 +373,9 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str) -> Non
     try:
         run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
     except Exception as e:
-        if isinstance(e, FrameRejected):
+        if isinstance(e, TransportUnhealthy):
             raise
-        ev = {"job_id": chain.job_id, "stage": "ops", "status": "error", "error": str(e)[:500]}
+        ev = {"job_id": chain.job_id, "stage": "ops", "status": "error", "error": safe_error(e)}
         _tag(ev, corr_id, session_id)
         ev.update({"phase": "work_finished", "outcome": "error", "error_type": type(e).__name__})
         cp.send_event(ev)
@@ -372,7 +384,7 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str) -> Non
             "stage": "ops",
             "status": "error",
             "corr_id": corr_id,
-            "error": str(e)[:500],
+            "error": safe_error(e),
             **({"session_id": session_id} if session_id is not None else {}),
         })
 
@@ -493,10 +505,12 @@ def _guarded(fn: Any, cp: ControlPlane) -> None:
     try:
         fn()
     except Exception as e:  # noqa: BLE001 — a worker must never take the agent down
-        _log(f"dispatch failed: {type(e).__name__}: {e}")
-        traceback.print_exc(file=sys.stderr)
+        _log(f"dispatch failed: {safe_error(e)}")
+        print(safe_traceback(e), file=sys.stderr, flush=True)
+        if isinstance(e, TransportUnhealthy):
+            raise
         cp.note({"stage": "dispatch", "status": "error", "phase": "work_finished",
-                 "error": f"{type(e).__name__}: {e}"[:500]})
+                 "error": safe_error(e)})
 
 
 def main() -> None:
@@ -587,7 +601,7 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                 pod_job = PodJob.model_validate(job)
             except ValidationError as e:
                 cp.send_event({"stage": "dispatch", "status": "error", "phase": "work_finished",
-                               "error": str(e)[:500]})
+                               "error": safe_error(e)})
                 if once:
                     return
                 continue
@@ -609,15 +623,17 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
             if once:
                 return
         except requests.RequestException as e:
-            _log(f"control-plane request failed: {e}")
+            _log(f"control-plane request failed: {safe_error(e)}")
             time.sleep(5)
+        except TransportUnhealthy:
+            raise
         # Anything else used to unwind main() and end the process with the claimed job unreported: the pod
         # stayed rented, the brain waited out its timeout, and nothing on the wire said why.
         except Exception as e:
-            _log(f"dispatch failed: {type(e).__name__}: {e}")
-            traceback.print_exc(file=sys.stderr)
+            _log(f"dispatch failed: {safe_error(e)}")
+            print(safe_traceback(e), file=sys.stderr, flush=True)
             cp.note({"stage": "dispatch", "status": "error", "phase": "work_finished",
-                     "error": f"{type(e).__name__}: {e}"[:500]})
+                     "error": safe_error(e)})
             time.sleep(5)
         if once:
             return

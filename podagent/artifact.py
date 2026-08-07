@@ -29,6 +29,8 @@ from typing import Callable, Protocol
 
 import requests
 
+from .sanitize import safe_text
+
 _CHUNK = 8 << 20
 DONE = ".complete"
 _PROGRESS_EVERY_S = 20.0
@@ -75,7 +77,7 @@ class TarRef(Protocol):
 
 
 def log(msg: str) -> None:
-    print(f"[podagent] {msg}", file=sys.stderr, flush=True)
+    print(f"[podagent] {safe_text(msg)}", file=sys.stderr, flush=True)
 
 
 def cache_root(env_var: str, default: str) -> Path:

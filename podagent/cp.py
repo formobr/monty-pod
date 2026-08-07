@@ -16,6 +16,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from podagent import event_stream
+from podagent.sanitize import safe_error, safe_text
 
 _TIMEOUT = 30
 
@@ -76,7 +77,7 @@ for _scheme in ("http://", "https://"):
     _store.mount(_scheme, HTTPAdapter(pool_connections=_store_pool(), pool_maxsize=_store_pool(),
                                       pool_block=False))
 def _log(msg: str) -> None:
-    print(f"[podagent] {msg}", file=sys.stderr, flush=True)
+    print(f"[podagent] {safe_text(msg)}", file=sys.stderr, flush=True)
 
 
 def _file_path(url: str) -> str | None:
@@ -118,7 +119,8 @@ class ControlPlane:
         """Durably deliver one correlated result; EventStream persists its result_acked transition."""
         accepted = self._stream.send_result(dict(payload), wait=wait)
         if wait and not accepted:
-            _log("result ACK remains ambiguous after bounded retries; durable outbox retains it for replay")
+            raise event_stream.DeliveryPending(
+                "result ACK remains ambiguous; durable outbox retains it for replay")
         return accepted
 
     def close_stream(self) -> None:
@@ -126,11 +128,8 @@ class ControlPlane:
         self._stream.close()
 
     def note(self, payload: dict[str, Any]) -> None:
-        """Append progress to disk synchronously, while ACK waiting stays on EventStream's sender thread."""
-        try:
-            self.send_event(payload, wait=False)
-        except Exception as e:  # noqa: BLE001 — loud diagnostic; work still owns its own failure policy
-            _log(f"progress event could not enter the durable outbox ({payload.get('phase', '')!r}): {e}")
+        """Append progress durably; persistence failure is fatal to admission and propagates."""
+        self.send_event(payload, wait=False)
 
     def report_infer_result(self, payload: dict[str, Any]) -> bool:
         """Deliver the real InferResult on the typed result frame. No result→event downgrade exists."""
@@ -244,7 +243,7 @@ def download(url: str, dest: Path) -> Path:
         except requests.RequestException as e:
             if attempt + 1 == _XFER_ATTEMPTS:
                 raise
-            _log(f"download failed (attempt {attempt + 1}/{_XFER_ATTEMPTS}): {e} — resuming from "
+            _log(f"download failed (attempt {attempt + 1}/{_XFER_ATTEMPTS}): {safe_error(e)} — resuming from "
                  f"{dest.stat().st_size if dest.exists() else 0} bytes")
             time.sleep(2**attempt)
     return dest

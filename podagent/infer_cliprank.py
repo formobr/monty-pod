@@ -23,6 +23,7 @@ from typing import Callable
 
 from .cp import download, upload
 from .models import ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload
+from .sanitize import safe_text
 
 _MISS = -1.0   # unreadable image, or an embed-only group where a score has nothing to mean
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
@@ -80,7 +81,7 @@ class ClipRankRun:
 
 
 def _log(msg: str) -> None:
-    print(f"[clip_rank] {msg}", file=sys.stderr, flush=True)
+    print(f"[clip_rank] {safe_text(msg)}", file=sys.stderr, flush=True)
 
 
 def _free_vram_mb() -> float | None:

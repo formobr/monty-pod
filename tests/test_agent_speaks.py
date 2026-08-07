@@ -82,10 +82,11 @@ def test_an_infer_terminal_uses_result_not_an_error_event_fallback():
         "a result may not be downgraded into the event vocabulary")
 
 
-def test_a_progress_event_never_kills_the_job():
+def test_a_progress_persist_failure_stops_work_before_it_can_go_silent():
     cp = _CP(event_fails=True)
-    _run(cp, _bad_request())
-    assert len(cp.results) == 1, "a pod must not die of failing to say what it is doing"
+    with pytest.raises(RuntimeError, match="down"):
+        _run(cp, _bad_request())
+    assert cp.results == [], "work must not continue when its durable voice cannot append"
 
 
 def test_a_rejected_result_is_not_rewritten_as_a_second_error_result():
@@ -113,6 +114,22 @@ def test_a_base_exception_reports_before_it_unwinds(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         _run(cp, _bad_request())
     assert cp.results and cp.results[0]["status"] == "error"
+
+
+def test_exception_urls_and_bearers_are_scrubbed_from_events_and_results(monkeypatch):
+    secret = "presigned-secret"
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError(
+            f"https://user:pass@store.example/object?X-Amz-Signature={secret} Bearer {secret}")
+
+    monkeypatch.setattr(agent_main.InferRequest, "model_validate", staticmethod(_boom))
+    cp = _CP()
+    _run(cp, _bad_request())
+    bodies = [*cp.events, *cp.results]
+    rendered = repr(bodies)
+    assert secret not in rendered and "user:pass" not in rendered
+    assert "[redacted-url]" in rendered
 
 
 def test_weights_fetch_reports_progress(monkeypatch, tmp_path):
