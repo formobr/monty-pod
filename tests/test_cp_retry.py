@@ -325,6 +325,51 @@ def test_stale_reader_cannot_wake_the_reconnected_socket_window(tmp_path: Path) 
     stream.close()
 
 
+def test_hanging_send_is_force_closed_inside_frame_wall_and_keeps_durable_admission_latch(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    release_send = threading.Event()
+    send_entered = threading.Event()
+    socket_closed = threading.Event()
+
+    class _Socket:
+        def shutdown(self, how: int) -> None:
+            assert how == event_stream.socket.SHUT_RDWR
+            release_send.set()
+
+        def close(self) -> None:
+            socket_closed.set()
+
+    class _HungConn:
+        socket = _Socket()
+
+        def send(self, _body: str) -> None:
+            send_entered.set()
+            assert release_send.wait(2), "the transport watchdog never interrupted send()"
+            raise OSError("socket force-closed")
+
+    monkeypatch.setattr(event_stream, "FRAME_WALL_S", 0.05)
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
+    path = tmp_path / "outbox.json"
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
+    conn = _HungConn()
+    with stream._state:
+        stream._conn = conn
+    monkeypatch.setattr(stream, "_ensure_open", lambda: True)
+
+    started = time.monotonic()
+    with pytest.raises(DeliveryPending, match="remains unacknowledged"):
+        stream.send_event(_event(phase="must-survive"), wait=True)
+    assert time.monotonic() - started < 0.5
+    assert send_entered.is_set() and release_send.is_set() and socket_closed.is_set()
+    assert isinstance(stream._admission_error, DeliveryPending)
+    with pytest.raises(DeliveryPending):
+        stream.claim(0.01)
+    disk = json.loads(path.read_text())
+    assert len(disk["frames"]) == 1
+    assert disk["frames"][0]["event"]["phase"] == "must-survive"
+    stream.close()
+
+
 def test_result_and_its_ack_event_cannot_overtake_prior_or_already_appended_frames(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[dict[str, Any]] = []

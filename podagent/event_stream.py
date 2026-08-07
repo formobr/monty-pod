@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -97,7 +98,6 @@ class EventStream:
 
         self._state = threading.RLock()
         self._work = threading.Condition(self._state)
-        self._write_lock = threading.Lock()
         self._open_lock = threading.Lock()
         self._conn: Any = None
         self._reader: threading.Thread | None = None
@@ -525,6 +525,9 @@ class EventStream:
     def _exchange_window(
             self, frames: list[dict[str, Any]],
     ) -> dict[tuple[str, int], dict[str, Any]]:
+        # `websockets.sync.send()` has no timeout. The watchdog below owns one wall shared by every write and
+        # every ACK in this attempt; on expiry, closing the raw socket interrupts a kernel-blocked send.
+        deadline = time.monotonic() + FRAME_WALL_S
         keys = [self._frame_key(frame) for frame in frames]
         ready = {key: threading.Event() for key in keys}
         with self._state:
@@ -536,15 +539,37 @@ class EventStream:
                 for key in keys:
                     self._ack_waiters.pop(key, None)
             return {}
-        try:
-            with self._write_lock:
+        write_done = threading.Event()
+        write_errors: list[BaseException] = []
+
+        def write_window() -> None:
+            try:
+                # The sender loop is the sole writer. A timed-out daemon may remain stuck in a broken old
+                # connection, so a process-global write lock here would also prevent the fresh socket retry.
                 for frame in frames:
                     conn.send(json.dumps(frame, ensure_ascii=False, separators=(",", ":")))
-        except Exception as e:  # noqa: BLE001 - transport, frame stays durable
-            _log(f"frame window write failed ({safe_error(e)})")
-            self._fail_connection(conn, f"write: {safe_error(e)}")
+            except BaseException as e:  # noqa: BLE001 - watchdog owns failure and durable replay
+                write_errors.append(e)
+            finally:
+                write_done.set()
 
-        deadline = time.monotonic() + FRAME_WALL_S
+        threading.Thread(
+            target=write_window, name="pod-stream-window-write", daemon=True).start()
+        while not write_done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log(f"frame window write exceeded the shared {FRAME_WALL_S}s wall")
+                self._fail_connection(conn, "write/ACK wall expired")
+                break
+            if write_done.wait(min(0.02, remaining)):
+                break
+            with self._state:
+                if self._conn is not conn:
+                    break
+        if write_errors:
+            _log(f"frame window write failed ({safe_error(write_errors[0])})")
+            self._fail_connection(conn, f"write: {safe_error(write_errors[0])}")
+
         for key in keys:
             ready[key].wait(max(0.0, deadline - time.monotonic()))
             with self._state:
@@ -680,12 +705,31 @@ class EventStream:
                 # A reader from the previous socket may observe its close after a reconnect already installed
                 # new ACK waiters under the same frame identities. It must not wake the new connection's window.
                 waiters = []
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001 - already dead
-            pass
         for waiter in waiters:
             waiter.set()
+        raw_socket = getattr(conn, "socket", None)
+        if raw_socket is not None:
+            # `Connection.close()` takes the same protocol mutex as send(). A wedged send owns that mutex, so
+            # only shutting down the underlying socket can guarantee that this failure path itself is bounded.
+            try:
+                raw_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                raw_socket.close()
+            except OSError:
+                pass
+        else:
+            # Test doubles and older transports may expose no socket. Never let their close implementation
+            # move the transport wall; it gets a daemon whose only job is to release the blocked writer.
+            def close_connection() -> None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001 - already dead
+                    pass
+
+            threading.Thread(
+                target=close_connection, name="pod-stream-force-close", daemon=True).start()
         _log(f"socket closed ({safe_text(why)}); {self.pending_count()} durable frame(s) pending")
 
     def claim(self, wall: float) -> dict[str, Any] | None:

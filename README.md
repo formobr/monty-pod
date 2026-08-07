@@ -37,9 +37,10 @@ sent it is fsynced to `POD_STREAM_OUTBOX` (default
 reconnect or process restart with their original `stream_id` and `seq`; the
 agent refuses to start if this durable state is unreadable or unwritable. One
 ordered sender pipelines at most `POD_STREAM_ACK_WINDOW` frames (default 32,
-hard cap 256),
-settles them from the durable head only, and reconnects with only the suffix
-that has not received a terminal ACK.
+hard cap 256), settles them from the durable head only, and reconnects with
+only the suffix that has not received a terminal ACK. A successful N-step ops
+chain emits `5N+6` event frames; its result and durable `result_acked` boundary
+make `5N+8` total client frames on the transport.
 
 ## Layout
 
