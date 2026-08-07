@@ -17,7 +17,7 @@ import requests
 from pydantic import ValidationError
 
 from .cp import ControlPlane
-from .event_stream import TransportUnhealthy
+from .event_stream import DeliveryPending, TransportUnhealthy
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 from .sanitize import safe_error, safe_text, safe_traceback
 
@@ -139,6 +139,7 @@ def _setup_vulkan_icd() -> None:
 def _log_gpu_status() -> None:
     # LOUD at boot: we rent a GPU to compute on it, not to crawl on CPU. Surface the torch arch so a host our
     # torch can't run shows immediately, not as a mystery-slow job.
+    _log_nvidia_runtime()
     try:
         import torch
         if torch.cuda.is_available():
@@ -148,6 +149,32 @@ def _log_gpu_status() -> None:
             _log("WARNING torch sees NO CUDA device — align will run on CPU (slow)")
     except Exception as e:  # noqa: BLE001 — a diagnostic must never block boot
         _log(f"WARNING GPU status check failed: {e}")
+
+
+def _log_nvidia_runtime() -> None:
+    """Name the injected device/driver independently of Torch without making this diagnostic a new gate."""
+    import subprocess
+    probe = ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]
+    try:
+        r = subprocess.run(probe, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        _log(f"WARNING nvidia-smi unavailable: {safe_error(e)}")
+        return
+    raw = r.stdout if r.returncode == 0 else (r.stderr or r.stdout)
+    detail = _bounded_stderr(raw or b"", edge=240) or "no diagnostic output"
+    if r.returncode == 0:
+        _log(f"nvidia-smi OK · {detail}")
+    else:
+        _log(f"WARNING nvidia-smi failed exit {r.returncode}: {detail}")
+
+
+def _bounded_stderr(stderr: bytes, *, edge: int = 500) -> str:
+    """A secret-safe root-cause line plus tail, without turning an ffmpeg dump into an event payload."""
+    text = safe_text(stderr.decode("utf-8", "replace").strip())
+    if len(text) <= edge * 2:
+        return text
+    omitted = len(text) - edge * 2
+    return f"{text[:edge].rstrip()}\n... {omitted} chars omitted ...\n{text[-edge:].lstrip()}"
 
 
 def _nvenc_or_refuse(cp: "ControlPlane") -> None:
@@ -165,15 +192,33 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
         if r.returncode == 0:
             _log("nvenc probe OK — h264_nvenc opens on this host")
             return
-        detail = f"exit {r.returncode}: {(r.stderr or b'')[-600:].decode('utf-8', 'replace').strip()}"
+        detail = f"exit {r.returncode}: {_bounded_stderr(r.stderr or b'')}"
     # Refused HERE or discovered 157 s into ingest, with b-roll already paid for on the same run.
     msg = f"REFUSING work: h264_nvenc will not open on this pod — {detail}"
     _log(msg)
     try:
-        cp.note({"stage": "boot", "status": "error", "phase": "work_finished", "step": msg})
-    except Exception:  # noqa: BLE001 — the refusal stands whether or not the beacon lands
-        pass
+        cp.send_event(
+            {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
+            wait=True,
+        )
+    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
+        _log(f"NVENC refusal delivery failed: {safe_error(e)}")
+    _mark_stopped()
     sys.exit(3)
+
+
+def _report_ready(cp: "ControlPlane") -> None:
+    """Open admission only after the capability verdict itself is durably acknowledged by the box."""
+    accepted = cp.send_event({
+        "stage": "boot",
+        "status": "step",
+        "phase": "ready",
+        "step": "capability preflight passed",
+    }, wait=True)
+    if not accepted:
+        # EventStream already latched DeliveryPending before returning False. Raising here keeps main from
+        # reaching capacity or the dispatch loop even if a test double (or future transport) only returns it.
+        raise DeliveryPending("boot readiness ACK remains ambiguous; refusing job admission")
 
 
 def _run_infer(
@@ -511,6 +556,13 @@ def _report_boot(cp: ControlPlane) -> None:
              "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s · {post}"})
 
 
+def _capability_preflight(cp: ControlPlane) -> None:
+    """Report the boot, prove the encoder, then make readiness an ACKed admission barrier."""
+    _report_boot(cp)
+    _nvenc_or_refuse(cp)
+    _report_ready(cp)
+
+
 def _guarded(fn: Any, cp: ControlPlane) -> None:
     """Run a dispatched envelope, reporting instead of dying. Off the claim loop the old outer `except` no
     longer covers these, and a worker thread that raises is a job the brain waits out in silence."""
@@ -536,8 +588,7 @@ def main() -> None:
         signal.signal(_sig, _stop_and_exit)
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
-    _report_boot(cp)
-    _nvenc_or_refuse(cp)   # after the beacon, so a refusal reaches the box instead of dying mute
+    _capability_preflight(cp)
 
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
     align_cache: dict[str, "AlignService"] = {}

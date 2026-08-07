@@ -42,6 +42,15 @@ only the suffix that has not received a terminal ACK. A successful N-step ops
 chain emits `5N+6` event frames; its result and durable `result_acked` boundary
 make `5N+8` total client frames on the transport.
 
+At boot, the agent reports its diagnostic beacon, proves that `h264_nvenc`
+actually opens on the rented host, then synchronously sends and waits for ACK of a typed
+`boot/ready` event. Capacity advertising and job admission happen only after
+that barrier. A failed capability probe reports a bounded, secret-safe stderr
+head and tail synchronously and exits as a deliberate refusal, not an unclean
+agent death. The boot diagnostic also records the injected `nvidia-smi` device
+name and driver independently of Torch, so provider metadata and container reality
+can be compared without treating the diagnostic itself as an admission verdict.
+
 ## Layout
 
 | path | what |

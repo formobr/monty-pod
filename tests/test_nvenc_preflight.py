@@ -9,12 +9,24 @@ import pytest
 from podagent import main as agent_main
 
 
+@pytest.fixture(autouse=True)
+def _isolated_live_mark(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
+
+
 class _CP:
-    def __init__(self) -> None:
+    def __init__(self, *, accept: bool = True) -> None:
         self.events: list[dict] = []
+        self.waits: list[bool] = []
+        self.accept = accept
 
     def note(self, ev: dict) -> None:
         self.events.append(ev)
+
+    def send_event(self, ev: dict, *, wait: bool = False) -> bool:
+        self.events.append(ev)
+        self.waits.append(wait)
+        return self.accept
 
 
 def _run(returncode: int = 0, stderr: bytes = b"") -> object:
@@ -51,6 +63,49 @@ def test_the_refusal_reaches_the_box_and_names_the_driver(monkeypatch):
     errs = [e for e in cp.events if e.get("status") == "error"]
     assert errs, "the pod died without telling the control plane why"
     assert "nvenc API version" in errs[0]["step"], f"the refusal does not carry ffmpeg's reason: {errs[0]}"
+    assert cp.waits == [True], "a refusal the process exits behind must wait for its typed ACK"
+
+
+def test_refusal_preserves_root_stderr_and_tail_without_unbounded_dump(monkeypatch):
+    root = b"Driver does not support the required nvenc API version\n"
+    err = root + (b"middle-noise\n" * 200) + b"final driver detail"
+    cp = _CP()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _run(218, err))
+    with pytest.raises(SystemExit):
+        agent_main._nvenc_or_refuse(cp)
+    step = cp.events[0]["step"]
+    assert root.decode().strip() in step
+    assert "final driver detail" in step
+    assert len(step) < 1200, "the bounded refusal accidentally forwarded the whole ffmpeg dump"
+
+
+def test_nvidia_runtime_diagnostic_names_the_injected_driver(monkeypatch):
+    lines: list[str] = []
+    monkeypatch.setattr(agent_main, "_log", lines.append)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=b"NVIDIA GeForce RTX 4090, 580.76.05\n", stderr=b"",
+    ))
+    agent_main._log_nvidia_runtime()
+    assert lines == ["nvidia-smi OK · NVIDIA GeForce RTX 4090, 580.76.05"]
+
+
+def test_nvidia_runtime_diagnostic_is_loud_but_not_a_gate(monkeypatch):
+    lines: list[str] = []
+    monkeypatch.setattr(agent_main, "_log", lines.append)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        FileNotFoundError("nvidia-smi missing")))
+    assert agent_main._log_nvidia_runtime() is None
+    assert len(lines) == 1 and lines[0].startswith("WARNING nvidia-smi unavailable:")
+
+
+def test_capability_refusal_clears_the_liveness_mark(monkeypatch, tmp_path):
+    mark = tmp_path / "podagent.alive"
+    mark.write_text("this incarnation")
+    monkeypatch.setattr(agent_main, "_LIVE_MARK", mark)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _run(218, b"driver mismatch"))
+    with pytest.raises(SystemExit):
+        agent_main._nvenc_or_refuse(_CP())
+    assert not mark.exists(), "a deliberate capability refusal would be reported as a false UNCLEAN death"
 
 
 def test_an_ffmpeg_that_will_not_even_launch_is_a_refusal_too(monkeypatch):
@@ -76,3 +131,63 @@ def test_the_probe_actually_asks_for_the_encoder_we_ship_with(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _capture)
     agent_main._nvenc_or_refuse(_CP())
     assert seen and "h264_nvenc" in seen[0], f"the boot probe does not exercise h264_nvenc: {seen}"
+
+
+def test_ready_is_sent_synchronously_only_after_a_successful_probe(monkeypatch):
+    timeline: list[str] = []
+
+    class _OrderedCP(_CP):
+        def send_event(self, ev: dict, *, wait: bool = False) -> bool:
+            timeline.append(str(ev.get("phase")))
+            return super().send_event(ev, wait=wait)
+
+    cp = _OrderedCP()
+    monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: timeline.append("boot"))
+    monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: timeline.append("probe"))
+    agent_main._capability_preflight(cp)
+    assert timeline == ["boot", "probe", "ready"]
+    assert cp.events == [{
+        "stage": "boot", "status": "step", "phase": "ready",
+        "step": "capability preflight passed",
+    }]
+    assert cp.waits == [True]
+
+
+def test_a_failed_probe_never_emits_ready(monkeypatch):
+    cp = _CP()
+    monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _run(218, b"driver mismatch"))
+    with pytest.raises(SystemExit):
+        agent_main._capability_preflight(cp)
+    assert not [e for e in cp.events if e.get("phase") == "ready"]
+
+
+def test_an_ambiguous_ready_ack_stops_before_capacity_or_dispatch():
+    cp = _CP(accept=False)
+    with pytest.raises(agent_main.DeliveryPending, match="readiness ACK remains ambiguous"):
+        agent_main._report_ready(cp)
+    assert cp.events[-1]["phase"] == "ready"
+
+
+def test_main_never_reaches_dispatch_when_ready_ack_is_ambiguous(monkeypatch):
+    cp = _CP(accept=False)
+    dispatched = False
+
+    def _dispatch(*_a, **_k):
+        nonlocal dispatched
+        dispatched = True
+
+    monkeypatch.setenv("CP_URL", "https://control-plane.example")
+    monkeypatch.setenv("JOB_TOKEN", "opaque-test-token")
+    monkeypatch.setattr(agent_main, "ControlPlane", lambda *_a, **_k: cp)
+    monkeypatch.setattr(agent_main.signal, "signal", lambda *_a, **_k: None)
+    monkeypatch.setattr(agent_main, "_setup_vulkan_icd", lambda: None)
+    monkeypatch.setattr(agent_main, "_log_gpu_status", lambda: None)
+    monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_dispatch_loop", _dispatch)
+
+    with pytest.raises(agent_main.DeliveryPending, match="readiness ACK remains ambiguous"):
+        agent_main.main()
+    assert not dispatched, "the pod claimed work despite an unacknowledged readiness verdict"
+    assert not [e for e in cp.events if e.get("phase") == "capacity"]
