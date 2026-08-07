@@ -39,6 +39,15 @@ class StreamEvent(BaseModel):
     capacity: dict[str, Any] | None = None
     ts: datetime | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _known_fields_are_not_null(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            nulls = sorted(k for k, v in value.items() if v is None and k != "outputs")
+            if nulls:
+                raise ValueError(f"event fields may be omitted but not null: {nulls}")
+        return value
+
 
 class StreamResult(BaseModel):
     # Result bodies remain extensible domain payloads. The transport address and discriminator are closed.
@@ -53,6 +62,17 @@ class StreamResult(BaseModel):
     result_key: str | None = Field(default=None, min_length=1)
     timing: dict[str, Any] | None = None
     timings: dict[str, Any] | None = None
+    error: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _known_fields_are_not_null(cls, value: Any) -> Any:
+        known = {"kind", "stage", "result_key", "timing", "timings", "error"}
+        if isinstance(value, dict):
+            nulls = sorted(k for k in known if k in value and value[k] is None)
+            if nulls:
+                raise ValueError(f"result fields may be omitted but not null: {nulls}")
+        return value
 
     @model_validator(mode="after")
     def _wire_shape(self) -> "StreamResult":
@@ -75,6 +95,15 @@ class StreamAck(BaseModel):
     duplicate: bool | None = None
     error: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _optional_fields_are_not_null(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            nulls = sorted(k for k in ("duplicate", "error") if k in value and value[k] is None)
+            if nulls:
+                raise ValueError(f"ACK fields may be omitted but not null: {nulls}")
+        return value
+
 
 class StreamJob(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -82,6 +111,17 @@ class StreamJob(BaseModel):
     type: Literal["job"]
     delivery_id: DeliveryID
     job: PodJob
+
+    @model_validator(mode="before")
+    @classmethod
+    def _job_blocks_are_not_null(cls, value: Any) -> Any:
+        if isinstance(value, dict) and isinstance(value.get("job"), dict):
+            nulls = sorted(
+                k for k in ("request", "spec", "chain")
+                if k in value["job"] and value["job"][k] is None)
+            if nulls:
+                raise ValueError(f"job blocks may be omitted but not null: {nulls}")
+        return value
 
     @model_validator(mode="after")
     def _one_identity(self) -> "StreamJob":

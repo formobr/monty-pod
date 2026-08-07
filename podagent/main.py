@@ -9,9 +9,9 @@ import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 import requests
 from pydantic import ValidationError
@@ -101,29 +101,10 @@ def _raw_job_meta(raw: dict[str, Any]) -> dict[str, str | None]:
 
 def _with_lifecycle(cp: "ControlPlane", meta: dict[str, str | None],
                     queued_at: float, fn: Any) -> None:
+    """Own admission/queue lifecycle only; the stage runner owns its single work_finished terminal."""
     started = time.monotonic()
     _lifecycle(cp, phase="started", timings={"pod_queue_s": started - queued_at}, **meta)
-    try:
-        fn()
-    except BaseException as e:
-        _lifecycle(
-            cp,
-            phase="work_finished",
-            timings={"work_s": time.monotonic() - started},
-            outcome="error",
-            error_type=type(e).__name__,
-            error=safe_error(e),
-            **meta,
-        )
-        raise
-    else:
-        _lifecycle(
-            cp,
-            phase="work_finished",
-            timings={"work_s": time.monotonic() - started},
-            outcome="ok",
-            **meta,
-        )
+    fn()
 
 
 def _env_or_exit(name: str) -> str:
@@ -211,6 +192,28 @@ def _run_infer(
     corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
+
+    @contextmanager
+    def phase(name: str):
+        phase_started = time.monotonic()
+        _lifecycle(
+            cp, phase=f"{name}_started", job_id=str(job_id), session_id=session_id,
+            corr_id=corr_id, stage="infer", op=kind)
+        try:
+            yield
+        except BaseException as exc:
+            _lifecycle(
+                cp, phase=f"{name}_error", job_id=str(job_id), session_id=session_id,
+                corr_id=corr_id, stage="infer", op=kind, outcome="error",
+                error_type=type(exc).__name__, error=safe_error(exc),
+                timings={"phase_s": time.monotonic() - phase_started})
+            raise
+        else:
+            _lifecycle(
+                cp, phase=f"{name}_finished", job_id=str(job_id), session_id=session_id,
+                corr_id=corr_id, stage="infer", op=kind, outcome="ok",
+                timings={"phase_s": time.monotonic() - phase_started})
+
     def note(step: str) -> None:
         ev: dict[str, Any] = {
             "stage": "infer", "status": "step", "phase": "progress",
@@ -233,9 +236,11 @@ def _run_infer(
             assert req.align is not None and req.weights is not None
             align_svc = align_cache.get(req.weights.sha256)
             if align_svc is None:
-                wdir = ensure(req.weights, req.model, note)
-                note(f"loading {req.model}")
-                align_svc = align_cache[req.weights.sha256] = AlignService(req.model, wdir)
+                with phase("weights_fetch"):
+                    wdir = ensure(req.weights, req.model, note)
+                with phase("model_load"):
+                    note(f"loading {req.model}")
+                    align_svc = align_cache[req.weights.sha256] = AlignService(req.model, wdir)
             infer_s = align_svc.run(req.align, req.put_url, note)
         elif req.kind == "clip_rank":
             from .infer_cliprank import ClipRankService
@@ -248,9 +253,11 @@ def _run_infer(
                 with _SVC_LOAD_LOCK:
                     rank_svc = rank_cache.get(req.weights.sha256)
                     if rank_svc is None:
-                        wdir = ensure(req.weights, req.model, note)
-                        note(f"loading {req.model}")
-                        rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
+                        with phase("weights_fetch"):
+                            wdir = ensure(req.weights, req.model, note)
+                        with phase("model_load"):
+                            note(f"loading {req.model}")
+                            rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
             rank_run = rank_svc.run(req.clip_rank, req.put_url, note)
             infer_s = rank_run.infer_s
             work_timings = rank_run.timings
@@ -261,7 +268,8 @@ def _run_infer(
             key = (yunet_path, req.model)
             probe_svc = probe_cache.get(key)
             if probe_svc is None:
-                probe_svc = probe_cache[key] = ProbeService(yunet_path, req.model)
+                with phase("model_load"):
+                    probe_svc = probe_cache[key] = ProbeService(yunet_path, req.model)
             infer_s = probe_svc.run(req.face_probe, req.put_url)
         if req.kind != "clip_rank":
             work_timings = {
@@ -286,7 +294,7 @@ def _run_infer(
             job_id=req.job_id,
             kind=req.kind,
             status="ok",
-            result_key=urlparse(req.put_url).path.lstrip("/"),
+            result_key=corr_id,
             corr_id=corr_id,
             timing=InferTiming(infer_s=infer_s, boot_s=boot_s),
         )
@@ -337,7 +345,7 @@ def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id:
         from .render import render_spec  # posts its own events; heavy deps stay out until a render job lands
 
         render_spec(spec, cp, corr_id=corr_id, session_id=session_id)
-    except Exception as e:
+    except BaseException as e:
         if isinstance(e, TransportUnhealthy):
             raise
         ev = {"job_id": job_id, "stage": "render", "status": "error", "error": safe_error(e)}
@@ -352,6 +360,8 @@ def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id:
             "error": safe_error(e),
             **({"session_id": session_id} if session_id is not None else {}),
         })
+        if not isinstance(e, Exception):
+            raise
 
 
 def _tag(ev: dict[str, Any], corr_id: str | None, session_id: str | None) -> dict[str, Any]:
@@ -372,7 +382,7 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str) -> Non
 
     try:
         run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
-    except Exception as e:
+    except BaseException as e:
         if isinstance(e, TransportUnhealthy):
             raise
         ev = {"job_id": chain.job_id, "stage": "ops", "status": "error", "error": safe_error(e)}
@@ -387,6 +397,8 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str) -> Non
             "error": safe_error(e),
             **({"session_id": session_id} if session_id is not None else {}),
         })
+        if not isinstance(e, Exception):
+            raise
 
 
 POST_MORTEM_WHY = """

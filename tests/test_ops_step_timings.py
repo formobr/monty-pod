@@ -121,6 +121,11 @@ def test_bind_run_upload_boundaries_are_structured_events(monkeypatch, wired, op
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
     cp = _CP()
     runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp, corr_id="c", session_id="s")
+    chain_phases = [e["phase"] for e in cp.events if e.get("op") == "ops" and e.get("phase")]
+    assert chain_phases[:4] == [
+        "preflight_started", "preflight_finished",
+        "pack_activate_started", "pack_activate_finished",
+    ]
     phases = [e for e in cp.events if e.get("step") == "s1" and e.get("phase")]
     assert [e["phase"] for e in phases] == [
         "bind_started", "bind_finished",

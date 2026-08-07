@@ -89,6 +89,25 @@ def test_a_progress_persist_failure_stops_work_before_it_can_go_silent():
     assert cp.results == [], "work must not continue when its durable voice cannot append"
 
 
+def test_lifecycle_wrapper_does_not_invent_success_after_stage_owned_failure():
+    cp = _CP()
+
+    def stage() -> None:
+        cp.send_event({
+            "job_id": "j", "session_id": "s", "corr_id": "c",
+            "stage": "ops", "status": "error", "phase": "work_finished", "outcome": "error",
+        })
+
+    agent_main._with_lifecycle(
+        cp,
+        {"job_id": "j", "session_id": "s", "corr_id": "c", "stage": "ops", "op": "ops"},
+        agent_main.time.monotonic(),
+        stage,
+    )
+    finished = [e for e in cp.events if e.get("phase") == "work_finished"]
+    assert len(finished) == 1 and finished[0]["outcome"] == "error"
+
+
 def test_a_rejected_result_is_not_rewritten_as_a_second_error_result():
     class _Rejected(_CP):
         def send_result(self, payload: dict, *, wait: bool = True) -> bool:
@@ -114,6 +133,33 @@ def test_a_base_exception_reports_before_it_unwinds(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         _run(cp, _bad_request())
     assert cp.results and cp.results[0]["status"] == "error"
+
+
+@pytest.mark.parametrize("stage", ["render", "ops"])
+def test_non_exception_terminal_is_reported_before_interrupt_unwinds(monkeypatch, stage):
+    cp = _CP()
+    if stage == "render":
+        monkeypatch.setattr(
+            agent_main.RenderSpec, "model_validate",
+            staticmethod(lambda *_a, **_kw: (_ for _ in ()).throw(KeyboardInterrupt("render abort"))),
+        )
+        call = lambda: agent_main._run_render({}, cp, corr_id="c", session_id="s")
+    else:
+        from podagent.ops import runner
+
+        monkeypatch.setattr(
+            runner, "run_chain",
+            lambda *_a, **_kw: (_ for _ in ()).throw(KeyboardInterrupt("ops abort")),
+        )
+        chain = type("Chain", (), {"job_id": "j"})()
+        call = lambda: agent_main._run_ops(chain, cp, corr_id="c", session_id="s")
+
+    with pytest.raises(KeyboardInterrupt):
+        call()
+    assert cp.results[-1]["status"] == "error"
+    assert cp.results[-1]["corr_id"] == "c" and cp.results[-1]["session_id"] == "s"
+    finished = [e for e in cp.events if e.get("phase") == "work_finished"]
+    assert len(finished) == 1 and finished[0]["outcome"] == "error"
 
 
 def test_exception_urls_and_bearers_are_scrubbed_from_events_and_results(monkeypatch):
@@ -173,3 +219,39 @@ def test_weights_fetch_reports_progress(monkeypatch, tmp_path):
     seen: list[str] = []
     artifact.ensure_tree(_Ref(), tmp_path, "weights siglip", seen.append)
     assert any("cache MISS" in s for s in seen) and any("ready" in s for s in seen)
+
+
+def test_cold_infer_exposes_weights_fetch_and_model_load_boundaries(monkeypatch, tmp_path):
+    import json
+    import sys
+    import types
+
+    raw = json.loads(
+        (Path(__file__).parents[1] / "contracts/examples/infer_request.align.json").read_text())
+    weights_module = types.ModuleType("podagent.weights")
+    weights_module.ensure = lambda *_a, **_kw: tmp_path / "weights"
+
+    class _Align:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def run(self, *_a, **_kw):
+            return 0.25
+
+    align_module = types.ModuleType("podagent.infer_align")
+    align_module.AlignService = _Align
+    monkeypatch.setitem(sys.modules, "podagent.weights", weights_module)
+    monkeypatch.setitem(sys.modules, "podagent.infer_align", align_module)
+
+    cp = _CP()
+    agent_main._run_infer(
+        raw, cp, {}, {}, {}, tmp_path / "yunet", False,
+        corr_id="work/result.json", session_id="s")
+    phases = [e["phase"] for e in cp.events if e.get("phase", "").startswith(
+        ("weights_fetch", "model_load"))]
+    assert phases == [
+        "weights_fetch_started", "weights_fetch_finished",
+        "model_load_started", "model_load_finished",
+    ]
+    finished = [e for e in cp.events if e.get("phase") == "work_finished"]
+    assert len(finished) == 1 and finished[0]["outcome"] == "ok"

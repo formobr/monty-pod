@@ -524,7 +524,10 @@ class EventStream:
                 return
             if delivery_id in self._inbox:
                 if self._inbox[delivery_id] != job:
-                    raise ProtocolError(f"job delivery_id {delivery_id!r} was reused with different content")
+                    error = TransportUnhealthy(
+                        f"job delivery_id {delivery_id!r} was reused with different content")
+                    self._latch_locked(error)
+                    raise error
                 return
             # Go replays retained inflight jobs before ACKing our replayed terminal. Ambiguous delivery
             # closes claim admission, not the reader: accepting/deduping the replay keeps the socket alive.

@@ -154,8 +154,9 @@ def test_render_download_ffmpeg_upload_boundaries_are_structured(monkeypatch, tm
     monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: _Done())
     render.render_spec(spec, _CP(), corr_id="c", session_id="s")
 
-    phases = [e for e in events if e.get("op") in {"download", "ffmpeg", "upload"}]
+    phases = [e for e in events if e.get("op") in {"gpu_probe", "download", "ffmpeg", "upload"}]
     assert [e["phase"] for e in phases] == [
+        "gpu_probe_started", "gpu_probe_finished",
         "download_started", "download_finished",
         "ffmpeg_started", "ffmpeg_finished",
         "upload_started", "upload_finished",

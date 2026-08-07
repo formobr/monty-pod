@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
@@ -607,6 +608,32 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
             payload["session_id"] = session_id
         cp.send_event(payload)
 
+    @contextmanager
+    def chain_phase(name: str):
+        started = time.monotonic()
+        _event(status="step", op="ops", phase=f"{name}_started")
+        try:
+            yield
+        except BaseException as exc:
+            _event(
+                status="step",
+                op="ops",
+                phase=f"{name}_error",
+                outcome="error",
+                error_type=type(exc).__name__,
+                error=safe_error(exc),
+                timings={"phase_s": round(time.monotonic() - started, 3)},
+            )
+            raise
+        else:
+            _event(
+                status="step",
+                op="ops",
+                phase=f"{name}_finished",
+                outcome="ok",
+                timings={"phase_s": round(time.monotonic() - started, 3)},
+            )
+
     # The clock the box cannot read. Started BEFORE preflight and the pack fetch on purpose: everything from
     # here to the terminal is the pod's own, and what the box's wall holds beyond it is transport and queue
     # (STEP_TIMING_WHY). `timings` on every list.append below is safe unlocked — `append` is atomic under the
@@ -614,8 +641,10 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
     t_chain = time.monotonic()
     timings: list[StepTiming] = []
 
-    preflight_chain(chain)      # FIRST: an unrunnable chain must cost nothing but the claim
-    pack.activate(chain.pack)
+    with chain_phase("preflight"):
+        preflight_chain(chain)      # FIRST: an unrunnable chain must cost nothing but the claim
+    with chain_phase("pack_activate"):
+        pack.activate(chain.pack)
 
     tmp = Path(tempfile.mkdtemp(prefix="opchain_"))
     ws = Workspace(tmp)

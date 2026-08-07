@@ -3,7 +3,7 @@
   "$id": "https://monty.fast/contracts/pod_stream_server.schema.json",
   "title": "PodStreamServerFrame",
   "description": "Strict control-plane->pod frame on the sole pod transport.",
-  "x-contract-version": 9,
+  "x-contract-version": 10,
   "oneOf": [
     {"$ref": "#/$defs/ackFrame"},
     {"$ref": "#/$defs/jobFrame"}

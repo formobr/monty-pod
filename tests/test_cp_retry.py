@@ -389,6 +389,68 @@ def test_reconnect_duplicate_job_is_not_queued_or_run_twice(
     stream.close()
 
 
+def test_conflicting_duplicate_delivery_latches_before_queued_work_can_run(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
+    monkeypatch.setattr(stream, "_ensure_open", lambda: True)
+    stream._accept_job(_job())
+    conflicting = _job()
+    conflicting["job"]["request"]["model"] = "different"
+    with pytest.raises(TransportUnhealthy, match="different content"):
+        stream._accept_job(conflicting)
+    with pytest.raises(TransportUnhealthy, match="different content"):
+        stream.claim(0.1)
+    assert "c" in stream._inbox
+    stream.close()
+
+
+def test_valid_infer_golden_crosses_real_event_stream_with_one_result_identity(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    from podagent import main as agent_main
+    from podagent.cp import ControlPlane
+
+    seen: list[dict[str, Any]] = []
+
+    def handler(ws: Any) -> None:
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            seen.append(frame)
+            ws.send(_ack(frame))
+
+    req = json.loads(
+        (Path(__file__).parents[1] / "contracts/examples/infer_request.face_probe.json").read_text())
+    corr = "work/session/result.json"
+    yunet = tmp_path / "yunet.onnx"
+
+    class _Probe:
+        def run(self, _params: Any, _put_url: str) -> float:
+            return 0.125
+
+    probe_module = types.ModuleType("podagent.infer_probe")
+    probe_module.ProbeService = _Probe
+    monkeypatch.setitem(sys.modules, "podagent.infer_probe", probe_module)
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        plane = object.__new__(ControlPlane)
+        plane._stream = stream
+        assert agent_main._run_infer(
+            req, plane, {}, {(yunet, req["model"]): _Probe()}, {}, yunet, False,
+            corr_id=corr, session_id="session-1")
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+    result = next(frame["result"] for frame in seen if frame["type"] == "result")
+    assert result["corr_id"] == corr == result["result_key"]
+    assert result["session_id"] == "session-1" and result["kind"] == "face_probe"
+
+
 def test_result_append_and_inbox_retirement_are_one_durable_transition(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "outbox.json"

@@ -552,7 +552,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
     if spec.mode == "final" and spec.overlays is not None and spec.overlays.trims:
         raise NotImplementedError("final overlay(s) not yet composited on the pod: ['trims']")
 
-    gpu = _gpu_available()
+    with phase("gpu_probe"):
+        gpu = _gpu_available()
     if not gpu and spec.motion is not None and spec.motion.segments:
         print("no NVENC: camera motion degrades to a static crop at the first keyframe",
               file=sys.stderr)
@@ -570,20 +571,27 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         music = _music_of(spec)
         sfx = spec.overlays.sfx if (spec.mode == "final" and spec.overlays is not None) else None
         if music is not None or sfx:
-            ids = input_ids(spec)
-            voice = input_paths[spec.timeline.segments[0].src]
-            dur = _probe_dur(voice)
-            # base already DFN3/MF2-rescued upstream → keep only the rumble cut, DROP afftdn (no double-process)
-            dirty = _voice_is_dirty(voice) and not spec.base_voice_rescued
-            clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
-            vln = _measure_loudnorm(voice, clean)
-            bed_idx: int | None = None
-            if music is not None:
-                extra_inputs = (_prerender_bed(input_paths[music.track], music.start, dur, tmp),)
-                bed_idx = len(ids)
-            sfx_tuples = tuple((ids.index(s.sound), s.at, s.gain) for s in (sfx or []))
-            audio = _AudioMix(voice_idx=ids.index(spec.timeline.segments[0].src), bed_idx=bed_idx,
-                              clean=clean, vln=vln, dur=dur, sfx=sfx_tuples)
+            with phase("audio_prepare"):
+                ids = input_ids(spec)
+                voice = input_paths[spec.timeline.segments[0].src]
+                dur = _probe_dur(voice)
+                # base already DFN3/MF2-rescued upstream → keep only the rumble cut, DROP afftdn
+                dirty = _voice_is_dirty(voice) and not spec.base_voice_rescued
+                clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
+                vln = _measure_loudnorm(voice, clean)
+                bed_idx: int | None = None
+                if music is not None:
+                    extra_inputs = (_prerender_bed(input_paths[music.track], music.start, dur, tmp),)
+                    bed_idx = len(ids)
+                sfx_tuples = tuple((ids.index(s.sound), s.at, s.gain) for s in (sfx or []))
+                audio = _AudioMix(
+                    voice_idx=ids.index(spec.timeline.segments[0].src),
+                    bed_idx=bed_idx,
+                    clean=clean,
+                    vln=vln,
+                    dur=dur,
+                    sfx=sfx_tuples,
+                )
         out = tmp / "render.mp4"
         cmd = build_command(spec, input_paths, out, gpu, extra_inputs, audio)
         with phase("ffmpeg"):
