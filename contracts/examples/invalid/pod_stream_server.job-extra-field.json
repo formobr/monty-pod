@@ -1,6 +1,11 @@
 {
   "type": "job",
-  "delivery_id": "c",
-  "job": {"type": "ops", "session_id": "s", "corr_id": "c", "chain": {}},
+  "job": {
+    "type": "ops",
+    "chain": {
+      "job_id": "render-preview-42",
+      "ops": []
+    }
+  },
   "seq": 17
 }

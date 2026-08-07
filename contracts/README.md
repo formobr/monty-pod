@@ -37,12 +37,11 @@ Transport conventions:
   is `CP_URL` + `JOB_TOKEN` (env); the pod dials out only, nothing dials in.
 - Client frames are fsynced before send and retired only by a matching 2xx ACK. A 4xx is moved to
   durable dead-letter; 5xx, timeout, and socket ambiguity remain replayable.
-- Every job carries `session_id` and `corr_id`; every result carries `corr_id` or `result_key`. There is no
-  FIFO-positional or event-as-result fallback.
-- `result_key` — the presigned `put_url`'s path with the leading slash stripped. OPAQUE and
-  informational only: under path-style presigning the URL path starts with the bucket name, so
-  the value may be bucket-prefixed. Consumers must locate the payload by the key they presigned
-  `put_url` for — never by parsing `result_key`.
+- Every job and result carries mandatory `session_id` and `corr_id`; `corr_id` is the sole routing,
+  delivery, and dedupe identity. There is no FIFO-positional or event-as-result fallback.
+- `result_key` is optional transport metadata. When present it must equal `corr_id`; it is never derived
+  from a presigned URL. Consumers locate payload bytes by the object address they issued, not by parsing
+  `result_key`.
 
 ## Invariants (enforced by schema + goldens)
 

@@ -3,5 +3,5 @@
   "stream_id": "pod-boot-7",
   "seq": 1,
   "event": {"stage": "ops", "status": "step"},
-  "result": {"job_id": "j", "session_id": "s", "corr_id": "c", "stage": "ops", "status": "ok"}
+  "result": {"job_id": "j", "status": "ok", "corr_id": "c"}
 }

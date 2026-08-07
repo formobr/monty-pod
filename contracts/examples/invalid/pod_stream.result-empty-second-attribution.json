@@ -1,11 +1,13 @@
 {
   "type": "result",
   "stream_id": "pod-boot-7",
-  "seq": 43,
+  "seq": 46,
   "result": {
     "job_id": "job-1",
+    "session_id": "session-1",
     "corr_id": "corr-1",
     "kind": "align",
+    "stage": "",
     "status": "ok"
   }
 }
