@@ -7,9 +7,11 @@ Client frames are a closed union::
     {"type":"result", "stream_id":str, "seq":int, "result":object}
 
 Every frame is appended to a disk outbox before any socket write.  One sender
-owns frame order.  A frame leaves the active outbox only after a matching 2xx
-ACK; a deterministic 4xx moves it to the durable dead-letter.  Reconnects and
-agent process restarts therefore cannot turn completed work into silence.
+owns frame order and may have a bounded window of writes awaiting ACKs.  A
+frame leaves the active outbox, in order, only after a matching 2xx ACK; a
+deterministic 4xx moves it to the durable dead-letter.  Reconnects replay only
+the unacknowledged suffix with the original identities, and process restarts
+cannot turn completed work into silence.
 
 Server frames are also closed: typed ``ack`` and ``job`` objects.  Treating an
 unknown object as an ACK is a protocol error, because retiring the wrong
@@ -44,6 +46,7 @@ OPEN_WALL_S = float(os.environ.get("POD_STREAM_OPEN_WALL_S", "10"))
 MAX_REOPENS = int(os.environ.get("POD_STREAM_MAX_REOPENS", "2"))
 REOPEN_BACKOFF_S = float(os.environ.get("POD_STREAM_REOPEN_BACKOFF_S", "0.25"))
 BACKGROUND_RETRY_S = float(os.environ.get("POD_STREAM_BACKGROUND_RETRY_S", "5"))
+ACK_WINDOW = min(256, max(1, int(os.environ.get("POD_STREAM_ACK_WINDOW", "32"))))
 DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 2
@@ -313,14 +316,16 @@ class EventStream:
         # Sender normally settles a synchronous waiter. This derived outer wall also covers a bug or an
         # unexpected persistence failure inside the daemon, so a terminal caller itself cannot wait forever.
         if not waiter.wait(_delivery_wall_s()):
-            with self._state:
+            with self._work:
                 key = (stream_id, seq)
                 self._delivery_waiters.pop(key, None)
                 raced = self._delivery_outcomes.pop(key, None)
-            if isinstance(raced, BaseException):
-                raise raced
-            if raced is not None:
-                return bool(raced)
+                if isinstance(raced, BaseException):
+                    raise raced
+                if raced is not None:
+                    return bool(raced)
+                self._latch_locked(DeliveryPending(
+                    f"{stream_id}:{seq} exceeded its caller delivery wall and remains durable"))
             _log(f"frame seq={seq} sender exceeded derived delivery wall {_delivery_wall_s():.2f}s; "
                  "frame remains durable")
             return False
@@ -335,21 +340,51 @@ class EventStream:
     # ── one ordered sender ─────────────────────────────────────────────────────────────────────────
 
     def _sender_loop(self) -> None:
+        # A later ACK may arrive before an earlier one on a non-Go test peer. Keep the verdict in memory,
+        # but never retire it from disk or wake its caller until every durable predecessor has settled.
+        known: dict[
+            tuple[str, int], tuple[str, dict[str, Any] | None, float]
+        ] = {}
         while True:
             with self._work:
                 self._work.wait_for(lambda: self._stop or self._outbox)
                 if self._stop:
                     return
-                frame = dict(self._outbox[0])
+                window = [dict(frame) for frame in self._outbox[:ACK_WINDOW]]
+                unsent = [frame for frame in window if self._frame_key(frame) not in known]
+            attempted: set[tuple[str, int]] = set()
             try:
-                delivery_started = time.monotonic()
-                disposition, ack = self._deliver(frame)
-                self._settle(frame, disposition, ack, time.monotonic() - delivery_started)
-                if disposition == "pending":
+                if unsent:
+                    attempted = {self._frame_key(frame) for frame in unsent}
+                    known.update(self._deliver_window(unsent))
+
+                while True:
+                    with self._state:
+                        if not self._outbox:
+                            break
+                        frame = dict(self._outbox[0])
+                    key = self._frame_key(frame)
+                    verdict = known.get(key)
+                    if verdict is None:
+                        break
+                    disposition, ack, delivery_s = verdict
+                    self._settle(frame, disposition, ack, delivery_s)
+                    known.pop(key, None)
+
+                with self._state:
+                    head = dict(self._outbox[0]) if self._outbox else None
+                if head is not None and self._frame_key(head) in attempted:
+                    # Exhaustion is ambiguous, not a verdict. It wakes a synchronous caller and closes job
+                    # admission, while the frame and any ACKed successors remain ordered and durable.
+                    self._settle(head, "pending", None, 0.0)
                     with self._work:
                         self._work.wait(timeout=BACKGROUND_RETRY_S)
             except BaseException as e:  # noqa: BLE001 - sender death would strand a synchronous terminal
-                key = (str(frame["stream_id"]), int(frame["seq"]))
+                with self._state:
+                    frame = dict(self._outbox[0]) if self._outbox else None
+                if frame is None:
+                    continue
+                key = self._frame_key(frame)
                 _log(f"sender failed while settling {key[0]}:{key[1]} "
                      f"({safe_error(e)}); frame remains durable")
                 with self._work:
@@ -442,61 +477,88 @@ class EventStream:
                 waiter.set()
             self._work.notify_all()
 
-    def _deliver(self, frame: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    @staticmethod
+    def _frame_key(frame: dict[str, Any]) -> tuple[str, int]:
+        return str(frame["stream_id"]), int(frame["seq"])
+
+    def _deliver_window(
+            self, frames: list[dict[str, Any]],
+    ) -> dict[tuple[str, int], tuple[str, dict[str, Any] | None, float]]:
+        """Write a bounded ordered window, retrying only frames without a terminal ACK."""
+        pending = list(frames)
+        started = {self._frame_key(frame): time.monotonic() for frame in frames}
+        outcomes: dict[tuple[str, int], tuple[str, dict[str, Any] | None, float]] = {}
         for attempt in range(MAX_REOPENS + 1):
+            if not pending:
+                break
             if self._unavailable:
                 break
             if not self._ensure_open():
                 if attempt < MAX_REOPENS:
                     time.sleep(REOPEN_BACKOFF_S)
                 continue
-            ack = self._exchange(frame)
-            if ack is None:
-                if attempt < MAX_REOPENS:
-                    time.sleep(REOPEN_BACKOFF_S)
-                continue
-            status = int(ack["status"])
-            if 200 <= status < 300:
-                return "accepted", ack
-            if 400 <= status < 500:
-                _log(f"frame seq={frame['seq']} REJECTED status={status} "
-                     f"reason={safe_text(ack.get('error') or '', 200)} — moved to durable dead-letter")
-                return "rejected", ack
-            # A 5xx did not judge content. Retry like a timeout/socket ambiguity, retaining the same identity.
-            if attempt < MAX_REOPENS:
+            acks = self._exchange_window(pending)
+            retry: list[dict[str, Any]] = []
+            for frame in pending:
+                key = self._frame_key(frame)
+                ack = acks.get(key)
+                status = int(ack["status"]) if ack is not None else 0
+                delivery_s = time.monotonic() - started[key]
+                if 200 <= status < 300:
+                    outcomes[key] = ("accepted", ack, delivery_s)
+                elif 400 <= status < 500:
+                    _log(f"frame seq={frame['seq']} REJECTED status={status} "
+                         f"reason={safe_text(ack.get('error') or '', 200)} "
+                         "— moved to durable dead-letter")
+                    outcomes[key] = ("rejected", ack, delivery_s)
+                else:
+                    # A 5xx or absent ACK made no content verdict. Keep the exact identity for replay.
+                    retry.append(frame)
+            pending = retry
+            if pending and attempt < MAX_REOPENS:
                 time.sleep(REOPEN_BACKOFF_S)
-        _log(f"frame seq={frame['seq']} delivery retries exhausted — retained in durable outbox")
-        return "pending", None
+        if pending:
+            first, last = pending[0]["seq"], pending[-1]["seq"]
+            _log(f"frame seq={first}..{last} delivery retries exhausted — retained in durable outbox")
+        return outcomes
 
-    def _exchange(self, frame: dict[str, Any]) -> dict[str, Any] | None:
-        seq = int(frame["seq"])
-        key = (str(frame["stream_id"]), seq)
-        ready = threading.Event()
+    def _exchange_window(
+            self, frames: list[dict[str, Any]],
+    ) -> dict[tuple[str, int], dict[str, Any]]:
+        keys = [self._frame_key(frame) for frame in frames]
+        ready = {key: threading.Event() for key in keys}
         with self._state:
             conn = self._conn
-            self._ack_waiters[key] = ready
+            for key, waiter in ready.items():
+                self._ack_waiters[key] = waiter
         if conn is None:
             with self._state:
-                self._ack_waiters.pop(key, None)
-            return None
+                for key in keys:
+                    self._ack_waiters.pop(key, None)
+            return {}
         try:
             with self._write_lock:
-                conn.send(json.dumps(frame, ensure_ascii=False, separators=(",", ":")))
+                for frame in frames:
+                    conn.send(json.dumps(frame, ensure_ascii=False, separators=(",", ":")))
         except Exception as e:  # noqa: BLE001 - transport, frame stays durable
-            _log(f"frame seq={seq} write failed ({safe_error(e)})")
-            with self._state:
-                self._ack_waiters.pop(key, None)
+            _log(f"frame window write failed ({safe_error(e)})")
             self._fail_connection(conn, f"write: {safe_error(e)}")
-            return None
-        got = ready.wait(FRAME_WALL_S)
+
+        deadline = time.monotonic() + FRAME_WALL_S
+        for key in keys:
+            ready[key].wait(max(0.0, deadline - time.monotonic()))
+            with self._state:
+                if self._conn is not conn:
+                    break
         with self._state:
-            self._ack_waiters.pop(key, None)
-            ack = self._acks.pop(key, None)
-        if not got or ack is None:
-            _log(f"frame seq={seq} unacknowledged for {FRAME_WALL_S}s")
+            acks = {key: self._acks.pop(key) for key in keys if key in self._acks}
+            for key in keys:
+                self._ack_waiters.pop(key, None)
+        if len(acks) != len(keys):
+            missing = len(keys) - len(acks)
+            _log(f"frame window has {missing}/{len(keys)} unacknowledged after {FRAME_WALL_S}s")
             self._fail_connection(conn, "ack timeout or invalid ACK")
-            return None
-        return ack
+        return acks
 
     # ── strict server frames ───────────────────────────────────────────────────────────────────────
 
@@ -560,15 +622,24 @@ class EventStream:
                 if kind != "ack":
                     raise ProtocolError(f"unknown server frame type {kind!r}")
                 ack = self._validate_ack(decoded)
+                seq = int(ack["seq"])
+                key = (str(ack["stream_id"]), seq)
+                with self._work:
+                    self._acks[key] = ack
+                    waiter = self._ack_waiters.get(key)
+                    status = int(ack["status"])
+                    if 400 <= status < 500:
+                        # Ordered persistence may wait for an earlier ACK. Admission cannot: the peer already
+                        # made a deterministic verdict, so no new paid job may enter during that gap.
+                        frame = next(
+                            (item for item in self._outbox if self._frame_key(item) == key), None)
+                        if frame is None:
+                            raise ProtocolError(f"ACK {key[0]}:{key[1]} has no durable frame")
+                        self._latch_locked(FrameRejected(dict(frame), ack))
             except Exception as e:  # noqa: BLE001 - malformed peer means connection is unsafe
                 _log(f"reader rejected server frame ({safe_error(e)})")
                 self._fail_connection(conn, safe_error(e))
                 return
-            seq = int(ack["seq"])
-            key = (str(ack["stream_id"]), seq)
-            with self._state:
-                self._acks[key] = ack
-                waiter = self._ack_waiters.get(key)
             if waiter is not None:
                 waiter.set()
 
@@ -604,7 +675,11 @@ class EventStream:
         with self._state:
             if self._conn is conn:
                 self._conn = None
-            waiters = list(self._ack_waiters.values())
+                waiters = list(self._ack_waiters.values())
+            else:
+                # A reader from the previous socket may observe its close after a reconnect already installed
+                # new ACK waiters under the same frame identities. It must not wake the new connection's window.
+                waiters = []
         try:
             conn.close()
         except Exception:  # noqa: BLE001 - already dead

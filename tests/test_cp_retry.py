@@ -95,6 +95,7 @@ def _fast_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(event_stream, "OPEN_WALL_S", 0.15)
     monkeypatch.setattr(event_stream, "REOPEN_BACKOFF_S", 0.01)
     monkeypatch.setattr(event_stream, "MAX_REOPENS", 1)
+    monkeypatch.setattr(event_stream, "ACK_WINDOW", 4)
 
 
 def test_result_is_a_typed_frame_and_requires_correlation(tmp_path: Path) -> None:
@@ -151,6 +152,212 @@ def test_single_sender_preserves_append_order(tmp_path: Path) -> None:
     assert [f["event"]["step"] for f in seen] == [f"n{n}" for n in range(6)]
     assert [f["seq"] for f in seen] == list(range(1, 7))
     assert len({f["stream_id"] for f in seen}) == 1
+
+
+def test_delayed_first_ack_still_receives_a_full_bounded_window_without_log_loss(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+    first_window_received = threading.Event()
+    sender_gate = threading.Event()
+    real_sender = EventStream._sender_loop
+
+    def gated_sender(stream: EventStream) -> None:
+        assert sender_gate.wait(1)
+        real_sender(stream)
+
+    monkeypatch.setattr(EventStream, "_sender_loop", gated_sender)
+
+    def handler(ws: Any) -> None:
+        first = [json.loads(ws.recv()) for _ in range(event_stream.ACK_WINDOW)]
+        seen.extend(first)
+        first_window_received.set()
+        for frame in first:
+            ws.send(_ack(frame))
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            seen.append(frame)
+            ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        count = event_stream.ACK_WINDOW * 2 + 1
+        for n in range(count):
+            assert stream.send_event(_event(phase="log", step=f"n{n}"), wait=False)
+        assert len(json.loads((tmp_path / "outbox.json").read_text())["frames"]) == count
+        sender_gate.set()
+        assert first_window_received.wait(1), "the first ACK was withheld until a whole window arrived"
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+    assert [frame["event"]["step"] for frame in seen] == [f"n{n}" for n in range(count)]
+    assert [frame["seq"] for frame in seen] == list(range(1, count + 1))
+
+
+def test_out_of_order_acks_are_not_settled_ahead_of_the_durable_head(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    later_acks_sent = threading.Event()
+    release_head = threading.Event()
+    sender_gate = threading.Event()
+    real_sender = EventStream._sender_loop
+    monkeypatch.setattr(
+        EventStream, "_sender_loop",
+        lambda stream: sender_gate.wait(1) and real_sender(stream),
+    )
+
+    def handler(ws: Any) -> None:
+        frames = [json.loads(ws.recv()) for _ in range(3)]
+        ws.send(_ack(frames[2]))
+        ws.send(_ack(frames[1]))
+        later_acks_sent.set()
+        assert release_head.wait(1)
+        ws.send(_ack(frames[0]))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        for n in range(3):
+            stream.send_event(_event(step=f"n{n}"), wait=False)
+        sender_gate.set()
+        assert later_acks_sent.wait(1)
+        time.sleep(0.03)
+        assert stream.pending_count() == 3, "later ACKs must not retire around an unacknowledged head"
+        release_head.set()
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+
+def test_later_window_4xx_latches_admission_before_its_predecessors_settle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    verdict_sent = threading.Event()
+    release_predecessors = threading.Event()
+    sender_gate = threading.Event()
+    real_sender = EventStream._sender_loop
+    monkeypatch.setattr(
+        EventStream, "_sender_loop",
+        lambda stream: sender_gate.wait(1) and real_sender(stream),
+    )
+
+    def handler(ws: Any) -> None:
+        frames = [json.loads(ws.recv()) for _ in range(3)]
+        ws.send(_ack(frames[2], status=422, error="late frame rejected"))
+        verdict_sent.set()
+        assert release_predecessors.wait(1)
+        ws.send(_ack(frames[0]))
+        ws.send(_ack(frames[1]))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        for n in range(3):
+            stream.send_event(_event(step=f"n{n}"), wait=False)
+        sender_gate.set()
+        assert verdict_sent.wait(1)
+        _wait_for(lambda: isinstance(stream._admission_error, FrameRejected))
+        assert stream.pending_count() == 3, "the durable head is intentionally still unacknowledged"
+        with pytest.raises(FrameRejected, match="422"):
+            stream.claim(0.1)
+        release_predecessors.set()
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+
+def test_mid_window_disconnect_replays_only_unacked_frames_with_the_same_ids(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connections: list[list[tuple[str, int]]] = []
+    handler_lock = threading.Lock()
+    sender_gate = threading.Event()
+    real_sender = EventStream._sender_loop
+    monkeypatch.setattr(
+        EventStream, "_sender_loop",
+        lambda stream: sender_gate.wait(1) and real_sender(stream),
+    )
+
+    def handler(ws: Any) -> None:
+        with handler_lock:
+            connection_no = len(connections)
+            connections.append([])
+        if connection_no == 0:
+            frames = [json.loads(ws.recv()) for _ in range(event_stream.ACK_WINDOW)]
+            connections[0].extend((frame["stream_id"], frame["seq"]) for frame in frames)
+            for frame in frames[:2]:
+                ws.send(_ack(frame))
+            return
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            connections[connection_no].append((frame["stream_id"], frame["seq"]))
+            ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        for n in range(event_stream.ACK_WINDOW):
+            stream.send_event(_event(step=f"n{n}"), wait=False)
+        sender_gate.set()
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+    assert len(connections) == 2
+    assert [seq for _, seq in connections[0]] == [1, 2, 3, 4]
+    assert connections[1] == connections[0][2:], "ACKed prefix must not cross the reconnect again"
+
+
+def test_stale_reader_cannot_wake_the_reconnected_socket_window(tmp_path: Path) -> None:
+    class _Conn:
+        def close(self) -> None:
+            pass
+
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
+    old_conn, new_conn = _Conn(), _Conn()
+    waiter = threading.Event()
+    key = (stream._stream_id, 1)
+    with stream._state:
+        stream._conn = new_conn
+        stream._ack_waiters[key] = waiter
+    stream._fail_connection(old_conn, "late old reader")
+    assert stream._conn is new_conn
+    assert not waiter.is_set(), "the old socket must not manufacture an ACK wakeup on the new window"
+    with stream._state:
+        stream._ack_waiters.clear()
+        stream._conn = None
+    stream.close()
+
+
+def test_result_and_its_ack_event_cannot_overtake_prior_or_already_appended_frames(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+    sender_gate = threading.Event()
+    real_sender = EventStream._sender_loop
+    monkeypatch.setattr(
+        EventStream, "_sender_loop",
+        lambda stream: sender_gate.wait(1) and real_sender(stream),
+    )
+
+    def handler(ws: Any) -> None:
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            seen.append(frame)
+            ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        stream.send_event(_event(step="before-1"), wait=False)
+        stream.send_event(_event(step="before-2"), wait=False)
+        stream.send_result(_result(), wait=False)
+        stream.send_event(_event(step="after"), wait=False)
+        sender_gate.set()
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+    assert [frame["type"] for frame in seen] == ["event", "event", "result", "event", "event"]
+    assert [frame["seq"] for frame in seen] == [1, 2, 3, 4, 5]
+    assert seen[3]["event"]["step"] == "after"
+    assert seen[4]["event"]["phase"] == "result_acked"
 
 
 def test_ack_lost_after_send_replays_the_same_identity(tmp_path: Path) -> None:
@@ -562,15 +769,17 @@ def test_stuck_sender_hits_caller_wall_without_leaking_waiter_or_outcome(
     release = threading.Event()
     monkeypatch.setattr(event_stream, "_delivery_wall_s", lambda: 0.05)
 
-    def stuck(_frame: dict[str, Any]) -> tuple[str, None]:
+    def stuck(_frames: list[dict[str, Any]]) -> dict[tuple[str, int], tuple[str, None, float]]:
         release.wait(1)
-        return "pending", None
+        return {}
 
-    monkeypatch.setattr(stream, "_deliver", stuck)
+    monkeypatch.setattr(stream, "_deliver_window", stuck)
     assert stream.send_result(_result()) is False
     assert stream._delivery_waiters == {} and stream._delivery_outcomes == {}
+    assert isinstance(stream._admission_error, DeliveryPending)
+    with pytest.raises(DeliveryPending, match="caller delivery wall"):
+        stream.claim(0.01)
     release.set()
-    _wait_for(lambda: isinstance(stream._admission_error, DeliveryPending))
     assert stream._delivery_outcomes == {}
     assert stream.pending_count() == 1
     stream.close()
