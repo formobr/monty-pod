@@ -127,6 +127,11 @@ class EventStream:
             try:
                 raw = conn.recv()
             except Exception as e:            # noqa: BLE001 — the connection ended; wake everyone waiting
+                # LOUD IN THE HANDLER, not only inside `_fail_connection`: the absorption gate reads this
+                # block and will not follow a call to decide whether anyone was told — rightly, because an
+                # announcement that lives one frame away is one refactor from being gone.
+                _log(f"reader lost the socket ({type(e).__name__}: {e}) — every sender waiting on it is "
+                     f"being woken and this pod has no second lane")
                 self._fail_connection(conn, f"{type(e).__name__}: {e}")
                 return
             try:
