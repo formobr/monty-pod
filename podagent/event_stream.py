@@ -17,6 +17,17 @@ AND THE FRAME IS THE SAME OBJECT THE POST CARRIED, plus a `seq`. The control pla
 same struct, so an old pod on the POST lane and a new pod on the socket are indistinguishable to it. That is
 what makes this safe to roll out in the only order available: control plane first, image second.
 
+ONE READER, TWO WRITERS, NO SHARED LOCK — and the first version got this wrong at a measured cost. It used a
+single mutex for everything, so `claim` (which waits up to 30 s for the next envelope) held the socket while
+it waited, and every step report the pod wanted to send queued behind it. The ledger read
+`!transport 535.2 s` over 24 steps against `1.6 s` over 17 the day before, and the box then blamed the CDN:
+nine preview batches all hit their 45 s wall while the pod had actually pulled 99.6 MB from pexels in 30.9 s.
+A LANE THAT BLOCKS ITS OWN REPORTS IS WORSE THAN THE POSTs IT REPLACED.
+
+So: a dedicated reader thread owns `recv` and nothing else. It routes each frame — an ack wakes the exact
+sender waiting on that `seq`, a job goes on a queue. Senders hold a WRITE lock only long enough to write.
+`claim` holds nothing at all; it waits on the queue.
+
 THE OUTBOX IS THE POINT, not the speed. A report is retired only when the control plane ACKs its `seq`.
 A socket that dies takes nothing with it — the unacked frames are re-sent on the next connection, in order.
 That is the class of failure this replaces: a pod that finished its work, could not deliver the terminal,
@@ -35,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
 from typing import Any, Callable
@@ -75,24 +87,31 @@ def _log(msg: str) -> None:
 
 
 class EventStream:
-    """The socket lane, with an outbox. Thread-safe: the ops runner reports from a pool.
+    """The socket lane: one reader thread, senders that wait on their own ack, and an outbox.
 
-    `send` NEVER raises. It returns True when the control plane acknowledged the frame, and False when the
-    caller must fall back to POST — which is what `cp.post_event` does with it.
+    `send` NEVER raises. It returns True when the control plane acknowledged the frame, False when it could
+    not be delivered — and with no POST lane behind it, False is a report that is GONE, which `cp.post_event`
+    says out loud.
     """
 
-    def __init__(self, base_url: str, job_token: str) -> None:  # noqa: D107 - documented on the class
+    def __init__(self, base_url: str, job_token: str) -> None:
         self._url = base_url.rstrip("/").replace("https://", "wss://", 1).replace("http://", "ws://", 1) \
             + "/pod/stream"
         self._token = job_token
-        self._lock = threading.Lock()
+        self._wlock = threading.Lock()        # serialises WRITES only; a reader never takes it
+        self._resend = threading.Lock()       # one re-sender at a time, so a reconnect cannot duplicate
+        self._state = threading.Lock()        # guards the small maps below
         self._conn: Any = None
+        self._reader: threading.Thread | None = None
         self._seq = 0
-        self._outbox: list[tuple[int, dict[str, Any]]] = []   # frames sent but not yet acknowledged
-        # WORK ARRIVES ON THE SAME WIRE AS ACKS, so a job frame read while waiting for an ack is parked here
-        # rather than dropped. Dropping it would lose an envelope the control plane has already BRPOP'd off
-        # the queue — the one loss this transport can still cause, and it must not be caused by US.
-        self._jobs: list[dict[str, Any]] = []
+        self._outbox: list[tuple[int, dict[str, Any]]] = []
+        self._waiters: dict[int, threading.Event] = {}
+        # Frames a sender has taken responsibility for. Claimed the moment `send` mints the seq, BEFORE any
+        # re-send can look — registering it later left a window where another thread saw the frame as
+        # orphaned and delivered it a second time.
+        self._mine: set[int] = set()
+        self._acks: dict[int, dict[str, Any]] = {}
+        self._jobs: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._reopens = 0
         self._dead = DISABLED or _ws_client is None
         if DISABLED:
@@ -101,175 +120,184 @@ class EventStream:
             _log(f"websockets is not importable ({_WS_IMPORT_ERROR}) — this pod CANNOT reach the control "
                  f"plane at all, because the socket is the only lane. Rebuild the image.")
 
+    # ── the reader ────────────────────────────────────────────────────────────────────────────────────
+    def _read_loop(self, conn: Any) -> None:
+        """Own `recv` for this connection and route what arrives. The ONLY thread that reads."""
+        while True:
+            try:
+                raw = conn.recv()
+            except Exception as e:            # noqa: BLE001 — the connection ended; wake everyone waiting
+                self._fail_connection(conn, f"{type(e).__name__}: {e}")
+                return
+            try:
+                frame = dict(json.loads(raw))
+            except (ValueError, TypeError):
+                _log("the control plane sent a frame that is not a JSON object — dropping this socket")
+                self._fail_connection(conn, "undecodable frame")
+                return
+            if str(frame.get("type")) == "job":
+                self._jobs.put(frame)
+                continue
+            seq = int(frame.get("seq") or 0)
+            with self._state:
+                self._acks[seq] = frame
+                ev = self._waiters.get(seq)
+            if ev is not None:
+                ev.set()
+
+    def _fail_connection(self, conn: Any, why: str) -> None:
+        """Tear down `conn` and wake every sender blocked on it, so nobody waits on a socket that is gone."""
+        with self._state:
+            if self._conn is conn:
+                self._conn = None
+            waiters = list(self._waiters.values())
+        _log(f"socket closed ({why}); {len(self._outbox)} frame(s) still unacknowledged")
+        try:
+            conn.close()
+        except Exception as e:                # noqa: BLE001 — closing a dead socket is not an error
+            _log(f"close of an already-dead socket raised ({type(e).__name__}: {e}) — ignored")
+        for ev in waiters:
+            ev.set()
+
     # ── connection ────────────────────────────────────────────────────────────────────────────────────
     def _open(self) -> bool:
-        """Raise the socket. Never raises, and — deliberately — sends NOTHING.
-
-        An earlier version re-sent the outbox from here, which double-delivered every frame: `send` appends
-        to the outbox and THEN connects, so the frame it was about to write was already in the batch this
-        replayed. Connecting and flushing are two jobs and are now two methods; a test pins the duplicate.
-        """
+        """Raise the socket and start its reader. Never raises, and sends NOTHING (flushing is `_flush`)."""
         try:
-            self._conn = _ws_client.connect(                       # type: ignore[union-attr]
+            conn = _ws_client.connect(                                  # type: ignore[union-attr]
                 self._url, additional_headers={"Authorization": f"Bearer {self._token}"},
                 open_timeout=OPEN_WALL_S, close_timeout=2.0, max_size=1 << 20)
-        except Exception as e:                    # noqa: BLE001 - a lane that will not open is not a crash
+        except Exception as e:                # noqa: BLE001 - a lane that will not open is not a crash
             self._reopens += 1
             _log(f"open failed ({type(e).__name__}: {e}) — attempt {self._reopens}/{MAX_REOPENS}")
             if self._reopens >= MAX_REOPENS:
                 self._dead = True
-                _log("giving up on the socket lane; every event goes by POST from here")
+                _log("giving up on the socket lane; this pod can no longer report or claim")
             return False
-        self._reopens = 0                     # a lane that opened is not a lane that keeps failing
+        self._reopens = 0
+        with self._state:
+            self._conn = conn
+        self._reader = threading.Thread(target=self._read_loop, args=(conn,),
+                                        name="pod-stream-reader", daemon=True)
+        self._reader.start()
         _log(f"open ✓ {self._url}")
         return True
 
-    def _flush(self) -> bool:
-        """Write every unacknowledged frame, OLDEST FIRST, until the outbox is empty or the socket dies.
-
-        THE ORDER IS LOAD-BEARING, not tidiness: the control plane folds a chain-level terminal into the FIFO
-        the box is blocked on, so a terminal delivered ahead of the steps it terminates reads as a chain that
-        did nothing. This is also THE RE-SEND — the frames a dead socket never got acknowledged are simply
-        still here, which is the whole reason the outbox exists.
-        """
-        while self._outbox:
-            seq, payload = self._outbox[0]
-            if not self._write_and_ack(seq, payload):
-                return False
+    # ── one frame ─────────────────────────────────────────────────────────────────────────────────────
+    def _write_and_ack(self, seq: int, payload: dict[str, Any]) -> bool:
+        """Write one frame and wait for ITS ack. False ⇒ the SOCKET failed (the caller reopens)."""
+        ev = threading.Event()
+        with self._state:
+            conn = self._conn
+            self._waiters[seq] = ev
+        if conn is None:
+            with self._state:
+                self._waiters.pop(seq, None)
+            return False
+        try:
+            with self._wlock:                 # WRITES only — the reader is never behind this
+                conn.send(json.dumps({"seq": seq, **payload}))
+        except Exception as e:                # noqa: BLE001 - transport, not content
+            _log(f"frame seq={seq} lost the socket on write ({type(e).__name__}: {e}) — it stays in the outbox")
+            with self._state:
+                self._waiters.pop(seq, None)
+            self._fail_connection(conn, f"{type(e).__name__}: {e}")
+            return False
+        got = ev.wait(FRAME_WALL_S)
+        with self._state:
+            self._waiters.pop(seq, None)
+            ack = self._acks.pop(seq, None)
+        if not got or ack is None:
+            # The control plane answers every frame, so silence inside the wall means the peer is gone even
+            # while the socket still looks open.
+            _log(f"frame seq={seq} went unacknowledged for {FRAME_WALL_S}s — dropping this socket")
+            if conn is not None:
+                self._fail_connection(conn, "ack timeout")
+            return False
+        status = int(ack.get("status") or 0)
+        if status != 202:
+            _log(f"frame seq={seq} REFUSED status={status} reason={str(ack.get('error'))[:200]}")
+        # RETIRED EITHER WAY: a 202 is delivery, a 4xx is a verdict on the content and a second copy earns
+        # the same verdict forever.
+        with self._state:
+            self._outbox = [(s, p) for s, p in self._outbox if s != seq]
+            self._mine.discard(seq)
         return True
 
-    def _drop(self, why: str) -> None:
-        _log(f"socket closed ({why}); {len(self._outbox)} frame(s) still unacknowledged")
-        try:
-            if self._conn is not None:
-                self._conn.close()
-        except Exception as e:                    # noqa: BLE001 - closing a dead socket is not an error
-            _log(f"close of an already-dead socket raised ({type(e).__name__}: {e}) — ignored")
-        self._conn = None
+    def _resend_outbox(self, upto_seq: int) -> bool:
+        """Re-send frames a DEAD socket never got acknowledged, oldest first, on the fresh one.
 
-    # ── one frame ─────────────────────────────────────────────────────────────────────────────────────
-    def _recv(self, wall: float) -> dict[str, Any] | None:
-        """One decoded frame, `_QUIET` if nothing arrived in time, or None if the SOCKET failed.
-
-        A READ THAT TIMED OUT IS NOT A BROKEN SOCKET, and conflating the two is not a style question: the
-        first version dropped the connection on every expiry, so a pod waiting for work re-opened its socket
-        every 30 s. The control plane's own log said so — `CLOSED … open_s=30.0` over and over, which is the
-        per-connection churn this transport exists to remove, reintroduced by its own claim loop.
+        ONLY THE FRAMES OLDER THAN THE CALLER'S OWN, and only one thread at a time. An earlier version had
+        every sender flush the whole outbox from the front, so eight concurrent reports each wrote frame #1
+        and the control plane received sixteen frames for eight events — a test caught it. The order still
+        matters: a chain terminal delivered ahead of its own steps reads as a chain that did nothing.
         """
-        try:
-            raw = self._conn.recv(timeout=wall)
-        except TimeoutError:
-            return _QUIET                          # nothing to read yet; the connection is fine
-        except Exception as e:                    # noqa: BLE001 - transport, not content
-            _log(f"socket read failed ({type(e).__name__}: {e}) — {len(self._outbox)} frame(s) unacknowledged")
-            self._drop(f"{type(e).__name__}: {e}")
-            return None
-        try:
-            return dict(json.loads(raw))
-        except (ValueError, TypeError):
-            _log("the control plane sent a frame that is not a JSON object — dropping this socket")
-            self._drop("undecodable frame")
-            return None
-
-    def _write_and_ack(self, seq: int, payload: dict[str, Any]) -> bool:
-        """Write one frame and wait for ITS ack. Returns False if the SOCKET failed (caller reopens).
-
-        A frame the control plane REFUSES (a 4xx in the ack) is not a socket failure: it is a verdict on the
-        content, it is said out loud, and the frame is retired — asking again earns the same verdict forever.
-        """
-        try:
-            self._conn.send(json.dumps({"seq": seq, **payload}))
-        except Exception as e:                    # noqa: BLE001 - transport, not content
-            _log(f"frame seq={seq} lost the socket on write ({type(e).__name__}: {e}) — it stays in the outbox")
-            self._drop(f"{type(e).__name__}: {e}")
-            return False
-        while True:
-            frame = self._recv(FRAME_WALL_S)
-            if frame is None:
-                return False
-            if frame is _QUIET:
-                # An ack that never came inside its own wall IS a fault: the control plane answers every
-                # frame, so silence here means the peer is gone even though the socket still looks open.
-                _log(f"frame seq={seq} went unacknowledged for {FRAME_WALL_S}s — dropping this socket")
-                self._drop("ack timeout")
-                return False
-            if str(frame.get("type")) == "job":
-                # WORK, arriving while we waited for an ack. Park it: the control plane has already taken it
-                # off the queue, so dropping it here is the one envelope loss this transport can still cause.
-                self._jobs.append(frame)
-                continue
-            status = int(frame.get("status") or 0)
-            if status != 202:
-                _log(f"frame seq={seq} REFUSED status={status} reason={str(frame.get('error'))[:200]}")
-            # RETIRED EITHER WAY (a 202 is delivery, a 4xx is a verdict) — see the docstring.
-            self._outbox = [(s, p) for s, p in self._outbox if s != seq]
-            return True
-
-    def claim(self, wall: float) -> dict[str, Any] | None:
-        """One envelope of work, or None if none arrived inside `wall`. NEVER raises.
-
-        This replaces `GET /pod/job` entirely. A parked frame is served first — it was already delivered and
-        waiting for it again would strand it behind a socket that may never speak.
-        """
-        if self._dead:
-            return None
-        with self._lock:
-            if self._jobs:
-                return self._jobs.pop(0).get("job")
-            if self._conn is None and not self._open():
-                return None
-            frame = self._recv(wall)
-            if frame is None or frame is _QUIET:
-                return None                        # no work this window; the socket stays up either way
-            if str(frame.get("type")) == "job":
-                return frame.get("job")
-            # An ack for a frame we already retired (a re-send that crossed with its own acknowledgement).
-            return None
+        with self._resend:
+            while True:
+                with self._state:
+                    # IN FLIGHT IS NOT UNSENT. A frame stays in the outbox until its ack lands, so its own
+                    # sender is still waiting on it — re-sending it here delivered the same event twice
+                    # (measured: eight concurrent reports became nineteen frames). Only frames nobody is
+                    # waiting for are genuinely orphaned by a dead socket.
+                    older = [(s, pl) for s, pl in self._outbox
+                             if s < upto_seq and s not in self._mine]
+                if not older:
+                    return True
+                seq, payload = older[0]
+                if not self._write_and_ack(seq, payload):
+                    return False
 
     def send(self, payload: dict[str, Any]) -> bool:
-        """Deliver one event over the socket. False ⇒ the caller must POST it instead. Never raises."""
+        """Deliver one event. NEVER raises. False ⇒ the report is GONE — there is no second lane."""
         if self._dead:
             return False
-        with self._lock:
+        with self._state:
             self._seq += 1
             seq = self._seq
             self._outbox.append((seq, payload))
-            for _ in range(MAX_REOPENS + 1):
-                if self._conn is None and not self._open():
-                    if self._dead:
-                        break
-                    continue
-                if self._flush():
-                    return True
+            self._mine.add(seq)
+        for _ in range(MAX_REOPENS + 1):
+            if self._conn is None and not self._open():
                 if self._dead:
                     break
-            # The frame stays in the outbox ONLY while the socket may still come back. Once we hand it to the
-            # POST lane it is that lane's problem, and keeping a copy would deliver it twice on a reconnect.
+                continue
+            # Anything the previous socket never got acknowledged goes first, then THIS frame — never the
+            # whole outbox per sender, which is how eight reports became sixteen frames.
+            if self._resend_outbox(seq) and self._write_and_ack(seq, payload):
+                return True
+            if self._dead:
+                break
+        with self._state:
             self._outbox = [(s, p) for s, p in self._outbox if s != seq]
-            return False
+            self._mine.discard(seq)
+        return False
+
+    def claim(self, wall: float) -> dict[str, Any] | None:
+        """One envelope of work, or None if none arrived inside `wall`. NEVER raises, and HOLDS NO LOCK —
+        that is the whole point: a claim that blocked the socket cost 535 s of `!transport` in one run."""
+        if self._dead:
+            return None
+        if self._conn is None and not self._open():
+            return None
+        try:
+            frame = self._jobs.get(timeout=wall)
+        except queue.Empty:
+            return None                        # no work this window; the socket is untouched
+        return frame.get("job")
 
     def close(self) -> None:
-        with self._lock:
-            if self._outbox:
-                # NEVER SILENT: frames still held here were never acknowledged by anyone.
-                _log(f"closing with {len(self._outbox)} frame(s) never acknowledged — "
-                     f"seq {[s for s, _ in self._outbox]}")
-            self._drop("pod shutting down")
+        with self._state:
+            held = list(self._outbox)
+            conn = self._conn
+            self._conn = None
+        if held:
+            _log(f"closing with {len(held)} frame(s) never acknowledged — seq {[s for s, _ in held]}")
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:            # noqa: BLE001
+                _log(f"close raised ({type(e).__name__}: {e}) — ignored")
 
 
-def make(base_url: str, job_token: str, post: Callable[[dict[str, Any]], None]) -> Callable[
-        [dict[str, Any]], None]:
-    """An event sender that prefers the socket and falls back to `post`, announcing the fallback once."""
-    stream = EventStream(base_url, job_token)
-    said = {"fell_back": False}
-
-    def send(payload: dict[str, Any]) -> None:
-        if stream.send(payload):
-            return
-        if not said["fell_back"]:
-            said["fell_back"] = True
-            _log("falling back to POST /pod/event for this event and any that follow it")
-        post(payload)
-
-    send.stream = stream          # type: ignore[attr-defined]  # so a caller can close it explicitly
-    return send
+def make(base_url: str, job_token: str) -> EventStream:
+    """The lane for one job. There is no fallback to wrap any more — the socket is it."""
+    return EventStream(base_url, job_token)
