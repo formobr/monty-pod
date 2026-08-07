@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import os
+import signal
 import sys
 import threading
 import time
@@ -267,17 +268,114 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str | None = None,
         cp.post_event(ev)
 
 
+POST_MORTEM_WHY = """
+A SECOND BOOT IS A DEATH NOBODY WROTE DOWN.
+
+MEASURED on a preview run: this agent stopped talking at run-offset 62.7 s and reported `agent up` again at
+114.3 s — two boots on ONE rent, so the process died inside the container and the supervisor restarted it.
+Fifty-one seconds of silence, twelve envelopes dropped by a control plane whose socket had gone, and a box
+that convicted two CDNs for it. When the question "why did it die" was finally asked, the answer was already
+gone: the container log dies with the pod, and by then the pod had been terminated to stop the billing.
+
+A crash cannot report itself. SIGKILL — which is what an OOM is — runs no handler, and a process that segv's
+has no voice at all. So the report is made by the NEXT incarnation, out of state that outlives a process but
+not a container:
+
+  · a liveness mark, written at boot and REMOVED on a clean exit. Finding it means the last agent did not
+    leave, it was taken.
+  · the cgroup's own `memory.events` oom_kill counter, which the kernel increments when it kills something in
+    this container. It is the difference between "we were too big" and "we broke".
+
+NEITHER IS ASSUMED WHEN UNREADABLE. A cgroup this kernel will not show is reported as unknown, never as zero:
+"nobody was OOM-killed" and "we could not ask" are different findings, and only one of them exonerates the
+memory budget.
+"""
+
+# NOT AN ENV KNOB. It was one for a minute, and `test_no_knob_the_pod_reads_is_written_by_nobody` was right
+# to refuse it: nothing on the box would ever have set it, and a knob no writer turns is a knob whose only
+# effect is to look configurable. The tests that need another path set THIS name.
+_LIVE_MARK = Path("/tmp/podagent.alive")
+
+
+_OOM_FILES = (Path("/sys/fs/cgroup/memory.events"),                 # cgroup v2
+              Path("/sys/fs/cgroup/memory/memory.oom_control"))     # v1, older hosts
+
+
+def _oom_from(text: str) -> str | None:
+    """The `oom_kill` count in one cgroup file's body, or None if this file does not carry one. Pure, so the
+    parse is testable without a kernel that happens to expose the right cgroup version."""
+    for line in text.splitlines():
+        key, _, val = line.partition(" ")
+        if key == "oom_kill" and val.strip().isdigit():
+            return val.strip()
+    return None
+
+
+def _oom_kills() -> str:
+    """How many times the kernel OOM-killed something in THIS container, or `unknown` (POST_MORTEM_WHY)."""
+    for p in _OOM_FILES:
+        try:
+            got = _oom_from(p.read_text())
+        except OSError:
+            continue
+        if got is not None:
+            return got
+    return "unknown"
+
+
+def _post_mortem() -> str:
+    """What happened to the PREVIOUS agent in this container, as a phrase for the boot beacon."""
+    oom = _oom_kills()
+    try:
+        died = _LIVE_MARK.read_text().strip()
+    except OSError:
+        return f"prev=none (first boot in this container) · oom_kills={oom}"
+    return f"prev=UNCLEAN (mark from {died} survived — the last agent was taken, not stopped) · oom_kills={oom}"
+
+
+def _mark_alive() -> None:
+    """Claim the liveness mark for this incarnation. Best effort: a mark we cannot write costs the NEXT
+    post-mortem its evidence, and that is not a reason to refuse the boot the pod is already billing for."""
+    try:
+        _LIVE_MARK.parent.mkdir(parents=True, exist_ok=True)
+        _LIVE_MARK.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    except OSError as e:
+        _log(f"⚠ could not write the liveness mark at {_LIVE_MARK} ({type(e).__name__}: {e}) — a crash of "
+             f"THIS agent will be indistinguishable from a clean stop (POST_MORTEM_WHY)")
+
+
+def _mark_stopped() -> None:
+    """Drop the mark on a deliberate exit, so the next boot does not report a death that never happened."""
+    try:
+        _LIVE_MARK.unlink(missing_ok=True)
+    except OSError as e:
+        _log(f"⚠ could not clear the liveness mark ({type(e).__name__}: {e}) — the next boot will read this "
+             f"clean stop as a crash")
+
+
+def _stop_and_exit(signum: int, _frame: Any) -> None:
+    """A signalled stop is deliberate: clear the mark, say which signal, and leave by the signal's own code."""
+    _log(f"signal {signum} — stopping; the liveness mark is cleared so the next boot reads a STOP, not a death")
+    _mark_stopped()
+    sys.exit(128 + int(signum))
+
+
 def _report_boot(cp: ControlPlane) -> None:
     """One event before the first poll. A keyless pod that cannot reach the CP has NO other voice: the box
     boots, bills and stays silent, which reads exactly like a dead host. This beacon turns that into a
-    fact on the wire — its presence proves the pod reached us, its absence indicts the network."""
+    fact on the wire — its presence proves the pod reached us, its absence indicts the network.
+
+    It also carries the PREVIOUS incarnation's post-mortem, because a second boot on one rent is the only
+    place a crash that ran no handler can still be described (POST_MORTEM_WHY)."""
     try:
         import torch
         gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no-cuda"
     except Exception:  # noqa: BLE001 — the beacon must never be what kills a boot
         gpu = "no-torch"
+    post = _post_mortem()
+    _mark_alive()
     cp.note({"stage": "boot", "status": "step",
-             "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s"})
+             "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s · {post}"})
 
 
 def _guarded(fn: Any, cp: ControlPlane) -> None:
@@ -295,6 +393,11 @@ def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
     cp = ControlPlane(cp_url, job_token)
+    # A STOP IS NOT A DEATH, and the next boot may not report it as one (POST_MORTEM_WHY). The teardown
+    # sends SIGTERM; anything that does NOT reach here — SIGKILL, a segv, an OOM — leaves the mark standing,
+    # which is exactly the signal.
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, _stop_and_exit)
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
     _report_boot(cp)
