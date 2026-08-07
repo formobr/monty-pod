@@ -66,10 +66,10 @@ RUN set -eux; \
     # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
     # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
     # transformers ships a get_image_features that returns a BaseModelOutputWithPooling → clip_rank crash.
-    # `websockets` is the EVENT LANE (podagent.event_stream): one socket instead of one POST per step.
+    # `websockets` is the only control-plane lane (podagent.event_stream): typed jobs, events and results.
     # It belongs on THIS line and not only in pyproject for the reason stated above — the app is
-    # installed --no-deps, so a pyproject dependency never reaches the image. The module degrades to
-    # POST out loud when the import fails, which is what keeps an older image running.
+    # installed --no-deps, so a pyproject dependency never reaches the image. Missing it makes the image
+    # unusable: there is deliberately no HTTP fallback.
     python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema websockets; \
     SP=/usr/local/lib/python3.11/dist-packages; \
     bucket() { n="$1"; shift; for p in "$@"; do d="/stage/$n/$(dirname "$p")"; mkdir -p "$d"; mv "$SP/$p" "$d/"; done; }; \
@@ -139,7 +139,12 @@ COPY --from=pydeps /usr/local/bin/ /usr/local/bin/
 # box whose egress may be blocked.
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
-    WEIGHTS_CACHE=/var/cache/monty/weights
+    WEIGHTS_CACHE=/var/cache/monty/weights \
+    POD_STREAM_OUTBOX=/var/cache/monty/pod-stream/outbox.json
+
+# The image runs as root (no later USER directive), but create the durable transport directory explicitly:
+# an unwritable outbox is a boot failure, never a reason to downgrade a terminal to memory.
+RUN mkdir -p /var/cache/monty/pod-stream
 
 # YuNet (face_probe) STAYS baked: 227 KB, every probe job needs it, and a fetch round-trip would cost
 # more than the bytes. The rule is "big models are inputs", not "nothing is baked".

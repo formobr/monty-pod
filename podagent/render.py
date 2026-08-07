@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -509,6 +510,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
     """Fetch inputs, run the single encode pass, PUT every non-cache output, report the event.
 
     corr_id/session_id are echoed from the claimed envelope onto the terminal (pool result demux)."""
+    work_started = time.monotonic()
     if spec.mode == "final" and spec.overlays is not None and spec.overlays.trims:
         raise NotImplementedError("final overlay(s) not yet composited on the pod: ['trims']")
 
@@ -618,4 +620,19 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         terminal["corr_id"] = corr_id
     if session_id is not None:
         terminal["session_id"] = session_id
-    cp.post_event(terminal)
+    # Observability and wake-up are separate typed frames. An event may be replayed without ever creating a
+    # second business result; the correlated result is the only terminal the awaiting brain consumes.
+    cp.send_event({
+        **terminal,
+        "phase": "work_finished",
+        "outcome": "ok",
+        "timings": {"work_s": round(time.monotonic() - work_started, 3)},
+    })
+    cp.send_result({
+        "job_id": spec.job_id,
+        "stage": "render",
+        "status": "ok",
+        "corr_id": corr_id,
+        "outputs": done,
+        **({"session_id": session_id} if session_id is not None else {}),
+    })

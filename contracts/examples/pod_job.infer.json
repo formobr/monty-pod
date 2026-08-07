@@ -1,5 +1,7 @@
 {
   "type": "infer",
+  "session_id": "session-demo-1",
+  "corr_id": "infer-demo-1",
   "request": {
     "infer_version": 5,
     "job_id": "job_9f2c1a",

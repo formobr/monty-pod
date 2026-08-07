@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -15,8 +14,6 @@ from urllib.request import url2pathname
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.exceptions import ReadTimeoutError
-from urllib3.util.retry import Retry
 
 from podagent import event_stream
 
@@ -78,34 +75,8 @@ _store = requests.Session()
 for _scheme in ("http://", "https://"):
     _store.mount(_scheme, HTTPAdapter(pool_connections=_store_pool(), pool_maxsize=_store_pool(),
                                       pool_block=False))
-# How long a terminal report keeps trying before the pod gives up on being heard. A result nobody receives
-# is the same to the brain as a pod that died, so this is worth far more patience than an ordinary call.
-_REPORT_ATTEMPTS = 6
-_REPORT_BACKOFF_S = 5.0
-
-# The CP transport's replay budget. Read at ControlPlane() construction, so a test can shrink the wait
-# without shrinking what it proves.
-_CP_RETRY_TOTAL = 5
-_CP_RETRY_BACKOFF_S = 0.5
-
-
 def _log(msg: str) -> None:
     print(f"[podagent] {msg}", file=sys.stderr, flush=True)
-
-
-class _LoudRetry(Retry):
-    """Replay a request whose CONNECTION died — announced, bounded, and never one that may have RUN."""
-
-    def increment(self, method: Any = None, url: Any = None, response: Any = None, error: Any = None,
-                  _pool: Any = None, _stacktrace: Any = None) -> Any:
-        # A drop means the server never answered. A read TIMEOUT means it may be inside the handler right
-        # now, and a replayed chain terminal puts a SECOND result on a FIFO key that carries exactly one.
-        if isinstance(error, ReadTimeoutError) and str(method).upper() == "POST":
-            raise error
-        cause = f"{type(error).__name__}: {error}" if error is not None else \
-                f"HTTP {getattr(response, 'status', '?')}"
-        _log(f"cp transport: replaying {method} {url} — {cause}")
-        return super().increment(method, url, response, error, _pool, _stacktrace)
 
 
 def _file_path(url: str) -> str | None:
@@ -120,20 +91,8 @@ def _file_path(url: str) -> str | None:
 class ControlPlane:
     def __init__(self, base_url: str, job_token: str) -> None:
         self.base = base_url.rstrip("/")
-        self.sess = requests.Session()
-        self.sess.headers["Authorization"] = f"Bearer {job_token}"
-        # Minutes of work between calls ⇒ the pooled socket is dead by the next POST, and urllib3 files that
-        # RemoteDisconnected under `read` — which at 0 refused the replay and failed the whole op chain.
-        retry = _LoudRetry(total=_CP_RETRY_TOTAL, connect=3, read=3, status=3,
-                           # "any verb": safety here is the FAILURE mode, which only increment can see
-                           status_forcelist=(502, 503, 504), allowed_methods=None,
-                           backoff_factor=_CP_RETRY_BACKOFF_S, raise_on_status=False)
-        adapter = HTTPAdapter(max_retries=retry)
-        self.sess.mount("http://", adapter)
-        self.sess.mount("https://", adapter)
-        # THE SOCKET IS THE ONLY LANE, both directions (event_stream WHY). No POST fallback and no poll: two
-        # mechanisms for one job is how they drift, and the poll that briefly survived beside the socket
-        # showed up in the control plane's access log as 32 fifty-second requests nobody wanted.
+        # One typed socket carries jobs, progress and terminal results. EventStream persists every client frame
+        # before sending, so this layer never invents an HTTP fallback or a second retry policy.
         self._stream = event_stream.EventStream(self.base, job_token)
 
     def poll_job(self) -> dict[str, Any] | None:
@@ -145,67 +104,37 @@ class ControlPlane:
         """
         return self._stream.claim(_CLAIM_WALL_S)
 
-    def post_event(self, payload: dict[str, Any]) -> None:
-        """Report one event over the socket. A socket that will not carry it is a FAILURE, said out loud —
-        there is nowhere else to put it, and pretending otherwise is what the removed POST lane did."""
-        if not self._stream.send(payload):
-            print(f"[cp] event NOT DELIVERED (stage={payload.get('stage')} status={payload.get('status')}) "
-                  f"— the socket is down and there is no second lane", file=sys.stderr, flush=True)
+    @staticmethod
+    def _stamped(payload: dict[str, Any]) -> dict[str, Any]:
+        stamped = dict(payload)
+        stamped.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        return stamped
+
+    def send_event(self, payload: dict[str, Any], *, wait: bool = False) -> bool:
+        """Durably enqueue a structured event; optionally wait for its typed ACK."""
+        return self._stream.send_event(self._stamped(payload), wait=wait)
+
+    def send_result(self, payload: dict[str, Any], *, wait: bool = True) -> bool:
+        """Durably deliver one correlated result; EventStream persists its result_acked transition."""
+        accepted = self._stream.send_result(dict(payload), wait=wait)
+        if wait and not accepted:
+            _log("result ACK remains ambiguous after bounded retries; durable outbox retains it for replay")
+        return accepted
 
     def close_stream(self) -> None:
         """Say out loud what was never acknowledged, and let the socket go."""
         self._stream.close()
 
-    def post_infer_result(self, payload: dict[str, Any]) -> None:
-        self.sess.post(f"{self.base}/pod/infer-result", json=payload, timeout=_TIMEOUT).raise_for_status()
-
     def note(self, payload: dict[str, Any]) -> None:
-        """Best-effort progress event, sent OFF the caller's thread. Never raises.
-
-        WHY IT LEFT THE CALLER'S THREAD. `artifact.download_verified` calls its progress hook from INSIDE the
-        chunk loop, so whatever that hook costs is paid out of the transfer's own bandwidth. That was free
-        when an event was a fire-and-forget POST (measured p50 0.5 ms on /pod/event). It stopped being free
-        the moment events moved to a socket that waits for an acknowledgement under a lock: a progress ping
-        could then hold the download for as long as an ack takes, which is the opposite of what a progress
-        ping is for. A REPORT MAY NEVER COST THE WORK IT IS REPORTING ON.
-        """
-        # A CLOSURE, not a method: `note` is borrowed by objects that are not ControlPlane instances (the
-        # agent's own fakes bind it directly), and a helper method would make this the one call that demands
-        # they be one.
-        def _send() -> None:
-            try:
-                self.post_event(payload)
-            except Exception as e:  # noqa: BLE001 — a progress ping is never worth failing a job over
-                _log(f"progress event dropped ({payload.get('step', '')!r}): {e}")
-
-        threading.Thread(target=_send, name="cp-note", daemon=True).start()
-
-    def report_infer_result(self, payload: dict[str, Any], wake_key: str | None = None) -> bool:
-        """Deliver a terminal InferResult, retrying, then fall back to an error event. Never raises.
-        It is the brain's ONLY wake-up: undelivered, it costs a full INFER_TIMEOUT_S of billed silence."""
-        for attempt in range(_REPORT_ATTEMPTS):
-            try:
-                self.post_infer_result(payload)
-                return True
-            except Exception as e:  # noqa: BLE001 — every failure mode here is retryable from our side
-                _log(f"infer-result post failed (attempt {attempt + 1}/{_REPORT_ATTEMPTS}): {e}")
-                if attempt + 1 < _REPORT_ATTEMPTS:
-                    time.sleep(_REPORT_BACKOFF_S * (attempt + 1))
-        # corr_id carries the awaited result_key: the CP echoes it onto the terminal it synthesizes from a
-        # chain-level error event, which is what lets this reach the keyed awaiter instead of just a log.
-        ev: dict[str, Any] = {
-            "job_id": payload.get("job_id", "unknown"), "stage": "infer", "status": "error",
-            "error": f"result undeliverable: {str(payload.get('error') or payload)[:400]}"}
-        key = payload.get("result_key") or payload.get("corr_id") or wake_key
-        if key:
-            ev["corr_id"] = key
+        """Append progress to disk synchronously, while ACK waiting stays on EventStream's sender thread."""
         try:
-            self.post_event(ev)
-        except Exception as e:  # noqa: BLE001 — nothing left to try; stderr is the last channel
-            _log(f"FATAL both /pod/infer-result and /pod/event are unreachable: {e}")
-            return False
-        _log("infer-result undeliverable — reported as a /pod/event instead")
-        return True
+            self.send_event(payload, wait=False)
+        except Exception as e:  # noqa: BLE001 — loud diagnostic; work still owns its own failure policy
+            _log(f"progress event could not enter the durable outbox ({payload.get('phase', '')!r}): {e}")
+
+    def report_infer_result(self, payload: dict[str, Any]) -> bool:
+        """Deliver the real InferResult on the typed result frame. No result→event downgrade exists."""
+        return self.send_result(dict(payload))
 
 
 class UrlNotAllowed(ValueError):

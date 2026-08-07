@@ -6,39 +6,40 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import requests
-
 from podagent import main as agent_main
 from podagent.cp import ControlPlane
+from podagent.event_stream import FrameRejected
 
 
 class _CP:
-    """Records what reached the control plane. post_infer_result fails `fail_times` times first."""
+    """Records which typed frame API the agent used."""
 
-    def __init__(self, fail_times: int = 0, event_fails: bool = False) -> None:
+    def __init__(self, event_fails: bool = False) -> None:
         self.results: list[dict] = []
         self.events: list[dict] = []
-        self.fail_times = fail_times
+        self.timeline: list[tuple[str, dict]] = []
         self.event_fails = event_fails
-        self.attempts = 0
 
-    def post_infer_result(self, payload: dict) -> None:
-        self.attempts += 1
-        if self.attempts <= self.fail_times:
-            raise requests.ConnectionError("Remote end closed connection without response")
+    def send_result(self, payload: dict, *, wait: bool = True) -> bool:
         self.results.append(payload)
+        self.timeline.append(("result", payload))
+        return True
 
-    def post_event(self, payload: dict) -> None:
+    def send_event(self, payload: dict, *, wait: bool = False) -> bool:
         if self.event_fails:
-            raise requests.ConnectionError("down")
+            raise RuntimeError("down")
         self.events.append(payload)
+        self.timeline.append(("event", payload))
+        return True
 
     report_infer_result = ControlPlane.report_infer_result
     note = ControlPlane.note
 
 
 def _run(cp, raw: dict) -> None:
-    agent_main._run_infer(raw, cp, {}, {}, {}, Path("/opt/models/yunet.onnx"), False, corr_id=None)
+    agent_main._run_infer(
+        raw, cp, {}, {}, {}, Path("/opt/models/yunet.onnx"), False,
+        corr_id="corr-1", session_id="session-1")
 
 
 def _bad_request() -> dict:
@@ -54,45 +55,51 @@ def test_a_failed_job_posts_an_error_result():
     assert len(cp.results) == 1, "a job that raised must leave a terminal, not silence"
     assert cp.results[0]["status"] == "error"
     assert cp.results[0]["kind"] == "clip_rank"
+    work_finished = next(
+        i for i, (kind, body) in enumerate(cp.timeline)
+        if kind == "event" and body.get("phase") == "work_finished")
+    result = next(i for i, (kind, _body) in enumerate(cp.timeline) if kind == "result")
+    assert work_finished < result, "the pod must finish work before it can deliver and ACK the result"
 
 
 def test_the_agent_announces_the_claim_before_it_can_die():
     cp = _CP()
     _run(cp, _bad_request())
-    steps = [e["step"] for e in cp.events if e.get("status") == "step"]
+    steps = [e["step"] for e in cp.events if e.get("status") == "step" and "step" in e]
     assert any("claimed clip_rank" in s for s in steps), (
         "without a claim event a pod that dies mid-job looks like one that never got the job")
-    # The CP authorizes an event by the TOKEN's lane and 403s a body naming a different job — and an infer
-    # request's job_id is a per-request id, not that lane. Every progress event was being rejected.
-    assert all("job_id" not in e for e in cp.events if e.get("status") == "step"), (
-        "a progress event carrying the infer job_id is 403'd by the control plane")
+    assert all(e.get("job_id") == "j1" for e in cp.events if e.get("status") == "step")
+    assert all(e.get("corr_id") == "corr-1" and e.get("session_id") == "session-1"
+               for e in cp.events if e.get("status") == "step")
     assert any("j1" in s for s in steps), "the request id still has to be readable in the step text"
 
 
-def test_a_dropped_terminal_is_retried_not_lost(monkeypatch):
-    # The live signature: minutes of work, then the pooled socket is dead and the POST never reaches Caddy.
-    monkeypatch.setattr("podagent.cp.time.sleep", lambda _s: None)
-    cp = _CP(fail_times=3)
+def test_an_infer_terminal_uses_result_not_an_error_event_fallback():
+    cp = _CP()
     _run(cp, _bad_request())
-    assert cp.attempts == 4 and len(cp.results) == 1
+    assert len(cp.results) == 1 and cp.results[0]["corr_id"] == "corr-1"
+    assert not [e for e in cp.events if e.get("status") == "error"], (
+        "a result may not be downgraded into the event vocabulary")
 
 
-def test_an_undeliverable_terminal_falls_back_to_an_event_carrying_the_wake_key(monkeypatch):
-    monkeypatch.setattr("podagent.cp.time.sleep", lambda _s: None)
-    cp = _CP(fail_times=99)
-    _run(cp, _bad_request())
-    assert not cp.results
-    err = [e for e in cp.events if e.get("status") == "error"]
-    assert len(err) == 1, "the last resort must still put the failure on the wire"
-    assert err[0]["corr_id"] == "out/j1/clip_rank.json", (
-        "the CP echoes corr_id onto its synthesized terminal — without it the awaiter starves anyway")
-
-
-def test_a_progress_event_never_kills_the_job(monkeypatch):
-    monkeypatch.setattr("podagent.cp.time.sleep", lambda _s: None)
+def test_a_progress_event_never_kills_the_job():
     cp = _CP(event_fails=True)
     _run(cp, _bad_request())
     assert len(cp.results) == 1, "a pod must not die of failing to say what it is doing"
+
+
+def test_a_rejected_result_is_not_rewritten_as_a_second_error_result():
+    class _Rejected(_CP):
+        def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+            self.results.append(payload)
+            frame = {"type": "result", "stream_id": "s", "seq": 1, "result": payload}
+            raise FrameRejected(frame, {
+                "type": "ack", "stream_id": "s", "seq": 1, "status": 422, "error": "bad content"})
+
+    cp = _Rejected()
+    with pytest.raises(FrameRejected):
+        _run(cp, _bad_request())
+    assert len(cp.results) == 1, "a deterministic verdict must not be replaced by another terminal"
 
 
 def test_a_base_exception_reports_before_it_unwinds(monkeypatch):

@@ -30,21 +30,26 @@ _PREVIEW_SPEC = {
 
 
 def test_infer_job_valid() -> None:
-    job = PodJob.model_validate({"type": "infer", "request": _ALIGN_REQUEST})
+    job = PodJob.model_validate({
+        "type": "infer", "session_id": "s", "corr_id": "c", "request": _ALIGN_REQUEST})
     assert job.type == "infer"
     assert job.request is not None and job.spec is None
 
 
 def test_render_job_valid() -> None:
-    job = PodJob.model_validate({"type": "render", "spec": _PREVIEW_SPEC})
+    job = PodJob.model_validate({
+        "type": "render", "session_id": "s", "corr_id": "c", "spec": _PREVIEW_SPEC})
     assert job.type == "render"
     assert job.spec is not None and job.request is None
 
 
-def test_pool_ids_default_none() -> None:
-    # old envelopes carry neither → optional, back-compat
-    job = PodJob.model_validate({"type": "infer", "request": _ALIGN_REQUEST})
-    assert job.session_id is None and job.corr_id is None
+@pytest.mark.parametrize("missing", ["session_id", "corr_id"])
+def test_missing_routing_id_is_rejected_before_work(missing: str) -> None:
+    raw = {
+        "type": "infer", "session_id": "s", "corr_id": "c", "request": _ALIGN_REQUEST}
+    raw.pop(missing)
+    with pytest.raises(ValidationError):
+        PodJob.model_validate(raw)
 
 
 def test_pool_ids_carried() -> None:
@@ -55,14 +60,17 @@ def test_pool_ids_carried() -> None:
 
 def test_mismatched_block_rejected() -> None:
     with pytest.raises(ValidationError):
-        PodJob.model_validate({"type": "infer", "request": _ALIGN_REQUEST, "spec": _PREVIEW_SPEC})
+        PodJob.model_validate({
+            "type": "infer", "session_id": "s", "corr_id": "c",
+            "request": _ALIGN_REQUEST, "spec": _PREVIEW_SPEC})
 
 
 def test_missing_block_rejected() -> None:
     with pytest.raises(ValidationError):
-        PodJob.model_validate({"type": "render"})
+        PodJob.model_validate({"type": "render", "session_id": "s", "corr_id": "c"})
 
 
 def test_unknown_type_rejected() -> None:
     with pytest.raises(ValidationError):
-        PodJob.model_validate({"type": "upscale", "request": _ALIGN_REQUEST})
+        PodJob.model_validate({
+            "type": "upscale", "session_id": "s", "corr_id": "c", "request": _ALIGN_REQUEST})

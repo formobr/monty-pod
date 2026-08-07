@@ -11,9 +11,8 @@ dependencies = [
     # JSON Schema validator at RUNTIME (it was dev-only when contracts were checked in CI alone).
     # Pure-python and ~200 KB against a 4.7 GB image.
     "jsonschema",
-    # ONE SOCKET for the reports that used to be one POST per step (podagent.event_stream). Pure-python,
-    # ~120 KB against a 4.7 GB image, and the module degrades to the POST lane OUT LOUD when it is absent —
-    # so an image built before this line keeps working rather than failing to start.
+    # ONE durable typed socket for jobs, events and results (podagent.event_stream). Pure-python,
+    # ~120 KB against a 4.7 GB image. There is deliberately no HTTP fallback.
     "websockets>=13",
 ]
 

@@ -162,9 +162,11 @@ def test_payload_carries_numbers_only(monkeypatch, tmp_path) -> None:
 
     params = ClipRankParams(groups=[ClipRankGroup(intent="chart", image_urls=["a", "b"]),
                                     ClipRankGroup(intent="", image_urls=["c", "d"])])
-    infer_s = _svc().run(params, "https://storage.example/o/1.json?sig=PUT")
+    result = _svc().run(params, "https://storage.example/o/1.json?sig=PUT")
 
-    assert infer_s >= 0
+    assert result.infer_s >= 0
+    assert set(result.timings) == {
+        "infer_s", "tile_gather_s", "forward_s", "payload_s", "upload_s", "work_s"}
     body = json.loads(put.read_text())
     assert set(body) == {"model", "groups"}, "no ranking, no threshold, no rationale crosses back"
     assert [g["scores"] for g in body["groups"]] == [[0.6, 0.8], [-1.0, -1.0]]

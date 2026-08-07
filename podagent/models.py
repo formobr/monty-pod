@@ -525,7 +525,7 @@ class InferResult(BaseModel):
     kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]
     result_key: str | None = Field(default=None, min_length=1)
-    # echoed verbatim from the claimed job envelope's corr_id (pool result demux); None on old envelopes
+    # Echoed from the job corr_id for errors; a success also carries result_key as durable business identity.
     corr_id: str | None = Field(default=None, min_length=1)
     error: str | None = Field(default=None, min_length=1)
     timing: InferTiming | None = None
@@ -719,7 +719,7 @@ class OpChain(BaseModel):
 
 
 class PodJob(BaseModel):
-    """The control-plane→pod job envelope (GET /pod/job). No version const of its
+    """The control-plane→pod job envelope (typed EventStream job frame). No version const of its
     own — request/spec/chain each pin their own version; contracts/VERSION is the shared pin."""
 
     model_config = ConfigDict(extra="forbid")
@@ -728,9 +728,9 @@ class PodJob(BaseModel):
     request: InferRequest | None = None
     spec: RenderSpec | None = None
     chain: OpChain | None = None
-    # pool routing/correlation — additive & optional; old envelopes carry neither (Go falls back to job_id/FIFO)
-    session_id: str | None = Field(default=None, min_length=1)
-    corr_id: str | None = Field(default=None, min_length=1)
+    # Pool routing. Every terminal must have a stable dedupe/demux identity; there is no positional fallback.
+    session_id: str = Field(min_length=1)
+    corr_id: str = Field(min_length=1)
 
     @model_validator(mode="after")
     def _block_matches_type(self) -> "PodJob":

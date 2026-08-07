@@ -44,8 +44,9 @@ class _CP:
         with self._lock:
             return self.jobs.pop(0) if self.jobs else None
 
-    def post_event(self, payload):
+    def send_event(self, payload, *, wait=False):
         self.events.append(payload)
+        return True
 
     def note(self, payload):
         self.events.append(payload)
@@ -129,7 +130,8 @@ def test_a_running_render_does_not_block_a_clip_rank_envelope():
         else:
             ranked.set()
 
-    cp = _CP([{"type": "render", "spec": _SPEC}, {"type": "infer", "request": _RANK_REQ}])
+    cp = _CP([{"type": "render", "session_id": "s", "corr_id": "render-c", "spec": _SPEC},
+              {"type": "infer", "session_id": "s", "corr_id": "rank-c", "request": _RANK_REQ}])
     with cf.ThreadPoolExecutor(max_workers=2) as ops, cf.ThreadPoolExecutor(max_workers=1) as gpu, \
             cf.ThreadPoolExecutor(max_workers=2) as rank:
         _pump(cp, ops, gpu, rank, heavy, 2)
@@ -148,8 +150,8 @@ def test_two_clip_rank_envelopes_are_in_flight_together():
         both_in.wait(timeout=3)
         seen.append(job.request.kind)
 
-    cp = _CP([{"type": "infer", "request": _RANK_REQ, "corr_id": "a"},
-              {"type": "infer", "request": _RANK_REQ, "corr_id": "b"}])
+    cp = _CP([{"type": "infer", "session_id": "s", "request": _RANK_REQ, "corr_id": "a"},
+              {"type": "infer", "session_id": "s", "request": _RANK_REQ, "corr_id": "b"}])
     with cf.ThreadPoolExecutor(max_workers=2) as ops, cf.ThreadPoolExecutor(max_workers=1) as gpu, \
             cf.ThreadPoolExecutor(max_workers=4) as rank:
         _pump(cp, ops, gpu, rank, heavy, 2)
@@ -157,9 +159,9 @@ def test_two_clip_rank_envelopes_are_in_flight_together():
 
 
 @pytest.mark.parametrize("job,wide", [
-    ({"type": "infer", "request": _ALIGN_REQ}, False),
-    ({"type": "render", "spec": _SPEC}, False),
-    ({"type": "infer", "request": _RANK_REQ}, True),
+    ({"type": "infer", "session_id": "s", "corr_id": "align-c", "request": _ALIGN_REQ}, False),
+    ({"type": "render", "session_id": "s", "corr_id": "render-c", "spec": _SPEC}, False),
+    ({"type": "infer", "session_id": "s", "corr_id": "rank-c", "request": _RANK_REQ}, True),
 ])
 def test_only_clip_rank_leaves_the_narrow_lane(job, wide):
     """align holds a wav2vec2 checkpoint and render holds the encoder — real card tenants, so routing is by
@@ -177,7 +179,7 @@ def test_two_lanes_missing_the_same_weights_load_the_service_once(monkeypatch, t
 
     class _Svc:
         def run(self, params, put_url, progress=None):
-            return 0.1
+            return m.ClipRankRun(infer_s=0.1, timings={"work_s": 0.1})
 
     def fake_service(model_id, wdir):
         loads.append(model_id)
@@ -188,12 +190,14 @@ def test_two_lanes_missing_the_same_weights_load_the_service_once(monkeypatch, t
     monkeypatch.setattr("podagent.weights.ensure", lambda w, mid, note: tmp_path)
 
     cp = _CP([])
-    cp.report_infer_result = lambda payload, wake=None: None
+    cp.report_infer_result = lambda payload, wake=None: True
     cache: dict = {}
 
     def one():
         start.wait()
-        agent_main._run_infer(dict(_RANK_REQ), cp, {}, {}, cache, Path("/opt/models/yunet.onnx"), True)
+        agent_main._run_infer(
+            dict(_RANK_REQ), cp, {}, {}, cache, Path("/opt/models/yunet.onnx"), True,
+            corr_id="rank-c", session_id="s")
 
     threads = [threading.Thread(target=one) for _ in range(2)]
     for t in threads:

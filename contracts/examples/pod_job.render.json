@@ -1,5 +1,7 @@
 {
   "type": "render",
+  "session_id": "session-demo-1",
+  "corr_id": "render-demo-1",
   "spec": {
     "spec_version": 5,
     "job_id": "job_9f2c1a",

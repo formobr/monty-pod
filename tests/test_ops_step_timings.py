@@ -31,9 +31,15 @@ class _CP:
 
     def __init__(self) -> None:
         self.events: list[dict] = []
+        self.results: list[dict] = []
 
-    def post_event(self, payload: dict) -> None:
+    def send_event(self, payload: dict, *, wait: bool = False) -> bool:
         self.events.append(payload)
+        return True
+
+    def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+        self.results.append(payload)
+        return True
 
     @property
     def terminal(self) -> dict:

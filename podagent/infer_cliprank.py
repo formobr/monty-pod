@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -70,6 +71,14 @@ _FETCH_WORKERS_ENV = "CLIP_RANK_FETCH_WORKERS"
 _FETCH_WORKERS_DEFAULT = 8
 
 
+@dataclass(frozen=True)
+class ClipRankRun:
+    """One request's wall plus phase walls; values overlap only where the implementation overlaps work."""
+
+    infer_s: float
+    timings: dict[str, float]
+
+
 def _log(msg: str) -> None:
     print(f"[clip_rank] {msg}", file=sys.stderr, flush=True)
 
@@ -118,6 +127,14 @@ def lane_width() -> int:
     return n
 
 
+def fetch_width() -> int:
+    """The process-wide tile-fetch width, resolved without constructing its pool."""
+    try:
+        return max(1, int(os.environ.get(_FETCH_WORKERS_ENV, "") or _FETCH_WORKERS_DEFAULT))
+    except ValueError:
+        return _FETCH_WORKERS_DEFAULT
+
+
 _fetch_pool_lock = threading.Lock()
 _FETCH_POOL: "cf.ThreadPoolExecutor | None" = None
 
@@ -127,11 +144,7 @@ def _fetch_pool() -> "cf.ThreadPoolExecutor":
     global _FETCH_POOL
     with _fetch_pool_lock:
         if _FETCH_POOL is None:
-            try:
-                n = max(1, int(os.environ.get(_FETCH_WORKERS_ENV, "") or _FETCH_WORKERS_DEFAULT))
-            except ValueError:
-                n = _FETCH_WORKERS_DEFAULT
-            _FETCH_POOL = cf.ThreadPoolExecutor(max_workers=n, thread_name_prefix="tile")
+            _FETCH_POOL = cf.ThreadPoolExecutor(max_workers=fetch_width(), thread_name_prefix="tile")
         return _FETCH_POOL
 
 
@@ -185,10 +198,11 @@ class ClipRankService:
         self.proc = AutoProcessor.from_pretrained(str(weights_dir), local_files_only=True)
 
     def run(self, params: ClipRankParams, put_url: str,
-            progress: "Callable[[str], None] | None" = None) -> float:
-        """Returns wall seconds spent on inference (reported in InferResult.timing)."""
+            progress: "Callable[[str], None] | None" = None) -> ClipRankRun:
+        """Returns total inference wall plus measured gather/forward/serialization/upload phase walls."""
         t0 = time.monotonic()
         n = len(params.groups)
+        gather_s = forward_s = 0.0
         with tempfile.TemporaryDirectory() as td:
             # Every tile of every group goes on the wire before the FIRST forward, so the card never waits on
             # a download it could already have had; group k is still forwarded in request order.
@@ -199,15 +213,34 @@ class ClipRankService:
                 # CDNs, and "which group was it on" is the whole diagnosis when one wedges.
                 if progress is not None:
                     progress(f"clip_rank group {i + 1}/{n} ({len(g.image_urls)} tiles)")
-                groups.append(self._score(g, *_gather(pending[i])))
+                tg = time.monotonic()
+                gathered = _gather(pending[i])
+                gather_s += time.monotonic() - tg
+                tf = time.monotonic()
+                groups.append(self._score(g, *gathered))
+                forward_s += time.monotonic() - tf
+            tp = time.monotonic()
             payload = ClipRankPayload(model=self.model_id, groups=groups)
             out = Path(td) / "clip_rank.json"
             out.write_text(payload.model_dump_json())
+            payload_s = time.monotonic() - tp
             infer_s = time.monotonic() - t0
             if progress is not None:
                 progress(f"clip_rank {n} groups done in {infer_s:.0f}s, uploading")
+            tu = time.monotonic()
             upload(out, put_url, "application/json")
-        return infer_s
+            upload_s = time.monotonic() - tu
+        return ClipRankRun(
+            infer_s=infer_s,
+            timings={
+                "infer_s": round(infer_s, 3),
+                "tile_gather_s": round(gather_s, 3),
+                "forward_s": round(forward_s, 3),
+                "payload_s": round(payload_s, 3),
+                "upload_s": round(upload_s, 3),
+                "work_s": round(time.monotonic() - t0, 3),
+            },
+        )
 
     def _run_group(self, group: ClipRankGroup, workdir: Path) -> ClipRankGroupResult:
         """One group, both phases — run() pipelines them instead, so the fetch of k+1 overlaps k's forward."""

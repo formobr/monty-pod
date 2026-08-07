@@ -1,126 +1,333 @@
-"""The CP transport survives a connection its peer already closed — the recycled keep-alive that failed
-two production runs on their first call after minutes of work."""
+"""The pod has one control-plane lane: a strict, durable, ordered WebSocket.
+
+These are transport tests, not mocks of the happy path.  Each failure shape was capable of losing a
+terminal when events and results used different in-memory/HTTP mechanisms.
+"""
 from __future__ import annotations
 
-import socket
+import json
 import threading
-from typing import Any
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Callable, Iterator
 
 import pytest
-import requests
-from urllib3.exceptions import ReadTimeoutError
+from websockets.sync.server import serve
 
-from podagent import cp
-
-_OK = (b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\n"
-       b"Content-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+from podagent import cp, event_stream
+from podagent.event_stream import EventStream, FrameRejected
 
 
-def _read_request(conn: socket.socket) -> None:
-    """Drain headers + body: an answer written into a socket the client is still filling gets an RST."""
-    conn.settimeout(5)
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = conn.recv(4096)
-        if not chunk:
-            return
-        buf += chunk
-    head, _, rest = buf.partition(b"\r\n\r\n")
-    want = 0
-    for line in head.split(b"\r\n"):
-        if line.lower().startswith(b"content-length:"):
-            want = int(line.split(b":", 1)[1])
-    while len(rest) < want:
-        chunk = conn.recv(4096)
-        if not chunk:
-            return
-        rest += chunk
+def _ack(frame: dict[str, Any], status: int = 202, **extra: Any) -> str:
+    return json.dumps({
+        "type": "ack",
+        "stream_id": frame["stream_id"],
+        "seq": frame["seq"],
+        "status": status,
+        **extra,
+    })
 
 
-class _FlakyCP:
-    """A control plane that hangs up on its first `drops` connections without answering, then accepts."""
+@contextmanager
+def _server(handler: Callable[[Any], None]) -> Iterator[str]:
+    server = serve(handler, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.socket.getsockname()[1]}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
 
-    def __init__(self, drops: int) -> None:
-        self.drops = drops
-        self.hits = 0
-        self._srv = socket.socket()
-        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._srv.bind(("127.0.0.1", 0))
-        self._srv.listen(16)
-        self.base = f"http://127.0.0.1:{self._srv.getsockname()[1]}"
-        threading.Thread(target=self._serve, daemon=True).start()
 
-    def _serve(self) -> None:
+def _wait_for(predicate: Callable[[], bool], wall: float = 3.0) -> None:
+    deadline = time.monotonic() + wall
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition did not become true")
+        time.sleep(0.01)
+
+
+@pytest.fixture(autouse=True)
+def _fast_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(event_stream, "FRAME_WALL_S", 0.15)
+    monkeypatch.setattr(event_stream, "OPEN_WALL_S", 0.15)
+    monkeypatch.setattr(event_stream, "REOPEN_BACKOFF_S", 0.01)
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 1)
+
+
+def test_result_is_a_typed_frame_and_requires_correlation(tmp_path: Path) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(ws: Any) -> None:
         while True:
             try:
-                conn, _ = self._srv.accept()
-            except OSError:
+                frame = json.loads(ws.recv())
+            except Exception:
                 return
-            self.hits += 1
+            seen.append(frame)
+            ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        with pytest.raises(ValueError, match="corr_id or result_key"):
+            stream.send_result({"job_id": "j", "status": "ok"})
+        assert stream.send_result({"job_id": "j", "status": "ok", "corr_id": "c"})
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+    assert seen[0] == {
+        "type": "result",
+        "stream_id": seen[0]["stream_id"],
+        "seq": 1,
+        "result": {"job_id": "j", "status": "ok", "corr_id": "c"},
+    }
+    assert seen[1]["type"] == "event"
+    acked = seen[1]["event"]
+    assert acked["phase"] == "result_acked" and acked["corr_id"] == "c"
+    assert acked["op"] == "result" and set(acked["timings"]) == {"delivery_s"}
+
+
+def test_single_sender_preserves_append_order(tmp_path: Path) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(ws: Any) -> None:
+        while True:
             try:
-                _read_request(conn)
-                if self.hits > self.drops:
-                    conn.sendall(_OK)
-                    conn.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-            finally:
-                conn.close()
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            seen.append(frame)
+            ws.send(_ack(frame))
 
-    def close(self) -> None:
-        self._srv.close()
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        for n in range(6):
+            assert stream.send_event({"n": n}, wait=False)
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
 
-
-@pytest.fixture
-def instant_backoff(monkeypatch: Any) -> None:
-    monkeypatch.setattr(cp, "_CP_RETRY_BACKOFF_S", 0.0)
-
-
-def test_post_event_survives_one_dropped_connection(instant_backoff: None) -> None:
-    server = _FlakyCP(drops=1)
-    try:
-        plane = cp.ControlPlane(server.base, "job-token")
-        # `post_infer_result` IS the HTTP lane now — events and claims both moved to the socket, and this
-        # file is about urllib3's replay of a dropped connection, so it drives what still uses it.
-        plane.post_infer_result({"job_id": "j", "status": "ok"})
-    finally:
-        server.close()
-    assert server.hits == 2, "one drop must cost a socket, not the run behind it"
+    assert [f["event"]["n"] for f in seen] == list(range(6))
+    assert [f["seq"] for f in seen] == list(range(1, 7))
+    assert len({f["stream_id"] for f in seen}) == 1
 
 
-def test_a_control_plane_that_always_hangs_up_still_fails(instant_backoff: None,
-                                                          monkeypatch: Any) -> None:
-    monkeypatch.setattr(cp, "_CP_RETRY_TOTAL", 2)
-    server = _FlakyCP(drops=10_000)
-    try:
-        plane = cp.ControlPlane(server.base, "job-token")
-        with pytest.raises(requests.RequestException):
-            plane.post_infer_result({"job_id": "j", "status": "error"})
-    finally:
-        server.close()
-    assert server.hits == 3, "bounded by _CP_RETRY_TOTAL — a dead endpoint is never an infinite wait"
+def test_ack_lost_after_send_replays_the_same_identity(tmp_path: Path) -> None:
+    seen: list[tuple[str, int]] = []
+    first = True
+
+    def handler(ws: Any) -> None:
+        nonlocal first
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            if frame["type"] == "result":
+                seen.append((frame["stream_id"], frame["seq"]))
+                if first:
+                    first = False
+                    return  # The peer may have committed the frame; the ACK alone was lost.
+                ws.send(_ack(frame, duplicate=True))
+            else:
+                ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert stream.send_result({"job_id": "j", "corr_id": "c", "status": "ok"})
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+    assert len(seen) == 2
+    assert seen[0] == seen[1], "ambiguity must replay the original dedupe identity"
 
 
+def test_process_restart_replays_old_identity_and_new_frames_use_a_new_stream(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "outbox.json"
+    rejected_seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
 
-def test_a_post_that_may_have_run_is_never_replayed() -> None:
-    retry = cp._LoudRetry(total=3, read=3, allowed_methods=None)
-    err = ReadTimeoutError(None, "/pod/event", "read timed out")  # type: ignore[arg-type]
-    with pytest.raises(ReadTimeoutError):
-        retry.increment("POST", "/pod/event", error=err)
+    def unavailable(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        rejected_seen.append(frame)
+        ws.send(_ack(frame, status=503, error="try later"))
+
+    with _server(unavailable) as base:
+        first = EventStream(base, "token", outbox_path=path)
+        assert not first.send_result(
+            {"job_id": "j", "stage": "ops", "status": "ok", "corr_id": "c"}, wait=True)
+        first.close()
+
+    old_identity = (rejected_seen[0]["stream_id"], rejected_seen[0]["seq"])
+    accepted: list[dict[str, Any]] = []
+
+    def accepting(ws: Any) -> None:
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            accepted.append(frame)
+            ws.send(_ack(frame))
+
+    with _server(accepting) as base:
+        second = EventStream(base, "token", outbox_path=path)
+        _wait_for(lambda: second.pending_count() == 0)
+        assert second.send_event({"phase": "received"}, wait=True)
+        second.close()
+
+    assert (accepted[0]["stream_id"], accepted[0]["seq"]) == old_identity
+    assert accepted[1]["type"] == "event" and accepted[1]["event"]["phase"] == "result_acked"
+    assert accepted[1]["stream_id"] != old_identity[0] and accepted[1]["seq"] == 1
+    assert accepted[2]["stream_id"] == accepted[1]["stream_id"] and accepted[2]["seq"] == 2
 
 
-def test_a_read_timeout_on_the_long_poll_is_replayable() -> None:
-    retry = cp._LoudRetry(total=3, read=3, allowed_methods=None)
-    err = ReadTimeoutError(None, "/pod/job", "read timed out")  # type: ignore[arg-type]
-    assert retry.increment("GET", "/pod/job", error=err).total == 2
+@pytest.mark.parametrize("reply", [
+    {"type": "mystery"},
+    {"type": "ack", "stream_id": "wrong", "seq": 1, "status": 202, "extra": True},
+])
+def test_unknown_or_malformed_ack_never_retires_a_frame(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply: dict[str, Any]) -> None:
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
+
+    def handler(ws: Any) -> None:
+        ws.recv()
+        ws.send(json.dumps(reply))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert not stream.send_event({"phase": "started"}, wait=True)
+        assert stream.pending_count() == 1
+        stream.close()
 
 
-def test_an_undeliverable_event_is_LOUD_because_there_is_no_second_lane(monkeypatch: Any,
-                                                                       capsys: Any) -> None:
-    """THE NEGATIVE TEST for removing the fallback. There is no POST lane to quietly absorb a report any
-    more, so a socket that cannot carry one must SAY so — a swallowed event here is a step nobody can prove
-    happened, which is the whole failure class this transport was rebuilt to remove."""
-    plane = cp.ControlPlane("http://127.0.0.1:1", "job-token")
-    plane.post_event({"stage": "ops", "status": "step", "step": "probe"})
-    said = capsys.readouterr().err
-    assert "NOT DELIVERED" in said and "no second lane" in said
+def test_4xx_is_durably_dead_lettered_and_fails_the_caller(tmp_path: Path) -> None:
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        ws.send(_ack(frame, status=422, error="bad result"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(FrameRejected, match="422"):
+            stream.send_result({"job_id": "j", "corr_id": "c", "status": "ok"})
+        assert stream.pending_count() == 0
+        stream.close()
+
+    state = json.loads(path.read_text())
+    assert state["frames"] == []
+    assert len(state["rejected"]) == 1
+    assert state["rejected"][0]["ack"]["error"] == "bad result"
+
+
+def test_async_4xx_dead_letters_without_accumulating_an_outcome(tmp_path: Path) -> None:
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        ws.send(_ack(frame, status=409, error="duplicate content key"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        assert stream.send_event({"phase": "started"})
+        _wait_for(lambda: bool(json.loads(path.read_text())["rejected"]))
+        assert stream.pending_count() == 0
+        assert stream._delivery_outcomes == {}
+        stream.close()
+
+
+def test_persist_failure_while_retiring_keeps_frame_and_unblocks_caller(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        real_persist = stream._persist_locked
+        calls = 0
+
+        def fail_retire() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("disk became read-only")
+            real_persist()
+
+        monkeypatch.setattr(stream, "_persist_locked", fail_retire)
+        with pytest.raises(OSError, match="read-only"):
+            stream.send_event({"phase": "work_finished"}, wait=True)
+        assert stream.pending_count() == 1
+        assert len(json.loads(path.read_text())["frames"]) == 1
+        stream.close()
+
+
+def test_unwritable_outbox_refuses_construction_before_claim(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        EventStream,
+        "_persist_locked",
+        lambda _self: (_ for _ in ()).throw(OSError("read-only outbox")),
+    )
+    with pytest.raises(OSError, match="read-only outbox"):
+        EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
+
+
+def test_retry_exhaustion_retains_the_frame(tmp_path: Path) -> None:
+    path = tmp_path / "outbox.json"
+    hits = 0
+
+    def handler(ws: Any) -> None:
+        nonlocal hits
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            hits += 1
+            ws.send(_ack(frame, status=503, error="overloaded"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        assert not stream.send_result({"job_id": "j", "corr_id": "c", "status": "ok"})
+        assert stream.pending_count() == 1
+        stream.close()
+
+    state = json.loads(path.read_text())
+    assert hits == 2
+    assert len(state["frames"]) == 1
+    assert state["rejected"] == []
+
+
+def test_jobs_are_typed_and_unwrapped(tmp_path: Path) -> None:
+    def handler(ws: Any) -> None:
+        ws.send(json.dumps({
+            "type": "job", "job": {"type": "infer", "session_id": "s", "corr_id": "c"}}))
+        time.sleep(0.1)
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert stream.claim(1) == {"type": "infer", "session_id": "s", "corr_id": "c"}
+        stream.close()
+
+
+def test_control_plane_delegates_one_result_without_a_second_lane() -> None:
+    calls: list[tuple[dict[str, Any], bool]] = []
+
+    class _Stream:
+        def send_result(self, payload: dict[str, Any], *, wait: bool = True) -> bool:
+            calls.append((payload, wait))
+            return True
+
+    plane = object.__new__(cp.ControlPlane)
+    plane._stream = _Stream()
+    plane.send_result({
+        "job_id": "j", "stage": "ops", "status": "ok", "session_id": "s", "corr_id": "c"})
+
+    assert calls == [({
+        "job_id": "j", "stage": "ops", "status": "ok", "session_id": "s", "corr_id": "c"}, True)]

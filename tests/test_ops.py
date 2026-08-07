@@ -159,11 +159,11 @@ def test_binding_names_exactly_one_source():
 def test_pod_job_ops_envelope_is_exclusive():
     """The envelope stays closed and one-block-per-type as `ops` joins infer/render."""
     chain = OpChain(job_id="j", pack=_PACK, steps=[_step("a")]).model_dump(mode="json")
-    PodJob(type="ops", chain=chain)
+    PodJob(type="ops", session_id="s", corr_id="c", chain=chain)
     with pytest.raises(ValidationError):
-        PodJob(type="ops")                                   # missing its block
+        PodJob(type="ops", session_id="s", corr_id="c")      # missing its block
     with pytest.raises(ValidationError):
-        PodJob(type="render", chain=chain)                   # wrong block for the type
+        PodJob(type="render", session_id="s", corr_id="c", chain=chain)  # wrong block for the type
 
 
 def test_a_new_op_adds_no_model_to_the_envelope():
@@ -388,7 +388,10 @@ def test_an_op_this_image_lacks_is_refused_before_any_step_runs(monkeypatch):
         _step("audio", op="media.audio", needs=["scale"], params={},
               outputs=[{"port": "mp3", "url": "https://x/a.mp3"}])])
 
-    cp = type("CP", (), {"post_event": staticmethod(lambda _ev: None)})()
+    cp = type("CP", (), {
+        "send_event": staticmethod(lambda _ev, wait=False: True),
+        "send_result": staticmethod(lambda _result, wait=True: True),
+    })()
     with pytest.raises(runner.ChainError, match="media.audio"):
         runner.run_chain(chain, cp=cp)
     assert ran == [], "nothing may be fetched, decoded or even unpacked for a chain this image cannot run"

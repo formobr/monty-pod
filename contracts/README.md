@@ -9,32 +9,36 @@ Consumers on both sides mirror these schemas and re-run the same goldens against
 
 | schema | direction | what |
 |---|---|---|
-| `pod_job.schema.json` | CP→pod (`GET /pod/job`) | the job envelope: `type` dispatches to `request` (infer) or `spec` (render) |
+| `pod_job.schema.json` | CP→pod (`job` frame) | the job envelope: `type` dispatches to `request`, `spec`, or `chain` |
 | `spec.schema.json` | planner→pod (object storage) | the render instruction: inputs, timeline (EDL+speed), motion keyframes, overlays (final only), encode, outputs |
 | `infer_request.schema.json` | planner→pod (CP job queue) | one BATCHED inference task: `align`, `face_probe` or `clip_rank` |
-| `infer_result.schema.json` | pod→CP (`POST /pod/infer-result`) | completion envelope; payload already PUT to storage |
+| `infer_result.schema.json` | pod→CP (`result` frame) | completion envelope; payload already PUT to storage |
 | `face_probe.schema.json` | payload (object storage) | raw face boxes + frame_diff per shot, pixel space |
 | `clip_rank.schema.json` | payload (object storage) | per-group SigLIP cosines + L2-normalized image embeddings |
 
-Transport: the planner and the pod NEVER talk directly. Requests ride the control-plane job queue
-(the pod polls `GET /pod/job`), payloads ride presigned URLs, completion is reported to the CP.
+Transport: the planner and the pod NEVER talk directly. Jobs, lifecycle events, and results use one
+typed EventStream WebSocket; media payloads ride presigned URLs.
 
-## The job envelope (frozen, v1)
+## The job envelope
 
-`pod_job.schema.json` is the exact shape the pod's poll loop dispatches on — frozen, not
-transitional. `{"type": "infer", "request": {...}}` or `{"type": "render", "spec": {...}}`;
+`pod_job.schema.json` is the exact payload inside a typed `job` frame.
+`{"type": "infer", "session_id": "...", "corr_id": "...", "request": {...}}`,
+`{"type": "render", "session_id": "...", "corr_id": "...", "spec": {...}}`, or
+`{"type": "ops", "session_id": "...", "corr_id": "...", "chain": {...}}`;
 `additionalProperties: false` and the `type`-conditional `allOf` make the other block a hard
 error. It has no version const of its own — `request`/`spec` each pin their own
-(`infer_version`/`spec_version`); `contracts/VERSION` stays the single shared pin (see
-Versioning below) since the envelope is additive, not a new seam.
+(`infer_version`/`spec_version`).
 
-Transport conventions (frozen alongside the envelope):
+Transport conventions:
 
-- `GET /pod/job` — long-poll; `204` = no work, poll again.
-- Auth — `Authorization: Bearer <JOB_TOKEN>` on every request. The pod's entire runtime config
+- `/pod/stream` — the only pod↔control-plane channel. Server frames are typed `job` or `ack`;
+  client frames are typed `event` or `result`, each identified by `stream_id` + monotonic `seq`.
+- Auth — `Authorization: Bearer <JOB_TOKEN>` on the WebSocket handshake. The pod's entire runtime config
   is `CP_URL` + `JOB_TOKEN` (env); the pod dials out only, nothing dials in.
-- `POST /pod/event` — free-form progress/error events (stage, status, ...).
-- `POST /pod/infer-result` — completion envelope for `kind=infer` jobs (`infer_result.schema.json`).
+- Client frames are fsynced before send and retired only by a matching 2xx ACK. A 4xx is moved to
+  durable dead-letter; 5xx, timeout, and socket ambiguity remain replayable.
+- Every job carries `session_id` and `corr_id`; every result carries `corr_id` or `result_key`. There is no
+  FIFO-positional or event-as-result fallback.
 - `result_key` — the presigned `put_url`'s path with the leading slash stripped. OPAQUE and
   informational only: under path-style presigning the URL path starts with the bucket name, so
   the value may be bucket-prefixed. Consumers must locate the payload by the key they presigned

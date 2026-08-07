@@ -566,7 +566,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
             payload["corr_id"] = corr_id
         if session_id is not None:
             payload["session_id"] = session_id
-        cp.post_event(payload)
+        cp.send_event(payload)
 
     # The clock the box cannot read. Started BEFORE preflight and the pack fetch on purpose: everything from
     # here to the terminal is the pod's own, and what the box's wall holds beyond it is transport and queue
@@ -607,10 +607,9 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
 
     cap, why = parallel_cap()
     xcap, xwhy = transport_cap()
-    # NOT sent as an event: `/pod/event` DROPS unknown fields at the Go seam (docs/gen/SEAM_ATLAS.md), so a
-    # capacity event would arrive carrying nothing. The box does not need to be told anyway — it ASSIGNS both
-    # numbers from the offer it rented (broker.pod_lane.pod_step_width) and can say so on its own side.
     log(f"ops parallel cap={cap} ({why}) · transport cap={xcap} ({xwhy})")
+    _event(job_id=chain.job_id, stage="ops", status="step", phase="capacity", op="ops",
+           capacity={"step_workers": cap, "transfer_workers": xcap})
     try:
         with cf.ThreadPoolExecutor(max_workers=cap) as ex:
             running: dict[cf.Future[Any], str] = {}
@@ -652,10 +651,20 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
         # 202 and ignored by an older box, while a changed element type would be a break on a field that
         # already crosses. `chain_s` is the pod's OWN wall: the box subtracts it from its own to get the
         # transport it has never been able to see (STEP_TIMING_WHY).
-        _event(job_id=chain.job_id, stage="ops", status="ok", steps=sorted(produced),
-               skipped=sorted(failed),
-               timings={"chain_s": round(time.monotonic() - t_chain, 3),
-                        "steps": [t.wire() for t in list(timings)]})
+        terminal_timings = {
+            "chain_s": round(time.monotonic() - t_chain, 3),
+            "steps": [t.wire() for t in list(timings)],
+        }
+        _event(job_id=chain.job_id, stage="ops", status="ok", phase="work_finished",
+               outcome="ok", steps=sorted(produced), skipped=sorted(failed), timings=terminal_timings)
+        cp.send_result({
+            "job_id": chain.job_id,
+            "stage": "ops",
+            "status": "ok",
+            "corr_id": corr_id,
+            "timings": terminal_timings,
+            **({"session_id": session_id} if session_id is not None else {}),
+        })
         return {sid: {p: ([str(x) for x in v] if isinstance(v, list) else str(v))
                       for p, v in outs.items()} for sid, outs in produced.items()}
     finally:

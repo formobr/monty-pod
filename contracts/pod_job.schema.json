@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/pod_job.schema.json",
-  "title": "PodJob — control-plane→pod job envelope (GET /pod/job)",
-  "description": "What the pod's long-poll returns: one unit of work, dispatched on type. request is an InferRequest (infer_request.schema.json); spec is a RenderSpec (spec.schema.json); chain is an OpChain — a DAG of declared operations (op.schema.json + ops/*.json) run on ONE box with local-disk handoff between steps. Each carries its own version const (infer_version/spec_version/chain_version) — this envelope has none, contracts/VERSION stays the single pin for all three. Adding `ops` is ADDITIVE: every envelope that validated before still validates unchanged, which is why it needs no VERSION bump — examples/pod_job.infer.json and pod_job.render.json are the regression goldens for exactly that.",
+  "title": "PodJob — control-plane→pod typed EventStream job",
+  "description": "The payload of one typed EventStream job frame, dispatched on type. request is an InferRequest (infer_request.schema.json); spec is a RenderSpec (spec.schema.json); chain is an OpChain — a DAG of declared operations (op.schema.json + ops/*.json) run on ONE box with local-disk handoff between steps. Each carries its own version const (infer_version/spec_version/chain_version) — this envelope has none, contracts/VERSION stays the single pin for all three.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["type"],
+  "required": ["type", "session_id", "corr_id"],
   "properties": {
     "type": { "enum": ["infer", "render", "ops"] },
     "request": {
@@ -21,12 +21,12 @@
       "type": "object"
     },
     "session_id": {
-      "description": "Optional pod-lane key (=tenant/session). One warm pod per session serves all its jobs; the pod echoes it on terminals. Missing → Go falls back to job_id (rollout back-compat).",
+      "description": "Required pod-lane key (=tenant/session). One warm pod per session serves all its jobs; the pod echoes it on lifecycle events and terminals.",
       "type": "string",
       "minLength": 1
     },
     "corr_id": {
-      "description": "Optional per-request correlation id (uuid4 hex) set by the worker at enqueue. The pod ECHOES it verbatim on every result/terminal it posts, so results demux on the shared session FIFO. Missing → FIFO-positional await.",
+      "description": "Required per-request correlation id set by the worker at enqueue. The pod ECHOES it verbatim on every result/terminal, providing both result demux and replay dedupe without a positional fallback.",
       "type": "string",
       "minLength": 1
     }

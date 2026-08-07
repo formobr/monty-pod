@@ -89,8 +89,8 @@ def test_final_overlays_not_implemented() -> None:
     spec = _spec("spec.final.json")
 
     class _StubCP:
-        def post_event(self, payload: dict) -> None:
-            raise AssertionError("post_event must not be reached before the render runs")
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            raise AssertionError("send_event must not be reached before the render runs")
 
     with pytest.raises(NotImplementedError):
         render.render_spec(spec, _StubCP())  # type: ignore[arg-type]

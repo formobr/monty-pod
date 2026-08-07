@@ -37,8 +37,9 @@ class _CP:
         with self._lock:
             return self.jobs.pop(0) if self.jobs else None
 
-    def post_event(self, payload):
+    def send_event(self, payload, *, wait=False):
         self.events.append(payload)
+        return True
 
     def note(self, payload):
         self.events.append(payload)
@@ -60,11 +61,16 @@ def test_two_ops_chains_run_at_once(monkeypatch):
         overlapped.append(corr_id)
 
     monkeypatch.setattr(agent_main, "_run_ops", fake_run_ops)
-    cp = _CP([{"type": "ops", "chain": _CHAIN, "corr_id": "a"},
-              {"type": "ops", "chain": _CHAIN, "corr_id": "b"}])
+    cp = _CP([{"type": "ops", "session_id": "s", "chain": _CHAIN, "corr_id": "a"},
+              {"type": "ops", "session_id": "s", "chain": _CHAIN, "corr_id": "b"}])
     with cf.ThreadPoolExecutor(max_workers=4) as ops_pool, cf.ThreadPoolExecutor(max_workers=1) as heavy_pool:
         _pump(cp, ops_pool, heavy_pool, lambda job: None, 2)
     assert sorted(overlapped) == ["a", "b"], "the two ops chains never overlapped — the claim loop ran them"
+    for corr in ("a", "b"):
+        lifecycle = [e for e in cp.events if e.get("corr_id") == corr]
+        assert {e.get("phase") for e in lifecycle} >= {"received", "queued", "started"}
+        assert all(e.get("session_id") == "s" and e.get("job_id") == "j" for e in lifecycle)
+        assert next(e for e in lifecycle if e.get("phase") == "started")["timings"]["pod_queue_s"] >= 0
 
 
 def test_a_running_render_does_not_block_claiming_ops(monkeypatch):
@@ -82,7 +88,8 @@ def test_a_running_render_does_not_block_claiming_ops(monkeypatch):
         ops_ran.set()
 
     monkeypatch.setattr(agent_main, "_run_ops", fake_run_ops)
-    cp = _CP([{"type": "render", "spec": _SPEC}, {"type": "ops", "chain": _CHAIN, "corr_id": "a"}])
+    cp = _CP([{"type": "render", "session_id": "s", "spec": _SPEC, "corr_id": "render-a"},
+              {"type": "ops", "session_id": "s", "chain": _CHAIN, "corr_id": "a"}])
     with cf.ThreadPoolExecutor(max_workers=4) as ops_pool, cf.ThreadPoolExecutor(max_workers=1) as heavy_pool:
         _pump(cp, ops_pool, heavy_pool, fake_heavy, 2)
         assert ops_ran.wait(timeout=3), "the ops chain waited out the render"
@@ -97,7 +104,7 @@ def test_a_worker_that_raises_is_reported_not_fatal(monkeypatch):
         raise RuntimeError("handler exploded")
 
     monkeypatch.setattr(agent_main, "_run_ops", boom)
-    cp = _CP([{"type": "ops", "chain": _CHAIN, "corr_id": "a"}])
+    cp = _CP([{"type": "ops", "session_id": "s", "chain": _CHAIN, "corr_id": "a"}])
     with cf.ThreadPoolExecutor(max_workers=2) as ops_pool, cf.ThreadPoolExecutor(max_workers=1) as heavy_pool:
         _pump(cp, ops_pool, heavy_pool, lambda job: None, 1)
     assert any(e.get("status") == "error" and "handler exploded" in str(e.get("error")) for e in cp.events)

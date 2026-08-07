@@ -31,6 +31,12 @@ weights) rides in as presigned URLs from the control plane. `WEIGHTS_CACHE`
 (default `/var/cache/monty/weights`) is where fetched checkpoints land; point
 it at the roomiest local disk.
 
+Jobs, events, and results share one typed WebSocket. Before a client frame is
+sent it is fsynced to `POD_STREAM_OUTBOX` (default
+`/var/cache/monty/pod-stream/outbox.json`). Unacknowledged frames replay after
+reconnect or process restart with their original `stream_id` and `seq`; the
+agent refuses to start if this durable state is unreadable or unwritable.
+
 ## Layout
 
 | path | what |

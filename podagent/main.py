@@ -18,6 +18,7 @@ import requests
 from pydantic import ValidationError
 
 from .cp import ControlPlane
+from .event_stream import FrameRejected
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 
 if TYPE_CHECKING:
@@ -60,6 +61,61 @@ def ops_chain_pool_size() -> int:
 
 def _log(msg: str) -> None:
     print(f"[podagent] {msg}", file=sys.stderr, flush=True)
+
+
+def _lifecycle(cp: "ControlPlane", *, phase: str, job_id: str = "unknown",
+               session_id: str | None = None, corr_id: str | None = None,
+               stage: str = "dispatch", op: str | None = None,
+               timings: dict[str, float] | None = None,
+               **extra: Any) -> None:
+    """One structured lifecycle event. Progress is durable-before-return but never waits on its ACK."""
+    ev: dict[str, Any] = {
+        "job_id": job_id,
+        "stage": stage,
+        "status": "step",
+        "phase": phase,
+    }
+    if session_id:
+        ev["session_id"] = session_id
+    if corr_id:
+        ev["corr_id"] = corr_id
+    if op:
+        ev["op"] = op
+    if timings:
+        ev["timings"] = {k: round(float(v), 3) for k, v in timings.items()}
+    ev.update({k: v for k, v in extra.items() if v is not None})
+    cp.note(ev)
+
+
+def _raw_job_meta(raw: dict[str, Any]) -> dict[str, str | None]:
+    block = raw.get("request") or raw.get("spec") or raw.get("chain") or {}
+    kind = block.get("kind") if isinstance(block, dict) else None
+    return {
+        "job_id": str(block.get("job_id") or "unknown") if isinstance(block, dict) else "unknown",
+        "session_id": str(raw.get("session_id")) if raw.get("session_id") else None,
+        "corr_id": str(raw.get("corr_id")) if raw.get("corr_id") else None,
+        "stage": str(raw.get("type") or "dispatch"),
+        "op": f"{raw.get('type')}:{kind}" if kind else str(raw.get("type") or "unknown"),
+    }
+
+
+def _with_lifecycle(cp: "ControlPlane", meta: dict[str, str | None],
+                    queued_at: float, fn: Any) -> None:
+    started = time.monotonic()
+    _lifecycle(cp, phase="started", timings={"pod_queue_s": started - queued_at}, **meta)
+    try:
+        fn()
+    except BaseException as e:
+        _lifecycle(
+            cp,
+            phase="work_finished",
+            timings={"work_s": time.monotonic() - started},
+            outcome="error",
+            error_type=type(e).__name__,
+            error=str(e)[:500],
+            **meta,
+        )
+        raise
 
 
 def _env_or_exit(name: str) -> str:
@@ -125,7 +181,7 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     msg = f"REFUSING work: h264_nvenc will not open on this pod — {detail}"
     _log(msg)
     try:
-        cp.note({"stage": "boot", "status": "error", "step": msg})
+        cp.note({"stage": "boot", "status": "error", "phase": "work_finished", "step": msg})
     except Exception:  # noqa: BLE001 — the refusal stands whether or not the beacon lands
         pass
     sys.exit(3)
@@ -139,24 +195,24 @@ def _run_infer(
     rank_cache: dict[str, "ClipRankService"],
     yunet_path: Path,
     boot_reported: bool,
-    corr_id: str | None = None,
+    corr_id: str,
+    session_id: str,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag.
 
     corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
-    # The brain awaits by result_key, and a status=error result is forbidden to carry one — so keep it here
-    # to route the last-resort event, which is otherwise unclaimable and starves the awaiter anyway.
-    wake_key = urlparse(str(raw.get("put_url", ""))).path.lstrip("/") or None
-
     def note(step: str) -> None:
-        # No job_id: an infer request's job_id is a per-request id, NOT the token's lane, so sending it made
-        # the CP's spoof guard 403 every progress event. Omitted → attributed to the token's own job.
-        ev: dict[str, Any] = {"stage": "infer", "status": "step", "step": f"{job_id}: {step}"}
-        cp.note(_tag(ev, corr_id, None))
+        ev: dict[str, Any] = {
+            "stage": "infer", "status": "step", "phase": "progress",
+            "op": kind, "step": f"{job_id}: {step}",
+            "job_id": str(job_id),
+        }
+        cp.note(_tag(ev, corr_id, session_id))
 
     note(f"claimed {kind}")
+    work_started = time.monotonic()
     try:
         req = InferRequest.model_validate(raw)
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
@@ -187,7 +243,9 @@ def _run_infer(
                         wdir = ensure(req.weights, req.model, note)
                         note(f"loading {req.model}")
                         rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
-            infer_s = rank_svc.run(req.clip_rank, req.put_url, note)
+            rank_run = rank_svc.run(req.clip_rank, req.put_url, note)
+            infer_s = rank_run.infer_s
+            work_timings = rank_run.timings
         else:
             from .infer_probe import ProbeService
 
@@ -197,8 +255,24 @@ def _run_infer(
             if probe_svc is None:
                 probe_svc = probe_cache[key] = ProbeService(yunet_path, req.model)
             infer_s = probe_svc.run(req.face_probe, req.put_url)
+        if req.kind != "clip_rank":
+            work_timings = {
+                "infer_s": infer_s,
+                "work_s": time.monotonic() - work_started,
+            }
 
         boot_s = None if boot_reported else time.monotonic() - BOOT_T0
+        _lifecycle(
+            cp,
+            phase="work_finished",
+            job_id=str(job_id),
+            session_id=session_id,
+            corr_id=corr_id,
+            stage="infer",
+            op=req.kind,
+            timings=work_timings,
+            outcome="ok",
+        )
         result = InferResult(
             infer_version=req.infer_version,
             job_id=req.job_id,
@@ -215,6 +289,21 @@ def _run_infer(
     except BaseException as e:
         _log(f"infer job {job_id} failed: {type(e).__name__}: {e}")
         traceback.print_exc(file=sys.stderr)
+        if isinstance(e, FrameRejected):
+            raise
+        _lifecycle(
+            cp,
+            phase="work_finished",
+            job_id=str(job_id),
+            session_id=session_id,
+            corr_id=corr_id,
+            stage="infer",
+            op=kind,
+            timings={"work_s": time.monotonic() - work_started},
+            outcome="error",
+            error_type=type(e).__name__,
+            error=str(e)[:500],
+        )
         error_result = InferResult(
             infer_version=SPEC_VERSION,
             job_id=str(job_id),
@@ -223,14 +312,13 @@ def _run_infer(
             corr_id=corr_id,
             error=f"{type(e).__name__}: {e}"[:500],
         )
-        cp.report_infer_result(error_result.model_dump(exclude_none=True), wake_key)
+        cp.report_infer_result(error_result.model_dump(exclude_none=True))
         if not isinstance(e, Exception):
             raise
         return boot_reported
 
 
-def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str | None = None,
-                session_id: str | None = None) -> None:
+def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id: str) -> None:
     job_id = raw.get("job_id", "unknown")
     try:
         spec = RenderSpec.model_validate(raw)
@@ -238,9 +326,20 @@ def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str | None = Non
 
         render_spec(spec, cp, corr_id=corr_id, session_id=session_id)
     except Exception as e:
+        if isinstance(e, FrameRejected):
+            raise
         ev = {"job_id": job_id, "stage": "render", "status": "error", "error": str(e)[:500]}
         _tag(ev, corr_id, session_id)
-        cp.post_event(ev)
+        ev.update({"phase": "work_finished", "outcome": "error", "error_type": type(e).__name__})
+        cp.send_event(ev)
+        cp.send_result({
+            "job_id": job_id,
+            "stage": "render",
+            "status": "error",
+            "corr_id": corr_id,
+            "error": str(e)[:500],
+            **({"session_id": session_id} if session_id is not None else {}),
+        })
 
 
 def _tag(ev: dict[str, Any], corr_id: str | None, session_id: str | None) -> dict[str, Any]:
@@ -252,8 +351,7 @@ def _tag(ev: dict[str, Any], corr_id: str | None, session_id: str | None) -> dic
     return ev
 
 
-def _run_ops(chain: Any, cp: ControlPlane, corr_id: str | None = None,
-             session_id: str | None = None) -> None:
+def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str) -> None:
     """Run an op chain. There is NO per-op branch here and there must never be one: the op names its
     handler in contracts/ops/<op>.json, the pack provides it, and dispatch is a registry LOOKUP. Adding a
     tool costs a declaration and a handler — this file is not one of the files that changes.
@@ -263,9 +361,20 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str | None = None,
     try:
         run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
     except Exception as e:
+        if isinstance(e, FrameRejected):
+            raise
         ev = {"job_id": chain.job_id, "stage": "ops", "status": "error", "error": str(e)[:500]}
         _tag(ev, corr_id, session_id)
-        cp.post_event(ev)
+        ev.update({"phase": "work_finished", "outcome": "error", "error_type": type(e).__name__})
+        cp.send_event(ev)
+        cp.send_result({
+            "job_id": chain.job_id,
+            "stage": "ops",
+            "status": "error",
+            "corr_id": corr_id,
+            "error": str(e)[:500],
+            **({"session_id": session_id} if session_id is not None else {}),
+        })
 
 
 POST_MORTEM_WHY = """
@@ -374,7 +483,7 @@ def _report_boot(cp: ControlPlane) -> None:
         gpu = "no-torch"
     post = _post_mortem()
     _mark_alive()
-    cp.note({"stage": "boot", "status": "step",
+    cp.note({"stage": "boot", "status": "step", "phase": "started",
              "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s · {post}"})
 
 
@@ -386,7 +495,8 @@ def _guarded(fn: Any, cp: ControlPlane) -> None:
     except Exception as e:  # noqa: BLE001 — a worker must never take the agent down
         _log(f"dispatch failed: {type(e).__name__}: {e}")
         traceback.print_exc(file=sys.stderr)
-        cp.note({"stage": "dispatch", "status": "error", "error": f"{type(e).__name__}: {e}"[:500]})
+        cp.note({"stage": "dispatch", "status": "error", "phase": "work_finished",
+                 "error": f"{type(e).__name__}: {e}"[:500]})
 
 
 def main() -> None:
@@ -423,18 +533,30 @@ def main() -> None:
             request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
             mine = _claim_boot()
             if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
-                              yunet_path, not mine, corr_id=pod_job.corr_id) and mine:
+                              yunet_path, not mine, corr_id=pod_job.corr_id,
+                              session_id=pod_job.session_id) and mine:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None
             spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
             _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
 
-    from .infer_cliprank import lane_width
+    from .infer_cliprank import fetch_width, lane_width
 
+    rank_width = lane_width()
+    cp.note({
+        "stage": "infer",
+        "status": "step",
+        "phase": "capacity",
+        "op": "clip_rank",
+        "capacity": {
+            "rank_lanes": rank_width,
+            "fetch_workers": fetch_width(),
+        },
+    })
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
             cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool, \
-            cf.ThreadPoolExecutor(max_workers=lane_width(), thread_name_prefix="rank") as rank_pool:
+            cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool:
         _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy)
 
 
@@ -458,22 +580,32 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                     return
                 continue
 
+            received_at = time.monotonic()
+            raw_meta = _raw_job_meta(job)
+            _lifecycle(cp, phase="received", **raw_meta)
             try:
                 pod_job = PodJob.model_validate(job)
             except ValidationError as e:
-                cp.post_event({"stage": "dispatch", "status": "error", "error": str(e)[:500]})
+                cp.send_event({"stage": "dispatch", "status": "error", "phase": "work_finished",
+                               "error": str(e)[:500]})
                 if once:
                     return
                 continue
 
+            queued_at = time.monotonic()
+            _lifecycle(cp, phase="queued", timings={"dispatch_s": queued_at - received_at}, **raw_meta)
             if pod_job.type == "ops":
                 assert pod_job.chain is not None
                 chain, corr, sid = pod_job.chain, pod_job.corr_id, pod_job.session_id
                 ops_pool.submit(_guarded,
-                                lambda c=chain, r=corr, s=sid: _run_ops(c, cp, corr_id=r, session_id=s), cp)
+                                lambda c=chain, r=corr, s=sid, m=raw_meta, q=queued_at:
+                                _with_lifecycle(
+                                    cp, m, q, lambda: _run_ops(c, cp, corr_id=r, session_id=s)), cp)
             else:
                 pool = rank_pool if _is_clip_rank(pod_job) else heavy_pool
-                pool.submit(_guarded, lambda j=pod_job: heavy(j), cp)
+                pool.submit(_guarded,
+                            lambda j=pod_job, m=raw_meta, q=queued_at:
+                            _with_lifecycle(cp, m, q, lambda: heavy(j)), cp)
             if once:
                 return
         except requests.RequestException as e:
@@ -484,7 +616,8 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
         except Exception as e:
             _log(f"dispatch failed: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stderr)
-            cp.note({"stage": "dispatch", "status": "error", "error": f"{type(e).__name__}: {e}"[:500]})
+            cp.note({"stage": "dispatch", "status": "error", "phase": "work_finished",
+                     "error": f"{type(e).__name__}: {e}"[:500]})
             time.sleep(5)
         if once:
             return

@@ -102,13 +102,13 @@ def test_progress_never_runs_on_the_transfer_thread(monkeypatch):
     class _Slow:
         base = "http://x"
 
-        def post_event(self, payload):
-            time.sleep(0.4)           # stand-in for an ack that is not instant
+        def send_event(self, payload, *, wait=False):
+            assert wait is False
             seen.append("sent")
+            return True
 
         note = CP.ControlPlane.note
 
     _Slow().note({"stage": "ops", "status": "step", "step": "probe"})
     assert time.monotonic() - started < 0.2, "note() blocked its caller — the transfer would pay for it"
-    time.sleep(0.8)
-    assert seen == ["sent"], "the event must still actually go, just not on the caller's thread"
+    assert seen == ["sent"], "the event must enter the durable sender without waiting for its ACK"
