@@ -478,7 +478,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     timing = StepTiming(step_id=str(step.id), op=str(step.op))
 
     def live(phase: str, *, started: float | None = None,
-             exc: BaseException | None = None, timings: dict[str, float] | None = None) -> None:
+             exc: BaseException | None = None, timings: dict[str, float] | None = None,
+             outputs: list[dict[str, Any]] | None = None, outcome: str | None = None) -> None:
         if emit is None:
             return
         payload: dict[str, Any] = {
@@ -489,6 +490,10 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         }
         if timings:
             payload["timings"] = {k: round(v, 3) for k, v in timings.items()}
+        if outputs is not None:
+            payload["outputs"] = list(outputs)
+        if outcome is not None:
+            payload["outcome"] = outcome
         if started is not None:
             payload.setdefault("timings", {})["phase_s"] = round(time.monotonic() - started, 3)
         if exc is not None:
@@ -497,9 +502,10 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
             payload["error"] = safe_error(exc)
         emit(**payload)
 
-    # LIVE is deliberately one START boundary per waitable phase and no success completions. Each event is a
-    # durable outbox rewrite+fsync and then a stop-and-wait socket frame. The four boundaries make a missing
-    # terminal unambiguous (bind / handler-slot / run / upload); the terminal preserves all completed detail.
+    # LIVE is deliberately one START boundary per waitable phase plus ONE success closure for the whole step.
+    # Each event is a durable outbox rewrite+fsync, so restoring every phase-finished event would make wide
+    # chains pay for noise. The single closure is not optional: without it, completed siblings and siblings
+    # hung in upload are indistinguishable until a terminal that a hung chain can never produce.
     live("bind_started")
     t_bind = time.monotonic()
     try:
@@ -571,6 +577,13 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     # work that did not land is the kind of number that makes a ledger worse than none.
     if sink is not None:
         sink.append(timing)
+    live("step_finished", timings={
+        "slot_wait_s": timing.slot_wait_s,
+        "bind_s": timing.bind_s,
+        "run_s": timing.run_s,
+        "put_s": timing.put_s,
+        "seconds": timing.seconds,
+    }, outputs=timing.outputs, outcome="ok")
     return outputs
 
 

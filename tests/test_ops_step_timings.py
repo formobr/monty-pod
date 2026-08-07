@@ -120,9 +120,9 @@ def test_the_terminal_carries_one_timing_per_step(monkeypatch, wired, tmp_path, 
     assert got[0]["outputs"], "the terminal names every output measured on the pod"
 
 
-def test_live_events_are_only_started_boundaries_while_terminal_keeps_detail(monkeypatch, wired, op):
-    """Each live event is an ordered ACK plus two fsyncs. Success keeps exactly one boundary per phase that
-    may hang; finished detail survives in the one terminal."""
+def test_live_events_keep_starts_plus_one_step_closure_while_terminal_keeps_detail(monkeypatch, wired, op):
+    """Success keeps one boundary per phase that may hang plus one closure for the whole step; the terminal
+    remains the full-chain receipt."""
     src, required = wired
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
     cp = _CP()
@@ -134,28 +134,76 @@ def test_live_events_are_only_started_boundaries_while_terminal_keeps_detail(mon
     ]
     phases = [e for e in cp.events if e.get("step") == "s1" and e.get("phase")]
     assert [e["phase"] for e in phases] == [
-        "bind_started", "slot_wait_started", "run_started", "upload_started",
+        "bind_started", "slot_wait_started", "run_started", "upload_started", "step_finished",
     ]
     assert all(e["stage"] == "ops" and e["corr_id"] == "c" and e["session_id"] == "s"
                for e in phases)
     assert set(phases[1]["timings"]) == {"bind_s"}
     assert set(phases[2]["timings"]) == {"bind_s", "slot_wait_s"}
     assert set(phases[3]["timings"]) == {"run_s"}
+    assert set(phases[4]["timings"]) == {"slot_wait_s", "bind_s", "run_s", "put_s", "seconds"}
+    assert phases[4]["outcome"] == "ok" and phases[4]["outputs"]
 
 
 def test_success_event_count_has_a_small_constant_per_step(monkeypatch, wired, op):
-    """NEGATIVE/perf: restoring three finished boundaries plus step-done changes 4N+6 back to 7N+6 and makes
-    the durable stop-and-wait stream itself the critical path for wide b-roll chains."""
+    """NEGATIVE/perf: restoring three phase-finished boundaries changes 5N+6 back to 8N+6 and makes the
+    durable stream itself the critical path for wide b-roll chains."""
     src, required = wired
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
     cp = _CP()
     count = 8
     runner.run_chain(_Chain([_Step(f"s{i}", op.op, src, required) for i in range(count)]), cp)
 
-    assert len(cp.events) == 4 * count + 6, [e.get("phase") for e in cp.events]
+    assert len(cp.events) == 5 * count + 6, [e.get("phase") for e in cp.events]
     terminal = cp.terminal["timings"]["steps"]
     assert len(terminal) == count
     assert all(set(row["legs"]) >= {"slot_wait", "bind", "run", "put"} for row in terminal)
+
+
+def test_completed_sibling_is_durably_closed_while_another_sibling_hangs(monkeypatch, wired, op):
+    """NEGATIVE: start-only events left every completed sibling looking stuck in upload until the chain
+    terminal, but a sibling hung in the same chain prevents that terminal forever."""
+    src, required = wired
+    release = threading.Event()
+
+    def selective(*, params, inputs, outputs):
+        if outputs[required].parent.name == "hung":
+            assert release.wait(timeout=2), "test release did not arrive"
+        outputs[required].write_bytes(b"landed")
+
+    monkeypatch.setattr(runner, "parallel_cap", lambda: (2, "test"))
+    slots = threading.Semaphore(2)
+    monkeypatch.setattr(runner, "step_slots", lambda: slots)
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: selective)
+    cp = _CP()
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            runner.run_chain(_Chain([
+                _Step("done", op.op, src, required),
+                _Step("hung", op.op, src, required),
+            ]), cp)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    deadline = time.monotonic() + 1
+    while not (any(e.get("step") == "done" and e.get("phase") == "step_finished" for e in cp.events)
+               and any(e.get("step") == "hung" and e.get("phase") == "run_started" for e in cp.events)):
+        assert time.monotonic() < deadline, cp.events
+        time.sleep(0.005)
+
+    closed = next(e for e in cp.events if e.get("step") == "done" and e.get("phase") == "step_finished")
+    assert closed["outcome"] == "ok" and closed["outputs"][0]["present"] is True
+    hung_phases = [e["phase"] for e in cp.events if e.get("step") == "hung" and e.get("phase")]
+    assert hung_phases[-1] == "run_started", hung_phases
+    assert not any(e.get("phase") == "work_finished" for e in cp.events)
+
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive() and not errors
 
 
 @pytest.mark.parametrize("boundary", [
