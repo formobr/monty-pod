@@ -12,6 +12,7 @@ reverted. Hermetic — no control plane, no network, no pack fetch (runner.STEP_
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -112,11 +113,16 @@ def test_the_terminal_carries_one_timing_per_step(monkeypatch, wired, tmp_path, 
     assert t["timings"]["chain_s"] > 0, "the pod's own wall is what the box subtracts to get transport"
     got = t["timings"]["steps"]
     assert [s["id"] for s in got] == ["s1"] and got[0]["op"] == op.op, got
-    assert got[0]["seconds"] >= 0.0 and set(got[0]["legs"]) <= {"bind", "run", "put", "connect",
-                                                                "body", "seek_decode", "encode"}, got
+    assert got[0]["seconds"] >= 0.0 and set(got[0]["legs"]) <= {
+        "slot_wait", "bind", "run", "put", "connect", "body", "seek_decode", "encode",
+    }, got
+    assert got[0]["slot_wait_s"] == got[0]["legs"]["slot_wait"]
+    assert got[0]["outputs"], "the terminal names every output measured on the pod"
 
 
-def test_bind_run_upload_boundaries_are_structured_events(monkeypatch, wired, op):
+def test_live_events_are_only_started_boundaries_while_terminal_keeps_detail(monkeypatch, wired, op):
+    """Each live event is an ordered ACK plus two fsyncs. Success keeps exactly one boundary per phase that
+    may hang; finished detail survives in the one terminal."""
     src, required = wired
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
     cp = _CP()
@@ -128,13 +134,113 @@ def test_bind_run_upload_boundaries_are_structured_events(monkeypatch, wired, op
     ]
     phases = [e for e in cp.events if e.get("step") == "s1" and e.get("phase")]
     assert [e["phase"] for e in phases] == [
-        "bind_started", "bind_finished",
-        "run_started", "run_finished",
-        "upload_started", "upload_finished",
+        "bind_started", "slot_wait_started", "run_started", "upload_started",
     ]
     assert all(e["stage"] == "ops" and e["corr_id"] == "c" and e["session_id"] == "s"
                for e in phases)
-    assert all("phase_s" in e["timings"] for e in phases if e["phase"].endswith("_finished"))
+    assert set(phases[1]["timings"]) == {"bind_s"}
+    assert set(phases[2]["timings"]) == {"bind_s", "slot_wait_s"}
+    assert set(phases[3]["timings"]) == {"run_s"}
+
+
+def test_success_event_count_has_a_small_constant_per_step(monkeypatch, wired, op):
+    """NEGATIVE/perf: restoring three finished boundaries plus step-done changes 4N+6 back to 7N+6 and makes
+    the durable stop-and-wait stream itself the critical path for wide b-roll chains."""
+    src, required = wired
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
+    cp = _CP()
+    count = 8
+    runner.run_chain(_Chain([_Step(f"s{i}", op.op, src, required) for i in range(count)]), cp)
+
+    assert len(cp.events) == 4 * count + 6, [e.get("phase") for e in cp.events]
+    terminal = cp.terminal["timings"]["steps"]
+    assert len(terminal) == count
+    assert all(set(row["legs"]) >= {"slot_wait", "bind", "run", "put"} for row in terminal)
+
+
+@pytest.mark.parametrize("boundary", [
+    "bind_started", "slot_wait_started", "run_started", "upload_started",
+])
+def test_a_hung_step_names_its_exact_live_phase(monkeypatch, wired, op, boundary):
+    """The terminal cannot exist while an op is hung. The last durable boundary must distinguish input bind,
+    semaphore wait, handler execution and output upload without a completion event."""
+    src, required = wired
+    release = threading.Event()
+    step = _Step("hung", op.op, src, required)
+    real_bind = runner._bind_inputs
+
+    if boundary == "bind_started":
+        def _blocked_bind(*args, **kwargs):
+            assert release.wait(timeout=2), "test release did not arrive"
+            return real_bind(*args, **kwargs)
+
+        monkeypatch.setattr(runner, "_bind_inputs", _blocked_bind)
+
+    if boundary == "slot_wait_started":
+        @contextmanager
+        def _blocked_slot():
+            assert release.wait(timeout=2), "test release did not arrive"
+            yield
+
+        monkeypatch.setattr(runner, "step_slots", _blocked_slot)
+
+    def _hung(*, params, inputs, outputs):
+        if boundary == "run_started":
+            assert release.wait(timeout=2), "test release did not arrive"
+        outputs[required].write_bytes(b"y")
+
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _hung)
+    if boundary == "upload_started":
+        step.outputs[0].url = "https://store.example/out"
+
+        def _blocked_upload(*_args, **_kwargs):
+            assert release.wait(timeout=2), "test release did not arrive"
+
+        monkeypatch.setattr(runner, "upload", _blocked_upload)
+    cp = _CP()
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            runner.run_chain(_Chain([step]), cp)
+        except BaseException as exc:  # test thread must report into the assertion thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    deadline = time.monotonic() + 1
+    while not any(e.get("phase") == boundary for e in cp.events):
+        assert time.monotonic() < deadline, cp.events
+        time.sleep(0.005)
+    live = next(e for e in cp.events if e.get("phase") == boundary)
+    assert live["step"] == "hung" and live["op"] == op.op
+    step_phases = [e["phase"] for e in cp.events if e.get("step") == "hung" and e.get("phase")]
+    assert step_phases[-1] == boundary, step_phases
+    assert not any(e.get("phase") == "work_finished" for e in cp.events)
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive() and not errors
+
+
+def test_slot_wait_is_not_mislabeled_as_handler_runtime(monkeypatch, wired, op):
+    """NEGATIVE: starting the run clock before semaphore acquisition hides saturation inside `run`. The
+    terminal must expose ready→acquired separately, both as a named leg and an explicit metric."""
+    src, required = wired
+
+    @contextmanager
+    def delayed_slot():
+        time.sleep(0.03)
+        yield
+
+    monkeypatch.setattr(runner, "step_slots", delayed_slot)
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
+    cp = _CP()
+    runner.run_chain(_Chain([_Step("waited", op.op, src, required)]), cp)
+
+    row = cp.terminal["timings"]["steps"][0]
+    assert row["slot_wait_s"] >= 0.02, row
+    assert row["legs"]["slot_wait"] == row["slot_wait_s"]
+    assert row["legs"]["run"] < row["slot_wait_s"], row
 
 
 def test_the_step_weighs_what_it_wrote(monkeypatch, wired, tmp_path, op):
@@ -146,13 +252,18 @@ def test_the_step_weighs_what_it_wrote(monkeypatch, wired, tmp_path, op):
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required, b"z" * 8192))
     cp = _CP()
     runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp)
-    assert cp.terminal["timings"]["steps"][0]["bytes"] == 8192, cp.terminal["timings"]
+    row = cp.terminal["timings"]["steps"][0]
+    assert row["bytes"] == 8192, cp.terminal["timings"]
+    assert next(x for x in row["outputs"] if x["port"] == required) == {
+        "port": required, "present": True, "bytes": 8192,
+    }
+    assert row["bytes"] == sum(x["bytes"] for x in row["outputs"])
 
 
 def test_the_handler_legs_reach_the_terminal_when_the_pack_can_take_them(monkeypatch, wired, op):
     """A handler is handed typed params and local paths and returns nothing — deliberately. So for
     `media.fetch`, whose origin GET, redirect hops and GOP walk all happen INSIDE the one call, the runner's
-    three legs place the whole 33 s in `run` and answer nothing. The pack may carry a recorder; when it does,
+    runner legs place the whole 33 s in `run` and answer nothing. The pack may carry a recorder; when it does,
     its legs must survive onto the wire.
 
     NEGATIVE: drop the `pack.legs()` hook in `_run_step_inner` and `connect`/`seek_decode` vanish, which is
@@ -189,7 +300,7 @@ def test_the_handler_legs_reach_the_terminal_when_the_pack_can_take_them(monkeyp
 
 def test_an_older_pack_with_no_recorder_still_times_the_step(monkeypatch, wired, op):
     """The pack and the image ship separately, so a NEW agent WILL meet an OLD pack. It must degrade to the
-    three legs it can always see itself, never crash and never lose the step.
+    four legs it can always see itself, never crash and never lose the step.
 
     NEGATIVE: import the recorder at module scope instead of discovering it by name, and this agent refuses
     every pack built before it."""

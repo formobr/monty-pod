@@ -361,7 +361,10 @@ The box could not tell a slow origin from a long GOP walk from its own transport
 finished work, because one span covered the enqueue, the claim, every step and the trip home.
 
 THIS BOX IS THE ONLY PLACE THE SPLIT EXISTS, so this is where it is measured and it rides home on the
-terminal. Three legs the runner itself can always see, for EVERY op:
+terminal. Four legs the runner itself can always see, for EVERY op:
+
+  · `slot_wait` — ready-to-run time spent behind the box-wide handler semaphore. This is not handler work:
+                  booking it as `run` made a saturated box look like a slow ffmpeg/CDN.
 
   · `bind`  — pulling this step's inputs into the workspace. Real transport, paid before any frame decodes,
               and free on a `from_step` hand-off (which is the whole point of the local-disk chain).
@@ -370,7 +373,7 @@ terminal. Three legs the runner itself can always see, for EVERY op:
 
 ...plus whatever the HANDLER can see inside `run`, through the pack's optional recorder (pack.LEGS_MODULE).
 `media.fetch` is the case that motivated all of this: its origin GET happens INSIDE the handler, so the
-runner's three legs would place the whole 33 s in `run` and answer nothing.
+runner's own legs would place the whole 33 s in `run` and answer nothing.
 
 ADDITIVE IN BOTH DIRECTIONS. An older pack has no recorder and the handler legs are simply absent; an older
 control plane drops the whole `timings` key and answers 202. Nothing here may ever be load-bearing for the
@@ -380,32 +383,41 @@ work — a measurement that can fail the job it measures is worse than no measur
 
 @dataclass
 class StepTiming:
-    """What one step cost, split the only three ways this process can always see it (STEP_TIMING_WHY)."""
+    """What one step cost, split the four ways this process can always see it (STEP_TIMING_WHY)."""
     step_id: str
     op: str
+    slot_wait_s: float = 0.0
     bind_s: float = 0.0
     run_s: float = 0.0
     put_s: float = 0.0
     nbytes: int = 0
+    outputs: list[dict[str, Any]] = field(default_factory=list)
     legs: dict[str, float] = field(default_factory=dict)
 
     @property
     def seconds(self) -> float:
-        return round(self.bind_s + self.run_s + self.put_s, 3)
+        return round(self.slot_wait_s + self.bind_s + self.run_s + self.put_s, 3)
 
     def wire(self) -> dict[str, Any]:
-        """The shape that crosses the seam. `legs` merges the runner's three with the handler's, and the
+        """The shape that crosses the seam. `legs` merges the runner's four with the handler's, and the
         runner's win a name collision: a handler cannot know what its own binding cost.
 
-        The three are ALWAYS present, zero included. A `bind` of 0.0 is a measurement, not an absence — it
+        The four are ALWAYS present, zero included. A `bind` of 0.0 is a measurement, not an absence — it
         says this step's input was a `from_step` hand-off on local disk and crossed no network, which is the
         performance contract at the top of this file being kept. Dropping it would make "free" and "never
         measured" the same reading, which is the class of error this whole change exists to remove."""
         legs = {**{k: round(v, 3) for k, v in self.legs.items()},
-                "bind": round(self.bind_s, 3), "run": round(self.run_s, 3), "put": round(self.put_s, 3)}
-        out: dict[str, Any] = {"id": self.step_id, "op": self.op, "seconds": self.seconds, "legs": legs}
-        if self.nbytes:
-            out["bytes"] = self.nbytes
+                "slot_wait": round(self.slot_wait_s, 3), "bind": round(self.bind_s, 3),
+                "run": round(self.run_s, 3), "put": round(self.put_s, 3)}
+        out: dict[str, Any] = {
+            "id": self.step_id,
+            "op": self.op,
+            "seconds": self.seconds,
+            "slot_wait_s": round(self.slot_wait_s, 3),
+            "legs": legs,
+            "outputs": list(self.outputs),
+            "bytes": self.nbytes,
+        }
         return out
 
 
@@ -422,17 +434,28 @@ def _collect_legs(recorder: Any) -> dict[str, float]:
     return {str(k): float(v) for k, v in dict(got or {}).items()}
 
 
-def _moved_bytes(outputs: dict[str, Any]) -> int:
+def _moved_outputs(outputs: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
     """What this step actually wrote. Seconds without bytes name no defect — 33 s is a mood, 7 MB in 33 s is
     a diagnosis — and this box is the only side that can weigh the files."""
     total = 0
-    for path in outputs.values():
-        for one in (path if isinstance(path, list) else [path]):
+    rows: list[dict[str, Any]] = []
+    for port, path in outputs.items():
+        many = isinstance(path, list)
+        for index, one in enumerate(path if many else [path]):
+            row: dict[str, Any] = {"port": str(port)}
+            if many:
+                row["index"] = index
             try:
-                total += one.stat().st_size
+                nbytes = one.stat().st_size
             except OSError:
-                continue      # an optional port nothing wrote weighs nothing; that is not an error
-    return total
+                nbytes = 0     # optional absent output remains visible, but weighs nothing
+                row["present"] = False
+            else:
+                row["present"] = True
+                total += nbytes
+            row["bytes"] = nbytes
+            rows.append(row)
+    return total, rows
 
 
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
@@ -454,32 +477,37 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
 
     timing = StepTiming(step_id=str(step.id), op=str(step.op))
 
-    def phase(name: str, state: str, started: float, exc: BaseException | None = None) -> None:
+    def live(phase: str, *, started: float | None = None,
+             exc: BaseException | None = None, timings: dict[str, float] | None = None) -> None:
         if emit is None:
             return
         payload: dict[str, Any] = {
             "status": "step",
             "step": str(step.id),
             "op": str(step.op),
-            "phase": f"{name}_{state}",
+            "phase": phase,
         }
-        if state != "started":
-            payload["timings"] = {"phase_s": round(time.monotonic() - started, 3)}
-            payload["outcome"] = "error" if exc is not None else "ok"
+        if timings:
+            payload["timings"] = {k: round(v, 3) for k, v in timings.items()}
+        if started is not None:
+            payload.setdefault("timings", {})["phase_s"] = round(time.monotonic() - started, 3)
         if exc is not None:
+            payload["outcome"] = "error"
             payload["error_type"] = type(exc).__name__
             payload["error"] = safe_error(exc)
         emit(**payload)
 
+    # LIVE is deliberately one START boundary per waitable phase and no success completions. Each event is a
+    # durable outbox rewrite+fsync and then a stop-and-wait socket frame. The four boundaries make a missing
+    # terminal unambiguous (bind / handler-slot / run / upload); the terminal preserves all completed detail.
+    live("bind_started")
     t_bind = time.monotonic()
-    phase("bind", "started", t_bind)
     try:
         with transport_slots():
             inputs = _bind_inputs(step, op, ws, produced)
     except BaseException as exc:
-        phase("bind", "error", t_bind, exc)
+        live("bind_error", started=t_bind, exc=exc)
         raise
-    phase("bind", "finished", t_bind)
     timing.bind_s = time.monotonic() - t_bind
     out_dir = ws.step_dir(step.id)
     declared_out = {p.id: p for p in op.outputs}
@@ -487,16 +515,21 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
 
     fn = pack.resolve(op.handler)
     recorder = pack.legs()
-    t0 = time.monotonic()
-    phase("run", "started", t0)
+    live("slot_wait_started", timings={"bind_s": timing.bind_s})
+    slot_ready = time.monotonic()
     # THE handler call. `LocalBackend` makes this exact call in-process on the origin machine; here the
     # pod makes it. ONE handler, two transports — parity is structural, not tested into existence. Note
     # what the handler is NOT given: no URL, no credential, no control-plane handle. It sees typed params
     # and local paths, so it cannot depend on where it is running.
     # THE CPU BUDGET, and only here: this call is the ffmpeg, and `CORES_PER_STEP` / `MEM_PER_STEP_BYTES`
     # are statements about exactly this frame (TRANSPORT_BUDGET_WHY).
+    run_announced = False
     try:
         with step_slots():
+            timing.slot_wait_s = time.monotonic() - slot_ready
+            live("run_started", timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
+            run_announced = True
+            t0 = time.monotonic()
             if recorder is not None:
                 with recorder.recording():
                     fn(params=step.params, inputs=inputs, outputs=outputs)
@@ -504,9 +537,12 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
             else:
                 fn(params=step.params, inputs=inputs, outputs=outputs)
     except BaseException as exc:
-        phase("run", "error", t0, exc)
+        # If the durable `step_started` append itself failed, do not try another append and mask the transport
+        # refusal; work has not started, and main must stop before paid work can go silent.
+        if run_announced:
+            live("run_error", started=t0, exc=exc,
+                 timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
         raise
-    phase("run", "finished", t0)
     dt = time.monotonic() - t0
     timing.run_s = dt
 
@@ -515,11 +551,11 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
             if not one.exists() and not declared_out[port].optional:
                 raise ChainError(f"step {step.id!r}: handler produced no {port!r} at {one}")
     log(f"op {step.op} [{step.id}] ok in {dt:.1f}s")
-    timing.nbytes = _moved_bytes(outputs)
+    timing.nbytes, timing.outputs = _moved_outputs(outputs)
 
     # Only NOW does anything leave the box, and only for bindings that named a url.
+    live("upload_started", timings={"run_s": timing.run_s})
     t_put = time.monotonic()
-    phase("upload", "started", t_put)
     try:
         with transport_slots():
             for b in step.outputs:
@@ -528,9 +564,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
                 elif b.urls is not None:
                     _upload_many(step, b, outputs[b.port])
     except BaseException as exc:
-        phase("upload", "error", t_put, exc)
+        live("upload_error", started=t_put, exc=exc)
         raise
-    phase("upload", "finished", t_put)
     timing.put_s = time.monotonic() - t_put
     # LAST, and only on the success road: a step that raised delivered nothing, and a duration booked for
     # work that did not land is the kind of number that makes a ledger worse than none.
@@ -713,8 +748,6 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     raise
                 with lock:
                     produced[sid] = outs
-                _event(job_id=chain.job_id, stage="ops", status="step",
-                       step=sid, op=by_id[sid].op)
         # PER-STEP SECONDS RIDE THE TERMINAL, in one additive key. Not folded into `steps` (a list of ids
         # that both sides already know the shape of) — a new key is dropped by an older control plane with a
         # 202 and ignored by an older box, while a changed element type would be a break on a field that
