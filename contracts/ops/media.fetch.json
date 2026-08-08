@@ -34,6 +34,11 @@
         "minimum": 0,
         "maximum": 3600,
         "description": "Where the window STARTS on the file's own axis. Was refused on the grounds that a prefix cannot disclose where in a clip anything is cut — and that refusal cost whole masters: 30 winners on one fixture are 1642 MB to play 2.4 s each (839 s fetched, ~72 s used, 11.7x). What it discloses is ONE number: somebody wanted this url starting around here. No intent, no score, no threshold, no rank, no beat, nothing that says a moment was CHOSEN or that distinguishes a winner from a candidate — the same class of fact as a duration or a geometry, arriving already collapsed into a number. No selection RULE crosses. The handler guarantees the delivered file PRESENTS from this offset (input `-ss` + mp4 edit list; a degrade re-trims locally rather than silently shipping a file that starts at 0), because the caller records it as the clip's origin and seeks relative to it."
+      },
+      "window_policy": {
+        "type": "string",
+        "enum": ["strict"],
+        "description": "When present, `window_seconds` is mandatory and the transport may deliver only that window. The small-object whole-body optimisation and the whole-file retry after a failed Range/remux are forbidden: the step fails without a `dst`, so the caller can try another rendition/source. Omit for adaptive fetches such as cheap low-resolution rank previews, whose measured small-object whole-body path remains valid."
       }
     }
   },
