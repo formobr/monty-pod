@@ -31,6 +31,16 @@ weights) rides in as presigned URLs from the control plane. `WEIGHTS_CACHE`
 (default `/var/cache/monty/weights`) is where fetched checkpoints land; point
 it at the roomiest local disk.
 
+Warm pods also keep two bounded, local-only caches. An immutable reflink/copy snapshot is both the successful
+object PUT body and the input-cache entry (`OPS_INPUT_CACHE`, off with `OPS_INPUT_CACHE_OFF=1`), so later
+workspace mutation cannot make R2 and the cache disagree. Same-object PUT+adoption is serialised; a failed
+PUT preserves the prior value, while a successful PUT whose adoption fails invalidates it so no stale bytes
+can be served. Readers get independent workspace leases, never an evictable cache path. `media.scale` is
+the sole result-cache allowlist entry (`OPS_RESULT_CACHE`, default 12 GB, `OPS_RESULT_CACHE_MAX_GB`, off with
+`OPS_RESULT_CACHE_OFF=1`): its key includes input bytes, canonical params, suffix, op and pack versions, pod
+image, and ffmpeg build. Hits are checksum-verified, copied to the run-owned output, uploaded normally, and
+reported as `cache_hit`; no cache object is shared across pods or stored in R2.
+
 Jobs, events, and results share one typed WebSocket. Before a client frame is
 sent it is fsynced to `POD_STREAM_OUTBOX` (default
 `/var/cache/monty/pod-stream/outbox.json`). Unacknowledged frames replay after

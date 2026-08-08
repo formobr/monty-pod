@@ -94,6 +94,12 @@ def resolve(handler: str) -> Callable[..., Any]:
     return fn
 
 
+def active_sha() -> str | None:
+    """Digest of the only pack whose handlers this process can execute."""
+    with _lock:
+        return _loaded_sha
+
+
 LEGS_MODULE = "montyops.legs"
 """The pack's OPTIONAL leg stopwatch. A handler is handed typed params and local paths and returns nothing —
 deliberately, so it cannot depend on where it runs — which leaves the runner able to time the WHOLE call and

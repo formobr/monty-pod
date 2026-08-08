@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 from ..artifact import log
 from ..cp import download, upload
 from ..sanitize import safe_error
-from . import inputcache, pack, registry
+from . import inputcache, pack, registry, resultcache
 
 MAX_PARALLEL_ENV = "OPS_MAX_PARALLEL"
 
@@ -213,12 +213,13 @@ class Workspace:
             hit = self._downloads.get(url)
         if hit is not None:
             return hit
-        # keyed by the object, so it survives the chain and a re-minted presign
-        shared = inputcache.get(url, download, log=log)
+        dest = self.root / "_in" / f"{abs(hash(url)):016x}"
+        # keyed by the object, so it survives the chain and a re-minted presign. The returned path is an
+        # independent workspace lease: cache eviction cannot unlink a file while ffmpeg reads it.
+        shared = inputcache.get(url, download, lease=dest, log=log)
         if shared is not None:
             with self._lock:
                 return self._downloads.setdefault(url, shared)
-        dest = self.root / "_in" / f"{abs(hash(url)):016x}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         # Two steps racing the same URL both download; the loser's copy is byte-identical and discarded.
         # Holding the lock across a multi-hundred-MB transfer would serialise the whole chain, which is
@@ -393,6 +394,7 @@ class StepTiming:
     nbytes: int = 0
     outputs: list[dict[str, Any]] = field(default_factory=list)
     legs: dict[str, float] = field(default_factory=dict)
+    cache_hit: bool = False
 
     @property
     def seconds(self) -> float:
@@ -417,6 +419,7 @@ class StepTiming:
             "legs": legs,
             "outputs": list(self.outputs),
             "bytes": self.nbytes,
+            "cache_hit": self.cache_hit,
         }
         return out
 
@@ -456,6 +459,11 @@ def _moved_outputs(outputs: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
             row["bytes"] = nbytes
             rows.append(row)
     return total, rows
+
+
+def _upload_with_affinity(url: str, path: Path) -> None:
+    """One immutable snapshot is both PUT body and, after success, the warm input-cache entry."""
+    inputcache.upload_and_adopt(url, path, upload, log=log)
 
 
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
@@ -538,10 +546,10 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
             t0 = time.monotonic()
             if recorder is not None:
                 with recorder.recording():
-                    fn(params=step.params, inputs=inputs, outputs=outputs)
+                    timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
                 timing.legs = _collect_legs(recorder)
             else:
-                fn(params=step.params, inputs=inputs, outputs=outputs)
+                timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
     except BaseException as exc:
         # If the durable `step_started` append itself failed, do not try another append and mask the transport
         # refusal; work has not started, and main must stop before paid work can go silent.
@@ -566,7 +574,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         with transport_slots():
             for b in step.outputs:
                 if b.url is not None and outputs[b.port].exists():
-                    upload(outputs[b.port], b.url)
+                    _upload_with_affinity(b.url, outputs[b.port])
                 elif b.urls is not None:
                     _upload_many(step, b, outputs[b.port])
     except BaseException as exc:
@@ -583,6 +591,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         "run_s": timing.run_s,
         "put_s": timing.put_s,
         "seconds": timing.seconds,
+        "cache_hit": float(timing.cache_hit),
     }, outputs=timing.outputs, outcome="ok")
     return outputs
 
@@ -593,7 +602,7 @@ def _upload_many(step: Any, b: Any, paths: list[Path]) -> None:
         if not path.exists():
             continue
         try:
-            upload(path, url)
+            _upload_with_affinity(url, path)
         except Exception as e:
             raise ChainError(f"step {step.id!r}: output {b.port!r}[{i}] of {len(b.urls)} would not upload "
                              f"({safe_error(e)}); {i} element(s) before it did land") from e

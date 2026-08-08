@@ -141,7 +141,9 @@ def test_live_events_keep_starts_plus_one_step_closure_while_terminal_keeps_deta
     assert set(phases[1]["timings"]) == {"bind_s"}
     assert set(phases[2]["timings"]) == {"bind_s", "slot_wait_s"}
     assert set(phases[3]["timings"]) == {"run_s"}
-    assert set(phases[4]["timings"]) == {"slot_wait_s", "bind_s", "run_s", "put_s", "seconds"}
+    assert set(phases[4]["timings"]) == {
+        "slot_wait_s", "bind_s", "run_s", "put_s", "seconds", "cache_hit"}
+    assert phases[4]["timings"]["cache_hit"] == 0.0
     assert phases[4]["outcome"] == "ok" and phases[4]["outputs"]
 
 
