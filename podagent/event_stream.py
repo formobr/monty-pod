@@ -111,6 +111,11 @@ class EventStream:
         self._delivery_outcomes: dict[tuple[str, int], bool | BaseException] = {}
         self._admission_error: TransportUnhealthy | None = None
         self._storage_error: TransportUnhealthy | None = None
+        # Admission state that must be replayed on every newly opened socket
+        # (for example worker capacity/ready). The payload is not a claim or
+        # result; it is appended to the same durable ordered outbox so it
+        # cannot race frame sequencing or vanish on reconnect.
+        self._bootstrap_event: dict[str, Any] | None = None
 
         # A process incarnation owns one new stream id. Frames restored from disk keep THEIR original id/seq;
         # mixing an old identity into the new stream makes server-side dedupe unable to identify a replay.
@@ -306,6 +311,18 @@ class EventStream:
         """Persist one event, then optionally wait until its strict ACK."""
         seq, waiter = self._append("event", payload, wait=wait)
         return True if waiter is None else self._await_delivery(self._stream_id, seq, waiter)
+
+    def set_bootstrap_event(self, payload: dict[str, Any]) -> None:
+        """Replay this admission event after every reconnect.
+
+        The current connection still receives the caller's ordinary event;
+        this hook only guarantees the next socket gets a fresh capacity/ready
+        frame after the API resets per-worker credit.
+        """
+        normalized = event_payload(payload)
+        with self._work:
+            self._bootstrap_event = normalized
+            self._work.notify_all()
 
     def send_result(self, payload: dict[str, Any], *, wait: bool = True) -> bool:
         """Persist one correlated result, then optionally wait until its strict ACK."""
@@ -595,10 +612,85 @@ class EventStream:
                 raise ProtocolError(f"ACK {stream_id}:{seq} has no in-flight frame")
         return checked
 
+    @staticmethod
+    def _raw_job_identity(frame: Any) -> tuple[str, str, str, str]:
+        """Extract the CP address before strict Python decoding.
+
+        Go may have durably claimed an envelope which is addressable by the
+        transport but not representable by this pod's current Pydantic model.
+        The rejection path therefore cannot call ``StreamJob.model_validate``
+        first: it must retain the delivery/correlation identity long enough to
+        emit the typed terminal that releases the CP credit.
+        """
+        outer = frame if isinstance(frame, dict) else {}
+        raw = outer.get("job") if isinstance(outer.get("job"), dict) else {}
+        delivery = str(outer.get("delivery_id") or "")
+        corr = str(raw.get("corr_id") or delivery or "")
+        session = str(raw.get("session_id") or "")
+        job_id = str(raw.get("job_id") or "")
+        for block_name in ("request", "spec", "chain"):
+            block = raw.get(block_name)
+            if isinstance(block, dict) and block.get("job_id"):
+                job_id = str(block["job_id"])
+                break
+        return delivery, job_id, session, corr
+
+    def _reject_invalid_job(self, frame: Any, error: BaseException) -> bool:
+        """Durably terminalize an addressed-but-Python-invalid server job.
+
+        This runs before latching the stream unhealthy.  A malformed payload
+        must stop admission, but it must not strand the already claimed CP
+        delivery and its credit.  Missing identity is deliberately not filled
+        with a fabricated value; such a frame is logged and the CP's protocol
+        guard remains authoritative.
+        """
+        delivery, job_id, session, corr = self._raw_job_identity(frame)
+        detail = f"invalid server job frame: {safe_error(error)}"
+        event: dict[str, Any] = {
+            "stage": "dispatch",
+            "status": "error",
+            "phase": "work_finished",
+            "outcome": "error",
+            "error_type": type(error).__name__,
+            "error": detail,
+        }
+        if job_id:
+            event["job_id"] = job_id
+        if session:
+            event["session_id"] = session
+        if corr:
+            event["corr_id"] = corr
+        try:
+            self.send_event(event, wait=False)
+            # A terminal is safe only when the outer delivery and inner
+            # correlation agree.  Never invent an address for an untrusted
+            # malformed frame.
+            if job_id and session and corr and (not delivery or delivery == corr):
+                self.send_result({
+                    "job_id": job_id,
+                    "session_id": session,
+                    "corr_id": corr,
+                    "stage": "dispatch",
+                    "status": "error",
+                    "error": detail,
+                }, wait=False)
+                return True
+        except BaseException as emit_error:  # noqa: BLE001 - original protocol error remains primary
+            _log(f"invalid job terminal could not be persisted ({safe_error(emit_error)})")
+        return False
+
     def _accept_job(self, frame: dict[str, Any]) -> None:
         try:
             checked = StreamJob.model_validate(frame)
         except BaseException as e:
+            # An addressed claim has a durable typed terminal.  Keep the
+            # socket alive so the CP can ACK it and grant the worker's next
+            # credit; closing here would strand the claim and cause a fleet-
+            # wide retry loop.  Only an unaddressable malformed frame latches
+            # the transport below.
+            if self._reject_invalid_job(frame, e):
+                _log("invalid addressed job terminalized; keeping stream admission alive")
+                return
             error = TransportUnhealthy(f"invalid server job frame: {safe_error(e)}")
             with self._work:
                 self._latch_locked(error)
@@ -690,6 +782,22 @@ class EventStream:
                 return False
             with self._state:
                 self._conn = conn
+            # The first connection may already have the same event in the
+            # outbox (ControlPlane sends it normally). On reconnect append one
+            # only when no identical durable frame is pending, preserving the
+            # ordered stream while ensuring capacity is replayed.
+            with self._work:
+                bootstrap = dict(self._bootstrap_event) if self._bootstrap_event else None
+                already_pending = bool(bootstrap and any(
+                    frame.get("type") == "event" and frame.get("event") == bootstrap
+                    for frame in self._outbox
+                ))
+            if bootstrap is not None and not already_pending:
+                try:
+                    self._append("event", bootstrap, wait=False)
+                except BaseException as e:  # noqa: BLE001 — no admission without durable bootstrap
+                    self._fail_connection(conn, f"bootstrap append: {safe_error(e)}")
+                    return False
             self._reader = threading.Thread(
                 target=self._read_loop, args=(conn,), name="pod-stream-reader", daemon=True)
             self._reader.start()

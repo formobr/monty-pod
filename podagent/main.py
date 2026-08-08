@@ -4,6 +4,7 @@ Run: python -m podagent.main"""
 from __future__ import annotations
 
 import concurrent.futures as cf
+import contextlib
 import os
 import signal
 import sys
@@ -59,6 +60,21 @@ def ops_chain_pool_size() -> int:
         return _OPS_MAX_CHAINS_DEFAULT
 
 
+def capacity_payload(*, rank_lanes: int, fetch_workers: int) -> dict[str, int]:
+    """Advertise diagnostics plus one durable claim credit per physical worker.
+
+    ``OPS_MAX_CHAINS`` is an internal fan-out width inside one claimed op chain; it is not a second queue
+    credit. Mixed infer/render/ops jobs share this socket, so advertising that width would let the API place
+    several envelopes on one pod while its heavy lane executes serially and strand peer pods.
+    """
+    return {
+        "rank_lanes": int(rank_lanes),
+        "fetch_workers": int(fetch_workers),
+        "max_inflight": 1,
+        "max_parallel": 1,
+    }
+
+
 def _log(msg: str) -> None:
     print(f"[podagent] {safe_text(msg)}", file=sys.stderr, flush=True)
 
@@ -107,12 +123,69 @@ def _with_lifecycle(cp: "ControlPlane", meta: dict[str, str | None],
     fn()
 
 
+def _dispatch_validation_terminal(cp: "ControlPlane", meta: dict[str, str | None], error: BaseException) -> None:
+    """Release a claimed credit when envelope validation fails before PodJob exists.
+
+    The raw envelope is the only authority available on this path, so preserve
+    its corr/session/product job ids in both event and typed terminal. If one
+    required address is absent, a result cannot be routed safely; the event
+    still names the defect loudly instead of fabricating a corr-less terminal.
+    """
+    detail = safe_error(error)
+    event = {
+        "stage": "dispatch",
+        "status": "error",
+        "phase": "work_finished",
+        "outcome": "error",
+        "error_type": type(error).__name__,
+        "error": detail,
+        "job_id": meta.get("job_id") or "unknown",
+    }
+    for field in ("session_id", "corr_id"):
+        if meta.get(field):
+            event[field] = meta[field]
+    cp.send_event(event)
+    if meta.get("corr_id") and meta.get("session_id"):
+        cp.send_result({
+            "job_id": meta.get("job_id") or "unknown",
+            "stage": "dispatch",
+            "status": "error",
+            "corr_id": meta["corr_id"],
+            "session_id": meta["session_id"],
+            "error": detail,
+        })
+    else:
+        _log("validation failure had no complete corr/session authority; typed terminal was not fabricated")
+
+
 def _env_or_exit(name: str) -> str:
     val = os.environ.get(name)
     if not val:
         _log(f"missing required environment variable {name}")
         sys.exit(2)
     return val
+
+
+@contextlib.contextmanager
+def _llm_correlation(corr_id: str | None):
+    """Delegate one product corr to the keyless control-plane LLM proxy.
+
+    The pod's ``JOB_TOKEN`` authenticates the physical worker, not a tenant.  The API therefore requires
+    the claimed corr on worker LLM requests.  Keep the binding in ``scripts.llm``'s ContextVar so concurrent
+    chains cannot race through a process-wide ``MONTY_CORR_ID`` environment variable.  The import is lazy:
+    the public pod image may run an ops pack with no engine LLM module at all.
+    """
+    try:
+        import llm  # type: ignore[import-not-found]
+    except ImportError:
+        yield
+        return
+    scope = getattr(llm, "correlation", None)
+    if scope is None:
+        yield
+        return
+    with scope(corr_id):
+        yield
 
 
 def _setup_vulkan_icd() -> None:
@@ -207,14 +280,17 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     sys.exit(3)
 
 
-def _report_ready(cp: "ControlPlane") -> None:
+def _report_ready(cp: "ControlPlane", *, capacity: dict[str, int] | None = None) -> None:
     """Open admission only after the capability verdict itself is durably acknowledged by the box."""
-    accepted = cp.send_event({
+    event: dict[str, Any] = {
         "stage": "boot",
         "status": "step",
         "phase": "ready",
         "step": "capability preflight passed",
-    }, wait=True)
+    }
+    if capacity is not None:
+        event["capacity"] = dict(capacity)
+    accepted = cp.send_event(event, wait=True)
     if not accepted:
         # EventStream already latched DeliveryPending before returning False. Raising here keeps main from
         # reaching capacity or the dispatch loop even if a test double (or future transport) only returns it.
@@ -426,7 +502,8 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str) -> Non
     from .ops.runner import run_chain
 
     try:
-        run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
+        with _llm_correlation(corr_id):
+            run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
     except BaseException as e:
         if isinstance(e, TransportUnhealthy):
             raise
@@ -556,14 +633,14 @@ def _report_boot(cp: ControlPlane) -> None:
              "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s · {post}"})
 
 
-def _capability_preflight(cp: ControlPlane) -> None:
+def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, int] | None = None) -> None:
     """Report the boot, prove the encoder, then make readiness an ACKed admission barrier."""
     _report_boot(cp)
     _nvenc_or_refuse(cp)
-    _report_ready(cp)
+    _report_ready(cp, capacity=capacity)
 
 
-def _guarded(fn: Any, cp: ControlPlane) -> None:
+def _guarded(fn: Any, cp: ControlPlane, meta: dict[str, str | None] | None = None) -> None:
     """Run a dispatched envelope, reporting instead of dying. Off the claim loop the old outer `except` no
     longer covers these, and a worker thread that raises is a job the brain waits out in silence."""
     try:
@@ -573,13 +650,19 @@ def _guarded(fn: Any, cp: ControlPlane) -> None:
         print(safe_traceback(e), file=sys.stderr, flush=True)
         if isinstance(e, TransportUnhealthy):
             raise
-        cp.note({"stage": "dispatch", "status": "error", "phase": "work_finished",
-                 "error": safe_error(e)})
+        if meta is not None:
+            _dispatch_validation_terminal(cp, meta, e)
+        else:
+            cp.note({"stage": "dispatch", "status": "error", "phase": "work_finished",
+                     "error": safe_error(e)})
 
 
 def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
+    # Shared-fleet workers hold one physical bearer.  It is deliberately not copied into a product-session
+    # field; the control plane resolves the product tenant from corr attribution for every LLM call.
+    os.environ["MONTY_JOB_TOKEN"] = job_token
     cp = ControlPlane(cp_url, job_token)
     # A STOP IS NOT A DEATH, and the next boot may not report it as one (POST_MORTEM_WHY). The teardown
     # sends SIGTERM; anything that does NOT reach here — SIGKILL, a segv, an OOM — leaves the mark standing,
@@ -588,7 +671,19 @@ def main() -> None:
         signal.signal(_sig, _stop_and_exit)
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
-    _capability_preflight(cp)
+    from .infer_cliprank import fetch_width, lane_width
+    rank_width = lane_width()
+    capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width())
+    _capability_preflight(cp, capacity=capacity)
+    # On reconnect the API resets credit. Replay the ACKed readiness verdict
+    # together with capacity; this event is installed only after preflight.
+    cp.set_bootstrap_event({
+        "stage": "boot",
+        "status": "step",
+        "phase": "ready",
+        "step": "capability preflight passed",
+        "capacity": capacity,
+    })
 
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
     align_cache: dict[str, "AlignService"] = {}
@@ -618,19 +713,6 @@ def main() -> None:
             spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
             _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
 
-    from .infer_cliprank import fetch_width, lane_width
-
-    rank_width = lane_width()
-    cp.note({
-        "stage": "infer",
-        "status": "step",
-        "phase": "capacity",
-        "op": "clip_rank",
-        "capacity": {
-            "rank_lanes": rank_width,
-            "fetch_workers": fetch_width(),
-        },
-    })
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
             cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool, \
             cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool:
@@ -663,8 +745,7 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
             try:
                 pod_job = PodJob.model_validate(job)
             except ValidationError as e:
-                cp.send_event({"stage": "dispatch", "status": "error", "phase": "work_finished",
-                               "error": safe_error(e)})
+                _dispatch_validation_terminal(cp, raw_meta, e)
                 if once:
                     return
                 continue
@@ -677,12 +758,12 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                 ops_pool.submit(_guarded,
                                 lambda c=chain, r=corr, s=sid, m=raw_meta, q=queued_at:
                                 _with_lifecycle(
-                                    cp, m, q, lambda: _run_ops(c, cp, corr_id=r, session_id=s)), cp)
+                                    cp, m, q, lambda: _run_ops(c, cp, corr_id=r, session_id=s)), cp, raw_meta)
             else:
                 pool = rank_pool if _is_clip_rank(pod_job) else heavy_pool
                 pool.submit(_guarded,
                             lambda j=pod_job, m=raw_meta, q=queued_at:
-                            _with_lifecycle(cp, m, q, lambda: heavy(j)), cp)
+                            _with_lifecycle(cp, m, q, lambda: heavy(j)), cp, raw_meta)
             if once:
                 return
         except requests.RequestException as e:

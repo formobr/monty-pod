@@ -16,6 +16,7 @@ pattern, generalised and made declarative.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import contextvars
 import os
 import shutil
 import tempfile
@@ -744,8 +745,11 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     ready = [sid for sid in pending if not (deps[sid] - done_ids)]
                 for sid in ready:
                     pending.discard(sid)
+                    # ContextVars carry the claimed corr into an op's LLM call without a process-wide env
+                    # race.  Each future gets its own snapshot because sibling steps may run concurrently.
+                    ctx = contextvars.copy_context()
                     running[ex.submit(
-                        _run_step, by_id[sid], ws, produced, timings, _event)] = sid
+                        ctx.run, _run_step, by_id[sid], ws, produced, timings, _event)] = sid
                 if not running:
                     # pending non-empty with nothing runnable cannot happen (OpChain rejects cycles at
                     # validation) — but a deadlock on a rented box is expensive enough to name explicitly.

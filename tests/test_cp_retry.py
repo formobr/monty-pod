@@ -304,6 +304,39 @@ def test_mid_window_disconnect_replays_only_unacked_frames_with_the_same_ids(
     assert connections[1] == connections[0][2:], "ACKed prefix must not cross the reconnect again"
 
 
+def test_reconnect_replays_worker_capacity_bootstrap(tmp_path: Path) -> None:
+    """A fresh API socket must receive capacity again before admitting more claims."""
+    connections: list[list[dict[str, Any]]] = []
+    lock = threading.Lock()
+
+    def handler(ws: Any) -> None:
+        with lock:
+            no = len(connections)
+            connections.append([])
+        try:
+            while True:
+                frame = json.loads(ws.recv())
+                connections[no].append(frame)
+                if no == 0:
+                    # Force a reconnect with both the original frame and the
+                    # bootstrap event still durable.
+                    return
+                ws.send(_ack(frame))
+        except Exception:
+            return
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        stream.set_bootstrap_event(_event(phase="capacity", capacity={"max_inflight": 5, "max_parallel": 5}))
+        stream.send_event(_event(step="work"), wait=False)
+        _wait_for(lambda: len(connections) >= 2 and stream.pending_count() == 0)
+        stream.close()
+
+    replayed = connections[1]
+    assert any(frame["type"] == "event" and frame["event"].get("phase") == "capacity"
+               for frame in replayed)
+
+
 def test_stale_reader_cannot_wake_the_reconnected_socket_window(tmp_path: Path) -> None:
     class _Conn:
         def close(self) -> None:
@@ -615,6 +648,58 @@ def test_jobs_are_typed_and_unwrapped(tmp_path: Path) -> None:
         stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
         assert stream.claim(1) == _job()["job"]
         stream.close()
+
+
+def test_python_invalid_but_addressed_job_gets_correlated_terminal_before_latch(
+        tmp_path: Path) -> None:
+    """A Go-addressable claim must release credit even when Python rejects its payload."""
+    path = tmp_path / "outbox.json"
+    malformed = _job("bad-python-job")
+    # Keep the transport address intact while violating the strict PodJob
+    # schema.  This is the production ingress seam, before _dispatch_loop.
+    del malformed["job"]["request"]["model"]
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
+    stream._accept_job(malformed)
+    frames = json.loads(path.read_text())["frames"]
+    results = [frame["result"] for frame in frames if frame["type"] == "result"]
+    assert len(results) == 1
+    assert results[0]["job_id"] == "j"
+    assert results[0]["session_id"] == "s"
+    assert results[0]["corr_id"] == "bad-python-job"
+    assert results[0]["stage"] == "dispatch"
+    assert results[0]["status"] == "error"
+    assert results[0]["error"].startswith("invalid server job frame:")
+    assert any(frame["type"] == "event" and frame["event"]["corr_id"] == "bad-python-job"
+               for frame in frames)
+    stream.close()
+
+
+def test_python_invalid_job_is_terminalized_and_next_delivery_is_admitted(tmp_path: Path) -> None:
+    """The reader stays up through the terminal ACK, then accepts the next claim credit."""
+    malformed = _job("bad-python-job")
+    del malformed["job"]["request"]["model"]
+    seen: list[dict[str, Any]] = []
+
+    def handler(ws: Any) -> None:
+        ws.send(json.dumps(malformed))
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            seen.append(frame)
+            ws.send(_ack(frame))
+            if frame["type"] == "result":
+                ws.send(json.dumps(_job("next-job")))
+                return
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert stream.claim(2.0)["corr_id"] == "next-job"
+        stream.close()
+
+    assert any(frame["type"] == "result" and frame["result"]["corr_id"] == "bad-python-job"
+               for frame in seen)
 
 
 def test_inbox_replays_after_receive_before_run_crash(

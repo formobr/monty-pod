@@ -131,6 +131,10 @@ class ControlPlane:
         """Append progress durably; persistence failure is fatal to admission and propagates."""
         self.send_event(payload, wait=False)
 
+    def set_bootstrap_event(self, payload: dict[str, Any]) -> None:
+        """Replay a worker admission event after each WebSocket reconnect."""
+        self._stream.set_bootstrap_event(self._stamped(payload))
+
     def report_infer_result(self, payload: dict[str, Any]) -> bool:
         """Deliver the real InferResult on the typed result frame. No result→event downgrade exists."""
         return self.send_result(dict(payload))
