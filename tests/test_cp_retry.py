@@ -340,6 +340,31 @@ def test_reconnect_replays_worker_capacity_bootstrap(tmp_path: Path) -> None:
                for frame in replayed)
 
 
+def test_bootstrap_persist_failure_closes_admission_loudly(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """A reconnect that cannot durably queue capacity may not quietly look like an idle socket."""
+    class _Connection:
+        pass
+
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
+    stream.set_bootstrap_event(_event(phase="capacity", capacity={"max_inflight": 1, "max_parallel": 1}))
+    monkeypatch.setattr(event_stream, "_ws_client", type(
+        "_Client", (), {"connect": staticmethod(lambda *_a, **_k: _Connection())}))
+    monkeypatch.setattr(stream, "_append", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")))
+    failed: list[str] = []
+
+    def fail_connection(_conn: Any, why: str) -> None:
+        failed.append(why)
+        with stream._state:
+            stream._conn = None
+
+    monkeypatch.setattr(stream, "_fail_connection", fail_connection)
+    assert stream._ensure_open() is False
+    assert failed == ["bootstrap append: OSError: disk full"]
+    assert "bootstrap append failed" in capsys.readouterr().err
+    stream.close()
+
+
 def test_stale_reader_cannot_wake_the_reconnected_socket_window(tmp_path: Path) -> None:
     class _Conn:
         def close(self) -> None:

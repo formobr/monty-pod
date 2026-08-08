@@ -795,8 +795,10 @@ class EventStream:
             if bootstrap is not None and not already_pending:
                 try:
                     self._append("event", bootstrap, wait=False)
-                except BaseException as e:  # noqa: BLE001 — no admission without durable bootstrap
-                    self._fail_connection(conn, f"bootstrap append: {safe_error(e)}")
+                except Exception as e:  # noqa: BLE001 — no admission without durable bootstrap
+                    why = f"bootstrap append: {safe_error(e)}"
+                    self._fail_connection(conn, why)
+                    _log(f"bootstrap append failed ({safe_error(e)}); admission remains closed")
                     return False
             self._reader = threading.Thread(
                 target=self._read_loop, args=(conn,), name="pod-stream-reader", daemon=True)
