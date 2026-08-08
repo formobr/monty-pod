@@ -54,8 +54,16 @@ def test_missing_routing_id_is_rejected_before_work(missing: str) -> None:
 
 def test_pool_ids_carried() -> None:
     job = PodJob.model_validate(
-        {"type": "render", "spec": _PREVIEW_SPEC, "session_id": "tenant_1", "corr_id": "abc123"})
-    assert job.session_id == "tenant_1" and job.corr_id == "abc123"
+        {"type": "render", "spec": _PREVIEW_SPEC, "session_id": "tenant_1", "corr_id": "abc123",
+         "target_worker_id": "fleet-worker-7"})
+    assert (job.session_id, job.corr_id, job.target_worker_id) == ("tenant_1", "abc123", "fleet-worker-7")
+
+
+def test_target_worker_id_is_strictly_bounded() -> None:
+    with pytest.raises(ValidationError):
+        PodJob.model_validate({
+            "type": "infer", "session_id": "s", "corr_id": "c",
+            "target_worker_id": "worker with spaces", "request": _ALIGN_REQUEST})
 
 
 def test_mismatched_block_rejected() -> None:

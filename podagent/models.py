@@ -731,6 +731,13 @@ class PodJob(BaseModel):
     # Pool routing. Every terminal must have a stable dedupe/demux identity; there is no positional fallback.
     session_id: str = Field(min_length=1)
     corr_id: str = Field(min_length=1)
+    # Optional physical-worker fence used only for infrastructure warm-up.
+    # The API routes a targeted envelope to the named worker; the pod keeps
+    # the field in its strict model for contract parity and dispatches the
+    # admitted product payload exactly as usual.
+    target_worker_id: str | None = Field(
+        default=None, min_length=1, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
 
     @model_validator(mode="after")
     def _block_matches_type(self) -> "PodJob":

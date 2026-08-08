@@ -29,6 +29,12 @@
       "description": "Required per-request correlation id set by the worker at enqueue. The pod ECHOES it verbatim on every result/terminal, providing both result demux and replay dedupe without a positional fallback.",
       "type": "string",
       "minLength": 1
+    },
+    "target_worker_id": {
+      "description": "Optional physical-worker fence for infrastructure warm-up; the API admits the envelope only on this worker.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
     }
   },
   "allOf": [

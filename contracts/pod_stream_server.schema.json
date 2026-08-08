@@ -3,7 +3,7 @@
   "$id": "https://monty.fast/contracts/pod_stream_server.schema.json",
   "title": "PodStreamServerFrame",
   "description": "Strict control-plane->pod frame on the sole pod transport.",
-  "x-contract-version": 10,
+  "x-contract-version": 11,
   "oneOf": [
     {"$ref": "#/$defs/ackFrame"},
     {"$ref": "#/$defs/jobFrame"}
@@ -46,6 +46,7 @@
         "type": {"enum": ["infer", "render", "ops"]},
         "session_id": {"type": "string", "minLength": 1},
         "corr_id": {"type": "string", "minLength": 1},
+        "target_worker_id": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_.:-]+$"},
         "request": {"type": "object"},
         "spec": {"type": "object"},
         "chain": {"type": "object"}

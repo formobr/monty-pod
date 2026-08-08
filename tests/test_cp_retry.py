@@ -34,28 +34,31 @@ def _result(corr_id: str = "c", **extra: Any) -> dict[str, Any]:
     }
 
 
-def _job(corr_id: str = "c") -> dict[str, Any]:
+def _job(corr_id: str = "c", *, target_worker_id: str | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "type": "infer",
+        "session_id": "s",
+        "corr_id": corr_id,
+        "request": {
+            "infer_version": 5,
+            "job_id": "j",
+            "kind": "face_probe",
+            "model": "m",
+            "put_url": "https://storage.example/out?sig=x",
+            "face_probe": {
+                "video_url": "https://storage.example/in?sig=x",
+                "shots": [[0.0, 1.0]],
+                "stride": 1,
+                "frame_diff": False,
+            },
+        },
+    }
+    if target_worker_id:
+        body["target_worker_id"] = target_worker_id
     return {
         "type": "job",
         "delivery_id": corr_id,
-        "job": {
-            "type": "infer",
-            "session_id": "s",
-            "corr_id": corr_id,
-            "request": {
-                "infer_version": 5,
-                "job_id": "j",
-                "kind": "face_probe",
-                "model": "m",
-                "put_url": "https://storage.example/out?sig=x",
-                "face_probe": {
-                    "video_url": "https://storage.example/in?sig=x",
-                    "shots": [[0.0, 1.0]],
-                    "stride": 1,
-                    "frame_diff": False,
-                },
-            },
-        },
+        "job": body,
     }
 
 
@@ -648,6 +651,20 @@ def test_jobs_are_typed_and_unwrapped(tmp_path: Path) -> None:
         stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
         assert stream.claim(1) == _job()["job"]
         stream.close()
+
+
+def test_targeted_warm_job_is_accepted_and_keeps_worker_fence(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """The target is a strict transport field: admission retains it while
+    dispatch continues to use product session/correlation identity."""
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
+    monkeypatch.setattr(stream, "_ensure_open", lambda: True)
+    stream._accept_job(_job("warm-corr", target_worker_id="fleet-worker-7"))
+    admitted = stream.claim(0.2)
+    assert admitted["corr_id"] == "warm-corr"
+    assert admitted["session_id"] == "s"
+    assert admitted["target_worker_id"] == "fleet-worker-7"
+    stream.close()
 
 
 def test_python_invalid_but_addressed_job_gets_correlated_terminal_before_latch(
