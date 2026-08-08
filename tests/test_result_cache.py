@@ -169,6 +169,18 @@ def test_corruption_is_a_miss_and_never_served(damage, tmp_path):
     assert calls == 2 and outputs["dst"].read_bytes() == b"good-2"
 
 
+def test_restore_exception_is_a_safe_loud_miss(tmp_path, monkeypatch):
+    slot = tmp_path / "secret-slot-name"
+    slot.mkdir()
+    dst = tmp_path / "secret-output-name.mp4"
+    monkeypatch.setattr(Path, "read_text", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("secret body")))
+    lines: list[str] = []
+
+    assert resultcache._restore(slot, "secret-cache-key", dst, lines.append) is False
+    assert lines == ["[result-cache] restore miss (OSError); recomputing"]
+    assert "secret" not in lines[0]
+
+
 def test_identical_concurrent_calls_compute_once_and_copy_twice(tmp_path):
     op = registry.get("media.scale")
     inputs, first = _paths(tmp_path, "first.mp4")

@@ -106,7 +106,7 @@ def _discard(slot: Path) -> None:
     shutil.rmtree(slot, ignore_errors=True)
 
 
-def _restore(slot: Path, key: str, dst: Path) -> bool:
+def _restore(slot: Path, key: str, dst: Path, log: Callable[[str], None]) -> bool:
     payload, meta_path = slot / "payload", slot / "meta.json"
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -127,7 +127,9 @@ def _restore(slot: Path, key: str, dst: Path) -> bool:
             tmp.unlink(missing_ok=True)
         os.utime(payload, None)
         return True
-    except Exception:  # cache corruption/IO is a miss; handler exceptions never enter this function
+    except Exception as exc:  # cache corruption/IO is a miss; handler exceptions never enter this function
+        # Type only: paths, cache keys and payload metadata are deliberately absent from the event stream.
+        log(f"[result-cache] restore miss ({type(exc).__name__}); recomputing")
         return False
 
 
@@ -204,7 +206,7 @@ def execute(op: registry.Op, params: dict[str, Any], inputs: dict[str, Path], ou
 
     with _lock(key):
         slot = _slot(key)
-        if _restore(slot, key, outputs["dst"]):
+        if _restore(slot, key, outputs["dst"], log):
             log(f"[result-cache] hit {op.op} {key[:12]}")
             return True
         if slot.exists():
