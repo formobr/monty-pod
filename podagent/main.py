@@ -43,6 +43,7 @@ _MIN_POLL_INTERVAL_S = 1.0
 # it queued behind renders — infer_cliprank.LANE_SIZING_WHY); align/face_probe/render keep the pool of ONE.
 _OPS_MAX_CHAINS_ENV = "OPS_MAX_CHAINS"
 _OPS_MAX_CHAINS_DEFAULT = 8
+_OPS_CLAIM_MAX = 4
 
 # Two pools now run infer and both can miss the SAME weights hash at the same instant — a second 4.6 GB
 # SigLIP is an OOM, not a cache miss.
@@ -60,18 +61,21 @@ def ops_chain_pool_size() -> int:
         return _OPS_MAX_CHAINS_DEFAULT
 
 
-def capacity_payload(*, rank_lanes: int, fetch_workers: int) -> dict[str, int]:
-    """Advertise diagnostics plus one durable claim credit per physical worker.
+def capacity_payload(*, rank_lanes: int, fetch_workers: int) -> dict[str, Any]:
+    """Advertise diagnostics and bounded credits for the three independent executors.
 
-    ``OPS_MAX_CHAINS`` is an internal fan-out width inside one claimed op chain; it is not a second queue
-    credit. Mixed infer/render/ops jobs share this socket, so advertising that width would let the API place
-    several envelopes on one pod while its heavy lane executes serially and strand peer pods.
+    The API admits by class, so the ops pool can use several workspaces without multiplying serial render/
+    align work or the card-sized rank lane. Four is the transport/OOM ceiling even when OPS_MAX_CHAINS is
+    larger; the runner's step semaphore remains the lower-level execution bound.
     """
     return {
         "rank_lanes": int(rank_lanes),
         "fetch_workers": int(fetch_workers),
-        "max_inflight": 1,
-        "max_parallel": 1,
+        "claim_capacity": {
+            "ops": min(ops_chain_pool_size(), _OPS_CLAIM_MAX),
+            "rank": 1,
+            "heavy": 1,
+        },
     }
 
 
@@ -280,7 +284,7 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     sys.exit(3)
 
 
-def _report_ready(cp: "ControlPlane", *, capacity: dict[str, int] | None = None) -> None:
+def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None) -> None:
     """Open admission only after the capability verdict itself is durably acknowledged by the box."""
     event: dict[str, Any] = {
         "stage": "boot",
@@ -636,7 +640,7 @@ def _report_boot(cp: ControlPlane) -> None:
              "step": f"agent up · gpu={gpu} · {time.monotonic() - BOOT_T0:.1f}s · {post}"})
 
 
-def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, int] | None = None) -> None:
+def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, Any] | None = None) -> None:
     """Report the boot, prove the encoder, then make readiness an ACKed admission barrier."""
     _report_boot(cp)
     _nvenc_or_refuse(cp)

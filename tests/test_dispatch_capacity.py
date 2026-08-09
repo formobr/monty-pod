@@ -51,6 +51,12 @@ def test_capacity_advertises_worker_credit_limits(monkeypatch):
     assert capacity == {
         "rank_lanes": 3,
         "fetch_workers": 7,
-        "max_inflight": 1,
-        "max_parallel": 1,
+        "claim_capacity": {"ops": 4, "rank": 1, "heavy": 1},
+    }
+
+
+def test_capacity_never_advertises_more_ops_claims_than_executor(monkeypatch):
+    monkeypatch.setenv("OPS_MAX_CHAINS", "2")
+    assert agent_main.capacity_payload(rank_lanes=9, fetch_workers=9)["claim_capacity"] == {
+        "ops": 2, "rank": 1, "heavy": 1,
     }
