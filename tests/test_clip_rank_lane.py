@@ -181,7 +181,7 @@ def test_two_lanes_missing_the_same_weights_load_the_service_once(monkeypatch, t
         def run(self, params, put_url, progress=None):
             return m.ClipRankRun(infer_s=0.1, timings={"work_s": 0.1})
 
-    def fake_service(model_id, wdir):
+    def fake_service(model_id, wdir, **kwargs):
         loads.append(model_id)
         time.sleep(0.3)   # the second lane must reach its cache miss while this load is still running
         return _Svc()
@@ -212,6 +212,8 @@ def test_two_lanes_missing_the_same_weights_load_the_service_once(monkeypatch, t
 def _svc() -> ClipRankService:
     svc = ClipRankService.__new__(ClipRankService)
     svc.model_id = "siglip"
+    svc.parallel = 1
+    svc._slots = threading.BoundedSemaphore(1)
     return svc
 
 
@@ -256,8 +258,9 @@ def test_the_next_groups_tiles_are_already_on_the_wire_while_this_one_forwards(m
     m._FETCH_POOL = None
 
     svc = _svc()
-    svc._forward = lambda intent, images: (seen_at_forward.append(list(requested)),
-                                           ([0.5] * len(images), [[0.5]] * len(images)))[1]
+    svc._prepare = lambda images, ok: (seen_at_forward.append(list(requested)),
+                                       (object(), [[0.5]] * len(images), ok))[1]
+    svc._text_scores = lambda intent, ie: [0.5]
     params = ClipRankParams(groups=[ClipRankGroup(intent="a", image_urls=["g0t0"]),
                                     ClipRankGroup(intent="b", image_urls=["g1t0"])])
     svc.run(params, "https://storage.example/o/1.json?sig=PUT")

@@ -186,7 +186,8 @@ class ClipRankService:
     provenance only (it rides into the payload), so a request string can never steer what gets loaded.
     """
 
-    def __init__(self, model_id: str, weights_dir: Path) -> None:
+    def __init__(self, model_id: str, weights_dir: Path, *, parallel: int = 1,
+                 slots: threading.BoundedSemaphore | None = None) -> None:
         import torch
         from transformers import AutoModel, AutoProcessor
 
@@ -194,6 +195,8 @@ class ClipRankService:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
         self.model_id = model_id
+        self.parallel = max(1, int(parallel))
+        self._slots = slots or threading.BoundedSemaphore(self.parallel)
         self.model = AutoModel.from_pretrained(
             str(weights_dir), dtype=self.dtype, local_files_only=True).to(self.device).eval()
         self.proc = AutoProcessor.from_pretrained(str(weights_dir), local_files_only=True)
@@ -205,21 +208,50 @@ class ClipRankService:
         n = len(params.groups)
         gather_s = forward_s = 0.0
         with tempfile.TemporaryDirectory() as td:
-            # Every tile of every group goes on the wire before the FIRST forward, so the card never waits on
-            # a download it could already have had; group k is still forwarded in request order.
-            pending = [_submit_tiles(g.image_urls, Path(td) / f"g{i}") for i, g in enumerate(params.groups)]
+            # score_many sends several phrasings over the SAME pixels. Download/decode/image-forward that exact
+            # URL tuple once, then reuse its image embeddings for every text tower. Distinct shortlists occupy
+            # the already-sized rank lanes concurrently; result assembly remains in request order.
+            keys = [tuple(g.image_urls) for g in params.groups]
+            unique = list(dict.fromkeys(keys))
+            pending = {key: _submit_tiles(list(key), Path(td) / f"g{i}")
+                       for i, key in enumerate(unique)}
+            if progress is not None:
+                progress(f"clip_rank preparing {len(unique)} unique image set(s) for {n} group(s)")
+
+            def prepare(key):
+                tg = time.monotonic()
+                images, ok = _gather(pending[key])
+                gs = time.monotonic() - tg
+                if not self._slots.acquire(timeout=60.0):
+                    raise TimeoutError("clip_rank image forward waited 60s for a card lane")
+                try:
+                    tf = time.monotonic()
+                    prepared = self._prepare(images, ok)
+                    return prepared, gs, time.monotonic() - tf
+                finally:
+                    self._slots.release()
+
+            with cf.ThreadPoolExecutor(max_workers=min(self.parallel, max(1, len(unique))),
+                                       thread_name_prefix="clip-rank-group") as ex:
+                prepared = {key: ex.submit(prepare, key) for key in unique}
+                ready = {}
+                for key in unique:
+                    ready[key], gs, fs = prepared[key].result()
+                    gather_s += gs
+                    forward_s += fs
+
             groups = []
-            for i, g in enumerate(params.groups):
-                # Per-GROUP, not per-batch: a coalesced batch is many beats × many tiles over third-party
-                # CDNs, and "which group was it on" is the whole diagnosis when one wedges.
+            for i, (g, key) in enumerate(zip(params.groups, keys)):
                 if progress is not None:
                     progress(f"clip_rank group {i + 1}/{n} ({len(g.image_urls)} tiles)")
-                tg = time.monotonic()
-                gathered = _gather(pending[i])
-                gather_s += time.monotonic() - tg
+                if not self._slots.acquire(timeout=60.0):
+                    raise TimeoutError("clip_rank text forward waited 60s for a card lane")
                 tf = time.monotonic()
-                groups.append(self._score(g, *gathered))
-                forward_s += time.monotonic() - tf
+                try:
+                    groups.append(self._score_prepared(g, *ready[key]))
+                    forward_s += time.monotonic() - tf
+                finally:
+                    self._slots.release()
             tp = time.monotonic()
             payload = ClipRankPayload(model=self.model_id, groups=groups)
             out = Path(td) / "clip_rank.json"
@@ -235,11 +267,14 @@ class ClipRankService:
             infer_s=infer_s,
             timings={
                 "infer_s": round(infer_s, 3),
-                "tile_gather_s": round(gather_s, 3),
-                "forward_s": round(forward_s, 3),
+                "tile_gather_work_s": round(gather_s, 3),
+                "forward_work_s": round(forward_s, 3),
                 "payload_s": round(payload_s, 3),
                 "upload_s": round(upload_s, 3),
                 "work_s": round(time.monotonic() - t0, 3),
+                "unique_image_sets_n": float(len(unique)),
+                "reused_groups_n": float(n - len(unique)),
+                "parallel_width_n": float(self.parallel),
             },
         )
 
@@ -248,11 +283,21 @@ class ClipRankService:
         return self._score(group, *self._fetch(group.image_urls, workdir))
 
     def _score(self, group: ClipRankGroup, images: list, ok: list[int]) -> ClipRankGroupResult:
-        n = len(group.image_urls)
-        if not images:
-            return ClipRankGroupResult(scores=[_MISS] * n, embeds=[None] * n)
+        return self._score_prepared(group, *self._prepare(images, ok))
 
-        scores, embeds = self._forward(group.intent, images)
+    def _prepare(self, images: list, ok: list[int]):
+        if not images:
+            return None, [], ok
+        with self.torch.no_grad():
+            ie = self._image_features(images)
+            embeds = [[round(x, _DP) for x in e] for e in ie.float().cpu().tolist()]
+        return ie, embeds, ok
+
+    def _score_prepared(self, group: ClipRankGroup, ie, embeds: list, ok: list[int]) -> ClipRankGroupResult:
+        n = len(group.image_urls)
+        if ie is None:
+            return ClipRankGroupResult(scores=[_MISS] * n, embeds=[None] * n)
+        scores = self._text_scores(group.intent, ie)
         # re-align onto the REQUESTED order: an image we could not fetch keeps -1.0/None so it sorts last
         by_idx = dict(zip(ok, scores))
         emb_by_idx = dict(zip(ok, embeds))
@@ -260,6 +305,17 @@ class ClipRankService:
             scores=[by_idx.get(i, _MISS) for i in range(n)],
             embeds=[emb_by_idx.get(i) for i in range(n)],
         )
+
+    def _text_scores(self, intent: str, ie) -> list[float]:
+        if not intent:
+            return [_MISS] * len(getattr(ie, "rows", ie))
+        torch = self.torch
+        with torch.no_grad():
+            tin = self.proc(text=[intent], return_tensors="pt", padding="max_length", truncation=True)
+            te = torch.nn.functional.normalize(
+                self._feat(self.model.get_text_features(**tin.to(self.device))), dim=-1)
+            sims = (ie @ te.T).squeeze(-1).float().cpu().tolist()
+        return [round(s, _DP) for s in sims]
 
     @staticmethod
     def _feat(out):
@@ -284,18 +340,8 @@ class ClipRankService:
         return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
     def _forward(self, intent: str, images: list) -> tuple[list[float], list[list[float]]]:
-        torch = self.torch
-        with torch.no_grad():
-            ie = self._image_features(images)
-            embeds = [[round(x, _DP) for x in e] for e in ie.float().cpu().tolist()]
-            # NO intent = an embed-only caller (the image tower is text-independent). Bailing here would hand it
-            # Nones and silently blind the dedup/MMR that asked ONLY for embeddings.
-            if not intent:
-                return [_MISS] * len(images), embeds
-            tin = self.proc(text=[intent], return_tensors="pt", padding="max_length", truncation=True)
-            te = torch.nn.functional.normalize(self._feat(self.model.get_text_features(**tin.to(self.device))), dim=-1)
-            sims = (ie @ te.T).squeeze(-1).float().cpu().tolist()
-        return [round(s, _DP) for s in sims], embeds
+        ie, embeds, _ = self._prepare(images, list(range(len(images))))
+        return self._text_scores(intent, ie), embeds
 
     @staticmethod
     def _fetch(urls: list[str], workdir: Path) -> tuple[list, list[int]]:

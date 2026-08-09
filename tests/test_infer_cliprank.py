@@ -9,6 +9,7 @@ What the pod side must guarantee, and what each test pins:
 from __future__ import annotations
 
 import contextlib
+import threading
 import types
 from pathlib import Path
 
@@ -69,6 +70,8 @@ def _svc(text_calls: list | None = None) -> ClipRankService:
     svc.device = "cpu"
     svc.dtype = _Torch.float32
     svc.model_id = "google/siglip2-so400m-patch14-384"
+    svc.parallel = 1
+    svc._slots = threading.BoundedSemaphore(1)
     svc.proc = lambda **kw: _In()
 
     class _Model:
@@ -166,11 +169,75 @@ def test_payload_carries_numbers_only(monkeypatch, tmp_path) -> None:
 
     assert result.infer_s >= 0
     assert set(result.timings) == {
-        "infer_s", "tile_gather_s", "forward_s", "payload_s", "upload_s", "work_s"}
+        "infer_s", "tile_gather_work_s", "forward_work_s", "payload_s", "upload_s", "work_s",
+        "unique_image_sets_n", "reused_groups_n", "parallel_width_n"}
     body = json.loads(put.read_text())
     assert set(body) == {"model", "groups"}, "no ranking, no threshold, no rationale crosses back"
     assert [g["scores"] for g in body["groups"]] == [[0.6, 0.8], [-1.0, -1.0]]
     assert all(set(g) == {"scores", "embeds"} for g in body["groups"])
+
+
+def test_identical_url_groups_reuse_one_image_forward_without_changing_order(monkeypatch, tmp_path) -> None:
+    """Two phrasings are two text scores, not two downloads/decodes/image towers."""
+    import json
+    import podagent.infer_cliprank as m
+    from podagent.models import ClipRankParams
+
+    fetched: list[str] = []
+    monkeypatch.setattr(m, "download", lambda url, dest: (fetched.append(url),
+        dest.parent.mkdir(parents=True, exist_ok=True), dest.write_bytes(b"img"), dest)[-1])
+    monkeypatch.setattr("PIL.Image.open", lambda p: types.SimpleNamespace(convert=lambda mode: "img"))
+    put = tmp_path / "out.json"
+    monkeypatch.setattr(m, "upload", lambda src, url, ct=None: put.write_bytes(src.read_bytes()))
+    svc = _svc()
+    image_calls = 0
+    original = svc._image_features
+
+    def counted(images):
+        nonlocal image_calls
+        image_calls += 1
+        return original(images)
+
+    svc._image_features = counted
+    params = ClipRankParams(groups=[
+        ClipRankGroup(intent="first", image_urls=["a", "b"]),
+        ClipRankGroup(intent="second", image_urls=["a", "b"]),
+    ])
+    run = svc.run(params, "put")
+    assert fetched == ["a", "b"] and image_calls == 1
+    assert [g["scores"] for g in json.loads(put.read_text())["groups"]] == [[0.6, 0.8], [0.6, 0.8]]
+    assert run.timings["unique_image_sets_n"] == 1 and run.timings["reused_groups_n"] == 1
+
+
+def test_distinct_shortlists_overlap_but_results_keep_request_order(monkeypatch, tmp_path) -> None:
+    """The envelope's rank width is real scheduling width, never output-order nondeterminism."""
+    import json
+    import podagent.infer_cliprank as m
+    from podagent.models import ClipRankParams
+
+    monkeypatch.setattr(m, "download", lambda url, dest: (dest.parent.mkdir(parents=True, exist_ok=True),
+                                                          dest.write_bytes(b"img"), dest)[-1])
+    monkeypatch.setattr("PIL.Image.open", lambda p: types.SimpleNamespace(convert=lambda mode: "img"))
+    put = tmp_path / "out.json"
+    monkeypatch.setattr(m, "upload", lambda src, url, ct=None: put.write_bytes(src.read_bytes()))
+    svc = _svc()
+    svc.parallel = 2
+    svc._slots = threading.BoundedSemaphore(2)
+    together = threading.Barrier(2, timeout=2)
+
+    def prepare(images, ok):
+        together.wait()
+        marker = 1.0 if len(images) == 1 else 2.0
+        return marker, [[marker]], ok
+
+    svc._prepare = prepare
+    svc._text_scores = lambda intent, marker: [marker] * int(marker)
+    params = ClipRankParams(groups=[
+        ClipRankGroup(intent="one", image_urls=["a"]),
+        ClipRankGroup(intent="two", image_urls=["b", "c"]),
+    ])
+    svc.run(params, "put")
+    assert [g["scores"] for g in json.loads(put.read_text())["groups"]] == [[1.0], [2.0, 2.0]]
 
 
 def test_service_is_registered_for_the_clip_rank_kind() -> None:

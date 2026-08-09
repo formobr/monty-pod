@@ -307,6 +307,8 @@ def _run_infer(
     boot_reported: bool,
     corr_id: str,
     session_id: str,
+    rank_parallel: int = 1,
+    rank_slots: threading.BoundedSemaphore | None = None,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag.
 
@@ -378,7 +380,8 @@ def _run_infer(
                             wdir = ensure(req.weights, req.model, note)
                         with phase("model_load"):
                             note(f"loading {req.model}")
-                            rank_svc = rank_cache[req.weights.sha256] = ClipRankService(req.model, wdir)
+                            rank_svc = rank_cache[req.weights.sha256] = ClipRankService(
+                                req.model, wdir, parallel=rank_parallel, slots=rank_slots)
             rank_run = rank_svc.run(req.clip_rank, req.put_url, note)
             infer_s = rank_run.infer_s
             work_timings = rank_run.timings
@@ -689,6 +692,7 @@ def main() -> None:
     align_cache: dict[str, "AlignService"] = {}
     probe_cache: dict[tuple[Path, str], "ProbeService"] = {}
     rank_cache: dict[str, "ClipRankService"] = {}
+    rank_slots = threading.BoundedSemaphore(rank_width)
     boot: list[bool] = [False]
     boot_lock = threading.Lock()
 
@@ -706,7 +710,8 @@ def main() -> None:
             mine = _claim_boot()
             if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
                               yunet_path, not mine, corr_id=pod_job.corr_id,
-                              session_id=pod_job.session_id) and mine:
+                              session_id=pod_job.session_id, rank_parallel=rank_width,
+                              rank_slots=rank_slots) and mine:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None
