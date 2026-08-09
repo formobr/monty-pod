@@ -177,6 +177,10 @@ RUN python3 -m pip install --no-cache-dir --no-deps .
 # what it actually booted. Set from the CI tag; "unknown" on a hand-built image, which is itself the answer.
 # Last layer: it changes on every tag and must invalidate nothing above it.
 ARG IMAGE_TAG=dev
+ARG IMAGE_REVISION=unknown
 ENV POD_IMAGE_TAG=${IMAGE_TAG}
+LABEL org.opencontainers.image.revision=${IMAGE_REVISION} \
+      org.opencontainers.image.version=${IMAGE_TAG} \
+      org.opencontainers.image.source="https://github.com/formobr/monty-pod"
 
 ENTRYPOINT ["python3", "-m", "podagent.main"]

@@ -60,6 +60,7 @@ jobs:
           # first thing anyone reading that error needs to know.
           build-args: |
             IMAGE_TAG=${{ github.ref_name }}
+            IMAGE_REVISION=${{ github.sha }}
           secrets: |
             hf_token=${{ secrets.HF_TOKEN }}
           tags: |
