@@ -253,7 +253,28 @@ def download(url: str, dest: Path) -> Path:
     return dest
 
 
-def upload(src: Path, put_url: str, content_type: str = "application/octet-stream") -> None:
+def _upload_content_type(src: Path) -> str:
+    """Infer the small closed set of browser media types from bytes, not the workspace filename.
+
+    The ops input cache uploads an immutable ``*.put-snapshot`` copy, so suffix-only MIME inference loses
+    the original ``.jpg``/``.png`` name.  R2 then stores ``application/octet-stream`` and the preview API
+    correctly refuses to hand that object to an ``<img>``.  Magic bytes survive the snapshot and are the
+    authority for these formats; unknown outputs stay binary.
+    """
+    with src.open("rb") as f:
+        head = f.read(16)
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "application/octet-stream"
+
+
+def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
     """Presigned PUT ← file, streamed, 3 attempts. A file:// url copies to local disk (local backend).
 
     A retry re-sends the object FROM BYTE 0 — a presigned PUT is one signed request and has no resume. The
@@ -265,6 +286,8 @@ def upload(src: Path, put_url: str, content_type: str = "application/octet-strea
         shutil.copyfile(src, local)
         return
     size = src.stat().st_size
+    if content_type is None:
+        content_type = _upload_content_type(src)
     resent = 0
     for attempt in range(_XFER_ATTEMPTS):
         if attempt:
