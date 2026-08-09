@@ -1,0 +1,41 @@
+{
+  "op": "media.range_frames",
+  "version": 1,
+  "summary": "Sample separate frames from a remote clip through an aggregate byte-capped Range-only view. Geometry in, N pictures plus a closed transport receipt out.",
+  "needs": ["net", "video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "The decoder receives the origin's original compressed bytes and media.frames' exact one-pass implementation. tests/test_op_media_range.py compares every landed PNG against media.frames over the full local object. If the exact one-pass cannot answer every position, the arm fails closed: the historical N-process fallback could outlive the receipt deadline, and approximate pixels are forbidden. The required closed receipt proves origin_bytes < object_bytes and counts whole origin attempts. Range refusal never falls back to a whole GET. Positions and cell geometry are identical to media.frames and carry no rule for choosing one frame over another."
+  },
+  "inputs": [],
+  "outputs": [
+    {"id": "frames", "kind": "image", "durable": true, "optional": true, "many": true},
+    {"id": "receipt", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["url", "positions", "width", "height", "max_origin_bytes"],
+    "properties": {
+      "url": {"type": "string", "pattern": "^https://", "maxLength": 4096},
+      "positions": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 64,
+        "items": {"type": "number", "minimum": 0, "maximum": 1},
+        "description": "Fractions of the clip's own measured duration, one per bound output address."
+      },
+      "width": {"type": "integer", "minimum": 16, "maximum": 1024, "multipleOf": 2},
+      "height": {"type": "integer", "minimum": 16, "maximum": 2048, "multipleOf": 2},
+      "fit": {"enum": ["cover", "contain", "contain_alpha"], "default": "cover"},
+      "max_origin_bytes": {
+        "type": "integer",
+        "minimum": 65536,
+        "maximum": 67108864,
+        "description": "One aggregate ceiling for discovery, probe and decode, always clamped below Content-Length."
+      }
+    }
+  },
+  "handler": "montyops.media_range_frames:run"
+}

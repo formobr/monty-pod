@@ -1,0 +1,46 @@
+{
+  "op": "media.range_filmstrip",
+  "version": 1,
+  "summary": "Sample a remote clip into one filmstrip through an aggregate byte-capped Range-only view. Geometry in, one picture plus a closed transport receipt out.",
+  "needs": ["net", "video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "The decoder receives the origin's original compressed bytes and the exact media.filmstrip argv, including its measured duration, rounded seek timestamps, crop, scaler and PNG sink. Only the HTTP reader changes: every origin request is an explicit bounded Range and a shared block cache applies one aggregate byte cap across ffprobe plus all ffmpeg inputs. tests/test_op_media_range.py renders the ordinary full-file path and this path over the same real MP4 and compares the final PNG bytes. The required JSON receipt is closed and proves origin_bytes < object_bytes, whole_attempts=0, Range request count, ignored-Range refusals, cap refusal and output presence. An origin 200 is closed while still streamed, before any body byte is consumed; cap exhaustion and malformed Content-Range produce no strip and never fall back to a whole GET. No selection rule crosses: positions and cell geometry are the same surface as media.filmstrip."
+  },
+  "inputs": [],
+  "outputs": [
+    {"id": "strip", "kind": "image", "durable": true, "optional": true},
+    {"id": "receipt", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["url", "positions", "width", "height", "max_origin_bytes"],
+    "properties": {
+      "url": {
+        "type": "string",
+        "pattern": "^https://",
+        "maxLength": 4096,
+        "description": "Credential-free public origin location. Checked on every redirect before it is dereferenced."
+      },
+      "positions": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 12,
+        "items": {"type": "number", "minimum": 0, "maximum": 1},
+        "description": "Fractions of the clip's own measured duration; geometry only, with no selection rule."
+      },
+      "width": {"type": "integer", "minimum": 16, "maximum": 1024, "multipleOf": 2},
+      "height": {"type": "integer", "minimum": 16, "maximum": 2048, "multipleOf": 2},
+      "fit": {"enum": ["cover", "contain", "contain_alpha"], "default": "cover"},
+      "max_origin_bytes": {
+        "type": "integer",
+        "minimum": 65536,
+        "maximum": 67108864,
+        "description": "Aggregate ceiling across discovery, probe and every decode input. The handler additionally clamps it below Content-Length, so no setting admits a whole object."
+      }
+    }
+  },
+  "handler": "montyops.media_range_filmstrip:run"
+}
