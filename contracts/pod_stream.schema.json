@@ -2,11 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://monty.fast/contracts/pod_stream.schema.json",
   "title": "PodStreamClientFrame",
-  "description": "Strict pod->control-plane frame on the sole pod transport. Exactly one typed payload rides each durable delivery identity.",
-  "x-contract-version": 10,
+  "description": "Strict pod->control-plane frame on the sole pod transport. Every frame carries a pod-monotonic send stamp; terminal frames echo the atomic claim attempt.",
+  "x-contract-version": 12,
   "oneOf": [
     {"$ref": "#/$defs/eventFrame"},
-    {"$ref": "#/$defs/resultFrame"}
+    {"$ref": "#/$defs/resultFrame"},
+    {"$ref": "#/$defs/jobAckFrame"}
   ],
   "$defs": {
     "streamId": {
@@ -16,26 +17,58 @@
       "pattern": "^[A-Za-z0-9_.-]+$",
       "description": "Fresh for one pod process, stable across reconnects."
     },
+    "attemptId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "Claim identity minted atomically with Redis reserve and stable across socket replay."
+    },
+    "monotonicNs": {"type": "integer", "minimum": 0},
     "eventFrame": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "stream_id", "seq", "event"],
+      "required": ["type", "stream_id", "seq", "client_send_mono_ns", "event"],
       "properties": {
         "type": {"const": "event"},
         "stream_id": {"$ref": "#/$defs/streamId"},
         "seq": {"type": "integer", "minimum": 1},
+        "client_send_mono_ns": {"$ref": "#/$defs/monotonicNs"},
         "event": {"$ref": "#/$defs/podEvent"}
       }
     },
     "resultFrame": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "stream_id", "seq", "result"],
+      "required": ["type", "stream_id", "seq", "client_send_mono_ns", "attempt_id", "result"],
       "properties": {
         "type": {"const": "result"},
         "stream_id": {"$ref": "#/$defs/streamId"},
         "seq": {"type": "integer", "minimum": 1},
+        "client_send_mono_ns": {"$ref": "#/$defs/monotonicNs"},
+        "attempt_id": {"$ref": "#/$defs/attemptId"},
         "result": {"$ref": "#/$defs/podResult"}
+      }
+    },
+    "jobAckFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "stream_id", "seq", "client_send_mono_ns", "job_ack"],
+      "properties": {
+        "type": {"const": "job_ack"},
+        "stream_id": {"$ref": "#/$defs/streamId"},
+        "seq": {"type": "integer", "minimum": 1},
+        "client_send_mono_ns": {"$ref": "#/$defs/monotonicNs"},
+        "job_ack": {"$ref": "#/$defs/jobAck"}
+      }
+    },
+    "jobAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delivery_id", "corr_id", "attempt_id", "client_recv_mono_ns"],
+      "properties": {
+        "delivery_id": {"type": "string", "minLength": 1},
+        "corr_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"$ref": "#/$defs/attemptId"},
+        "client_recv_mono_ns": {"$ref": "#/$defs/monotonicNs"}
       }
     },
     "podEvent": {
@@ -59,6 +92,7 @@
         "outputs": {},
         "error": {"type": "string"},
         "timings": {"type": "object"},
+        "timeline": {"type": "object", "description": "Opaque terminal/step timeline preserved unchanged by Go."},
         "capacity": {"type": "object"},
         "ts": {"type": "string", "format": "date-time"}
       }
@@ -83,7 +117,8 @@
         "status": {"enum": ["ok", "error"]},
         "error": {"type": "string"},
         "timing": {"type": "object"},
-        "timings": {"type": "object"}
+        "timings": {"type": "object"},
+        "timeline": {"type": "object", "description": "Opaque terminal timeline preserved unchanged by Go."}
       },
       "additionalProperties": true,
       "description": "Full infer/result body is stored immutable and interpreted by the box. Go validates routing/status/correlation only."

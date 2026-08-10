@@ -1,6 +1,17 @@
 {
   "type": "job",
   "delivery_id": "infer-demo-1",
+  "attempt_id": "0123456789abcdef0123456789abcdef",
+  "stream_id": "pod-boot-42",
+  "seq": 1,
+  "replayed": false,
+  "timeline": {
+    "enqueue_min_unix_ns": 100,
+    "enqueue_max_unix_ns": 110,
+    "claim_min_unix_ns": 120,
+    "claim_max_unix_ns": 130,
+    "socket_write_min_unix_ns": 140
+  },
   "job": {
     "type": "infer",
     "session_id": "session-demo-1",

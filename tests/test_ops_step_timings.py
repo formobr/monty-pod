@@ -11,6 +11,8 @@ reverted. Hermetic — no control plane, no network, no pack fetch (runner.STEP_
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import threading
 import time
@@ -41,6 +43,21 @@ class _CP:
     def send_result(self, payload: dict, *, wait: bool = True) -> bool:
         self.results.append(payload)
         return True
+
+    def timeline_context(self, corr_id: str) -> dict:
+        return {
+            "complete": True,
+            "incomplete_reasons": [],
+            "pod_clock_id": "pod-clock-1",
+            "attempt_id": "attempt-1",
+            "delivery": {"delivery_id": corr_id or "local", "attempt_id": "attempt-1"},
+            "clock_sync": [{
+                "pod_clock_id": "pod-clock-1", "seq": 1, "wire_attempt": 1,
+                "client_send_mono_ns": 1, "server_recv_unix_ns": 11,
+                "server_send_unix_ns": 12, "client_recv_mono_ns": 3,
+                "theta_min_ns": 9, "theta_max_ns": 10,
+            }],
+        }
 
     @property
     def terminal(self) -> dict:
@@ -383,6 +400,8 @@ def test_a_recorder_that_raises_costs_its_legs_and_never_the_step(monkeypatch, w
     runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp)
     assert cp.terminal["status"] == "ok"
     assert cp.terminal["timings"]["steps"][0]["legs"], "the runner's own legs were lost with the handler's"
+    assert cp.terminal["timeline"]["pod"]["complete"] is False
+    assert "handler_leg_intervals_missing" in cp.terminal["timeline"]["pod"]["incomplete_reasons"]
 
 
 def test_a_step_that_failed_contributes_no_timing(monkeypatch, wired, op):
@@ -421,6 +440,136 @@ def test_the_pods_own_wall_covers_every_step_it_reports(monkeypatch, wired, op):
     runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp)
     t = cp.terminal["timings"]
     assert t["chain_s"] >= sum(s["seconds"] for s in t["steps"]), t
+
+
+def test_timeline_places_parallel_steps_as_overlap_not_a_sum(monkeypatch, wired, op):
+    src, required = wired
+    gate = threading.Barrier(2)
+
+    def concurrent(*, params, inputs, outputs):
+        gate.wait(timeout=1)
+        time.sleep(0.04)
+        outputs[required].write_bytes(b"y")
+
+    monkeypatch.setattr(runner, "parallel_cap", lambda: (2, "test"))
+    monkeypatch.setattr(runner.pack, "resolve", lambda _handler: concurrent)
+    cp = _CP()
+    runner.run_chain(_Chain([
+        _Step("left", op.op, src, required),
+        _Step("right", op.op, src, required),
+    ]), cp, corr_id="corr")
+
+    timeline = cp.terminal["timeline"]["pod"]
+    run_spans = {span["step"]: span for span in timeline["spans"] if span["leg"] == "run"}
+    left, right = run_spans["left"], run_spans["right"]
+    assert max(left["start_mono_ns"], right["start_mono_ns"]) < min(
+        left["end_mono_ns"], right["end_mono_ns"]), run_spans
+    union = max(left["end_mono_ns"], right["end_mono_ns"]) - min(
+        left["start_mono_ns"], right["start_mono_ns"])
+    summed = sum(row["end_mono_ns"] - row["start_mono_ns"] for row in (left, right))
+    assert union < summed, "parallel arms must be unioned on one clock, never added"
+    chain = next(span for span in timeline["spans"] if span["scope"] == "chain")
+    assert chain["start_mono_ns"] <= min(left["start_mono_ns"], right["start_mono_ns"])
+    assert chain["end_mono_ns"] >= max(left["end_mono_ns"], right["end_mono_ns"])
+    assert set(run_spans) == {"left", "right"}
+    assert all(span["scope"] == "phase" and span["parent"] == "chain"
+               and span["pod_clock_id"] == "pod-clock-1" for span in run_spans.values())
+    assert len(timeline["chain_digest"]) == 64
+
+
+def test_step_phase_boundaries_remain_separate_and_ordered(monkeypatch, wired, op):
+    src, required = wired
+    monkeypatch.setattr(runner.pack, "resolve", lambda _handler: _handler_writing(required))
+    cp = _CP()
+    runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp, corr_id="corr")
+    spans = cp.terminal["timeline"]["pod"]["spans"]
+    phases = {span["leg"]: span for span in spans
+              if span.get("step") == "s1" and span["scope"] == "phase"}
+    assert list(phases) == ["bind", "slot_wait", "run", "put"]
+    ordered = [phases[name] for name in ("bind", "slot_wait", "run", "put")]
+    assert all(row["start_mono_ns"] <= row["end_mono_ns"] for row in ordered)
+    assert all(left["end_mono_ns"] <= right["start_mono_ns"]
+               for left, right in zip(ordered, ordered[1:])), phases
+
+
+def test_repeated_handler_legs_keep_each_interval_and_totals(monkeypatch, wired, op):
+    src, required = wired
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.totals: dict[str, float] = {}
+            self.rows: list[dict] = []
+
+        @contextmanager
+        def recording(self):
+            self.totals, self.rows = {}, []
+            yield self.totals
+
+        @contextmanager
+        def leg(self, name: str):
+            start = time.monotonic_ns()
+            yield
+            end = time.monotonic_ns()
+            self.rows.append({"name": name, "start_mono_ns": start, "end_mono_ns": end})
+            self.totals[name] = self.totals.get(name, 0.0) + (end - start) / 1_000_000_000
+
+        def collect(self):
+            return dict(self.totals)
+
+        def collect_intervals(self):
+            return list(self.rows)
+
+    recorder = _Recorder()
+
+    def measured(*, params, inputs, outputs):
+        for _ in range(2):
+            with recorder.leg("connect"):
+                time.sleep(0.003)
+        with recorder.leg("body"):
+            time.sleep(0.002)
+        with recorder.leg("seek_decode"):
+            time.sleep(0.002)
+        with recorder.leg("encode"):
+            outputs[required].write_bytes(b"y")
+
+    monkeypatch.setattr(runner.pack, "resolve", lambda _handler: measured)
+    monkeypatch.setattr(runner.pack, "legs", lambda: recorder)
+    cp = _CP()
+    runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp, corr_id="corr")
+    spans = cp.terminal["timeline"]["pod"]["spans"]
+    connects = [row for row in spans if row["scope"] == "handler_leg" and row["leg"] == "connect"]
+    assert len(connects) == 2, spans
+    assert connects[0]["end_mono_ns"] <= connects[1]["start_mono_ns"]
+    totals = cp.terminal["timings"]["steps"][0]["legs"]
+    observed_connect_s = sum(
+        row["end_mono_ns"] - row["start_mono_ns"] for row in connects) / 1_000_000_000
+    assert totals["connect"] == pytest.approx(observed_connect_s, abs=0.001)
+    assert {row["leg"] for row in spans if row["scope"] == "handler_leg"} >= {
+        "connect", "body", "seek_decode", "encode"}
+
+
+def test_put_timeline_uses_semantic_object_ids_and_contains_no_addresses(monkeypatch, wired, tmp_path, op):
+    src, required = wired
+    target = tmp_path / "durable-output.bin"
+    step = _Step("s1", op.op, src, required)
+    step.outputs[0].url = target.as_uri()
+    monkeypatch.setattr(runner.pack, "resolve", lambda _handler: _handler_writing(required))
+    monkeypatch.setattr(runner.inputcache, "enabled", lambda: False)
+    cp = _CP()
+    runner.run_chain(_Chain([step]), cp, corr_id="corr")
+
+    put = next(span for span in cp.terminal["timeline"]["pod"]["spans"]
+               if span["scope"] == "put_wire")
+    assert put["direction"] == "output" and put["port"] == required and put["index"] == 0
+    assert len(put["object_id"]) == 64 and set(put["object_id"]) <= set("0123456789abcdef")
+    expected = hashlib.sha256(json.dumps(
+        ["j-1", "corr", "s1", "output", required, 0],
+        ensure_ascii=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    assert put["object_id"] == expected
+    assert put["outcome"] == "ok"
+    encoded = json.dumps(cp.terminal["timeline"], sort_keys=True)
+    assert "file:" not in encoded and str(target) not in encoded and "?" not in encoded
 
 
 def test_the_timings_key_is_additive_and_nothing_that_already_crossed_moved(monkeypatch, wired, op):

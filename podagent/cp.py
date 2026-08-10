@@ -124,6 +124,10 @@ class ControlPlane:
                 "result ACK remains ambiguous; durable outbox retains it for replay")
         return accepted
 
+    def timeline_context(self, corr_id: str) -> dict[str, Any]:
+        """Best-effort measurement context for a terminal; absence never changes work success."""
+        return self._stream.timeline_context(corr_id)
+
     def close_stream(self) -> None:
         """Say out loud what was never acknowledged, and let the socket go."""
         self._stream.close()
@@ -274,6 +278,39 @@ class _RetryClock:
 retry = _RetryClock()
 
 
+class _PutTrace:
+    """Repeated PUT attempt intervals for this thread; never contains an address or filesystem path."""
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def reset(self) -> None:
+        self._local.rows = []
+
+    def add(self, *, attempt: int, start_mono_ns: int, end_mono_ns: int,
+            outcome: str, retry_end_mono_ns: int | None = None) -> None:
+        try:
+            row: dict[str, Any] = {
+                "attempt": int(attempt),
+                "wire": {"start_mono_ns": int(start_mono_ns), "end_mono_ns": int(end_mono_ns)},
+                "outcome": str(outcome),
+            }
+            if retry_end_mono_ns is not None:
+                row["retry"] = {
+                    "start_mono_ns": int(start_mono_ns),
+                    "end_mono_ns": int(retry_end_mono_ns),
+                }
+            self._local.rows = [*getattr(self._local, "rows", []), row]
+        except Exception:  # noqa: BLE001 - measurement may not fail a transfer
+            pass
+
+    def collect(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in getattr(self._local, "rows", [])]
+
+
+put_trace = _PutTrace()
+
+
 def _upload_content_type(src: Path) -> str:
     """Infer the small closed set of browser media types from bytes, not the workspace filename.
 
@@ -303,8 +340,11 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
     cost one part instead of the object; until that mint exists the waste is at least MEASURED, not unknown."""
     local = _file_path(put_url)
     if local is not None:
+        t0_ns = time.monotonic_ns()
         Path(local).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, local)
+        put_trace.add(
+            attempt=1, start_mono_ns=t0_ns, end_mono_ns=time.monotonic_ns(), outcome="ok")
         return
     size = src.stat().st_size
     if content_type is None:
@@ -316,6 +356,7 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
             _log(f"upload retry {attempt + 1}/{_XFER_ATTEMPTS} for {src.name}: re-sending all {size} bytes "
                  f"from 0 ({resent} bytes re-sent so far, no resume on a presigned PUT)")
         t_attempt = time.monotonic()
+        t_attempt_ns = time.monotonic_ns()
         try:
             with src.open("rb") as f:
                 r = _store.put(
@@ -324,10 +365,20 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
                     timeout=max(_TIMEOUT, size // (1 << 20)),
                 )
             r.raise_for_status()
+            put_trace.add(
+                attempt=attempt + 1, start_mono_ns=t_attempt_ns,
+                end_mono_ns=time.monotonic_ns(), outcome="ok")
             return
         except requests.RequestException:
+            wire_end_ns = time.monotonic_ns()
             if attempt + 1 == _XFER_ATTEMPTS:
                 retry.add(time.monotonic() - t_attempt)
+                put_trace.add(
+                    attempt=attempt + 1, start_mono_ns=t_attempt_ns,
+                    end_mono_ns=wire_end_ns, retry_end_mono_ns=time.monotonic_ns(), outcome="error")
                 raise
             time.sleep(2**attempt)
             retry.add(time.monotonic() - t_attempt)
+            put_trace.add(
+                attempt=attempt + 1, start_mono_ns=t_attempt_ns,
+                end_mono_ns=wire_end_ns, retry_end_mono_ns=time.monotonic_ns(), outcome="retry")

@@ -3,7 +3,7 @@
   "$id": "https://monty.fast/contracts/pod_stream_server.schema.json",
   "title": "PodStreamServerFrame",
   "description": "Strict control-plane->pod frame on the sole pod transport.",
-  "x-contract-version": 11,
+  "x-contract-version": 12,
   "oneOf": [
     {"$ref": "#/$defs/ackFrame"},
     {"$ref": "#/$defs/jobFrame"}
@@ -15,15 +15,19 @@
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9_.-]+$"
     },
+    "attemptId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "unixNs": {"type": "integer", "minimum": 0},
     "ackFrame": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "stream_id", "seq", "status"],
+      "required": ["type", "stream_id", "seq", "status", "server_recv_unix_ns", "server_send_unix_ns"],
       "properties": {
         "type": {"const": "ack"},
         "stream_id": {"$ref": "#/$defs/streamId"},
         "seq": {"type": "integer", "minimum": 1},
         "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "server_recv_unix_ns": {"$ref": "#/$defs/unixNs"},
+        "server_send_unix_ns": {"$ref": "#/$defs/unixNs"},
         "duplicate": {"type": "boolean"},
         "error": {"type": "string"}
       }
@@ -31,11 +35,28 @@
     "jobFrame": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "delivery_id", "job"],
+      "required": ["type", "delivery_id", "attempt_id", "stream_id", "seq", "replayed", "timeline", "job"],
       "properties": {
         "type": {"const": "job"},
         "delivery_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"$ref": "#/$defs/attemptId"},
+        "stream_id": {"$ref": "#/$defs/streamId"},
+        "seq": {"type": "integer", "minimum": 1},
+        "replayed": {"type": "boolean"},
+        "timeline": {"$ref": "#/$defs/jobTimeline"},
         "job": {"$ref": "#/$defs/podJob"}
+      }
+    },
+    "jobTimeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enqueue_min_unix_ns", "enqueue_max_unix_ns", "claim_min_unix_ns", "claim_max_unix_ns", "socket_write_min_unix_ns"],
+      "properties": {
+        "enqueue_min_unix_ns": {"$ref": "#/$defs/unixNs"},
+        "enqueue_max_unix_ns": {"$ref": "#/$defs/unixNs"},
+        "claim_min_unix_ns": {"$ref": "#/$defs/unixNs"},
+        "claim_max_unix_ns": {"$ref": "#/$defs/unixNs"},
+        "socket_write_min_unix_ns": {"$ref": "#/$defs/unixNs"}
       }
     },
     "podJob": {
@@ -46,7 +67,7 @@
         "type": {"enum": ["infer", "render", "ops"]},
         "session_id": {"type": "string", "minLength": 1},
         "corr_id": {"type": "string", "minLength": 1},
-        "target_worker_id": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_.:-]+$"},
+        "target_worker_id": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_.:-]+$", "description": "Control-plane-only warm-up routing fence. The API strips it before the WebSocket payload; a fleet worker may claim the stored envelope only when its identity matches."},
         "request": {"type": "object"},
         "spec": {"type": "object"},
         "chain": {"type": "object"}

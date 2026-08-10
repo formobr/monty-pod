@@ -31,8 +31,12 @@ error. It has no version const of its own — `request`/`spec` each pin their ow
 
 Transport conventions:
 
-- `/pod/stream` — the only pod↔control-plane channel. Server frames are typed `job` or `ack`;
-  client frames are typed `event` or `result`, each identified by `stream_id` + monotonic `seq`.
+- `/pod/stream` — the only pod↔control-plane channel. Server frames are typed v12 `job` or `ack`;
+  client frames are typed `event`, `result`, or `job_ack`, each identified by `stream_id` + monotonic `seq`.
+- Every client wire attempt carries `client_send_mono_ns`; every ACK carries control-plane
+  `server_recv_unix_ns`/`server_send_unix_ns`. A pushed job names its Redis `attempt_id`, replay flag and
+  enqueue/claim/pre-write bounds; `job_ack` echoes that exact attempt with the pod receive boundary.
+  These are bounded clock evidence, never permission to treat pod monotonic time as Unix time.
 - Auth — `Authorization: Bearer <JOB_TOKEN>` on the WebSocket handshake. The pod's entire runtime config
   is `CP_URL` + `JOB_TOKEN` (env); the pod dials out only, nothing dials in.
 - Client frames are fsynced before send and retired only by a matching 2xx ACK. A 4xx is moved to

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """The pod's single bidirectional control-plane channel.
 
-Client frames are a closed union::
+Durable client frames are a closed union; each wire attempt adds
+``client_send_mono_ns`` immediately before its socket write::
 
     {"type":"event",  "stream_id":str, "seq":int, "event":object}
-    {"type":"result", "stream_id":str, "seq":int, "result":object}
+    {"type":"result", "stream_id":str, "seq":int, "attempt_id":str, "result":object}
+    {"type":"job_ack","stream_id":str, "seq":int, "job_ack":object}
 
 Every frame is appended to a disk outbox before any socket write.  One sender
 owns frame order and may have a bounded window of writes awaiting ACKs.  A
@@ -13,7 +15,7 @@ deterministic 4xx moves it to the durable dead-letter.  Reconnects replay only
 the unacknowledged suffix with the original identities, and process restarts
 cannot turn completed work into silence.
 
-Server frames are also closed: typed ``ack`` and ``job`` objects.  Treating an
+Server frames are also closed: typed ``ack`` and v12 claim-attributed ``job`` objects. Treating an
 unknown object as an ACK is a protocol error, because retiring the wrong
 terminal desynchronizes the ordered durable stream.
 """
@@ -32,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from .sanitize import safe_endpoint, safe_error, safe_text
-from .stream_models import StreamAck, StreamJob, event_payload, result_payload
+from .stream_models import StreamAck, StreamJob, event_payload, job_ack_payload, result_payload
 
 try:  # pragma: no cover - import shape is exercised through the no-module branch
     import websockets.sync.client as _ws_client
@@ -50,7 +52,7 @@ BACKGROUND_RETRY_S = float(os.environ.get("POD_STREAM_BACKGROUND_RETRY_S", "5"))
 ACK_WINDOW = min(256, max(1, int(os.environ.get("POD_STREAM_ACK_WINDOW", "32"))))
 DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
-_STATE_VERSION = 2
+_STATE_VERSION = 3
 _ADMISSION_WAKE = object()
 
 
@@ -107,6 +109,10 @@ class EventStream:
         self._claimed_ids: set[str] = set()
         self._ack_waiters: dict[tuple[str, int], threading.Event] = {}
         self._acks: dict[tuple[str, int], dict[str, Any]] = {}
+        self._wire_attempts: dict[tuple[str, int], int] = {}
+        self._wire_sends: dict[tuple[str, int], tuple[int, int]] = {}
+        self._clock_samples: list[dict[str, Any]] = []
+        self._delivery_meta: dict[str, dict[str, Any]] = {}
         self._delivery_waiters: dict[tuple[str, int], threading.Event] = {}
         self._delivery_outcomes: dict[tuple[str, int], bool | BaseException] = {}
         self._admission_error: TransportUnhealthy | None = None
@@ -120,7 +126,7 @@ class EventStream:
         # A process incarnation owns one new stream id. Frames restored from disk keep THEIR original id/seq;
         # mixing an old identity into the new stream makes server-side dedupe unable to identify a replay.
         self._stream_id, self._next_seq = uuid.uuid4().hex, 1
-        self._outbox, self._rejected, self._inbox = self._load()
+        self._outbox, self._rejected, self._inbox, self._delivery_meta = self._load()
         if self._rejected:
             self._admission_error = TransportUnhealthy(
                 "a deterministic rejected verdict remains in durable dead-letter")
@@ -155,9 +161,11 @@ class EventStream:
         if not isinstance(frame, dict):
             raise ProtocolError("outbox frame is not an object")
         kind = frame.get("type")
-        if kind not in ("event", "result"):
-            raise ProtocolError(f"outbox frame type must be event|result, got {kind!r}")
+        if kind not in ("event", "result", "job_ack"):
+            raise ProtocolError(f"outbox frame type must be event|result|job_ack, got {kind!r}")
         keys = {"type", "stream_id", "seq", kind}
+        if kind == "result":
+            keys.add("attempt_id")
         if set(frame) != keys:
             raise ProtocolError(f"{kind} frame keys must be {sorted(keys)}, got {sorted(frame)}")
         if (not isinstance(frame.get("stream_id"), str) or not frame["stream_id"]
@@ -167,27 +175,39 @@ class EventStream:
         seq = frame.get("seq")
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
             raise ProtocolError(f"outbox seq must be a positive integer, got {seq!r}")
+        if kind == "result" and re.fullmatch(r"[0-9a-f]{32}", str(frame.get("attempt_id") or "")) is None:
+            raise ProtocolError("result frame carries no v12 attempt_id")
         checked = dict(frame)
-        checked[kind] = event_payload(frame.get(kind)) if kind == "event" else result_payload(frame.get(kind))
+        if kind == "event":
+            checked[kind] = event_payload(frame.get(kind))
+        elif kind == "result":
+            checked[kind] = result_payload(frame.get(kind))
+        else:
+            checked[kind] = job_ack_payload(frame.get(kind))
         return checked
 
-    def _load(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    def _load(self) -> tuple[
+            list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+    ]:
         try:
             raw = json.loads(self._path.read_text())
         except FileNotFoundError:
-            return [], [], {}
+            return [], [], {}, {}
         except (OSError, ValueError) as e:
             raise RuntimeError(
                 f"durable pod state {self._path} is unreadable; refusing to discard it: {safe_error(e)}") from e
-        if not isinstance(raw, dict) or set(raw) != {"version", "frames", "rejected", "inbox"}:
+        if not isinstance(raw, dict) or set(raw) != {
+                "version", "frames", "rejected", "inbox", "deliveries"}:
             raise RuntimeError(f"durable pod outbox {self._path} has an unknown shape; refusing to discard it")
         if raw.get("version") != _STATE_VERSION:
             raise RuntimeError(f"durable pod outbox version {raw.get('version')!r} is unsupported")
         frames = raw.get("frames")
         rejected = raw.get("rejected")
         inbox = raw.get("inbox")
-        if not isinstance(frames, list) or not isinstance(rejected, list) or not isinstance(inbox, dict):
-            raise RuntimeError("durable pod state frames/rejected/inbox have invalid container types")
+        deliveries = raw.get("deliveries")
+        if (not isinstance(frames, list) or not isinstance(rejected, list)
+                or not isinstance(inbox, dict) or not isinstance(deliveries, dict)):
+            raise RuntimeError("durable pod state frames/rejected/inbox/deliveries have invalid containers")
         checked = [self._validate_client_frame(f) for f in frames]
         identities = [(str(f["stream_id"]), int(f["seq"])) for f in checked]
         if len(identities) != len(set(identities)):
@@ -198,9 +218,25 @@ class EventStream:
             self._validate_client_frame(row["frame"])
         checked_inbox: dict[str, dict[str, Any]] = {}
         for delivery_id, job in inbox.items():
+            delivery = deliveries.get(delivery_id)
+            if not isinstance(delivery, dict):
+                raise RuntimeError(f"durable pod inbox {delivery_id!r} has no delivery identity")
             decoded = StreamJob.model_validate(
-                {"type": "job", "delivery_id": delivery_id, "job": job})
+                {
+                    "type": "job",
+                    "delivery_id": delivery_id,
+                    "attempt_id": delivery.get("attempt_id"),
+                    "stream_id": delivery.get("pod_clock_id"),
+                    "seq": delivery.get("delivery_seq"),
+                    "replayed": delivery.get("replayed"),
+                    "timeline": {key: delivery.get(key) for key in (
+                        "enqueue_min_unix_ns", "enqueue_max_unix_ns", "claim_min_unix_ns",
+                        "claim_max_unix_ns", "socket_write_min_unix_ns")},
+                    "job": job,
+                })
             checked_inbox[delivery_id] = decoded.job.model_dump(exclude_none=True, mode="json")
+        if set(deliveries) != set(checked_inbox):
+            raise RuntimeError("durable pod deliveries do not exactly match inbox identities")
         result_corrs = {
             str(f["result"]["corr_id"]) for f in checked if f["type"] == "result"
         } | {
@@ -211,7 +247,8 @@ class EventStream:
         if overlap:
             raise RuntimeError(
                 f"durable pod state repeats completed delivery identity: {sorted(overlap)}")
-        return checked, list(rejected), checked_inbox
+        return checked, list(rejected), checked_inbox, {
+            str(key): dict(value) for key, value in deliveries.items()}
 
     def _persist_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,6 +257,7 @@ class EventStream:
             "frames": self._outbox,
             "rejected": self._rejected,
             "inbox": self._inbox,
+            "deliveries": self._delivery_meta,
         }
         tmp = self._path.with_name(f".{self._path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
@@ -259,9 +297,18 @@ class EventStream:
             for row in self._rejected if row["frame"]["type"] == "result"
         }
 
-    def _append(self, kind: str, payload: dict[str, Any], *, wait: bool) -> tuple[int, threading.Event | None]:
+    def _append(
+            self, kind: str, payload: dict[str, Any], *, wait: bool, attempt_id: str | None = None,
+    ) -> tuple[int, threading.Event | None]:
         try:
-            normalized = event_payload(payload) if kind == "event" else result_payload(payload)
+            if kind == "event":
+                normalized = event_payload(payload)
+            elif kind == "result":
+                normalized = result_payload(payload)
+            elif kind == "job_ack":
+                normalized = job_ack_payload(payload)
+            else:
+                raise ProtocolError(f"unknown client frame kind {kind!r}")
         except BaseException as e:
             error = TransportUnhealthy(f"invalid {kind} payload: {safe_error(e)}")
             with self._work:
@@ -277,6 +324,8 @@ class EventStream:
                 raise error
             seq = self._next_seq
             frame = {"type": kind, "stream_id": self._stream_id, "seq": seq, kind: normalized}
+            if kind == "result":
+                frame["attempt_id"] = attempt_id
             self._validate_client_frame(frame)
             self._outbox.append(frame)
             self._next_seq += 1
@@ -284,11 +333,14 @@ class EventStream:
             if waiter is not None:
                 self._delivery_waiters[(self._stream_id, seq)] = waiter
             removed_job = self._inbox.pop(corr_id, None) if kind == "result" else None
+            removed_delivery = self._delivery_meta.pop(corr_id, None) if kind == "result" else None
             try:
                 self._persist_locked()  # append and matching inbox retirement are ONE durable transition
             except BaseException as e:
                 if removed_job is not None:
                     self._inbox[corr_id] = removed_job
+                if removed_delivery is not None:
+                    self._delivery_meta[corr_id] = removed_delivery
                 self._outbox.pop()
                 self._next_seq -= 1
                 self._delivery_waiters.pop((self._stream_id, seq), None)
@@ -326,8 +378,46 @@ class EventStream:
 
     def send_result(self, payload: dict[str, Any], *, wait: bool = True) -> bool:
         """Persist one correlated result, then optionally wait until its strict ACK."""
-        seq, waiter = self._append("result", payload, wait=wait)
+        payload = dict(payload)
+        corr_id = str(payload.get("corr_id") or "")
+        with self._state:
+            meta = self._delivery_meta.get(corr_id)
+        attempt_id = str(payload.pop("attempt_id", "") or (meta or {}).get("attempt_id") or "")
+        seq, waiter = self._append("result", payload, wait=wait, attempt_id=attempt_id)
         return True if waiter is None else self._await_delivery(self._stream_id, seq, waiter)
+
+    def send_job_ack(self, payload: dict[str, Any], *, wait: bool = True) -> bool:
+        """Persist the pod receipt for one exact claim attempt and wait for its clock-bearing ACK."""
+        seq, waiter = self._append("job_ack", payload, wait=wait)
+        return True if waiter is None else self._await_delivery(self._stream_id, seq, waiter)
+
+    def timeline_context(self, corr_id: str) -> dict[str, Any]:
+        """Claim/delivery identity plus exact clock-offset bounds known before the terminal is built."""
+        with self._state:
+            delivery = self._delivery_meta.get(corr_id)
+            samples = [dict(row) for row in self._clock_samples
+                       if row["pod_clock_id"] == self._stream_id]
+        reasons: list[str] = []
+        if delivery is None:
+            reasons.append("delivery_context_missing")
+        if not samples:
+            reasons.append("clock_sync_missing")
+        return {
+            "complete": not reasons,
+            "incomplete_reasons": reasons,
+            "pod_clock_id": self._stream_id,
+            **({"delivery": dict(delivery), "attempt_id": delivery["attempt_id"]}
+               if delivery is not None else {}),
+            "clock_sync": samples,
+        }
+
+    def _emit_job_ack(self, delivery: dict[str, Any]) -> None:
+        self.send_job_ack({
+            "delivery_id": delivery["delivery_id"],
+            "corr_id": delivery["delivery_id"],
+            "attempt_id": delivery["attempt_id"],
+            "client_recv_mono_ns": delivery["client_recv_mono_ns"],
+        }, wait=False)
 
     def _await_delivery(self, stream_id: str, seq: int, waiter: threading.Event) -> bool:
         # Sender normally settles a synchronous waiter. This derived outer wall also covers a bug or an
@@ -461,6 +551,8 @@ class EventStream:
                         raise TransportUnhealthy(
                             f"durable retire failed: {safe_error(e)}") from e
                 outcome = True
+                self._wire_attempts.pop(key, None)
+                self._wire_sends.pop(key, None)
                 if (isinstance(self._admission_error, DeliveryPending)
                         and not self._outbox and self._storage_error is None):
                     self._admission_error = None
@@ -482,6 +574,8 @@ class EventStream:
                         raise TransportUnhealthy(
                             f"durable dead-letter move failed: {safe_error(e)}") from e
                 outcome = FrameRejected(frame, ack or {})
+                self._wire_attempts.pop(key, None)
+                self._wire_sends.pop(key, None)
                 self._latch_locked(outcome)
             else:
                 # Retry exhaustion is not a verdict. Keep the frame durably at the head and continue bounded
@@ -564,7 +658,14 @@ class EventStream:
                 # The sender loop is the sole writer. A timed-out daemon may remain stuck in a broken old
                 # connection, so a process-global write lock here would also prevent the fresh socket retry.
                 for frame in frames:
-                    conn.send(json.dumps(frame, ensure_ascii=False, separators=(",", ":")))
+                    key = self._frame_key(frame)
+                    send_ns = time.monotonic_ns()
+                    with self._state:
+                        wire_attempt = self._wire_attempts.get(key, 0) + 1
+                        self._wire_attempts[key] = wire_attempt
+                        self._wire_sends[key] = (send_ns, wire_attempt)
+                    wire = {**frame, "client_send_mono_ns": send_ns}
+                    conn.send(json.dumps(wire, ensure_ascii=False, separators=(",", ":")))
             except BaseException as e:  # noqa: BLE001 - watchdog owns failure and durable replay
                 write_errors.append(e)
             finally:
@@ -612,8 +713,34 @@ class EventStream:
                 raise ProtocolError(f"ACK {stream_id}:{seq} has no in-flight frame")
         return checked
 
+    def _record_clock_sample_locked(
+            self, key: tuple[str, int], ack: dict[str, Any], client_recv_mono_ns: int) -> None:
+        sent = self._wire_sends.get(key)
+        if sent is None:
+            raise ProtocolError(f"ACK {key[0]}:{key[1]} has no client send boundary")
+        client_send_mono_ns, wire_attempt = sent
+        theta_min = int(ack["server_send_unix_ns"]) - client_recv_mono_ns
+        theta_max = int(ack["server_recv_unix_ns"]) - client_send_mono_ns
+        if theta_max < theta_min:
+            raise ProtocolError(
+                f"ACK {key[0]}:{key[1]} produces reversed clock-offset bounds")
+        self._clock_samples.append({
+            "pod_clock_id": key[0],
+            "seq": key[1],
+            "wire_attempt": wire_attempt,
+            "client_send_mono_ns": client_send_mono_ns,
+            "server_recv_unix_ns": int(ack["server_recv_unix_ns"]),
+            "server_send_unix_ns": int(ack["server_send_unix_ns"]),
+            "client_recv_mono_ns": client_recv_mono_ns,
+            "theta_min_ns": theta_min,
+            "theta_max_ns": theta_max,
+        })
+        # The terminal only needs nearby anchors; bounding this prevents a long-lived pod from retaining
+        # transport history forever. Exact frame identity remains in every retained sample.
+        del self._clock_samples[:-64]
+
     @staticmethod
-    def _raw_job_identity(frame: Any) -> tuple[str, str, str, str]:
+    def _raw_job_identity(frame: Any) -> tuple[str, str, str, str, str]:
         """Extract the CP address before strict Python decoding.
 
         Go may have durably claimed an envelope which is addressable by the
@@ -625,6 +752,7 @@ class EventStream:
         outer = frame if isinstance(frame, dict) else {}
         raw = outer.get("job") if isinstance(outer.get("job"), dict) else {}
         delivery = str(outer.get("delivery_id") or "")
+        attempt = str(outer.get("attempt_id") or "")
         corr = str(raw.get("corr_id") or delivery or "")
         session = str(raw.get("session_id") or "")
         job_id = str(raw.get("job_id") or "")
@@ -633,7 +761,7 @@ class EventStream:
             if isinstance(block, dict) and block.get("job_id"):
                 job_id = str(block["job_id"])
                 break
-        return delivery, job_id, session, corr
+        return delivery, attempt, job_id, session, corr
 
     def _reject_invalid_job(self, frame: Any, error: BaseException) -> bool:
         """Durably terminalize an addressed-but-Python-invalid server job.
@@ -644,7 +772,7 @@ class EventStream:
         with a fabricated value; such a frame is logged and the CP's protocol
         guard remains authoritative.
         """
-        delivery, job_id, session, corr = self._raw_job_identity(frame)
+        delivery, attempt, job_id, session, corr = self._raw_job_identity(frame)
         detail = f"invalid server job frame: {safe_error(error)}"
         event: dict[str, Any] = {
             "stage": "dispatch",
@@ -670,6 +798,7 @@ class EventStream:
                     "job_id": job_id,
                     "session_id": session,
                     "corr_id": corr,
+                    "attempt_id": attempt,
                     "stage": "dispatch",
                     "status": "error",
                     "error": detail,
@@ -679,7 +808,9 @@ class EventStream:
             _log(f"invalid job terminal could not be persisted ({safe_error(emit_error)})")
         return False
 
-    def _accept_job(self, frame: dict[str, Any]) -> None:
+    def _accept_job(
+            self, frame: dict[str, Any], *, client_recv_mono_ns: int | None = None,
+    ) -> dict[str, Any] | None:
         try:
             checked = StreamJob.model_validate(frame)
         except BaseException as e:
@@ -690,58 +821,95 @@ class EventStream:
             # the transport below.
             if self._reject_invalid_job(frame, e):
                 _log("invalid addressed job terminalized; keeping stream admission alive")
-                return
+                return None
             error = TransportUnhealthy(f"invalid server job frame: {safe_error(e)}")
             with self._work:
                 self._latch_locked(error)
             raise error from e
         delivery_id = checked.delivery_id
         job = checked.job.model_dump(exclude_none=True, mode="json")
+        received_ns = client_recv_mono_ns or time.monotonic_ns()
+        delivery = {
+            "delivery_id": delivery_id,
+            "attempt_id": checked.attempt_id,
+            "pod_clock_id": checked.stream_id,
+            "delivery_seq": checked.seq,
+            "replayed": checked.replayed,
+            "client_recv_mono_ns": received_ns,
+            **checked.timeline.model_dump(mode="json"),
+        }
         with self._work:
             if delivery_id in self._result_corrs_locked():
                 _log(f"job delivery={delivery_id} deduplicated: durable result already exists")
-                return
+                return delivery
             if delivery_id in self._inbox:
                 if self._inbox[delivery_id] != job:
                     error = TransportUnhealthy(
                         f"job delivery_id {delivery_id!r} was reused with different content")
                     self._latch_locked(error)
                     raise error
-                return
+                previous = self._delivery_meta.get(delivery_id)
+                if previous is not None and previous["attempt_id"] != checked.attempt_id:
+                    error = TransportUnhealthy(
+                        f"job delivery_id {delivery_id!r} changed attempt_id before terminal")
+                    self._latch_locked(error)
+                    raise error
+                # Same attempt on a new socket is an explicit replay, not a second unit of work. Retain the
+                # newest receipt boundary so the ACK reports the delivery that is actually live now.
+                self._delivery_meta[delivery_id] = delivery
+                try:
+                    self._persist_locked()
+                except BaseException as e:
+                    if previous is not None:
+                        self._delivery_meta[delivery_id] = previous
+                    error = TransportUnhealthy(f"durable replay receipt failed: {safe_error(e)}")
+                    self._latch_locked(error, storage=True)
+                    raise error from e
+                return delivery
             # Go replays retained inflight jobs before ACKing our replayed terminal. Ambiguous delivery
             # closes claim admission, not the reader: accepting/deduping the replay keeps the socket alive.
             if (self._admission_error is not None
                     and not isinstance(self._admission_error, DeliveryPending)):
                 raise self._admission_error
             self._inbox[delivery_id] = job
+            self._delivery_meta[delivery_id] = delivery
             try:
                 self._persist_locked()
             except BaseException as e:
                 self._inbox.pop(delivery_id, None)
+                self._delivery_meta.pop(delivery_id, None)
                 error = TransportUnhealthy(f"durable job inbox append failed: {safe_error(e)}")
                 self._latch_locked(error, storage=True)
                 raise error from e
             self._queued_ids.add(delivery_id)
             self._jobs.put(delivery_id)
             self._work.notify_all()
+        return delivery
 
     def _read_loop(self, conn: Any) -> None:
         while True:
             try:
                 raw = conn.recv()
+                client_recv_mono_ns = time.monotonic_ns()
                 decoded = json.loads(raw)
                 if not isinstance(decoded, dict):
                     raise ProtocolError("server frame is not an object")
                 kind = decoded.get("type")
                 if kind == "job":
-                    self._accept_job(decoded)
+                    delivery = self._accept_job(decoded, client_recv_mono_ns=client_recv_mono_ns)
+                    if delivery is not None:
+                        self._emit_job_ack(delivery)
                     continue
                 if kind != "ack":
                     raise ProtocolError(f"unknown server frame type {kind!r}")
+                with self._state:
+                    if self._conn is not conn:
+                        return
                 ack = self._validate_ack(decoded)
                 seq = int(ack["seq"])
                 key = (str(ack["stream_id"]), seq)
                 with self._work:
+                    self._record_clock_sample_locked(key, ack, client_recv_mono_ns)
                     self._acks[key] = ack
                     waiter = self._ack_waiters.get(key)
                     status = int(ack["status"])

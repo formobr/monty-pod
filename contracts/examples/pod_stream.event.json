@@ -2,8 +2,9 @@
   "type": "event",
   "stream_id": "pod-boot-7",
   "seq": 41,
+  "client_send_mono_ns": 4100,
   "event": {
-    "job_id": "job-1",
+    "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
     "session_id": "session-7",
     "corr_id": "corr-41",
     "stage": "ops",
@@ -13,6 +14,7 @@
     "phase": "put",
     "outcome": "ok",
     "capacity": {"rank_lanes": 6, "fetch_workers": 24},
+    "timeline": {"pod_run_ns": 3000},
     "ts": "2026-08-07T10:15:30Z"
   }
 }

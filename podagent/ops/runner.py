@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import contextvars
+import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -29,7 +31,7 @@ from typing import Any, Final
 from urllib.parse import urlparse
 
 from ..artifact import log
-from ..cp import download, retry, upload
+from ..cp import download, put_trace, retry, upload
 from ..sanitize import safe_error
 from . import inputcache, pack, registry, resultcache
 
@@ -415,6 +417,10 @@ class StepTiming:
     outputs: list[dict[str, Any]] = field(default_factory=list)
     legs: dict[str, float] = field(default_factory=dict)
     cache_hit: bool = False
+    intervals: dict[str, dict[str, int]] = field(default_factory=dict)
+    handler_intervals: list[dict[str, Any]] = field(default_factory=list)
+    puts: list[dict[str, Any]] = field(default_factory=list)
+    incomplete_reasons: list[str] = field(default_factory=list)
 
     @property
     def seconds(self) -> float:
@@ -444,18 +450,55 @@ class StepTiming:
         }
         return out
 
+    def timeline_wire(self, *, job_id: str, corr_id: str) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        for put in self.puts:
+            port, index = str(put["port"]), int(put["index"])
+            semantic = json.dumps(
+                [job_id, corr_id, self.step_id, "output", port, index],
+                ensure_ascii=True, separators=(",", ":"),
+            ).encode()
+            rows.append({
+                **put,
+                "object_id": hashlib.sha256(semantic).hexdigest(),
+            })
+        return {
+            "id": self.step_id,
+            "op": self.op,
+            "intervals": dict(self.intervals),
+            "handler_legs": [dict(row) for row in self.handler_intervals],
+            "puts": rows,
+            "complete": not self.incomplete_reasons,
+            "incomplete_reasons": sorted(set(self.incomplete_reasons)),
+        }
 
-def _collect_legs(recorder: Any) -> dict[str, float]:
+
+def _collect_legs(recorder: Any) -> tuple[dict[str, float], list[dict[str, Any]], bool]:
     """Whatever the pack's recorder gathered for the call that just returned. Best-effort by contract: a
     recorder that raises loses its legs and never the step."""
     if recorder is None:
-        return {}
+        return {}, [], False
     try:
         got = recorder.collect()
     except Exception as e:  # noqa: BLE001 — announced; a stopwatch may not break the work it times
         log(f"ops: leg recorder failed ({type(e).__name__}: {e}) — step timed without handler legs")
-        return {}
-    return {str(k): float(v) for k, v in dict(got or {}).items()}
+        return {}, [], False
+    totals = {str(k): float(v) for k, v in dict(got or {}).items()}
+    try:
+        intervals = recorder.collect_intervals()
+    except Exception as e:  # noqa: BLE001 - old/broken recorder only loses placement
+        if not isinstance(e, AttributeError):
+            log(f"ops: leg interval recorder failed ({type(e).__name__}: {e})")
+        return totals, [], not totals
+    checked: list[dict[str, Any]] = []
+    for row in list(intervals or []):
+        checked.append({
+            "name": str(row["name"]),
+            "start_mono_ns": int(row["start_mono_ns"]),
+            "end_mono_ns": int(row["end_mono_ns"]),
+        })
+    observed = {str(row["name"]) for row in checked}
+    return totals, checked, set(totals) <= observed
 
 
 def _moved_outputs(outputs: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
@@ -509,75 +552,87 @@ from byte zero) are sub-legs of `put`, the way `connect`/`body` are sub-legs of 
 """
 
 
-def _upload_one(url: str, path: Path) -> tuple[float, float]:
+def _upload_one(url: str, path: Path) -> tuple[float, float, dict[str, Any]]:
     """ONE object under ONE permit → (permit wait, seconds lost to failed attempts). The acquire is the
     same unbounded one the serial phase had; the transfer inside carries `cp._XFER_DEADLINE_S` per attempt."""
     t0 = time.monotonic()
+    wait_start_ns = time.monotonic_ns()
     with transport_slots():
+        wait_end_ns = time.monotonic_ns()
         waited = time.monotonic() - t0
         retry.reset()
+        put_trace.reset()
         try:
             _upload_with_affinity(url, path)
         finally:
             spent = retry.seconds()
-    return waited, spent
+            attempts = put_trace.collect()
+    return waited, spent, {
+        "wait": {"start_mono_ns": wait_start_ns, "end_mono_ns": wait_end_ns},
+        "attempts": attempts,
+    }
 
 
-def _output_arms(step: Any, outputs: dict[str, Any]) -> list[list[tuple[str, Path, str]]]:
+def _output_arms(step: Any, outputs: dict[str, Any]) -> list[list[tuple[str, Path, str, str, int]]]:
     """One arm per PORT — never per element (PUT_FANOUT_WHY). A binding with no url crosses nothing and an
     absent optional output weighs nothing; a LIST port's `what` names its index (ARITY_WHY), a single one
     stays unnamed so its refusal reaches the caller exactly as the serial phase raised it."""
-    arms: list[list[tuple[str, Path, str]]] = []
+    arms: list[list[tuple[str, Path, str, str, int]]] = []
     for b in step.outputs:
         if b.url is not None:
             if outputs[b.port].exists():
-                arms.append([(b.url, outputs[b.port], "")])
+                arms.append([(b.url, outputs[b.port], "", str(b.port), 0)])
         elif b.urls is not None:
-            arms.append([(url, path, f"{str(b.port)!r}[{i}] of {len(b.urls)}")
+            arms.append([(url, path, f"{str(b.port)!r}[{i}] of {len(b.urls)}", str(b.port), i)
                          for i, (path, url) in enumerate(zip(outputs[b.port], b.urls)) if path.exists()])
     return [arm for arm in arms if arm]
 
 
-def _upload_arm(step_id: str, arm: list[tuple[str, Path, str]]) -> tuple[float, float]:
+def _upload_arm(
+        step_id: str, arm: list[tuple[str, Path, str, str, int]],
+) -> tuple[float, float, list[dict[str, Any]]]:
     """A port's objects, in order, stopping at the first refusal: an address the store refused three times
     with backoff will refuse the next one too, and a rented box may not spend its lease proving it."""
     waited = retried = 0.0
-    for i, (url, path, what) in enumerate(arm):
+    traces: list[dict[str, Any]] = []
+    for i, (url, path, what, port, index) in enumerate(arm):
         try:
-            one_wait, one_retry = _upload_one(url, path)
+            one_wait, one_retry, trace = _upload_one(url, path)
         except Exception as exc:
             if not what:
                 raise
             raise ChainError(f"step {step_id!r}: output {what} would not upload ({safe_error(exc)}); "
                              f"{i} element(s) before it did land") from exc
         waited, retried = max(waited, one_wait), retried + one_retry
-    return waited, retried
+        traces.append({"direction": "output", "port": port, "index": index, **trace})
+    return waited, retried, traces
 
 
-def _upload_outputs(step: Any, outputs: dict[str, Any]) -> tuple[float, float]:
+def _upload_outputs(step: Any, outputs: dict[str, Any]) -> tuple[float, float, list[dict[str, Any]]]:
     """A step's PORTS out concurrently → (worst permit wait, retry seconds) (PUT_FANOUT_WHY). Every arm is
     joined, failure included: unwinding while a transfer still reads the workspace deletes it underneath."""
     arms = _output_arms(step, outputs)
     if not arms:
-        return 0.0, 0.0
+        return 0.0, 0.0, []
     if len(arms) == 1:
         return _upload_arm(str(step.id), arms[0])
     # One thread per PORT, and the permit is the only bound: sizing the pool by the budget too would
     # serialise arms without ever booking the queueing as `put_wait`.
-    waits, retries, failed = [0.0], [0.0], []
+    waits, retries, traces, failed = [0.0], [0.0], [], []
     with cf.ThreadPoolExecutor(max_workers=len(arms), thread_name_prefix="ops-put") as ex:
         futures = [ex.submit(_upload_arm, str(step.id), arm) for arm in arms]
         for fut in futures:
             try:
-                waited, spent = fut.result()
+                waited, spent, rows = fut.result()
             except Exception as exc:
                 failed.append(exc)
             else:
                 waits.append(waited)
                 retries.append(spent)
+                traces.extend(rows)
     if failed:
         raise failed[0]
-    return max(waits), sum(retries)
+    return max(waits), sum(retries), traces
 
 
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
@@ -630,6 +685,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     # hung in upload are indistinguishable until a terminal that a hung chain can never produce.
     live("bind_started")
     t_bind = time.monotonic()
+    bind_start_ns = time.monotonic_ns()
     try:
         with transport_slots():
             inputs = _bind_inputs(step, op, ws, produced)
@@ -637,6 +693,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         live("bind_error", started=t_bind, exc=exc)
         raise
     timing.bind_s = time.monotonic() - t_bind
+    timing.intervals["bind"] = {
+        "start_mono_ns": bind_start_ns, "end_mono_ns": time.monotonic_ns()}
     out_dir = ws.step_dir(step.id)
     declared_out = {p.id: p for p in op.outputs}
     outputs = _bind_outputs(step, op, out_dir)
@@ -645,6 +703,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     recorder = pack.legs()
     live("slot_wait_started", timings={"bind_s": timing.bind_s})
     slot_ready = time.monotonic()
+    slot_start_ns = time.monotonic_ns()
     # THE handler call. `LocalBackend` makes this exact call in-process on the origin machine; here the
     # pod makes it. ONE handler, two transports — parity is structural, not tested into existence. Note
     # what the handler is NOT given: no URL, no credential, no control-plane handle. It sees typed params
@@ -656,15 +715,21 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     try:
         with handler_slots(op):
             timing.slot_wait_s = time.monotonic() - slot_ready
+            timing.intervals["slot_wait"] = {
+                "start_mono_ns": slot_start_ns, "end_mono_ns": time.monotonic_ns()}
             live("run_started", timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
             run_announced = True
             t0 = time.monotonic()
+            run_start_ns = time.monotonic_ns()
             if recorder is not None:
                 with recorder.recording():
                     timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
-                timing.legs = _collect_legs(recorder)
+                timing.legs, timing.handler_intervals, placed = _collect_legs(recorder)
+                if not placed:
+                    timing.incomplete_reasons.append("handler_leg_intervals_missing")
             else:
                 timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
+                timing.incomplete_reasons.append("handler_recorder_missing")
     except BaseException as exc:
         # If the durable `step_started` append itself failed, do not try another append and mask the transport
         # refusal; work has not started, and main must stop before paid work can go silent.
@@ -674,6 +739,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         raise
     dt = time.monotonic() - t0
     timing.run_s = dt
+    timing.intervals["run"] = {
+        "start_mono_ns": run_start_ns, "end_mono_ns": time.monotonic_ns()}
 
     for port, path in outputs.items():
         for one in (path if isinstance(path, list) else [path]):
@@ -685,12 +752,17 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     # Only NOW does anything leave the box, and only for bindings that named a url.
     live("upload_started", timings={"run_s": timing.run_s})
     t_put = time.monotonic()
+    put_start_ns = time.monotonic_ns()
     try:
-        timing.put_wait_s, timing.put_retry_s = _upload_outputs(step, outputs)
+        timing.put_wait_s, timing.put_retry_s, timing.puts = _upload_outputs(step, outputs)
     except BaseException as exc:
         live("upload_error", started=t_put, exc=exc)
         raise
     timing.put_s = time.monotonic() - t_put
+    timing.intervals["put"] = {
+        "start_mono_ns": put_start_ns, "end_mono_ns": time.monotonic_ns()}
+    if any(not row.get("attempts") for row in timing.puts):
+        timing.incomplete_reasons.append("put_attempt_intervals_missing")
     # LAST, and only on the success road: a step that raised delivered nothing, and a duration booked for
     # work that did not land is the kind of number that makes a ledger worse than none.
     if sink is not None:
@@ -748,6 +820,136 @@ def preflight_chain(chain: Any) -> None:
                     f"LIST port — a binding cannot say which of its files to read (ARITY_WHY)")
 
 
+def _chain_digest(chain: Any) -> str:
+    """Digest only DAG shape and semantic port names; never bindings, params, URLs, paths or query data."""
+    shape = [{
+        "id": str(step.id),
+        "op": str(step.op),
+        "needs": sorted(str(value) for value in step.needs),
+        "inputs": [{
+            "port": str(binding.port),
+            "from_step": str(binding.from_step) if getattr(binding, "from_step", None) is not None else None,
+            "from_port": str(binding.from_port) if getattr(binding, "from_port", None) is not None else None,
+            "external": getattr(binding, "url", None) is not None or getattr(binding, "path", None) is not None,
+        } for binding in step.inputs],
+        "outputs": [{
+            "port": str(binding.port),
+            "many": binding.urls is not None,
+            "durable": binding.url is not None or binding.urls is not None,
+        } for binding in step.outputs],
+    } for step in chain.steps]
+    encoded = json.dumps(shape, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _timeline_spans(
+        *, pod_clock_id: str | None, chain_start_ns: int, chain_end_ns: int,
+        steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flatten nested measurement into independently placeable, explicitly parented intervals."""
+    clock = str(pod_clock_id or "")
+    spans: list[dict[str, Any]] = [{
+        "span_id": "chain",
+        "scope": "chain",
+        "lane": "pod",
+        "op": "ops",
+        "leg": "chain",
+        "pod_clock_id": clock,
+        "start_mono_ns": chain_start_ns,
+        "end_mono_ns": chain_end_ns,
+    }]
+    handler_lanes = {
+        "connect": "transport", "body": "transport",
+        "seek_decode": "compute", "encode": "compute",
+    }
+    phase_lanes = {
+        "bind": "transport", "slot_wait": "scheduler", "run": "compute", "put": "transport"}
+    for step in steps:
+        sid, op = str(step["id"]), str(step["op"])
+        for leg, interval in step["intervals"].items():
+            spans.append({
+                "span_id": f"step:{sid}:{leg}",
+                "scope": "phase",
+                "lane": phase_lanes[leg],
+                "parent": "chain",
+                "step": sid,
+                "op": op,
+                "leg": leg,
+                "pod_clock_id": clock,
+                **interval,
+            })
+        occurrences: dict[str, int] = {}
+        for interval in step["handler_legs"]:
+            leg = str(interval["name"])
+            ordinal = occurrences.get(leg, 0)
+            occurrences[leg] = ordinal + 1
+            spans.append({
+                "span_id": f"step:{sid}:handler:{leg}:{ordinal}",
+                "scope": "handler_leg",
+                "lane": handler_lanes.get(leg, "compute"),
+                "parent": f"step:{sid}:run",
+                "step": sid,
+                "op": op,
+                "leg": leg,
+                "pod_clock_id": clock,
+                "start_mono_ns": int(interval["start_mono_ns"]),
+                "end_mono_ns": int(interval["end_mono_ns"]),
+            })
+        for put in step["puts"]:
+            object_id = str(put["object_id"])
+            object_fields = {
+                "object_id": object_id,
+                "direction": str(put["direction"]),
+                "port": str(put["port"]),
+                "index": int(put["index"]),
+            }
+            wait = put["wait"]
+            spans.append({
+                "span_id": f"step:{sid}:put:{object_id}:wait",
+                "scope": "put_wait",
+                "lane": "transport_wait",
+                "parent": f"step:{sid}:put",
+                "step": sid,
+                "op": op,
+                "leg": "wait",
+                "pod_clock_id": clock,
+                **object_fields,
+                **wait,
+            })
+            for attempt in put["attempts"]:
+                attempt_n = int(attempt["attempt"])
+                wire = attempt["wire"]
+                spans.append({
+                    "span_id": f"step:{sid}:put:{object_id}:wire:{attempt_n}",
+                    "scope": "put_wire",
+                    "lane": "transport",
+                    "parent": f"step:{sid}:put",
+                    "step": sid,
+                    "op": op,
+                    "leg": "wire",
+                    "pod_clock_id": clock,
+                    **object_fields,
+                    "attempt": attempt_n,
+                    "outcome": str(attempt["outcome"]),
+                    **wire,
+                })
+                if (retry_interval := attempt.get("retry")) is not None:
+                    spans.append({
+                        "span_id": f"step:{sid}:put:{object_id}:retry:{attempt_n}",
+                        "scope": "put_retry",
+                        "lane": "transport_retry",
+                        "parent": f"step:{sid}:put",
+                        "step": sid,
+                        "op": op,
+                        "leg": "retry",
+                        "pod_clock_id": clock,
+                        **object_fields,
+                        "attempt": attempt_n,
+                        **retry_interval,
+                    })
+    return spans
+
+
 def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
               session_id: str | None = None) -> dict[str, Any]:
     """Execute the whole chain. Returns {step_id: {port: str(path)}} for the caller to inspect.
@@ -794,6 +996,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
     # (STEP_TIMING_WHY). `timings` on every list.append below is safe unlocked — `append` is atomic under the
     # GIL, and a lock here would be a wait with no deadline anyone could state.
     t_chain = time.monotonic()
+    chain_start_ns = time.monotonic_ns()
     timings: list[StepTiming] = []
 
     with chain_phase("preflight"):
@@ -876,18 +1079,53 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
         # 202 and ignored by an older box, while a changed element type would be a break on a field that
         # already crosses. `chain_s` is the pod's OWN wall: the box subtracts it from its own to get the
         # transport it has never been able to see (STEP_TIMING_WHY).
+        chain_end_ns = time.monotonic_ns()
         terminal_timings = {
             "chain_s": round(time.monotonic() - t_chain, 3),
             "steps": [t.wire() for t in list(timings)],
         }
+        timeline_reasons: list[str] = []
+        try:
+            context = cp.timeline_context(str(corr_id or ""))
+        except Exception as exc:  # noqa: BLE001 - a measurement may not change a successful work result
+            context = {"complete": False, "incomplete_reasons": ["delivery_context_unavailable"]}
+            log(f"ops: terminal timeline context unavailable ({type(exc).__name__})")
+        timeline_reasons.extend(str(reason) for reason in context.get("incomplete_reasons", []))
+        step_rows = [
+            timing.timeline_wire(job_id=str(chain.job_id), corr_id=str(corr_id or ""))
+            for timing in list(timings)
+        ]
+        for row in step_rows:
+            timeline_reasons.extend(str(reason) for reason in row["incomplete_reasons"])
+        pod_clock_id = context.get("pod_clock_id")
+        terminal_timeline = {
+            "schema_version": 1,
+            "pod": {
+                "complete": bool(context.get("complete")) and not timeline_reasons,
+                "incomplete_reasons": sorted(set(timeline_reasons)),
+                "pod_clock_id": pod_clock_id,
+                "attempt_id": context.get("attempt_id"),
+                "chain_digest": _chain_digest(chain),
+                "delivery": context.get("delivery"),
+                "sync": list(context.get("clock_sync", [])),
+                "spans": _timeline_spans(
+                    pod_clock_id=pod_clock_id,
+                    chain_start_ns=chain_start_ns,
+                    chain_end_ns=chain_end_ns,
+                    steps=step_rows,
+                ),
+            },
+        }
         _event(job_id=chain.job_id, stage="ops", status="ok", phase="work_finished",
-               outcome="ok", steps=sorted(produced), skipped=sorted(failed), timings=terminal_timings)
+               outcome="ok", steps=sorted(produced), skipped=sorted(failed), timings=terminal_timings,
+               timeline=terminal_timeline)
         cp.send_result({
             "job_id": chain.job_id,
             "stage": "ops",
             "status": "ok",
             "corr_id": corr_id,
             "timings": terminal_timings,
+            "timeline": terminal_timeline,
             **({"session_id": session_id} if session_id is not None else {}),
         })
         return {sid: {p: ([str(x) for x in v] if isinstance(v, list) else str(v))

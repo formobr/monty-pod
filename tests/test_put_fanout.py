@@ -8,7 +8,9 @@ import time
 from pathlib import Path
 
 import pytest
+import requests
 
+from podagent import cp
 from podagent.models import OpChain, OpsPackRef
 from podagent.ops import runner
 
@@ -160,3 +162,33 @@ def test_a_list_port_still_walks_its_addresses_in_order_and_stops_at_a_refusal(t
     with pytest.raises(runner.ChainError, match=r"frames'\[2\] of 4"):
         runner._run_step(step, runner.Workspace(tmp_path / "ws"), {})
     assert sent == ["https://x/g0.png", "https://x/g1.png"]
+
+
+def test_each_put_retry_keeps_wire_and_retry_intervals_without_changing_total(tmp_path, monkeypatch):
+    src = tmp_path / "payload.bin"
+    src.write_bytes(b"x" * 32)
+    calls = {"n": 0}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+    def put(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.ConnectionError("retry me")
+        return _Response()
+
+    monkeypatch.setattr(cp._store, "put", put)
+    monkeypatch.setattr(cp.time, "sleep", lambda _seconds: None)
+    cp.retry.reset()
+    cp.put_trace.reset()
+    cp.upload(src, "https://store.example/out?signature=must-not-cross")
+
+    rows = cp.put_trace.collect()
+    assert [row["attempt"] for row in rows] == [1, 2]
+    assert rows[0]["outcome"] == "retry" and "retry" in rows[0]
+    assert rows[1]["outcome"] == "ok" and "retry" not in rows[1]
+    retry_s = (rows[0]["retry"]["end_mono_ns"] - rows[0]["retry"]["start_mono_ns"]) / 1_000_000_000
+    assert cp.retry.seconds() == pytest.approx(retry_s, abs=0.001)
+    assert "store.example" not in str(rows) and "signature" not in str(rows)

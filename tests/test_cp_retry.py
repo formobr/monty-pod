@@ -18,6 +18,8 @@ from websockets.sync.server import serve
 from podagent import cp, event_stream
 from podagent.event_stream import DeliveryPending, EventStream, FrameRejected, TransportUnhealthy
 
+_ATTEMPT_ID = "a" * 32
+
 
 def _event(**extra: Any) -> dict[str, Any]:
     return {"stage": "test", "status": "step", **extra}
@@ -30,6 +32,7 @@ def _result(corr_id: str = "c", **extra: Any) -> dict[str, Any]:
         "corr_id": corr_id,
         "stage": "ops",
         "status": "ok",
+        "attempt_id": _ATTEMPT_ID,
         **extra,
     }
 
@@ -58,16 +61,30 @@ def _job(corr_id: str = "c", *, target_worker_id: str | None = None) -> dict[str
     return {
         "type": "job",
         "delivery_id": corr_id,
+        "attempt_id": _ATTEMPT_ID,
+        "stream_id": "pod-stream-1",
+        "seq": 1,
+        "replayed": False,
+        "timeline": {
+            "enqueue_min_unix_ns": 1,
+            "enqueue_max_unix_ns": 2,
+            "claim_min_unix_ns": 3,
+            "claim_max_unix_ns": 4,
+            "socket_write_min_unix_ns": 5,
+        },
         "job": body,
     }
 
 
 def _ack(frame: dict[str, Any], status: int = 202, **extra: Any) -> str:
+    server_recv_unix_ns = time.time_ns()
     return json.dumps({
         "type": "ack",
         "stream_id": frame["stream_id"],
         "seq": frame["seq"],
         "status": status,
+        "server_recv_unix_ns": server_recv_unix_ns,
+        "server_send_unix_ns": time.time_ns(),
         **extra,
     })
 
@@ -125,7 +142,9 @@ def test_result_is_a_typed_frame_and_requires_correlation(tmp_path: Path) -> Non
         "type": "result",
         "stream_id": seen[0]["stream_id"],
         "seq": 1,
-        "result": _result(),
+        "client_send_mono_ns": seen[0]["client_send_mono_ns"],
+        "attempt_id": _ATTEMPT_ID,
+        "result": {key: value for key, value in _result().items() if key != "attempt_id"},
     }
     assert seen[1]["type"] == "event"
     acked = seen[1]["event"]
@@ -466,8 +485,8 @@ def test_result_and_its_ack_event_cannot_overtake_prior_or_already_appended_fram
     assert seen[4]["event"]["phase"] == "result_acked"
 
 
-def test_ack_lost_after_send_replays_the_same_identity(tmp_path: Path) -> None:
-    seen: list[tuple[str, int]] = []
+def test_ack_lost_after_send_replays_the_same_identity_with_a_new_send_boundary(tmp_path: Path) -> None:
+    seen: list[tuple[str, int, int]] = []
     first = True
 
     def handler(ws: Any) -> None:
@@ -478,7 +497,7 @@ def test_ack_lost_after_send_replays_the_same_identity(tmp_path: Path) -> None:
             except Exception:
                 return
             if frame["type"] == "result":
-                seen.append((frame["stream_id"], frame["seq"]))
+                seen.append((frame["stream_id"], frame["seq"], frame["client_send_mono_ns"]))
                 if first:
                     first = False
                     return  # The peer may have committed the frame; the ACK alone was lost.
@@ -493,7 +512,8 @@ def test_ack_lost_after_send_replays_the_same_identity(tmp_path: Path) -> None:
         stream.close()
 
     assert len(seen) == 2
-    assert seen[0] == seen[1], "ambiguity must replay the original dedupe identity"
+    assert seen[0][:2] == seen[1][:2], "ambiguity must replay the original dedupe identity"
+    assert seen[0][2] < seen[1][2], "each wire attempt needs its own pre-write monotonic boundary"
 
 
 def test_process_restart_replays_old_identity_and_new_frames_use_a_new_stream(
@@ -753,6 +773,11 @@ def test_inbox_replays_after_receive_before_run_crash(
 
     second = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
     monkeypatch.setattr(second, "_ensure_open", lambda: True)
+    # v12 durably ACKs the exact delivery receipt before work admission. This test isolates inbox replay;
+    # model that receipt having been accepted while the process was down.
+    with second._work:
+        second._outbox.clear()
+        second._admission_error = None
     assert second.claim(0.2)["corr_id"] == "work/infer/result.json"
     second.close()
 
@@ -817,6 +842,7 @@ def test_valid_infer_golden_crosses_real_event_stream_with_one_result_identity(
 
     with _server(handler) as base:
         stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        stream._delivery_meta[corr] = {"attempt_id": _ATTEMPT_ID}
         plane = object.__new__(ControlPlane)
         plane._stream = stream
         assert agent_main._run_infer(
@@ -825,7 +851,9 @@ def test_valid_infer_golden_crosses_real_event_stream_with_one_result_identity(
         _wait_for(lambda: stream.pending_count() == 0)
         stream.close()
 
-    result = next(frame["result"] for frame in seen if frame["type"] == "result")
+    result_frame = next(frame for frame in seen if frame["type"] == "result")
+    assert result_frame["attempt_id"] == _ATTEMPT_ID
+    result = result_frame["result"]
     assert result["corr_id"] == corr == result["result_key"]
     assert result["session_id"] == "session-1" and result["kind"] == "face_probe"
 
@@ -891,7 +919,84 @@ def test_replayed_job_before_pending_result_ack_does_not_reconnect_livelock_or_r
         _wait_for(lambda: stream.pending_count() == 0)
         assert stream.claim(0.1) is None
         stream.close()
-    assert seen == ["result", "event"]
+    assert seen == ["result", "job_ack", "event"]
+
+
+def test_ack_records_four_timestamps_and_bounded_offset_after_delayed_delivery(tmp_path: Path) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        seen.append(frame)
+        server_recv_ns = time.time_ns()
+        time.sleep(0.02)
+        ws.send(json.dumps({
+            "type": "ack",
+            "stream_id": frame["stream_id"],
+            "seq": frame["seq"],
+            "status": 202,
+            "server_recv_unix_ns": server_recv_ns,
+            "server_send_unix_ns": time.time_ns(),
+        }))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert stream.send_event(_event(step="clock"), wait=True)
+        sample = stream._clock_samples[-1]
+        stream.close()
+
+    assert seen[0]["client_send_mono_ns"] == sample["client_send_mono_ns"]
+    assert sample["client_send_mono_ns"] <= sample["client_recv_mono_ns"]
+    assert sample["server_recv_unix_ns"] <= sample["server_send_unix_ns"]
+    assert sample["theta_min_ns"] <= sample["theta_max_ns"]
+    assert sample["wire_attempt"] == 1 and sample["seq"] == seen[0]["seq"]
+
+
+def test_job_replay_has_one_work_item_two_exact_receipts_and_no_secret_timeline(tmp_path: Path) -> None:
+    corr = "work/infer/result.json"
+    receipts: list[dict[str, Any]] = []
+
+    def handler(ws: Any) -> None:
+        first = _job(corr)
+        first["seq"] = 41
+        ws.send(json.dumps(first))
+        first_ack = json.loads(ws.recv())
+        receipts.append(first_ack)
+        ws.send(_ack(first_ack))
+
+        replay = _job(corr)
+        replay.update({"seq": 42, "replayed": True})
+        ws.send(json.dumps(replay))
+        replay_ack = json.loads(ws.recv())
+        receipts.append(replay_ack)
+        ws.send(_ack(replay_ack))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert stream.claim(1.0)["corr_id"] == corr
+        _wait_for(lambda: len(receipts) == 2 and stream.pending_count() == 0)
+        assert stream._jobs.empty(), "socket replay must not queue the same work twice"
+        context = stream.timeline_context(corr)
+        stream.close()
+
+    assert [row["type"] for row in receipts] == ["job_ack", "job_ack"]
+    assert all(row["job_ack"]["attempt_id"] == _ATTEMPT_ID for row in receipts)
+    assert receipts[0]["job_ack"]["client_recv_mono_ns"] <= receipts[1]["job_ack"]["client_recv_mono_ns"]
+    assert receipts[0]["seq"] != receipts[1]["seq"]
+    assert context["delivery"]["delivery_seq"] == 42 and context["delivery"]["replayed"] is True
+    assert context["attempt_id"] == _ATTEMPT_ID and context["complete"] is True
+    encoded = json.dumps(context, sort_keys=True)
+    assert "storage.example" not in encoded and "sig=x" not in encoded
+
+
+def test_missing_ack_sync_marks_measurement_incomplete_without_losing_claim(tmp_path: Path) -> None:
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
+    stream._accept_job(_job("fast-job"), client_recv_mono_ns=123)
+    context = stream.timeline_context("fast-job")
+    assert context["delivery"]["attempt_id"] == _ATTEMPT_ID
+    assert context["complete"] is False
+    assert context["incomplete_reasons"] == ["clock_sync_missing"]
+    stream.close()
 
 
 def test_result_acked_persist_failure_replays_result_after_restart(
