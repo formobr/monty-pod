@@ -90,7 +90,10 @@ before. `keep_ids` is a sorted, de-duplicated **set**: an alphabet, never text.
 ## clip_rank payload (JSON, `clip_rank.schema.json`)
 
 `groups[i]` answers `clip_rank.groups[i]` of the request, and within a group `scores[j]`/`embeds[j]`
-answer `image_urls[j]` — position IS the join, nothing is reordered.
+answer `image_urls[j]` — position IS the join, nothing is reordered. `image_cells`, when present, is an
+optional parallel array of `[x,y,width,height,sheet_width,sheet_height]` crops. The agent downloads each
+distinct sheet once, validates its exact declared shape, and slices cells locally; a missing/malformed cell
+fails the request instead of scoring the whole sheet.
 
 - `scores[j]` — cosine(image, intent). `-1.0` means "no score to give": an image the pod could not
   fetch or decode, or an embed-only group.

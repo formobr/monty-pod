@@ -449,6 +449,16 @@ class ClipRankGroup(BaseModel):
 
     intent: str
     image_urls: list[str] = Field(min_length=1)
+    image_cells: list[tuple[int, int, int, int, int, int] | None] | None = None
+
+    @model_validator(mode="after")
+    def _cells_match(self) -> "ClipRankGroup":
+        if self.image_cells is not None and len(self.image_cells) != len(self.image_urls):
+            raise ValueError("image_cells must be parallel to image_urls")
+        for cell in self.image_cells or []:
+            if cell is not None and (min(cell[:2]) < 0 or min(cell[2:]) <= 0):
+                raise ValueError("image cell geometry must be non-negative with positive sizes")
+        return self
 
 
 class ClipRankParams(BaseModel):

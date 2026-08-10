@@ -164,15 +164,30 @@ def _submit_tiles(urls: list[str], workdir: Path) -> list:
     """Put every tile on the wire NOW. Submitting FLAT — never a pool task that itself submits — is what
     keeps a bounded shared pool from deadlocking on its own children."""
     pool = _fetch_pool()
-    return [pool.submit(_fetch_tile, u, workdir / f"{i}.img") for i, u in enumerate(urls)]
+    by_url = {u: pool.submit(_fetch_tile, u, workdir / f"{i}.img")
+              for i, u in enumerate(dict.fromkeys(urls))}
+    return [by_url[u] for u in urls]
 
 
-def _gather(futs: list) -> tuple[list, list[int]]:
+def _gather(futs: list, cells=None) -> tuple[list, list[int]]:
     """The decoded images and their REQUEST indices — a tile that came back None is dropped here."""
     images: list = []
     ok: list[int] = []
     for i, f in enumerate(futs):
         img = f.result()
+        cell = cells[i] if cells is not None else None
+        if cell is not None:
+            if img is None:
+                raise ValueError(f"clip_rank sheet for cell {i} could not be fetched or decoded")
+            x, y, w, h, sheet_w, sheet_h = (int(v) for v in cell)
+            if min(x, y) < 0 or min(w, h, sheet_w, sheet_h) <= 0:
+                raise ValueError(f"clip_rank cell {i} has non-positive geometry")
+            if img.size != (sheet_w, sheet_h):
+                raise ValueError(f"clip_rank cell {i} expected sheet {sheet_w}x{sheet_h}, got "
+                                 f"{img.width}x{img.height}")
+            if x + w > sheet_w or y + h > sheet_h:
+                raise ValueError(f"clip_rank cell {i} lies outside its declared sheet")
+            img = img.crop((x, y, x + w, y + h))
         if img is not None:
             images.append(img)
             ok.append(i)
@@ -211,16 +226,17 @@ class ClipRankService:
             # score_many sends several phrasings over the SAME pixels. Download/decode/image-forward that exact
             # URL tuple once, then reuse its image embeddings for every text tower. Distinct shortlists occupy
             # the already-sized rank lanes concurrently; result assembly remains in request order.
-            keys = [tuple(g.image_urls) for g in params.groups]
+            keys = [(tuple(g.image_urls), tuple(g.image_cells) if g.image_cells is not None else None)
+                    for g in params.groups]
             unique = list(dict.fromkeys(keys))
-            pending = {key: _submit_tiles(list(key), Path(td) / f"g{i}")
+            pending = {key: _submit_tiles(list(key[0]), Path(td) / f"g{i}")
                        for i, key in enumerate(unique)}
             if progress is not None:
                 progress(f"clip_rank preparing {len(unique)} unique image set(s) for {n} group(s)")
 
             def prepare(key):
                 tg = time.monotonic()
-                images, ok = _gather(pending[key])
+                images, ok = _gather(pending[key], key[1])
                 gs = time.monotonic() - tg
                 if not self._slots.acquire(timeout=60.0):
                     raise TimeoutError("clip_rank image forward waited 60s for a card lane")

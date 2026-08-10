@@ -9,6 +9,7 @@ What the pod side must guarantee, and what each test pins:
 from __future__ import annotations
 
 import contextlib
+import concurrent.futures as cf
 import threading
 import types
 from pathlib import Path
@@ -136,6 +137,45 @@ def test_unfetchable_image_scores_minus_one_and_keeps_request_order(monkeypatch,
 
     assert res.scores == [0.6, -1.0, 0.8], "a dead tile sorts last; the live ones keep their slots"
     assert res.embeds == [[0.6, 0.8], None, [0.8, 0.6]]
+
+
+def test_sheet_cells_are_exact_pixels_in_request_order() -> None:
+    """Packed transport may change the object count, never a decoded pixel or the scorer's row order."""
+    from PIL import Image
+    from podagent.infer_cliprank import _gather
+
+    left = Image.new("RGB", (2, 2), (11, 22, 33))
+    right = Image.new("RGB", (2, 2), (101, 77, 9))
+    sheet = Image.new("RGB", (4, 2))
+    sheet.paste(left, (0, 0)); sheet.paste(right, (2, 0))
+    future = cf.Future(); future.set_result(sheet)
+
+    images, order = _gather([future, future], [(0, 0, 2, 2, 4, 2), (2, 0, 2, 2, 4, 2)])
+
+    assert order == [0, 1]
+    assert list(images[0].getdata()) == list(left.getdata())
+    assert list(images[1].getdata()) == list(right.getdata())
+    score = lambda im: sum(sum(px) for px in im.getdata())
+    assert [score(im) for im in images] == [score(left), score(right)], "pixel-derived scores moved"
+
+
+def test_sheet_cell_missing_or_wrong_shape_fails_loudly() -> None:
+    from PIL import Image
+    from podagent.infer_cliprank import _gather
+
+    dead = cf.Future(); dead.set_result(None)
+    with pytest.raises(ValueError, match="could not be fetched"):
+        _gather([dead], [(0, 0, 2, 2, 2, 2)])
+    wrong = cf.Future(); wrong.set_result(Image.new("RGB", (3, 2)))
+    with pytest.raises(ValueError, match="expected sheet 2x2"):
+        _gather([wrong], [(0, 0, 2, 2, 2, 2)])
+
+
+def test_sheet_cell_contract_rejects_missing_parallel_entry_and_bad_geometry() -> None:
+    with pytest.raises(ValueError, match="parallel"):
+        ClipRankGroup(intent="x", image_urls=["sheet", "sheet"], image_cells=[(0, 0, 2, 2, 4, 2)])
+    with pytest.raises(ValueError, match="positive sizes"):
+        ClipRankGroup(intent="x", image_urls=["sheet"], image_cells=[(0, 0, 0, 2, 4, 2)])
 
 
 def test_a_wholly_dead_group_returns_misses_without_a_forward(monkeypatch, tmp_path) -> None:
