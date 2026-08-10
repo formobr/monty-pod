@@ -1,0 +1,2659 @@
+{
+  "bundle_format": 1,
+  "bundle_sha256": "989f7c2935b3ad12370d0bc52ed57f4c7604e235b34d3a46d4932d654597dab5",
+  "contract_version": 12,
+  "fixtures": {
+    "event.pod": {
+      "classification": "valid",
+      "document": {
+        "capacity": {
+          "fetch_workers": 24,
+          "rank_lanes": 6
+        },
+        "corr_id": "corr-9",
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "op": "media.fetch",
+        "optional": false,
+        "origin": "pod",
+        "outcome": "ok",
+        "outputs": {
+          "dst": "work/out.mp4"
+        },
+        "phase": "put",
+        "schema_version": 12,
+        "session_id": "session-7",
+        "skipped": [],
+        "stage": "ops",
+        "status": "done",
+        "step": "fetch",
+        "steps": [
+          "fetch"
+        ],
+        "timings": {
+          "chain_s": 4.5,
+          "steps": [
+            {
+              "id": "fetch",
+              "seconds": 4.1
+            }
+          ]
+        },
+        "ts": "2026-08-07T10:15:30Z"
+      },
+      "sha256": "adacf1be8d7ad9185e6785e1c372c7c2fccbb318e1f58346148fcf39d96bf9c5",
+      "source_path": "examples/event.pod.json",
+      "surface": "event"
+    },
+    "event.running": {
+      "classification": "valid",
+      "document": {
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "pct": 47.5,
+        "schema_version": 12,
+        "stage": "head_motion",
+        "status": "running",
+        "ts": "2026-06-28T10:15:30Z"
+      },
+      "sha256": "92e6b8e37a61e08195c01367c9dbf4774200793c47f38dc154026e45bae4df3e",
+      "source_path": "examples/event.running.json",
+      "surface": "event"
+    },
+    "event.skipped": {
+      "classification": "valid",
+      "document": {
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "reason": "optional",
+        "schema_version": 12,
+        "stage": "resolve_broll",
+        "status": "skipped",
+        "timing_seconds": 0.0
+      },
+      "sha256": "f94e86e453b25b9c100216fb4034680c3d4a84d3333a565bf86972d678ff5e43",
+      "source_path": "examples/event.skipped.json",
+      "surface": "event"
+    },
+    "invalid/event.bad-status": {
+      "classification": "invalid",
+      "document": {
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "schema_version": 12,
+        "stage": "head_motion",
+        "status": "almost-done"
+      },
+      "sha256": "095afbd17c20a40c46c38bf6f758aefd2d136e03ba0d754aa655dce25791d40b",
+      "source_path": "examples/invalid/event.bad-status.json",
+      "surface": "event"
+    },
+    "invalid/job.bad-render-tier": {
+      "classification": "invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "provider": "subscription",
+        "render_tier": "hd",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/x?sig=1",
+        "tenant_id": "tenant_abc123",
+        "type": "render_preview",
+        "work_prefix": "work/tenant_abc123/job1/"
+      },
+      "sha256": "c82584541c923efea9486d03c10ed53ef58fd9e368640d5ecf367c04f8c7b4f1",
+      "source_path": "examples/invalid/job.bad-render-tier.json",
+      "surface": "job"
+    },
+    "invalid/job.bad-type": {
+      "classification": "invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "provider": "subscription",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/x?sig=1",
+        "tenant_id": "tenant_abc123",
+        "type": "transcode",
+        "work_prefix": "work/tenant_abc123/job1/"
+      },
+      "sha256": "211636e7f24903ee4b17b0289400a5e8504f210892cd4e13f4d1fd5cfa6b9420",
+      "source_path": "examples/invalid/job.bad-type.json",
+      "surface": "job"
+    },
+    "invalid/job.dead-montage": {
+      "classification": "invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "provider": "subscription",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/x?sig=1",
+        "tenant_id": "tenant_abc123",
+        "type": "montage",
+        "work_prefix": "work/tenant_abc123/job1/"
+      },
+      "sha256": "532af85cbabaeec63b81995e39ac1f14cd08a43e0bbe70da572f393a78a6cafa",
+      "source_path": "examples/invalid/job.dead-montage.json",
+      "surface": "job"
+    },
+    "invalid/job.empty-brand": {
+      "classification": "invalid",
+      "document": {
+        "brand": "",
+        "callback": {
+          "channel": "job:f47ac10b:events",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "params": {
+          "turnkey": true
+        },
+        "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+        "provider": "subscription",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
+        "tenant_id": "tenant_abc123",
+        "type": "plan",
+        "work_prefix": "work/tenant_abc123/f47ac10b-58cc-4372-a567-0e02b2c3d479/"
+      },
+      "sha256": "0848c645b244b8f7c30d356eeb51ed82a945f014de91d631daa989bbcd51242b",
+      "source_path": "examples/invalid/job.empty-brand.json",
+      "surface": "job"
+    },
+    "invalid/job.empty-chain-id": {
+      "classification": "invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "chain_id": "",
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "provider": "subscription",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/x?sig=1",
+        "tenant_id": "tenant_abc123",
+        "type": "plan",
+        "work_prefix": "work/tenant_abc123/job1/"
+      },
+      "sha256": "6010fc883cfa4c30816af690ce2e1ee4ed891e0f68ede724e88bbca5a4c80697",
+      "source_path": "examples/invalid/job.empty-chain-id.json",
+      "surface": "job"
+    },
+    "invalid/job.empty-source-key": {
+      "classification": "invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "provider": "subscription",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_key": "",
+        "source_url": "https://r2.example.com/x?sig=1",
+        "tenant_id": "tenant_abc123",
+        "type": "plan",
+        "work_prefix": "work/tenant_abc123/job1/"
+      },
+      "sha256": "bc3b0f833eab098a7b91985644fbb53db65426a0648b73beaa27758ad57460ef",
+      "source_path": "examples/invalid/job.empty-source-key.json",
+      "surface": "job"
+    },
+    "invalid/job.render-final-no-plan": {
+      "classification": "invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "provider": "subscription",
+        "render_tier": "final",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/x?sig=1",
+        "tenant_id": "tenant_abc123",
+        "type": "render_final",
+        "work_prefix": "work/tenant_abc123/job1/"
+      },
+      "sha256": "d85d39ad6aea0164628f33db1d8d90fb051f9806a495743dc489ddee67103c39",
+      "source_path": "examples/invalid/job.render-final-no-plan.json",
+      "surface": "job"
+    },
+    "invalid/job.typo-key": {
+      "classification": "invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "provider": "subscription",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "sourceUrl": "https://typo.example.com/should-fail",
+        "source_url": "https://r2.example.com/x?sig=1",
+        "tenant_id": "tenant_abc123",
+        "type": "plan",
+        "work_prefix": "work/tenant_abc123/job1/"
+      },
+      "sha256": "d31450e060f97e2450ff968b1c8ed6b522f1709031bae3cd26aa3aee2b032f7a",
+      "source_path": "examples/invalid/job.typo-key.json",
+      "surface": "job"
+    },
+    "invalid/manifest.scenario-missing-field": {
+      "classification": "invalid",
+      "document": {
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "scenario": {
+          "body": "Сегодня разберём, что реально движет ценой — и почему паника в чате всегда опаздывает на день.",
+          "title": "Почему биткоин падает"
+        },
+        "schema_version": 12,
+        "status": "done"
+      },
+      "sha256": "b10474ed164adf2dfee6c21b09f365fc7226bd1331d43b7d7db8fbce36fc2027",
+      "source_path": "examples/invalid/manifest.scenario-missing-field.json",
+      "surface": "manifest"
+    },
+    "invalid/manifest.with-stage": {
+      "classification": "invalid",
+      "document": {
+        "artifacts": [],
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "schema_version": 12,
+        "stage": "job",
+        "status": "done",
+        "timing_seconds": 512.3
+      },
+      "sha256": "323ee81b9a5dad2808f666ae0de3f2cc9d788b7ca4a1ab7e03fc6c7fd912d08b",
+      "source_path": "examples/invalid/manifest.with-stage.json",
+      "surface": "manifest"
+    },
+    "invalid/pod_enqueue_ack.missing-bound": {
+      "classification": "invalid",
+      "document": {
+        "corr_id": "fetch-a",
+        "duplicate": false,
+        "enqueue_max_unix_ns": 120,
+        "enqueue_min_unix_ns": 110,
+        "ok": true,
+        "schema_version": 12,
+        "server_recv_unix_ns": 100
+      },
+      "sha256": "5fd5630060d1564e4e67c6665b2195dc71938b280a0c536e2e16dbc91a414735",
+      "source_path": "examples/invalid/pod_enqueue_ack.missing-bound.json",
+      "surface": "pod_enqueue_ack"
+    },
+    "invalid/pod_stream.both-payloads": {
+      "classification": "invalid",
+      "document": {
+        "event": {
+          "stage": "ops",
+          "status": "step"
+        },
+        "result": {
+          "corr_id": "c",
+          "job_id": "j",
+          "status": "ok"
+        },
+        "seq": 1,
+        "stream_id": "pod-boot-7",
+        "type": "event"
+      },
+      "sha256": "21abb704b5b83c55e3e45be6c618fdd2969cec316ad2eb2c522d40929a12bde8",
+      "source_path": "examples/invalid/pod_stream.both-payloads.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.event-empty-job": {
+      "classification": "invalid",
+      "document": {
+        "event": {
+          "job_id": "",
+          "stage": "ops",
+          "status": "step"
+        },
+        "seq": 45,
+        "stream_id": "pod-boot-7",
+        "type": "event"
+      },
+      "sha256": "0624d84b203e6978dee2d0dd089566cce4265a2335512fe50a40b192fd69bf6b",
+      "source_path": "examples/invalid/pod_stream.event-empty-job.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.event-null-optional": {
+      "classification": "invalid",
+      "document": {
+        "event": {
+          "optional": null,
+          "stage": "ops",
+          "status": "step"
+        },
+        "seq": 47,
+        "stream_id": "pod-boot-7",
+        "type": "event"
+      },
+      "sha256": "ab5f75dea6e9f8d4d68b6747e2f23dfedbc61b504655e2751ad0e07a59893f52",
+      "source_path": "examples/invalid/pod_stream.event-null-optional.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.job-ack-unknown": {
+      "classification": "invalid",
+      "document": {
+        "client_send_mono_ns": 100,
+        "job_ack": {
+          "attempt_id": "0123456789abcdef0123456789abcdef",
+          "client_recv_mono_ns": 90,
+          "corr_id": "d",
+          "delivery_id": "d",
+          "guess": 1
+        },
+        "seq": 1,
+        "stream_id": "pod-boot-7",
+        "type": "job_ack"
+      },
+      "sha256": "d1def157c657dc40a85b96f84edb40fe1d65ad6dab754b5bb6d6f807673d5c8a",
+      "source_path": "examples/invalid/pod_stream.job-ack-unknown.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.missing-client-send": {
+      "classification": "invalid",
+      "document": {
+        "event": {
+          "stage": "ops",
+          "status": "step"
+        },
+        "seq": 1,
+        "stream_id": "pod-boot-7",
+        "type": "event"
+      },
+      "sha256": "4ae53e47a3196b3280f580d64be80ce6b749fa1f7bbf8c528997bee1069fe41a",
+      "source_path": "examples/invalid/pod_stream.missing-client-send.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-both-attributions": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "corr_id": "corr-1",
+          "job_id": "job-1",
+          "kind": "align",
+          "session_id": "session-1",
+          "stage": "ops",
+          "status": "ok"
+        },
+        "seq": 44,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "a9ecaeacbd20cbda9abb611321c5b3dc5c3049f617fa7f7c2ef9e33837c2febf",
+      "source_path": "examples/invalid/pod_stream.result-both-attributions.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-empty-result-key": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "corr_id": "corr-1",
+          "job_id": "job-1",
+          "kind": "align",
+          "result_key": "",
+          "session_id": "session-1",
+          "status": "ok"
+        },
+        "seq": 45,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "07ef77dd93ca6523e85d71d1196194da0c4fe9f5cf55c0ec09923d7771aeed8b",
+      "source_path": "examples/invalid/pod_stream.result-empty-result-key.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-empty-second-attribution": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "corr_id": "corr-1",
+          "job_id": "job-1",
+          "kind": "align",
+          "session_id": "session-1",
+          "stage": "",
+          "status": "ok"
+        },
+        "seq": 46,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "ac7b97dccc737c820b2bf262facb3df40fe7337ef66226ee993637b4483da467",
+      "source_path": "examples/invalid/pod_stream.result-empty-second-attribution.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-missing-session": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "corr_id": "corr-1",
+          "job_id": "job-1",
+          "kind": "align",
+          "status": "ok"
+        },
+        "seq": 43,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "0b865dcfbb186d014bf0097b39ef31e36a8e9ece1bcd7bc96d321f2af269478c",
+      "source_path": "examples/invalid/pod_stream.result-missing-session.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-null-error": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "corr_id": "corr-1",
+          "error": null,
+          "job_id": "job-1",
+          "kind": "align",
+          "session_id": "session-1",
+          "status": "error"
+        },
+        "seq": 49,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "4196a80c31184947b37b4e3aac572fb3ec30fc435ff1c5d1ed009079bdc2ce36",
+      "source_path": "examples/invalid/pod_stream.result-null-error.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-null-result-key": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "corr_id": "corr-1",
+          "job_id": "job-1",
+          "kind": "align",
+          "result_key": null,
+          "session_id": "session-1",
+          "status": "ok"
+        },
+        "seq": 48,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "ea77c89fbae6f516be5f50bb35279823a17d742fa3f4182a476e0c4caeabb995",
+      "source_path": "examples/invalid/pod_stream.result-null-result-key.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-without-correlation": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "job_id": "j",
+          "status": "ok"
+        },
+        "seq": 1,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "48592cb549548518f67ac85005e06631f67510e289ed15a748c705f5a7b4b807",
+      "source_path": "examples/invalid/pod_stream.result-without-correlation.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream.result-wrong-error-type": {
+      "classification": "invalid",
+      "document": {
+        "result": {
+          "corr_id": "corr-1",
+          "error": {
+            "type": "timeout"
+          },
+          "job_id": "job-1",
+          "kind": "align",
+          "session_id": "session-1",
+          "status": "error"
+        },
+        "seq": 50,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "d6488d45d945cd3c4d06484e3e94fab4ad836e4e4160b7e56d6beb0a2247df39",
+      "source_path": "examples/invalid/pod_stream.result-wrong-error-type.json",
+      "surface": "pod_stream"
+    },
+    "invalid/pod_stream_server.ack-missing-stream": {
+      "classification": "invalid",
+      "document": {
+        "seq": 17,
+        "status": 202,
+        "type": "ack"
+      },
+      "sha256": "f80ced897650af508cd6b99ae9297632036157780ae3717b62a741416fe1f4a8",
+      "source_path": "examples/invalid/pod_stream_server.ack-missing-stream.json",
+      "surface": "pod_stream_server"
+    },
+    "invalid/pod_stream_server.job-extra-field": {
+      "classification": "invalid",
+      "document": {
+        "job": {
+          "chain": {
+            "job_id": "render-preview-42",
+            "ops": []
+          },
+          "type": "ops"
+        },
+        "seq": 17,
+        "type": "job"
+      },
+      "sha256": "cd73b47600f517943a700f57fd1d5ab0a09e2ce4495ae3a01f0a9d3a14547ad9",
+      "source_path": "examples/invalid/pod_stream_server.job-extra-field.json",
+      "surface": "pod_stream_server"
+    },
+    "invalid/pod_transport_receipt.unknown-field": {
+      "classification": "invalid",
+      "document": {
+        "attempt_id": "0123456789abcdef0123456789abcdef",
+        "claim_max_unix_ns": 130,
+        "claim_min_unix_ns": 120,
+        "corr_id": "fetch-a",
+        "enqueue_max_unix_ns": 110,
+        "enqueue_min_unix_ns": 100,
+        "guess_ms": 4,
+        "job_accepted_max_unix_ns": 170,
+        "job_accepted_min_unix_ns": 150,
+        "job_delivered_unix_ns": 150,
+        "replayed": false,
+        "result_commit_max_unix_ns": 510,
+        "result_commit_min_unix_ns": 500,
+        "schema_version": 12,
+        "seq": 3,
+        "socket_write_max_unix_ns": 150,
+        "socket_write_min_unix_ns": 140,
+        "stream_id": "pod-boot-a"
+      },
+      "sha256": "790ec8c39266ddeb3efcd7fb8db38da02bb8772728663a9bb7fc934ecb76f990",
+      "source_path": "examples/invalid/pod_transport_receipt.unknown-field.json",
+      "surface": "pod_transport_receipt"
+    },
+    "invalid/publish_job.no-job-id": {
+      "classification": "invalid",
+      "document": {
+        "params": {
+          "deliverables": {
+            "master": "https://r2.example.com/m.mp4?sig=1"
+          },
+          "platforms": [
+            "youtube"
+          ],
+          "publish_meta": {
+            "title": "t"
+          },
+          "tokens": {}
+        },
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "tenant_id": "tenant_abc123"
+      },
+      "sha256": "813af37d202dd4930a66af612acfb0870d1a81f4b7867875062ffbf7a8bd354b",
+      "source_path": "examples/invalid/publish_job.no-job-id.json",
+      "surface": "publish_job"
+    },
+    "invalid/publish_job.typo-key": {
+      "classification": "invalid",
+      "document": {
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "params": {
+          "deliverables": {
+            "master": "https://r2.example.com/m.mp4?sig=1"
+          },
+          "platforms": [
+            "youtube"
+          ],
+          "publish_meta": {
+            "title": "t"
+          },
+          "tokens": {}
+        },
+        "publish_params": {
+          "platforms": [
+            "youtube"
+          ]
+        },
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "tenant_id": "tenant_abc123"
+      },
+      "sha256": "cb4f6366eecf7bd055261ffca95d14b7f5f53d7f513ead30cd1abf05123717f9",
+      "source_path": "examples/invalid/publish_job.typo-key.json",
+      "surface": "publish_job"
+    },
+    "job.chained": {
+      "classification": "valid",
+      "document": {
+        "callback": {
+          "channel": "job:d4e5f607:events",
+          "kind": "redis"
+        },
+        "chain_id": "7f1e2d3c-4b5a-4968-8877-665544332211",
+        "job_id": "d4e5f607-1829-4304-b5c6-d7e8f9012345",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "params": {
+          "pace": "auto"
+        },
+        "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+        "provider": "subscription",
+        "render_tier": "preview",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_key": "uploads/tenant_abc123/0f9c1d2e-zapis-iyun.mkv",
+        "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
+        "tenant_id": "tenant_abc123",
+        "type": "render_preview",
+        "work_prefix": "work/tenant_abc123/7f1e2d3c-4b5a-4968-8877-665544332211/d4e5f607-1829-4304-b5c6-d7e8f9012345/"
+      },
+      "sha256": "3ad30dd284323e7853cc754610e9b1a65e99f368b498b76849fe3f46a6870369",
+      "source_path": "examples/job.chained.json",
+      "surface": "job"
+    },
+    "job.ok": {
+      "classification": "valid",
+      "document": {
+        "brand": "cryptomonkeys",
+        "callback": {
+          "channel": "job:f47ac10b:events",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "music_recent": [
+          "music/dark/slimeyfox-hypermafia-543774.mp3",
+          "music/lofi/dreams-221033.mp3"
+        ],
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "params": {
+          "broll_jobs": 8,
+          "music": "lofi.mp3",
+          "pace": "auto",
+          "shorts": 3,
+          "turnkey": true
+        },
+        "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+        "provider": "subscription",
+        "scenario": {
+          "body": "Сегодня разберём, что реально движет ценой — и почему паника в чате всегда опаздывает на день.",
+          "music_mood": "dark high synth",
+          "title": "Почему биткоин падает"
+        },
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
+        "tenant_id": "tenant_abc123",
+        "type": "plan",
+        "work_prefix": "work/tenant_abc123/f47ac10b-58cc-4372-a567-0e02b2c3d479/"
+      },
+      "sha256": "99ba7ea1d185084c8f25412ddabfee43df1cb9f10a2da47cfd82e513d12e8d9f",
+      "source_path": "examples/job.ok.json",
+      "surface": "job"
+    },
+    "job.palette": {
+      "classification": "valid",
+      "document": {
+        "callback": {
+          "channel": "job:e5f60718:events",
+          "kind": "redis"
+        },
+        "chain_id": "7f1e2d3c-4b5a-4968-8877-665544332211",
+        "job_id": "e5f60718-2930-4415-a6b7-c8d9e0f12345",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "params": {
+          "pace": "auto"
+        },
+        "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+        "provider": "subscription",
+        "render_tier": "preview",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_key": "uploads/tenant_abc123/0f9c1d2e-zapis-iyun.mkv",
+        "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
+        "tenant_id": "tenant_abc123",
+        "type": "palette",
+        "work_prefix": "work/tenant_abc123/7f1e2d3c-4b5a-4968-8877-665544332211/e5f60718-2930-4415-a6b7-c8d9e0f12345/"
+      },
+      "sha256": "91c71409abda6dd680f297f691346322f83beeecd81a884d74ca14fbc07e5fad",
+      "source_path": "examples/job.palette.json",
+      "surface": "job"
+    },
+    "job.render-final": {
+      "classification": "valid",
+      "document": {
+        "callback": {
+          "channel": "job:c3d4e5f6:events",
+          "kind": "redis"
+        },
+        "job_id": "c3d4e5f6-7081-4293-a4b5-c6d7e8f90123",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "params": {
+          "music": "lofi.mp3"
+        },
+        "plan": {
+          "broll": [
+            {
+              "beat": 3,
+              "chosen": "cand_2"
+            }
+          ],
+          "edl": [
+            {
+              "keep_from": 0.0,
+              "keep_to": 12.4
+            }
+          ],
+          "music": {
+            "track": "lofi.mp3",
+            "vol": 0.2
+          }
+        },
+        "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+        "provider": "subscription",
+        "render_tier": "final",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
+        "tenant_id": "tenant_abc123",
+        "type": "render_final",
+        "work_prefix": "work/tenant_abc123/c3d4e5f6-7081-4293-a4b5-c6d7e8f90123/"
+      },
+      "sha256": "e48a4034dd6647988628b1f5c573a9fc10e44651c6fb6f0f9403f857f7e1f8c9",
+      "source_path": "examples/job.render-final.json",
+      "surface": "job"
+    },
+    "job.render-preview": {
+      "classification": "valid",
+      "document": {
+        "callback": {
+          "channel": "job:b2c3d4e5:events",
+          "kind": "redis"
+        },
+        "job_id": "b2c3d4e5-6f70-4182-93a4-b5c6d7e8f901",
+        "job_token": "eyJqaWQiOiJiMmMzZDRlNSJ9.c2lnbmF0dXJl",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "params": {
+          "broll_jobs": 8,
+          "pace": "auto"
+        },
+        "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+        "provider": "subscription",
+        "render_tier": "preview",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_key": "uploads/tenant_abc123/0f9c1d2e-zapis-iyun.mkv",
+        "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
+        "tenant_id": "tenant_abc123",
+        "type": "render_preview",
+        "work_prefix": "work/tenant_abc123/b2c3d4e5-6f70-4182-93a4-b5c6d7e8f901/"
+      },
+      "sha256": "c10e1ec6a1958b0d69392905f1cb2a91d63e74fcda0a308b9d41822010a62e16",
+      "source_path": "examples/job.render-preview.json",
+      "surface": "job"
+    },
+    "manifest.ok": {
+      "classification": "valid",
+      "document": {
+        "artifacts": [
+          {
+            "bytes": 84213440,
+            "duration_s": 183.4,
+            "height": 1080,
+            "key": "tenant_abc123/zapis-iyun/out/zapis-iyun.cover.mp4",
+            "kind": "master",
+            "width": 1920
+          },
+          {
+            "bytes": 1843200,
+            "height": 1080,
+            "key": "tenant_abc123/zapis-iyun/out/zapis-iyun.cover.png",
+            "kind": "cover",
+            "width": 1920
+          },
+          {
+            "bytes": 12582912,
+            "duration_s": 48.0,
+            "height": 1920,
+            "key": "tenant_abc123/zapis-iyun/out/zapis-iyun.short1.mp4",
+            "kind": "short",
+            "width": 1080
+          }
+        ],
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "music_track": "music/dark/slimeyfox-hypermafia-543774.mp3",
+        "schema_version": 12,
+        "status": "done",
+        "timing_seconds": 512.3
+      },
+      "sha256": "e71304ab13110844d14a57847265311412ad5a01c940dc1f1fb01c91218a68ef",
+      "source_path": "examples/manifest.ok.json",
+      "surface": "manifest"
+    },
+    "manifest.scenario": {
+      "classification": "valid",
+      "document": {
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "scenario": {
+          "body": "Сегодня разберём, что реально движет ценой — и почему паника в чате всегда опаздывает на день.",
+          "music_mood": "dark high synth",
+          "title": "Почему биткоин падает"
+        },
+        "schema_version": 12,
+        "status": "done",
+        "timing_seconds": 41.7
+      },
+      "sha256": "afc8ddfa23a6c0eea7e23a7434981d5448c7106c735cad677ca389952e59c61a",
+      "source_path": "examples/manifest.scenario.json",
+      "surface": "manifest"
+    },
+    "model-invalid/job.chain-id-not-in-work-prefix": {
+      "classification": "model-invalid",
+      "document": {
+        "callback": {
+          "channel": "c",
+          "kind": "redis"
+        },
+        "chain_id": "7f1e2d3c-4b5a-4968-8877-665544332211",
+        "job_id": "d4e5f607-1829-4304-b5c6-d7e8f9012345",
+        "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
+        "params": {},
+        "provider": "subscription",
+        "render_tier": "preview",
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
+        "tenant_id": "tenant_abc123",
+        "type": "render_preview",
+        "work_prefix": "work/tenant_abc123/d4e5f607-1829-4304-b5c6-d7e8f9012345/"
+      },
+      "sha256": "a62966c727e4e35bc76a277e6ab6c24a0b40771abd119728d9d5cfabba24d336",
+      "source_path": "examples/model-invalid/job.chain-id-not-in-work-prefix.json",
+      "surface": "job"
+    },
+    "model-invalid/pod_stream.result-key-disagrees": {
+      "classification": "model-invalid",
+      "document": {
+        "attempt_id": "0123456789abcdef0123456789abcdef",
+        "client_send_mono_ns": 4600,
+        "result": {
+          "corr_id": "corr-1",
+          "job_id": "job-1",
+          "kind": "align",
+          "result_key": "other",
+          "session_id": "session-1",
+          "status": "ok"
+        },
+        "seq": 46,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "c0a89df88e9f517b22b040dc960b9330b4b1d6c33ec61a71e679b2b641aee800",
+      "source_path": "examples/model-invalid/pod_stream.result-key-disagrees.json",
+      "surface": "pod_stream"
+    },
+    "model-invalid/pod_stream_server.delivery-id-disagrees": {
+      "classification": "model-invalid",
+      "document": {
+        "attempt_id": "0123456789abcdef0123456789abcdef",
+        "delivery_id": "wrong-corr",
+        "job": {
+          "chain": {
+            "job_id": "render-preview-42",
+            "ops": []
+          },
+          "corr_id": "clip-rank-12",
+          "session_id": "fleet-preview",
+          "type": "ops"
+        },
+        "replayed": false,
+        "seq": 1,
+        "stream_id": "pod-boot-42",
+        "timeline": {
+          "claim_max_unix_ns": 130,
+          "claim_min_unix_ns": 120,
+          "enqueue_max_unix_ns": 110,
+          "enqueue_min_unix_ns": 100,
+          "socket_write_min_unix_ns": 140
+        },
+        "type": "job"
+      },
+      "sha256": "787bba56477a6963da2f898475744c06396ababcba5b31709231a2841dfb1d26",
+      "source_path": "examples/model-invalid/pod_stream_server.delivery-id-disagrees.json",
+      "surface": "pod_stream_server"
+    },
+    "pod_enqueue_ack.ok": {
+      "classification": "valid",
+      "document": {
+        "corr_id": "fetch-a",
+        "duplicate": false,
+        "enqueue_max_unix_ns": 120,
+        "enqueue_min_unix_ns": 110,
+        "ok": true,
+        "schema_version": 12,
+        "server_recv_unix_ns": 100,
+        "server_send_unix_ns": 130
+      },
+      "sha256": "e4914b608d60b7cd66d7bf4c2b9b9dcc512ac9e6be6cac579402b1ce2a127ffd",
+      "source_path": "examples/pod_enqueue_ack.ok.json",
+      "surface": "pod_enqueue_ack"
+    },
+    "pod_stream.event": {
+      "classification": "valid",
+      "document": {
+        "client_send_mono_ns": 4100,
+        "event": {
+          "capacity": {
+            "fetch_workers": 24,
+            "rank_lanes": 6
+          },
+          "corr_id": "corr-41",
+          "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+          "op": "media.fetch",
+          "outcome": "ok",
+          "phase": "put",
+          "session_id": "session-7",
+          "stage": "ops",
+          "status": "step",
+          "step": "fetch",
+          "timeline": {
+            "pod_run_ns": 3000
+          },
+          "ts": "2026-08-07T10:15:30Z"
+        },
+        "seq": 41,
+        "stream_id": "pod-boot-7",
+        "type": "event"
+      },
+      "sha256": "24eeea48319af081949df52fba64e242ef5cbb7144bc2bb99000215ad6d2f0f0",
+      "source_path": "examples/pod_stream.event.json",
+      "surface": "pod_stream"
+    },
+    "pod_stream.job_ack": {
+      "classification": "valid",
+      "document": {
+        "client_send_mono_ns": 4300,
+        "job_ack": {
+          "attempt_id": "0123456789abcdef0123456789abcdef",
+          "client_recv_mono_ns": 4250,
+          "corr_id": "clip-rank-12",
+          "delivery_id": "clip-rank-12"
+        },
+        "seq": 43,
+        "stream_id": "pod-boot-7",
+        "type": "job_ack"
+      },
+      "sha256": "758315f18ad5f682ae2d2a035a9ab7a06c2c6f28eaaea8969a610fea628d2c0e",
+      "source_path": "examples/pod_stream.job_ack.json",
+      "surface": "pod_stream"
+    },
+    "pod_stream.result": {
+      "classification": "valid",
+      "document": {
+        "attempt_id": "0123456789abcdef0123456789abcdef",
+        "client_send_mono_ns": 4200,
+        "result": {
+          "corr_id": "work/t/run/rank-1.json",
+          "infer_version": 1,
+          "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+          "kind": "clip_rank",
+          "result_key": "work/t/run/rank-1.json",
+          "session_id": "fleet-preview",
+          "status": "ok",
+          "timeline": {
+            "pod_run_max_mono_ns": 200,
+            "pod_run_min_mono_ns": 100
+          },
+          "timing": {
+            "infer_s": 1.2
+          }
+        },
+        "seq": 42,
+        "stream_id": "pod-boot-7",
+        "type": "result"
+      },
+      "sha256": "5a432c4e4c5ef874969d38b252b338e4c4714b79201f3cf8d7ef1cb4e7e36338",
+      "source_path": "examples/pod_stream.result.json",
+      "surface": "pod_stream"
+    },
+    "pod_stream_server.ack": {
+      "classification": "valid",
+      "document": {
+        "duplicate": true,
+        "seq": 17,
+        "server_recv_unix_ns": 1000,
+        "server_send_unix_ns": 1100,
+        "status": 202,
+        "stream_id": "pod-boot-42",
+        "type": "ack"
+      },
+      "sha256": "fcb85dad3bd3715d446cb438627b4fa9c6a8612b825c84929c3136a1ea1e74d2",
+      "source_path": "examples/pod_stream_server.ack.json",
+      "surface": "pod_stream_server"
+    },
+    "pod_stream_server.job": {
+      "classification": "valid",
+      "document": {
+        "attempt_id": "0123456789abcdef0123456789abcdef",
+        "delivery_id": "clip-rank-12",
+        "job": {
+          "chain": {
+            "job_id": "render-preview-42",
+            "ops": []
+          },
+          "corr_id": "clip-rank-12",
+          "session_id": "fleet-preview",
+          "type": "ops"
+        },
+        "replayed": false,
+        "seq": 1,
+        "stream_id": "pod-boot-42",
+        "timeline": {
+          "claim_max_unix_ns": 130,
+          "claim_min_unix_ns": 120,
+          "enqueue_max_unix_ns": 110,
+          "enqueue_min_unix_ns": 100,
+          "socket_write_min_unix_ns": 140
+        },
+        "type": "job"
+      },
+      "sha256": "da66625a56ebb2aae28b97e79fb7c8276df3b7d2beaf146fb4a0d51be5854410",
+      "source_path": "examples/pod_stream_server.job.json",
+      "surface": "pod_stream_server"
+    },
+    "pod_transport_receipt.ok": {
+      "classification": "valid",
+      "document": {
+        "attempt_id": "0123456789abcdef0123456789abcdef",
+        "claim_max_unix_ns": 130,
+        "claim_min_unix_ns": 120,
+        "corr_id": "fetch-a",
+        "enqueue_max_unix_ns": 110,
+        "enqueue_min_unix_ns": 100,
+        "job_accepted_max_unix_ns": 170,
+        "job_accepted_min_unix_ns": 150,
+        "job_delivered_unix_ns": 150,
+        "replayed": false,
+        "result_commit_max_unix_ns": 510,
+        "result_commit_min_unix_ns": 500,
+        "schema_version": 12,
+        "seq": 3,
+        "socket_write_max_unix_ns": 150,
+        "socket_write_min_unix_ns": 140,
+        "stream_id": "pod-boot-a"
+      },
+      "sha256": "9b1f26441950b100335241fcdb19845a1e71f960d4a09018ef96a3b979a67c43",
+      "source_path": "examples/pod_transport_receipt.ok.json",
+      "surface": "pod_transport_receipt"
+    },
+    "publish_job.ok": {
+      "classification": "valid",
+      "document": {
+        "callback": {
+          "channel": "monty:events:f47ac10b-58cc-4372-a567-0e02b2c3d479",
+          "kind": "redis"
+        },
+        "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "params": {
+          "deliverables": {
+            "master": "https://r2.example.com/deliverables/tenant_abc123/zapis-iyun/master.mp4?X-Amz-Signature=deadbeef",
+            "short": "https://r2.example.com/deliverables/tenant_abc123/zapis-iyun/short1.mp4?X-Amz-Signature=deadbeef"
+          },
+          "funnel_url": "https://t.me/nefomoeb",
+          "platforms": [
+            "youtube",
+            "tiktok"
+          ],
+          "publish_meta": {
+            "music_attribution": "slimeyfox — hypermafia",
+            "tiktok": {
+              "privacy_level": "SELF_ONLY",
+              "title": "Почему биткоин падает"
+            },
+            "title": "Почему биткоин падает",
+            "youtube": {
+              "description": "Разбор без паники.",
+              "privacy": "private",
+              "tags": [
+                "крипта",
+                "биткоин"
+              ],
+              "title": "Почему биткоин падает"
+            }
+          },
+          "tokens": {
+            "tiktok": {
+              "access_token": "act.ExampleAccessToken",
+              "external_account_id": "tt-9931"
+            },
+            "youtube": {
+              "refresh_token": "1//0gRefreshTokenExample"
+            }
+          }
+        },
+        "schema_version": 12,
+        "slug": "zapis-iyun",
+        "tenant_id": "tenant_abc123"
+      },
+      "sha256": "fb29591416d6bfb64155bd91799d8083cd3359ac00843cc025ff5ec2ab3096ed",
+      "source_path": "examples/publish_job.ok.json",
+      "surface": "publish_job"
+    }
+  },
+  "generated_by": "tools/gen_wire.py",
+  "registry": {
+    "registry_format": 1,
+    "surfaces": [
+      {
+        "fixture_fingerprint": [
+          "schema_version",
+          "job_id",
+          "stage",
+          "status"
+        ],
+        "name": "event",
+        "python_models": [
+          "MontageEvent"
+        ],
+        "requires_valid_fixture": true,
+        "schema": "event.schema.json",
+        "version_pointers": [
+          "/properties/schema_version/const"
+        ]
+      },
+      {
+        "fixture_fingerprint": [
+          "schema_version",
+          "job_id",
+          "tenant_id",
+          "type"
+        ],
+        "name": "job",
+        "python_models": [
+          "MontageJob"
+        ],
+        "requires_valid_fixture": true,
+        "schema": "job.schema.json",
+        "version_pointers": [
+          "/properties/schema_version/const"
+        ]
+      },
+      {
+        "fixture_fingerprint": [
+          "schema_version",
+          "job_id",
+          "status",
+          "artifacts"
+        ],
+        "name": "manifest",
+        "python_models": [
+          "MontageManifest"
+        ],
+        "requires_valid_fixture": true,
+        "schema": "manifest.schema.json",
+        "version_pointers": [
+          "/properties/schema_version/const"
+        ]
+      },
+      {
+        "fixture_fingerprint": [
+          "schema_version",
+          "ok",
+          "corr_id",
+          "server_recv_unix_ns"
+        ],
+        "name": "pod_enqueue_ack",
+        "python_models": [
+          "PodEnqueueAck",
+          "PodEnqueueAckV12"
+        ],
+        "requires_valid_fixture": true,
+        "schema": "pod_enqueue_ack.schema.json",
+        "version_pointers": [
+          "/x-contract-version",
+          "/properties/schema_version/const"
+        ]
+      },
+      {
+        "fixture_fingerprint": [],
+        "name": "pod_stream",
+        "python_models": [],
+        "requires_valid_fixture": true,
+        "schema": "pod_stream.schema.json",
+        "version_pointers": [
+          "/x-contract-version"
+        ]
+      },
+      {
+        "fixture_fingerprint": [],
+        "name": "pod_stream_server",
+        "python_models": [],
+        "requires_valid_fixture": true,
+        "schema": "pod_stream_server.schema.json",
+        "version_pointers": [
+          "/x-contract-version"
+        ]
+      },
+      {
+        "fixture_fingerprint": [],
+        "name": "pod_token",
+        "python_models": [],
+        "requires_valid_fixture": false,
+        "schema": "pod_token.schema.json",
+        "version_pointers": [
+          "/x-contract-version"
+        ]
+      },
+      {
+        "fixture_fingerprint": [
+          "schema_version",
+          "corr_id",
+          "attempt_id",
+          "stream_id"
+        ],
+        "name": "pod_transport_receipt",
+        "python_models": [
+          "PodTransportReceipt",
+          "RouterConsumeReceiptV12"
+        ],
+        "requires_valid_fixture": true,
+        "schema": "pod_transport_receipt.schema.json",
+        "version_pointers": [
+          "/x-contract-version",
+          "/properties/schema_version/const"
+        ]
+      },
+      {
+        "fixture_fingerprint": [
+          "schema_version",
+          "job_id",
+          "params"
+        ],
+        "name": "publish_job",
+        "python_models": [
+          "PublishEnvelope"
+        ],
+        "requires_valid_fixture": true,
+        "schema": "publish_job.schema.json",
+        "version_pointers": [
+          "/properties/schema_version/const"
+        ]
+      }
+    ],
+    "version_file": "VERSION"
+  },
+  "schemas": {
+    "event": {
+      "$defs": {
+        "podWireStatus": {
+          "description": "The pod->control-plane WebSocket event status vocabulary and how it folds onto `status` above. The pod agent spells these and Go translates them before XADD. Not itself on this stream — the translated event is.",
+          "enum": [
+            "done",
+            "ok",
+            "step",
+            "error"
+          ],
+          "foldsTo": {
+            "done": "done",
+            "error": "failed",
+            "ok": "done",
+            "step": "running"
+          }
+        },
+        "reservedStage": {
+          "const": "job",
+          "description": "RESERVED stage name with contract force: an event whose stage is exactly this is about the WHOLE job, not a task, and the control plane sets terminal job state from it (internal/jobs ApplyEvent). Every other value is an opaque engine task name. Declared here because it was a magic string on both sides, constrained by nothing."
+        }
+      },
+      "$id": "https://monty.fast/contracts/event.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "One stage-progress event on the shared events stream. TWO producers: the Python worker (per engine task) and the Go control plane (which folds typed pod WebSocket event frames onto the same stream). Consumer is the Go control plane. stage is a free string (the engine's task name) so adding/removing/renaming a stage does NOT bump this contract; status is a closed vocab Go branches on. DISCRIMINATOR: event vs manifest on the one stream is decided by the presence of `stage` — see manifest.schema.json.",
+      "properties": {
+        "attempt": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capacity": {
+          "description": "opaque pod capacity snapshot (for example rank_lanes/fetch_workers), preserved independently from reason",
+          "type": "object"
+        },
+        "corr_id": {
+          "description": "address of the pod sub-job/terminal inside a shared session lane",
+          "minLength": 1,
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error_type": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "op": {
+          "description": "pod operation name, when the runner reports one",
+          "minLength": 1,
+          "type": "string"
+        },
+        "optional": {
+          "description": "whether a pod step may fail without failing its chain",
+          "type": "boolean"
+        },
+        "origin": {
+          "description": "present only on control-plane-normalized pod events; consumers must use this marker instead of guessing from stage",
+          "enum": [
+            "pod"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "ok",
+            "error"
+          ]
+        },
+        "outputs": {
+          "description": "pod output manifest, preserved as structured JSON rather than hidden in reason"
+        },
+        "pct": {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "number"
+        },
+        "phase": {
+          "description": "pod-side phase within a step",
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "description": "why skipped (blocked|optional) — present on status=skipped",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 12
+        },
+        "session_id": {
+          "description": "pod-lane session that carried this event; optional for non-pod producers",
+          "minLength": 1,
+          "type": "string"
+        },
+        "skipped": {
+          "description": "optional pod step ids skipped on a terminal",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "stage": {
+          "description": "engine task name (e.g. head_motion), or the reserved value in $defs/reservedStage for the overall job",
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "done",
+            "skipped",
+            "failed"
+          ]
+        },
+        "step": {
+          "description": "pod operation step id; preserved separately from human-readable reason",
+          "minLength": 1,
+          "type": "string"
+        },
+        "steps": {
+          "description": "completed pod step ids on a terminal",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "timeline": {
+          "description": "opaque end-to-end transport timeline. Go preserves the full tree; producers own its inner schema.",
+          "type": "object"
+        },
+        "timing_seconds": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "timings": {
+          "description": "opaque pod timing tree, relayed without a Go-side field mirror",
+          "type": "object"
+        },
+        "ts": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "job_id",
+        "stage",
+        "status"
+      ],
+      "title": "MontageEvent",
+      "type": "object"
+    },
+    "job": {
+      "$id": "https://monty.fast/contracts/job.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$comment": "render_final renders FROM the FE-mutated plan (TWO_TIER_RENDER §5.3) — a render_final with no plan would silently render the pre-edit out/*.json and diverge from what the user previewed. Guard it in the contract, not deep in the render.",
+          "if": {
+            "properties": {
+              "type": {
+                "const": "render_final"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "plan"
+            ]
+          }
+        }
+      ],
+      "description": "Go control plane -> Python worker. The envelope a worker pulls from Redis to run one job. type is one of scenario|plan|render_preview|render_final|palette|edit (RENDER_STAGE_MAP §5). The dev turnkey monolith is type=plan with params.turnkey=true. params AND plan are OPAQUE to Go (engine-owned; validated worker-side); only the envelope is the cross-language contract.",
+      "properties": {
+        "brand": {
+          "description": "channel brand slug (engine resolves brands/<brand>/). Go-owned, derived from projects.brand_id. Replaces the worker's hardcoded brand seed. OPTIONAL — absent on local-dev jobs built without the control plane, where the worker falls back to active_brand() (env BRAND).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "callback": {
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "description": "Redis pub/sub channel for events + manifest",
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "redis"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "channel"
+          ],
+          "type": "object"
+        },
+        "chain_id": {
+          "description": "identity of ONE montage RUN across its plan/render_preview/render_final jobs. job_id is minted per STAGE, so before this the run had no name and the three stages' work prefixes were siblings under the tenant root — a stale run's files merged into a fresh one by mtime. OPTIONAL: a v7-shaped envelope still validates and consumers fall back to `chain_id or job_id`, reproducing the 3-segment prefix exactly — that fallback IS the migration for jobs already queued.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "job_token": {
+          "description": "OPAQUE per-job bearer token the control plane mints at dispatch; the worker exports it (MONTY_JOB_TOKEN) for keyless /internal/llm calls. Closes the mint-never-wired gap.",
+          "type": "string"
+        },
+        "music_recent": {
+          "description": "Go-owned anti-repeat seed: recent track relpaths for this (tenant, brand), most-recent-first, read from the control-plane music_history table. The worker feeds these to music_select's recency penalty INSTEAD of brands/<brand>/music_history.json (now a local-dev fallback). OPTIONAL — absent on local-dev jobs (worker falls back to the file).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "output_prefix": {
+          "description": "R2 key prefix for KEPT deliverables, project-scoped: deliverables/<tenant>/<project>/",
+          "minLength": 1,
+          "type": "string"
+        },
+        "params": {
+          "description": "OPAQUE to Go. Engine montage knobs (pace/broll/director-model/...). Worker validates against engine-side params schema. Adding a knob does NOT bump this contract.",
+          "type": "object"
+        },
+        "plan": {
+          "description": "OPAQUE to Go, like params. The FE-mutated PreviewPlan (swaps/music/transitions/mograph text) — the SSOT input to render_final so preview and final render from ONE plan (TWO_TIER_RENDER §5.3). Present on render_final; absent elsewhere. Worker validates its shape against the engine PreviewPlan schema. May carry an optional `layers` control field (which composition layers render_final (re)builds: broll/captions/mograph/logo/cover/watermark, or absent = all) — a targeted PATCH; engine-validated against scripts/layer_set.py, still opaque to Go (Go only mirrors the closed key set).",
+          "type": "object"
+        },
+        "project_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "subscription",
+            "anthropic_api"
+          ]
+        },
+        "render_tier": {
+          "description": "which RenderProfile the render stages bake to: preview=540x960 proxy clean plate (render_base), final=1080x1920 master (render_final). OPTIONAL — absent on non-render jobs (analyze/resolve) and on the monolith unless it targets a tier.",
+          "enum": [
+            "preview",
+            "final"
+          ]
+        },
+        "scenario": {
+          "additionalProperties": false,
+          "description": "The APPROVED preproduction script the montage renders from. Go seeds it from the scenarios table (the durable per-(tenant, project) store); the worker writes it to projects/<slug>/scenario.md so the director reads it unchanged. OPTIONAL — absent on upload-only jobs and on type=scenario generation jobs.",
+          "properties": {
+            "body": {
+              "description": "read-aloud script text",
+              "minLength": 60,
+              "type": "string"
+            },
+            "music_mood": {
+              "description": "mood/energy/texture hint the Director Brief reads",
+              "minLength": 4,
+              "type": "string"
+            },
+            "title": {
+              "maxLength": 120,
+              "minLength": 3,
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "body",
+            "music_mood"
+          ],
+          "type": "object"
+        },
+        "schema_version": {
+          "const": 12
+        },
+        "slug": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_key": {
+          "description": "The raw recording's own R2 object key (uploads/<tenant>/<uid>-<name>, minted by POST /api/uploads and already validated by ownedKey). source_url is a ~24h capability: it cannot be re-minted, HEADed or stored, so a stage that must hand the recording to a keyless pod op has to re-upload a second copy under work_prefix — the box paying a full download+upload of the recording per stage. With the KEY the engine presigns the object where it already sits and the media never crosses the control-plane box (docs/TRANSPORT_ARCHITECTURE.md). OPTIONAL — absent on local-dev jobs built without the control plane and on any submit that named a raw source_url; consumers fall back to source_url.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_url": {
+          "description": "presigned R2 GET for the raw recording",
+          "format": "uri",
+          "type": "string"
+        },
+        "tenant_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "description": "scenario = preproduction script (ensemble); plan = brain, everything up to spec (replaces analyze+resolve; params.turnkey=true runs the dev monolith); render_preview = pod 540x960 proxy (render_tier=preview) — TERMINAL for the first view: its done-manifest means the viewer plan is on the store and playable; palette = the CONTINUATION render_preview chains into (render_tier=preview), which re-emits that SAME plan with the editor's swap-palette proxies and nothing else; render_final = 1080p master from the FE-mutated plan; edit = delta mutation (plan-patch / trims / NL). scenario+edit are not yet executable by the engine. FE CONTRACT ON `palette`: it is a booked stage-job like any other (own job row, chain edge, progress events, terminal manifest), so a client polling the submitted id sees type=palette the moment the preview is ready — the mere EXISTENCE of a palette stage in the chain is the statement that render_preview finished. While it runs the plan is already usable, with palette rows carrying no `previewSrc` (the player reads `previewSrc ?? src` and plays the master — the same degrade a failed proxy chain has always produced). When it reaches status=done the client re-GETs GET /api/jobs/{submitted_id}/plan, which always serves the NEWEST plan in the run.",
+          "enum": [
+            "scenario",
+            "plan",
+            "render_preview",
+            "render_final",
+            "palette",
+            "edit"
+          ]
+        },
+        "work_prefix": {
+          "description": "R2 key prefix for the job's WORKING SET (source+intermediates+ALL candidates): work/<tenant>/<chain>/<job>/ when chain_id is present, else the legacy job-scoped work/<tenant>/<job>/. Lives until the user commits, then GC'd (one prefix delete per run) — enables cheap re-edits without re-sourcing.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "job_id",
+        "tenant_id",
+        "type",
+        "slug",
+        "source_url",
+        "output_prefix",
+        "work_prefix",
+        "provider",
+        "callback"
+      ],
+      "title": "MontageJob",
+      "type": "object"
+    },
+    "manifest": {
+      "$id": "https://monty.fast/contracts/manifest.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Python worker -> Go control plane on completion. The deliverables a finished job produced in R2 (master/shorts/cover/thumbnail) — what Go meters for quota and hands the user via presigned URLs. Intermediates/sidecars are NOT in the boundary. DISCRIMINATOR: event and manifest share ONE Redis stream and are told apart by the presence of `stage` (contracts.IsEvent / cmd/api fold). That rule is only safe because this schema is closed AND declares no `stage` property — adding one here would make every manifest decode as an event and no job would ever reach a terminal state. examples/invalid/manifest.with-stage.json is the golden that holds it.",
+      "properties": {
+        "artifacts": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "bytes": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "duration_s": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "height": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "key": {
+                "description": "R2 object key under output_prefix",
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "master",
+                  "short",
+                  "cover",
+                  "thumbnail"
+                ]
+              },
+              "width": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "key",
+              "bytes"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "error": {
+          "description": "present on status=failed",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "music_track": {
+          "description": "repo-relative path of the music track the worker committed for this job. The control plane appends it to the music_history table (anti-repeat, per (tenant, brand)). OPTIONAL — absent when the job used no music or reused a sticky prior pick.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "scenario": {
+          "additionalProperties": false,
+          "description": "The preproduction script a type=scenario job generated. The control plane persists it to scenarios.body (per (tenant, project), a new draft version). OPTIONAL — present only on a done scenario job.",
+          "properties": {
+            "body": {
+              "minLength": 60,
+              "type": "string"
+            },
+            "music_mood": {
+              "minLength": 4,
+              "type": "string"
+            },
+            "title": {
+              "maxLength": 120,
+              "minLength": 3,
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "body",
+            "music_mood"
+          ],
+          "type": "object"
+        },
+        "schema_version": {
+          "const": 12
+        },
+        "status": {
+          "enum": [
+            "done",
+            "failed"
+          ]
+        },
+        "timing_seconds": {
+          "description": "total wall-clock for the job",
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "schema_version",
+        "job_id",
+        "status"
+      ],
+      "title": "MontageManifest",
+      "type": "object"
+    },
+    "pod_enqueue_ack": {
+      "$id": "https://monty.fast/contracts/pod_enqueue_ack.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Control-plane acknowledgement for one POST /internal/pod-jobs Redis enqueue. The bounds use the control-plane Unix clock; attempt_id is absent because attempts begin at claim.",
+      "properties": {
+        "corr_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "duplicate": {
+          "type": "boolean"
+        },
+        "enqueue_max_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enqueue_min_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ok": {
+          "const": true
+        },
+        "schema_version": {
+          "const": 12
+        },
+        "server_recv_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "server_send_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "ok",
+        "duplicate",
+        "corr_id",
+        "server_recv_unix_ns",
+        "enqueue_min_unix_ns",
+        "enqueue_max_unix_ns",
+        "server_send_unix_ns"
+      ],
+      "title": "PodEnqueueAck",
+      "type": "object",
+      "x-contract-version": 12
+    },
+    "pod_stream": {
+      "$defs": {
+        "attemptId": {
+          "description": "Claim identity minted atomically with Redis reserve and stable across socket replay.",
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "eventFrame": {
+          "additionalProperties": false,
+          "properties": {
+            "client_send_mono_ns": {
+              "$ref": "#/$defs/monotonicNs"
+            },
+            "event": {
+              "$ref": "#/$defs/podEvent"
+            },
+            "seq": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "stream_id": {
+              "$ref": "#/$defs/streamId"
+            },
+            "type": {
+              "const": "event"
+            }
+          },
+          "required": [
+            "type",
+            "stream_id",
+            "seq",
+            "client_send_mono_ns",
+            "event"
+          ],
+          "type": "object"
+        },
+        "jobAck": {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_id": {
+              "$ref": "#/$defs/attemptId"
+            },
+            "client_recv_mono_ns": {
+              "$ref": "#/$defs/monotonicNs"
+            },
+            "corr_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "delivery_id": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "delivery_id",
+            "corr_id",
+            "attempt_id",
+            "client_recv_mono_ns"
+          ],
+          "type": "object"
+        },
+        "jobAckFrame": {
+          "additionalProperties": false,
+          "properties": {
+            "client_send_mono_ns": {
+              "$ref": "#/$defs/monotonicNs"
+            },
+            "job_ack": {
+              "$ref": "#/$defs/jobAck"
+            },
+            "seq": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "stream_id": {
+              "$ref": "#/$defs/streamId"
+            },
+            "type": {
+              "const": "job_ack"
+            }
+          },
+          "required": [
+            "type",
+            "stream_id",
+            "seq",
+            "client_send_mono_ns",
+            "job_ack"
+          ],
+          "type": "object"
+        },
+        "monotonicNs": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "podEvent": {
+          "additionalProperties": false,
+          "properties": {
+            "capacity": {
+              "type": "object"
+            },
+            "corr_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "error_type": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "job_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "optional": {
+              "type": "boolean"
+            },
+            "outcome": {
+              "enum": [
+                "ok",
+                "error"
+              ]
+            },
+            "outputs": {},
+            "phase": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "session_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skipped": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stage": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "done",
+                "ok",
+                "step",
+                "error"
+              ]
+            },
+            "step": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "steps": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "timeline": {
+              "description": "Opaque terminal/step timeline preserved unchanged by Go.",
+              "type": "object"
+            },
+            "timings": {
+              "type": "object"
+            },
+            "ts": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "stage",
+            "status"
+          ],
+          "type": "object"
+        },
+        "podResult": {
+          "additionalProperties": true,
+          "allOf": [
+            {
+              "oneOf": [
+                {
+                  "required": [
+                    "kind"
+                  ]
+                },
+                {
+                  "required": [
+                    "stage"
+                  ]
+                }
+              ]
+            },
+            {
+              "not": {
+                "required": [
+                  "timing",
+                  "timings"
+                ]
+              }
+            }
+          ],
+          "description": "Full infer/result body is stored immutable and interpreted by the box. Go validates routing/status/correlation only.",
+          "properties": {
+            "corr_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "job_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "result_key": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "session_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "stage": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "ok",
+                "error"
+              ]
+            },
+            "timeline": {
+              "description": "Opaque terminal timeline preserved unchanged by Go.",
+              "type": "object"
+            },
+            "timing": {
+              "type": "object"
+            },
+            "timings": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "job_id",
+            "session_id",
+            "corr_id",
+            "status"
+          ],
+          "type": "object"
+        },
+        "resultFrame": {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_id": {
+              "$ref": "#/$defs/attemptId"
+            },
+            "client_send_mono_ns": {
+              "$ref": "#/$defs/monotonicNs"
+            },
+            "result": {
+              "$ref": "#/$defs/podResult"
+            },
+            "seq": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "stream_id": {
+              "$ref": "#/$defs/streamId"
+            },
+            "type": {
+              "const": "result"
+            }
+          },
+          "required": [
+            "type",
+            "stream_id",
+            "seq",
+            "client_send_mono_ns",
+            "attempt_id",
+            "result"
+          ],
+          "type": "object"
+        },
+        "streamId": {
+          "description": "Fresh for one pod process, stable across reconnects.",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        }
+      },
+      "$id": "https://monty.fast/contracts/pod_stream.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Strict pod->control-plane frame on the sole pod transport. Every frame carries a pod-monotonic send stamp; terminal frames echo the atomic claim attempt.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/eventFrame"
+        },
+        {
+          "$ref": "#/$defs/resultFrame"
+        },
+        {
+          "$ref": "#/$defs/jobAckFrame"
+        }
+      ],
+      "title": "PodStreamClientFrame",
+      "x-contract-version": 12
+    },
+    "pod_stream_server": {
+      "$defs": {
+        "ackFrame": {
+          "additionalProperties": false,
+          "properties": {
+            "duplicate": {
+              "type": "boolean"
+            },
+            "error": {
+              "type": "string"
+            },
+            "seq": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "server_recv_unix_ns": {
+              "$ref": "#/$defs/unixNs"
+            },
+            "server_send_unix_ns": {
+              "$ref": "#/$defs/unixNs"
+            },
+            "status": {
+              "maximum": 599,
+              "minimum": 100,
+              "type": "integer"
+            },
+            "stream_id": {
+              "$ref": "#/$defs/streamId"
+            },
+            "type": {
+              "const": "ack"
+            }
+          },
+          "required": [
+            "type",
+            "stream_id",
+            "seq",
+            "status",
+            "server_recv_unix_ns",
+            "server_send_unix_ns"
+          ],
+          "type": "object"
+        },
+        "attemptId": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "jobFrame": {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_id": {
+              "$ref": "#/$defs/attemptId"
+            },
+            "delivery_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "job": {
+              "$ref": "#/$defs/podJob"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "seq": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "stream_id": {
+              "$ref": "#/$defs/streamId"
+            },
+            "timeline": {
+              "$ref": "#/$defs/jobTimeline"
+            },
+            "type": {
+              "const": "job"
+            }
+          },
+          "required": [
+            "type",
+            "delivery_id",
+            "attempt_id",
+            "stream_id",
+            "seq",
+            "replayed",
+            "timeline",
+            "job"
+          ],
+          "type": "object"
+        },
+        "jobTimeline": {
+          "additionalProperties": false,
+          "properties": {
+            "claim_max_unix_ns": {
+              "$ref": "#/$defs/unixNs"
+            },
+            "claim_min_unix_ns": {
+              "$ref": "#/$defs/unixNs"
+            },
+            "enqueue_max_unix_ns": {
+              "$ref": "#/$defs/unixNs"
+            },
+            "enqueue_min_unix_ns": {
+              "$ref": "#/$defs/unixNs"
+            },
+            "socket_write_min_unix_ns": {
+              "$ref": "#/$defs/unixNs"
+            }
+          },
+          "required": [
+            "enqueue_min_unix_ns",
+            "enqueue_max_unix_ns",
+            "claim_min_unix_ns",
+            "claim_max_unix_ns",
+            "socket_write_min_unix_ns"
+          ],
+          "type": "object"
+        },
+        "podJob": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "infer"
+                  }
+                }
+              },
+              "then": {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "spec"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "chain"
+                      ]
+                    }
+                  ]
+                },
+                "required": [
+                  "request"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "render"
+                  }
+                }
+              },
+              "then": {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "request"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "chain"
+                      ]
+                    }
+                  ]
+                },
+                "required": [
+                  "spec"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "ops"
+                  }
+                }
+              },
+              "then": {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "request"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "spec"
+                      ]
+                    }
+                  ]
+                },
+                "required": [
+                  "chain"
+                ]
+              }
+            }
+          ],
+          "properties": {
+            "chain": {
+              "type": "object"
+            },
+            "corr_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "request": {
+              "type": "object"
+            },
+            "session_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "spec": {
+              "type": "object"
+            },
+            "target_worker_id": {
+              "description": "Control-plane-only warm-up routing fence. The API strips it before the WebSocket payload; a fleet worker may claim the stored envelope only when its identity matches.",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:-]+$",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "infer",
+                "render",
+                "ops"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "corr_id"
+          ],
+          "type": "object"
+        },
+        "streamId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "unixNs": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "$id": "https://monty.fast/contracts/pod_stream_server.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Strict control-plane->pod frame on the sole pod transport.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ackFrame"
+        },
+        {
+          "$ref": "#/$defs/jobFrame"
+        }
+      ],
+      "title": "PodStreamServerFrame",
+      "x-contract-version": 12
+    },
+    "pod_token": {
+      "$id": "monty/pod_token.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Cross-language HMAC token payload. aud separates submitter tokens from physical pod workers; omitted aud is legacy-only and cannot access shared-fleet transport.",
+      "properties": {
+        "aud": {
+          "enum": [
+            "pod_worker",
+            "pod_submitter"
+          ],
+          "type": "string"
+        },
+        "exp": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jid": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sid": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tid": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "jid",
+        "tid",
+        "sid",
+        "exp"
+      ],
+      "title": "Monty pod bearer claims",
+      "type": "object",
+      "x-contract-version": 12
+    },
+    "pod_transport_receipt": {
+      "$id": "https://monty.fast/contracts/pod_transport_receipt.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Authoritative control-plane timeline for one corr+attempt+pod-stream delivery. Persisted after socket write and completed by the pod's job_ack.",
+      "properties": {
+        "attempt_id": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "claim_max_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "claim_min_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "corr_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "enqueue_max_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enqueue_min_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "job_accepted_max_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "job_accepted_min_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "job_delivered_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "result_commit_max_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result_commit_min_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": 12
+        },
+        "seq": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "socket_write_max_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "socket_write_min_unix_ns": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stream_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "corr_id",
+        "attempt_id",
+        "stream_id",
+        "seq",
+        "replayed",
+        "enqueue_min_unix_ns",
+        "enqueue_max_unix_ns",
+        "claim_min_unix_ns",
+        "claim_max_unix_ns",
+        "socket_write_min_unix_ns",
+        "socket_write_max_unix_ns",
+        "job_delivered_unix_ns",
+        "job_accepted_min_unix_ns",
+        "job_accepted_max_unix_ns",
+        "result_commit_min_unix_ns",
+        "result_commit_max_unix_ns"
+      ],
+      "title": "PodTransportReceipt",
+      "type": "object",
+      "x-contract-version": 12
+    },
+    "publish_job": {
+      "$id": "https://monty.fast/contracts/publish_job.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Go control plane -> Python worker, on the SEPARATE monty:jobs:publish lane (redis_keys.json routing: type=publish). It is NOT a MontageJob — publish-on-behalf carries per-user OAuth grants and presigned deliverables, and it crossed the seam for a whole milestone described by nothing: Go typed a struct, the worker read two keys off a raw dict, and no schema knew the shape. Correlation fields sit top-level; the pinned creative contract is nested under params (opaque HERE exactly as MontageJob.params is opaque to Go — the worker validates it against publish_job_models.PublishJob, extra=forbid). REQUIRED is what the CONSUMER cannot work without: an address (job_id) and the params blob; everything else Go stamps for attribution and the worker may ignore.",
+      "properties": {
+        "callback": {
+          "additionalProperties": false,
+          "description": "VESTIGIAL, like MontageJob.callback: the worker ignores it and XADDs to the events stream. Declared because Go stamps it.",
+          "properties": {
+            "channel": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "redis"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "channel"
+          ],
+          "type": "object"
+        },
+        "job_id": {
+          "description": "the montage job whose deliverables are being published — the id every event/manifest on this lane is attributed to",
+          "minLength": 1,
+          "type": "string"
+        },
+        "params": {
+          "description": "OPAQUE here. The pinned publish contract (platforms/tokens/deliverables/publish_meta/funnel_url), validated worker-side by publish_job_models.PublishJob. A knob added there does NOT bump this contract.",
+          "type": "object"
+        },
+        "schema_version": {
+          "const": 12,
+          "description": "OPTIONAL on this lane: the worker addresses and validates the envelope without it, so requiring it would reject in-flight envelopes for nothing. Go stamps it so a version skew is visible in the payload."
+        },
+        "slug": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tenant_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "params"
+      ],
+      "title": "PublishEnvelope",
+      "type": "object"
+    }
+  },
+  "source_sha256": {
+    "VERSION": "a1fb50e6c86fae1679ef3351296fd6713411a08cf8dd1790a4fd05fae8688164",
+    "contract_surfaces.json": "d5f22942db5577a8076a6d0986d997470b9c39c34bc2de8bf05bf12f0e5ff045",
+    "event.schema.json": "88132fa8383dce0f60a42151fddf425e8a3aa8ae49651c89df4241567cd4df7f",
+    "examples/event.pod.json": "adacf1be8d7ad9185e6785e1c372c7c2fccbb318e1f58346148fcf39d96bf9c5",
+    "examples/event.running.json": "92e6b8e37a61e08195c01367c9dbf4774200793c47f38dc154026e45bae4df3e",
+    "examples/event.skipped.json": "f94e86e453b25b9c100216fb4034680c3d4a84d3333a565bf86972d678ff5e43",
+    "examples/invalid/event.bad-status.json": "095afbd17c20a40c46c38bf6f758aefd2d136e03ba0d754aa655dce25791d40b",
+    "examples/invalid/job.bad-render-tier.json": "c82584541c923efea9486d03c10ed53ef58fd9e368640d5ecf367c04f8c7b4f1",
+    "examples/invalid/job.bad-type.json": "211636e7f24903ee4b17b0289400a5e8504f210892cd4e13f4d1fd5cfa6b9420",
+    "examples/invalid/job.dead-montage.json": "532af85cbabaeec63b81995e39ac1f14cd08a43e0bbe70da572f393a78a6cafa",
+    "examples/invalid/job.empty-brand.json": "0848c645b244b8f7c30d356eeb51ed82a945f014de91d631daa989bbcd51242b",
+    "examples/invalid/job.empty-chain-id.json": "6010fc883cfa4c30816af690ce2e1ee4ed891e0f68ede724e88bbca5a4c80697",
+    "examples/invalid/job.empty-source-key.json": "bc3b0f833eab098a7b91985644fbb53db65426a0648b73beaa27758ad57460ef",
+    "examples/invalid/job.render-final-no-plan.json": "d85d39ad6aea0164628f33db1d8d90fb051f9806a495743dc489ddee67103c39",
+    "examples/invalid/job.typo-key.json": "d31450e060f97e2450ff968b1c8ed6b522f1709031bae3cd26aa3aee2b032f7a",
+    "examples/invalid/manifest.scenario-missing-field.json": "b10474ed164adf2dfee6c21b09f365fc7226bd1331d43b7d7db8fbce36fc2027",
+    "examples/invalid/manifest.with-stage.json": "323ee81b9a5dad2808f666ae0de3f2cc9d788b7ca4a1ab7e03fc6c7fd912d08b",
+    "examples/invalid/pod_enqueue_ack.missing-bound.json": "5fd5630060d1564e4e67c6665b2195dc71938b280a0c536e2e16dbc91a414735",
+    "examples/invalid/pod_stream.both-payloads.json": "21abb704b5b83c55e3e45be6c618fdd2969cec316ad2eb2c522d40929a12bde8",
+    "examples/invalid/pod_stream.event-empty-job.json": "0624d84b203e6978dee2d0dd089566cce4265a2335512fe50a40b192fd69bf6b",
+    "examples/invalid/pod_stream.event-null-optional.json": "ab5f75dea6e9f8d4d68b6747e2f23dfedbc61b504655e2751ad0e07a59893f52",
+    "examples/invalid/pod_stream.job-ack-unknown.json": "d1def157c657dc40a85b96f84edb40fe1d65ad6dab754b5bb6d6f807673d5c8a",
+    "examples/invalid/pod_stream.missing-client-send.json": "4ae53e47a3196b3280f580d64be80ce6b749fa1f7bbf8c528997bee1069fe41a",
+    "examples/invalid/pod_stream.result-both-attributions.json": "a9ecaeacbd20cbda9abb611321c5b3dc5c3049f617fa7f7c2ef9e33837c2febf",
+    "examples/invalid/pod_stream.result-empty-result-key.json": "07ef77dd93ca6523e85d71d1196194da0c4fe9f5cf55c0ec09923d7771aeed8b",
+    "examples/invalid/pod_stream.result-empty-second-attribution.json": "ac7b97dccc737c820b2bf262facb3df40fe7337ef66226ee993637b4483da467",
+    "examples/invalid/pod_stream.result-missing-session.json": "0b865dcfbb186d014bf0097b39ef31e36a8e9ece1bcd7bc96d321f2af269478c",
+    "examples/invalid/pod_stream.result-null-error.json": "4196a80c31184947b37b4e3aac572fb3ec30fc435ff1c5d1ed009079bdc2ce36",
+    "examples/invalid/pod_stream.result-null-result-key.json": "ea77c89fbae6f516be5f50bb35279823a17d742fa3f4182a476e0c4caeabb995",
+    "examples/invalid/pod_stream.result-without-correlation.json": "48592cb549548518f67ac85005e06631f67510e289ed15a748c705f5a7b4b807",
+    "examples/invalid/pod_stream.result-wrong-error-type.json": "d6488d45d945cd3c4d06484e3e94fab4ad836e4e4160b7e56d6beb0a2247df39",
+    "examples/invalid/pod_stream_server.ack-missing-stream.json": "f80ced897650af508cd6b99ae9297632036157780ae3717b62a741416fe1f4a8",
+    "examples/invalid/pod_stream_server.job-extra-field.json": "cd73b47600f517943a700f57fd1d5ab0a09e2ce4495ae3a01f0a9d3a14547ad9",
+    "examples/invalid/pod_transport_receipt.unknown-field.json": "790ec8c39266ddeb3efcd7fb8db38da02bb8772728663a9bb7fc934ecb76f990",
+    "examples/invalid/publish_job.no-job-id.json": "813af37d202dd4930a66af612acfb0870d1a81f4b7867875062ffbf7a8bd354b",
+    "examples/invalid/publish_job.typo-key.json": "cb4f6366eecf7bd055261ffca95d14b7f5f53d7f513ead30cd1abf05123717f9",
+    "examples/job.chained.json": "3ad30dd284323e7853cc754610e9b1a65e99f368b498b76849fe3f46a6870369",
+    "examples/job.ok.json": "99ba7ea1d185084c8f25412ddabfee43df1cb9f10a2da47cfd82e513d12e8d9f",
+    "examples/job.palette.json": "91c71409abda6dd680f297f691346322f83beeecd81a884d74ca14fbc07e5fad",
+    "examples/job.render-final.json": "e48a4034dd6647988628b1f5c573a9fc10e44651c6fb6f0f9403f857f7e1f8c9",
+    "examples/job.render-preview.json": "c10e1ec6a1958b0d69392905f1cb2a91d63e74fcda0a308b9d41822010a62e16",
+    "examples/manifest.ok.json": "e71304ab13110844d14a57847265311412ad5a01c940dc1f1fb01c91218a68ef",
+    "examples/manifest.scenario.json": "afc8ddfa23a6c0eea7e23a7434981d5448c7106c735cad677ca389952e59c61a",
+    "examples/model-invalid/job.chain-id-not-in-work-prefix.json": "a62966c727e4e35bc76a277e6ab6c24a0b40771abd119728d9d5cfabba24d336",
+    "examples/model-invalid/pod_stream.result-key-disagrees.json": "c0a89df88e9f517b22b040dc960b9330b4b1d6c33ec61a71e679b2b641aee800",
+    "examples/model-invalid/pod_stream_server.delivery-id-disagrees.json": "787bba56477a6963da2f898475744c06396ababcba5b31709231a2841dfb1d26",
+    "examples/pod_enqueue_ack.ok.json": "e4914b608d60b7cd66d7bf4c2b9b9dcc512ac9e6be6cac579402b1ce2a127ffd",
+    "examples/pod_stream.event.json": "24eeea48319af081949df52fba64e242ef5cbb7144bc2bb99000215ad6d2f0f0",
+    "examples/pod_stream.job_ack.json": "758315f18ad5f682ae2d2a035a9ab7a06c2c6f28eaaea8969a610fea628d2c0e",
+    "examples/pod_stream.result.json": "5a432c4e4c5ef874969d38b252b338e4c4714b79201f3cf8d7ef1cb4e7e36338",
+    "examples/pod_stream_server.ack.json": "fcb85dad3bd3715d446cb438627b4fa9c6a8612b825c84929c3136a1ea1e74d2",
+    "examples/pod_stream_server.job.json": "da66625a56ebb2aae28b97e79fb7c8276df3b7d2beaf146fb4a0d51be5854410",
+    "examples/pod_transport_receipt.ok.json": "9b1f26441950b100335241fcdb19845a1e71f960d4a09018ef96a3b979a67c43",
+    "examples/publish_job.ok.json": "fb29591416d6bfb64155bd91799d8083cd3359ac00843cc025ff5ec2ab3096ed",
+    "job.schema.json": "32e52bf40b8b4aec23b48a1137d82f0a21c2a1ced67a66614df0886c83bf869a",
+    "manifest.schema.json": "f631efff66f169ea23d8eb53fc87416a537a1d27067773051f6a475f2ba15dd4",
+    "pod_enqueue_ack.schema.json": "6591f4c1dd02f0cd0654436e9fb3a70ca2ae77bd3dfac3bee970e7b296743880",
+    "pod_stream.schema.json": "987c20e5652259a7deedce612566d447510b6faca31ce980a79ef14bb02afde6",
+    "pod_stream_server.schema.json": "3cd5644ca27d8d9304a392630435aa076a583c9578585fb236a80c4f6c60f110",
+    "pod_token.schema.json": "f10ecdf6482ea326169b1a0aca3ed6a06c63270d1ba6530b4670ec72007fa40d",
+    "pod_transport_receipt.schema.json": "60692ee7069014430b4c2f2cfda99899821d5f06c88e238f543e04dd2d992a11",
+    "publish_job.schema.json": "21e8aa1cf997391be36765291530ed011ee1191b30c90cb1a9f03f77a4fd346e"
+  }
+}

@@ -1,9 +1,0 @@
-{
-  "type": "ack",
-  "stream_id": "pod-boot-42",
-  "seq": 17,
-  "status": 202,
-  "server_recv_unix_ns": 1000,
-  "server_send_unix_ns": 1100,
-  "duplicate": true
-}

@@ -1,9 +1,12 @@
-"""Tripwire: podagent/models.py must mirror contracts/*.schema.json exactly.
+"""Tripwire: podagent/models.py must mirror the pod-owned contracts exactly.
 
 Every golden in contracts/examples/ is re-validated against BOTH the JSON Schema
 (the SSOT) and the pydantic mirror; every golden in contracts/examples/invalid/
 must be rejected by both. A model round-trip (model_dump back through the schema)
 catches mirrors that accept more than the schema does.
+
+The shared EventStream domain is intentionally absent.  Its source is the vendored
+monty-contracts bundle and its independent gate lives in test_wire_contracts.py.
 """
 from __future__ import annotations
 
@@ -23,8 +26,6 @@ from podagent.models import (
     PodJob,
     RenderSpec,
 )
-from podagent.stream_models import PodStreamFrame, PodStreamServerFrame
-
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
 EXAMPLES = CONTRACTS / "examples"
 
@@ -37,8 +38,6 @@ MODELS = {
     "face_probe": FaceProbePayload,
     "clip_rank": ClipRankPayload,
     "pod_job": PodJob,
-    "pod_stream": PodStreamFrame,
-    "pod_stream_server": PodStreamServerFrame,
 }
 
 VALID_EXAMPLES = sorted(EXAMPLES.glob("*.json"))
@@ -100,8 +99,6 @@ def test_model_cross_field_invalid_example_rejected(path: Path) -> None:
 
 def test_top_level_required_parity() -> None:
     for prefix, model_cls in MODELS.items():
-        if prefix.startswith("pod_stream"):
-            continue  # both stream schemas are closed tagged unions; required fields live in each branch
         model_required = {
             (field.alias or name)
             for name, field in model_cls.model_fields.items()

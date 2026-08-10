@@ -1,1 +1,0 @@
-{"type":"job_ack","stream_id":"pod-boot-7","seq":1,"client_send_mono_ns":100,"job_ack":{"delivery_id":"d","corr_id":"d","attempt_id":"0123456789abcdef0123456789abcdef","client_recv_mono_ns":90,"guess":1}}

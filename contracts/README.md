@@ -18,6 +18,9 @@ Consumers on both sides mirror these schemas and re-run the same goldens against
 
 Transport: the planner and the pod NEVER talk directly. Jobs, lifecycle events, and results use one
 typed EventStream WebSocket; media payloads ride presigned URLs.
+The two EventStream schemas and their shared goldens are not copied into this directory: they come from
+`../vendor/monty-contracts/wire_bundle.json` and generate `../podagent/wire_generated.py`. This directory's
+`VERSION=5` therefore remains solely the render/infer domain pin; shared transport currently has its own v12.
 
 ## The job envelope
 
@@ -31,7 +34,7 @@ error. It has no version const of its own — `request`/`spec` each pin their ow
 
 Transport conventions:
 
-- `/pod/stream` — the only pod↔control-plane channel. Server frames are typed v12 `job` or `ack`;
+- `/pod/stream` — the only pod↔control-plane channel. Server frames are typed shared-wire `job` or `ack`;
   client frames are typed `event`, `result`, or `job_ack`, each identified by `stream_id` + monotonic `seq`.
 - Every client wire attempt carries `client_send_mono_ns`; every ACK carries control-plane
   `server_recv_unix_ns`/`server_send_unix_ns`. A pushed job names its Redis `attempt_id`, replay flag and

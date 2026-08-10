@@ -64,6 +64,11 @@ presigned URLs, query strings and workspace paths never enter the receipt. If a
 recorder or clock sample is unavailable, the work still succeeds but the
 timeline is explicitly incomplete and cannot be used as a performance baseline.
 
+The WebSocket structure and its v12 version come from the deterministic
+`vendor/monty-contracts/wire_bundle.json`; `podagent/wire_generated.py` is regenerated from that bundle.
+Only cross-field identity/clock rules remain handwritten in `podagent/stream_models.py`. This shared-wire
+version is independent of `contracts/VERSION=5`, which still owns only render, inference and op payloads.
+
 At boot, the agent reports its diagnostic beacon, proves that `h264_nvenc`
 actually opens on the rented host, then synchronously sends and waits for ACK of a typed
 `boot/ready` event. Capacity advertising and job admission happen only after
@@ -78,6 +83,7 @@ can be compared without treating the diagnostic itself as an admission verdict.
 | path | what |
 |---|---|
 | `contracts/` | the render/inference seam — SSOT (JSON Schema + goldens), consumed by both sides |
+| `vendor/monty-contracts/` | pinned deterministic Go↔pod wire bundle used to generate EventStream fields |
 | `podagent/` | the agent: control-plane client, align/face-probe/clip-rank inference, spec renderer, weight fetch+cache |
 | `Dockerfile` | the thin runtime image (no weights, no browser) |
 | `tests/` | contract-mirror goldens + a secret-scan gate |

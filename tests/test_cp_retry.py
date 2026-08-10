@@ -17,6 +17,7 @@ from websockets.sync.server import serve
 
 from podagent import cp, event_stream
 from podagent.event_stream import DeliveryPending, EventStream, FrameRejected, TransportUnhealthy
+from wire_fixtures import DELETE, invalid_wire, valid_wire
 
 _ATTEMPT_ID = "a" * 32
 
@@ -56,10 +57,7 @@ def _job(corr_id: str = "c", *, target_worker_id: str | None = None) -> dict[str
             },
         },
     }
-    if target_worker_id:
-        body["target_worker_id"] = target_worker_id
-    return {
-        "type": "job",
+    job_patch: dict[str, Any] = {
         "delivery_id": corr_id,
         "attempt_id": _ATTEMPT_ID,
         "stream_id": "pod-stream-1",
@@ -72,21 +70,25 @@ def _job(corr_id: str = "c", *, target_worker_id: str | None = None) -> dict[str
             "claim_max_unix_ns": 4,
             "socket_write_min_unix_ns": 5,
         },
-        "job": body,
+        "job": {"chain": DELETE, **body},
     }
+    if target_worker_id:
+        job_patch["job"]["target_worker_id"] = target_worker_id
+    return valid_wire("pod_stream_server.job", job_patch)
 
 
 def _ack(frame: dict[str, Any], status: int = 202, **extra: Any) -> str:
     server_recv_unix_ns = time.time_ns()
-    return json.dumps({
-        "type": "ack",
+    patch = {
+        "duplicate": DELETE,
         "stream_id": frame["stream_id"],
         "seq": frame["seq"],
         "status": status,
         "server_recv_unix_ns": server_recv_unix_ns,
         "server_send_unix_ns": time.time_ns(),
-        **extra,
-    })
+    }
+    patch.update(extra)
+    return json.dumps(valid_wire("pod_stream_server.ack", patch))
 
 
 @contextmanager
@@ -138,14 +140,20 @@ def test_result_is_a_typed_frame_and_requires_correlation(tmp_path: Path) -> Non
         _wait_for(lambda: stream.pending_count() == 0)
         stream.close()
 
-    assert seen[0] == {
-        "type": "result",
+    assert seen[0] == valid_wire("pod_stream.result", {
         "stream_id": seen[0]["stream_id"],
         "seq": 1,
         "client_send_mono_ns": seen[0]["client_send_mono_ns"],
         "attempt_id": _ATTEMPT_ID,
-        "result": {key: value for key, value in _result().items() if key != "attempt_id"},
-    }
+        "result": {
+            "infer_version": DELETE,
+            "kind": DELETE,
+            "result_key": DELETE,
+            "timeline": DELETE,
+            "timing": DELETE,
+            **{key: value for key, value in _result().items() if key != "attempt_id"},
+        },
+    })
     assert seen[1]["type"] == "event"
     acked = seen[1]["event"]
     assert acked["phase"] == "result_acked" and acked["corr_id"] == "c"
@@ -559,7 +567,11 @@ def test_process_restart_replays_old_identity_and_new_frames_use_a_new_stream(
 
 @pytest.mark.parametrize("reply", [
     {"type": "mystery"},
-    {"type": "ack", "stream_id": "wrong", "seq": 1, "status": 202, "extra": True},
+    invalid_wire(
+        "pod_stream_server.ack",
+        patch={"stream_id": "wrong", "seq": 1, "status": 202, "extra": True},
+        reason="an ACK carrying an undeclared member must not retire a frame",
+    ),
 ])
 def test_unknown_or_malformed_ack_never_retires_a_frame(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply: dict[str, Any]) -> None:
@@ -930,14 +942,7 @@ def test_ack_records_four_timestamps_and_bounded_offset_after_delayed_delivery(t
         seen.append(frame)
         server_recv_ns = time.time_ns()
         time.sleep(0.02)
-        ws.send(json.dumps({
-            "type": "ack",
-            "stream_id": frame["stream_id"],
-            "seq": frame["seq"],
-            "status": 202,
-            "server_recv_unix_ns": server_recv_ns,
-            "server_send_unix_ns": time.time_ns(),
-        }))
+        ws.send(_ack(frame, server_recv_unix_ns=server_recv_ns))
 
     with _server(handler) as base:
         stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
