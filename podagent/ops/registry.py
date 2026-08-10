@@ -24,6 +24,7 @@ CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
 OPS_DIR = CONTRACTS / "ops"
 
 NEEDS_VOCAB = frozenset({"video_encode", "model_weights", "browser", "net", "keys", "llm"})
+BUDGET_VOCAB = frozenset({"cpu", "transport"})
 PARITY_MODES = frozenset({"bit_exact", "perceptual", "numeric"})
 
 
@@ -55,6 +56,7 @@ class Op:
     outputs: tuple[Port, ...]
     params_schema: dict[str, Any]
     handler: str
+    budget: str = "cpu"
 
     @property
     def durable_outputs(self) -> tuple[Port, ...]:
@@ -78,6 +80,9 @@ def _load_one(path: Path) -> Op:
     unknown = set(raw.get("needs", [])) - NEEDS_VOCAB
     if unknown:
         raise OpError(f"{path.name}: needs outside the closed vocabulary: {sorted(unknown)}")
+    budget = str(raw.get("budget", "cpu"))
+    if budget not in BUDGET_VOCAB:
+        raise OpError(f"{path.name}: budget outside the closed vocabulary: {sorted(BUDGET_VOCAB)}")
     parity = raw.get("parity") or {}
     if parity.get("mode") not in PARITY_MODES:
         raise OpError(f"{path.name}: parity.mode must be one of {sorted(PARITY_MODES)}")
@@ -99,7 +104,7 @@ def _load_one(path: Path) -> Op:
         parity_mode=parity["mode"], parity_tol=parity.get("tol"),
         inputs=tuple(_port(p) for p in raw.get("inputs", [])),
         outputs=tuple(_port(p) for p in raw["outputs"]),
-        params_schema=ps, handler=raw["handler"],
+        params_schema=ps, handler=raw["handler"], budget=budget,
     )
 
 

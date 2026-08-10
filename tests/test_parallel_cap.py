@@ -7,7 +7,7 @@ specific wrong cap is refused, and each was watched fail with the derivation rev
 """
 from __future__ import annotations
 
-from podagent.ops import runner
+from podagent.ops import registry, runner
 
 
 def test_big_box_scales_above_the_old_flat_eight():
@@ -130,3 +130,33 @@ def test_the_transport_budget_is_derived_from_the_cpu_one_and_overridable(monkey
     assert runner.transport_cap()[0] == 4 * runner.TRANSFERS_PER_STEP
     monkeypatch.setenv(runner.TRANSPORT_MAX_ENV, "0")
     assert runner.transport_cap()[0] == 4 * runner.TRANSFERS_PER_STEP
+
+
+def test_transport_budgeted_handler_can_use_transport_width_but_cpu_handler_cannot(monkeypatch):
+    """`media.fetch` waits on origin/remux I/O, so its handler may use the wider transport budget.
+
+    NEGATIVE: route every handler through `step_slots()` and six fetch siblings peak at the CPU cap;
+    route every handler through `transport_slots()` and pixel work can oversubscribe the box. The op
+    declaration must choose the one permit explicitly.
+    """
+    monkeypatch.setattr(runner, "parallel_cap", lambda: (2, "test"))
+    runner._reset_step_slots()
+
+    # Keep the actual probe explicit so the test models the runner's `with handler_slots(op)`.
+    def frame_for(op):
+        def frame(work):
+            with runner.handler_slots(op):
+                work()
+        return frame
+
+    fetch_peak = _budget_probe(monkeypatch, 2, frame_for(registry.get("media.fetch")))
+    cpu_peak = _budget_probe(monkeypatch, 2, frame_for(registry.get("media.scale")))
+    assert fetch_peak > 2
+    assert fetch_peak <= runner.transport_cap()[0]
+    assert cpu_peak <= 2
+
+
+def test_chain_executor_exposes_the_wider_budget():
+    """A per-chain executor capped at CPU width would hide transport slots behind an artificial queue."""
+    assert runner.executor_workers(5, 20) == 20
+    assert runner.executor_workers(20, 5) == 20

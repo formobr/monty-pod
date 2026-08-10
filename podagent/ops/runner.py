@@ -177,6 +177,22 @@ def transport_slots() -> threading.Semaphore:
         return _xfer
 
 
+def handler_slots(op: Any) -> threading.Semaphore:
+    """The permit for the handler's actual work.
+
+    Most handlers hold the CPU/RAM permit because they decode or encode pixels. A declared transport
+    handler is different: its bounded network/remux work may be wider, but it still takes the same
+    transport semaphore that protects sockets and disk. The declaration is explicit so a future op
+    cannot accidentally become wide merely because it happens to mention ``net``.
+    """
+    return transport_slots() if op.budget == "transport" else step_slots()
+
+
+def executor_workers(step_cap: int, transfer_cap: int) -> int:
+    """Threads needed to expose both budgets; semaphores remain the actual global bounds."""
+    return max(1, int(step_cap), int(transfer_cap))
+
+
 def _reset_step_slots() -> None:
     """Tests only: re-derive both budgets after monkeypatching the cap."""
     global _slots, _xfer
@@ -633,11 +649,12 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     # pod makes it. ONE handler, two transports — parity is structural, not tested into existence. Note
     # what the handler is NOT given: no URL, no credential, no control-plane handle. It sees typed params
     # and local paths, so it cannot depend on where it is running.
-    # THE CPU BUDGET, and only here: this call is the ffmpeg, and `CORES_PER_STEP` / `MEM_PER_STEP_BYTES`
-    # are statements about exactly this frame (TRANSPORT_BUDGET_WHY).
+    # The op declaration selects the permit here. Pixel handlers take the CPU budget; the one transport
+    # class (`media.fetch`) takes the wider socket/disk budget because its stream-copy/remux wait is not an
+    # encode. Both are still bounded globally (TRANSPORT_BUDGET_WHY).
     run_announced = False
     try:
-        with step_slots():
+        with handler_slots(op):
             timing.slot_wait_s = time.monotonic() - slot_ready
             live("run_started", timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
             run_announced = True
@@ -817,7 +834,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
     _event(job_id=chain.job_id, stage="ops", status="step", phase="capacity", op="ops",
            capacity={"step_workers": cap, "transfer_workers": xcap})
     try:
-        with cf.ThreadPoolExecutor(max_workers=cap) as ex:
+        with cf.ThreadPoolExecutor(max_workers=executor_workers(cap, xcap)) as ex:
             running: dict[cf.Future[Any], str] = {}
             while pending or running:
                 with lock:

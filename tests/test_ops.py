@@ -52,6 +52,26 @@ def test_needs_vocabulary_is_closed(tmp_path, monkeypatch):
     registry.all_ops.cache_clear()
 
 
+def test_handler_budget_vocabulary_is_closed(tmp_path, monkeypatch):
+    """A scheduling class is a resource claim, not an arbitrary per-op knob: typos must fail at image load."""
+    d = tmp_path / "ops"
+    d.mkdir()
+    decl = json.loads((CONTRACTS / "ops" / "media.fetch.json").read_text())
+    decl["budget"] = "unbounded"
+    (d / "media.fetch.json").write_text(json.dumps(decl))
+    monkeypatch.setattr(registry, "OPS_DIR", d)
+    registry.all_ops.cache_clear()
+    with pytest.raises(registry.OpError, match="budget outside the closed vocabulary"):
+        registry.all_ops()
+    registry.all_ops.cache_clear()
+
+
+def test_media_fetch_is_the_only_transport_budgeted_shipped_op():
+    ops = registry.all_ops()
+    assert ops["media.fetch"].budget == "transport"
+    assert all(op.budget == "cpu" for name, op in ops.items() if name != "media.fetch")
+
+
 def test_open_params_are_refused(tmp_path, monkeypatch):
     """`additionalProperties:false` is not a style preference. An open params bag re-admits argv across
     the seam — and argv is code: it publishes the algorithm verbatim and blinds the placement gate."""

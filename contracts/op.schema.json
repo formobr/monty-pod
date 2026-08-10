@@ -24,6 +24,11 @@
       "items": {"enum": ["video_encode", "model_weights", "browser", "net", "keys", "llm"]},
       "uniqueItems": true
     },
+    "budget": {
+      "enum": ["cpu", "transport"],
+      "default": "cpu",
+      "description": "Which box-wide permit covers the handler call. `cpu` protects ffmpeg decode/encode memory and cores; `transport` is for a bounded network/remux operation whose wait must not consume an encode slot. Omitted means `cpu` so an older pack remains conservative."
+    },
     "judgement": {
       "type": "boolean",
       "description": "True = this op DECIDES something (which keeps, which drops, pacing, tempo, shot planning, the b-roll judge, thresholds). A judgement op is control-plane-only BY CONSTRUCTION: the pod dispatcher refuses it and the placement gate refuses to route it, so the cut algorithm cannot reach a pod even if some future stage table says otherwise. This is the field that kills the render_base contradiction."

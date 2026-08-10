@@ -3,6 +3,7 @@
   "version": 1,
   "summary": "GET one https url and write the bytes to the output, optionally only a window of it. The host must be one the ops pack names; the url is checked again on every redirect hop.",
   "needs": ["net", "video_encode"],
+  "budget": "transport",
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
