@@ -29,7 +29,7 @@ from typing import Any, Final
 from urllib.parse import urlparse
 
 from ..artifact import log
-from ..cp import download, upload
+from ..cp import download, retry, upload
 from ..sanitize import safe_error
 from . import inputcache, pack, registry, resultcache
 
@@ -392,6 +392,9 @@ class StepTiming:
     bind_s: float = 0.0
     run_s: float = 0.0
     put_s: float = 0.0
+    # Inside put_s, never added to it: the phase's wall is still the four (PUT_FANOUT_WHY).
+    put_wait_s: float = 0.0
+    put_retry_s: float = 0.0
     nbytes: int = 0
     outputs: list[dict[str, Any]] = field(default_factory=list)
     legs: dict[str, float] = field(default_factory=dict)
@@ -411,7 +414,8 @@ class StepTiming:
         measured" the same reading, which is the class of error this whole change exists to remove."""
         legs = {**{k: round(v, 3) for k, v in self.legs.items()},
                 "slot_wait": round(self.slot_wait_s, 3), "bind": round(self.bind_s, 3),
-                "run": round(self.run_s, 3), "put": round(self.put_s, 3)}
+                "run": round(self.run_s, 3), "put": round(self.put_s, 3),
+                "put_wait": round(self.put_wait_s, 3), "put_retry": round(self.put_retry_s, 3)}
         out: dict[str, Any] = {
             "id": self.step_id,
             "op": self.op,
@@ -465,6 +469,99 @@ def _moved_outputs(outputs: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
 def _upload_with_affinity(url: str, path: Path) -> None:
     """One immutable snapshot is both PUT body and, after success, the warm input-cache entry."""
     inputcache.upload_and_adopt(url, path, upload, log=log)
+
+
+PUT_FANOUT_WHY = """
+A STEP'S OUTPUTS ARE INDEPENDENT OBJECTS AND WERE SENT ONE AFTER ANOTHER THROUGH ONE PERMIT.
+
+`media.sheet` declares two durable outputs (the contact sheet and the `.cells.json` sidecar that says which
+cells drew); `media.range_filmstrip` declares two (the strip and its transport receipt). The put phase held
+ONE `transport_slots()` permit and walked them serially, so a two-output step paid two full store latencies
+end to end while the transport budget — `TRANSFERS_PER_STEP` times the step cap, twenty on a five-step rent
+— sat idle. Measured on the b-roll rank wave of run img-8010: `media.sheet@put` 277.9 s over 29 calls for
+0.58 MB of object each, `media.range_filmstrip@put` 132.5 s over 48. Neither is bandwidth: the same pod put
+an 87 MB `cut.apply` master in 6.4 s.
+
+SO THE PERMIT IS TAKEN PER OBJECT, which is what the budget already says it counts ("how many BINDS and PUTS
+may be in flight at once"), and a step's objects go out together. The arms cannot exceed the budget, because
+each takes a permit of its own from it. Nothing about WHICH objects cross, or their bytes, changes.
+
+AND THE PHASE NOW SAYS WHICH HALF IT SPENT. `put` was permit-wait plus wire under one name, so a 9.6-second
+put could be a saturated transport budget or a slow store and no reading could tell them apart. `put_wait`
+(worst permit wait among the arms) and `put_retry` (seconds burned on attempts that failed and were re-sent
+from byte zero) are sub-legs of `put`, the way `connect`/`body` are sub-legs of `run`.
+"""
+
+
+def _upload_one(url: str, path: Path) -> tuple[float, float]:
+    """ONE object under ONE permit → (permit wait, seconds lost to failed attempts). The acquire is the
+    same unbounded one the serial phase had; the transfer inside carries `cp._XFER_DEADLINE_S` per attempt."""
+    t0 = time.monotonic()
+    with transport_slots():
+        waited = time.monotonic() - t0
+        retry.reset()
+        try:
+            _upload_with_affinity(url, path)
+        finally:
+            spent = retry.seconds()
+    return waited, spent
+
+
+def _output_arms(step: Any, outputs: dict[str, Any]) -> list[list[tuple[str, Path, str]]]:
+    """One arm per PORT — never per element (PUT_FANOUT_WHY). A binding with no url crosses nothing and an
+    absent optional output weighs nothing; a LIST port's `what` names its index (ARITY_WHY), a single one
+    stays unnamed so its refusal reaches the caller exactly as the serial phase raised it."""
+    arms: list[list[tuple[str, Path, str]]] = []
+    for b in step.outputs:
+        if b.url is not None:
+            if outputs[b.port].exists():
+                arms.append([(b.url, outputs[b.port], "")])
+        elif b.urls is not None:
+            arms.append([(url, path, f"{str(b.port)!r}[{i}] of {len(b.urls)}")
+                         for i, (path, url) in enumerate(zip(outputs[b.port], b.urls)) if path.exists()])
+    return [arm for arm in arms if arm]
+
+
+def _upload_arm(step_id: str, arm: list[tuple[str, Path, str]]) -> tuple[float, float]:
+    """A port's objects, in order, stopping at the first refusal: an address the store refused three times
+    with backoff will refuse the next one too, and a rented box may not spend its lease proving it."""
+    waited = retried = 0.0
+    for i, (url, path, what) in enumerate(arm):
+        try:
+            one_wait, one_retry = _upload_one(url, path)
+        except Exception as exc:
+            if not what:
+                raise
+            raise ChainError(f"step {step_id!r}: output {what} would not upload ({safe_error(exc)}); "
+                             f"{i} element(s) before it did land") from exc
+        waited, retried = max(waited, one_wait), retried + one_retry
+    return waited, retried
+
+
+def _upload_outputs(step: Any, outputs: dict[str, Any]) -> tuple[float, float]:
+    """A step's PORTS out concurrently → (worst permit wait, retry seconds) (PUT_FANOUT_WHY). Every arm is
+    joined, failure included: unwinding while a transfer still reads the workspace deletes it underneath."""
+    arms = _output_arms(step, outputs)
+    if not arms:
+        return 0.0, 0.0
+    if len(arms) == 1:
+        return _upload_arm(str(step.id), arms[0])
+    # One thread per PORT, and the permit is the only bound: sizing the pool by the budget too would
+    # serialise arms without ever booking the queueing as `put_wait`.
+    waits, retries, failed = [0.0], [0.0], []
+    with cf.ThreadPoolExecutor(max_workers=len(arms), thread_name_prefix="ops-put") as ex:
+        futures = [ex.submit(_upload_arm, str(step.id), arm) for arm in arms]
+        for fut in futures:
+            try:
+                waited, spent = fut.result()
+            except Exception as exc:
+                failed.append(exc)
+            else:
+                waits.append(waited)
+                retries.append(spent)
+    if failed:
+        raise failed[0]
+    return max(waits), sum(retries)
 
 
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
@@ -572,12 +669,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     live("upload_started", timings={"run_s": timing.run_s})
     t_put = time.monotonic()
     try:
-        with transport_slots():
-            for b in step.outputs:
-                if b.url is not None and outputs[b.port].exists():
-                    _upload_with_affinity(b.url, outputs[b.port])
-                elif b.urls is not None:
-                    _upload_many(step, b, outputs[b.port])
+        timing.put_wait_s, timing.put_retry_s = _upload_outputs(step, outputs)
     except BaseException as exc:
         live("upload_error", started=t_put, exc=exc)
         raise
@@ -595,18 +687,6 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         "cache_hit": float(timing.cache_hit),
     }, outputs=timing.outputs, outcome="ok")
     return outputs
-
-
-def _upload_many(step: Any, b: Any, paths: list[Path]) -> None:
-    """A LIST port's files to the addresses that named them, index by index (ARITY_WHY)."""
-    for i, (path, url) in enumerate(zip(paths, b.urls)):
-        if not path.exists():
-            continue
-        try:
-            _upload_with_affinity(url, path)
-        except Exception as e:
-            raise ChainError(f"step {step.id!r}: output {b.port!r}[{i}] of {len(b.urls)} would not upload "
-                             f"({safe_error(e)}); {i} element(s) before it did land") from e
 
 
 def preflight_chain(chain: Any) -> None:

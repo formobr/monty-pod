@@ -114,8 +114,10 @@ def test_the_terminal_carries_one_timing_per_step(monkeypatch, wired, tmp_path, 
     got = t["timings"]["steps"]
     assert [s["id"] for s in got] == ["s1"] and got[0]["op"] == op.op, got
     assert got[0]["seconds"] >= 0.0 and set(got[0]["legs"]) <= {
-        "slot_wait", "bind", "run", "put", "connect", "body", "seek_decode", "encode",
+        "slot_wait", "bind", "run", "put", "put_wait", "put_retry",
+        "connect", "body", "seek_decode", "encode",
     }, got
+    assert got[0]["legs"]["put_wait"] <= got[0]["legs"]["put"] + 1e-6, "put_wait is INSIDE put, not beside it"
     assert got[0]["slot_wait_s"] == got[0]["legs"]["slot_wait"]
     assert got[0]["outputs"], "the terminal names every output measured on the pod"
 

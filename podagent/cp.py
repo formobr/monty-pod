@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -253,6 +254,26 @@ def download(url: str, dest: Path) -> Path:
     return dest
 
 
+class _RetryClock:
+    """Seconds THIS THREAD lost to attempts that failed and were re-sent from byte zero. Per thread because
+    the runner puts a step's objects concurrently; best-effort, so a stopwatch can never fail a transfer."""
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def reset(self) -> None:
+        self._local.spent = 0.0
+
+    def add(self, seconds: float) -> None:
+        self._local.spent = self.seconds() + max(0.0, float(seconds))
+
+    def seconds(self) -> float:
+        return float(getattr(self._local, "spent", 0.0))
+
+
+retry = _RetryClock()
+
+
 def _upload_content_type(src: Path) -> str:
     """Infer the small closed set of browser media types from bytes, not the workspace filename.
 
@@ -294,6 +315,7 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
             resent += size
             _log(f"upload retry {attempt + 1}/{_XFER_ATTEMPTS} for {src.name}: re-sending all {size} bytes "
                  f"from 0 ({resent} bytes re-sent so far, no resume on a presigned PUT)")
+        t_attempt = time.monotonic()
         try:
             with src.open("rb") as f:
                 r = _store.put(
@@ -305,5 +327,7 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
             return
         except requests.RequestException:
             if attempt + 1 == _XFER_ATTEMPTS:
+                retry.add(time.monotonic() - t_attempt)
                 raise
             time.sleep(2**attempt)
+            retry.add(time.monotonic() - t_attempt)
