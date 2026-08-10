@@ -66,10 +66,12 @@ def test_handler_budget_vocabulary_is_closed(tmp_path, monkeypatch):
     registry.all_ops.cache_clear()
 
 
-def test_media_fetch_is_the_only_transport_budgeted_shipped_op():
+def test_media_fetch_and_fused_image_tile_are_transport_budgeted_shipped_ops():
     ops = registry.all_ops()
     assert ops["media.fetch"].budget == "transport"
-    assert all(op.budget == "cpu" for name, op in ops.items() if name != "media.fetch")
+    assert ops["media.image_tile"].budget == "transport"
+    assert all(op.budget == "cpu" for name, op in ops.items()
+               if name not in {"media.fetch", "media.image_tile"})
 
 
 def test_open_params_are_refused(tmp_path, monkeypatch):

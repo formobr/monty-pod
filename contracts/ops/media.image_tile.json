@@ -1,0 +1,38 @@
+{
+  "op": "media.image_tile",
+  "version": 1,
+  "summary": "Fetch one or more public still-image origins, normalize each to the rank cell geometry, and compose them into one tile with its drawn-cell proof.",
+  "needs": ["net", "video_encode"],
+  "budget": "transport",
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "This is the fused transport form of media.fetch -> media.filmstrip -> media.sheet. Each origin is streamed once, passed through the same filmstrip argv and the same sheet compositor as the former chain, so the output pixels and drawn-cell sidecar are unchanged; only intermediate files, scheduler steps and durable PUTs disappear. Origins are independent and may fail per cell: a failed URL leaves its cell empty while sibling cells and the sheet still land. The URLs are credential-free public locations checked on every redirect by media.fetch."
+  },
+  "inputs": [],
+  "outputs": [
+    {"id": "tile", "kind": "image", "durable": true},
+    {"id": "meta", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["urls", "width", "height", "fit"],
+    "properties": {
+      "urls": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 12,
+        "items": {"type": "string", "pattern": "^https://", "maxLength": 4096},
+        "description": "Credential-free still-image origins. Order is already chosen by the caller and is preserved in the cells."
+      },
+      "width": {"type": "integer", "minimum": 16, "maximum": 4096},
+      "height": {"type": "integer", "minimum": 16, "maximum": 4096},
+      "fit": {
+        "enum": ["cover", "contain", "contain_alpha"],
+        "description": "The same cell geometry enum accepted by media.filmstrip."
+      }
+    }
+  },
+  "handler": "montyops.media_image_tile:run"
+}
