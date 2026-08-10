@@ -1,0 +1,54 @@
+{
+  "op": "media.image_filmstrip",
+  "version": 1,
+  "summary": "Fetch one public still-image origin and render its exact multi-position rank filmstrip.",
+  "needs": ["net", "video_encode"],
+  "budget": "transport",
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "This is the fused transport form of media.fetch followed by media.filmstrip for a known still-image origin. It streams the same response into a temporary file and calls the same filmstrip handler with the same positions, measured-duration probe, crop and PNG sink; only the intermediate scheduler step and local binding disappear. A dead origin or unreadable image leaves the optional strip absent."
+  },
+  "inputs": [],
+  "outputs": [
+    {"id": "strip", "kind": "image", "durable": true, "optional": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["url", "positions", "width", "height"],
+    "properties": {
+      "url": {
+        "type": "string",
+        "pattern": "^https://",
+        "maxLength": 4096,
+        "description": "A credential-free public still-image origin. The caller has already classified the suffix as an image; this op has no video or editorial vocabulary."
+      },
+      "positions": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 12,
+        "items": {"type": "number", "minimum": 0, "maximum": 1},
+        "description": "Filmstrip geometry, passed unchanged to media.filmstrip. A still measures duration zero and therefore produces its one frame padded to the requested number of cells."
+      },
+      "width": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 1024,
+        "multipleOf": 2
+      },
+      "height": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 2048,
+        "multipleOf": 2
+      },
+      "fit": {
+        "enum": ["cover", "contain", "contain_alpha"],
+        "default": "cover",
+        "description": "The same cell geometry enum accepted by media.filmstrip."
+      }
+    }
+  },
+  "handler": "montyops.media_image_filmstrip:run"
+}
