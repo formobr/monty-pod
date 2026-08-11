@@ -950,6 +950,33 @@ def _timeline_spans(
     return spans
 
 
+def _terminal_timeline_context(
+        cp: Any, *, corr_id: str | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Take one terminal-near clock sample without making measurement part of the product result."""
+    sync_event: dict[str, Any] = {
+        "stage": "ops",
+        "status": "step",
+        "phase": "timeline_sync",
+    }
+    if corr_id is not None:
+        sync_event["corr_id"] = corr_id
+
+    reasons: list[str] = []
+    try:
+        if not cp.send_event(sync_event, wait=True):
+            reasons.append("terminal_clock_sync_unavailable")
+    except Exception as exc:  # noqa: BLE001 - measurement may not change a successful work result
+        reasons.append("terminal_clock_sync_unavailable")
+        log(f"ops: terminal clock sync unavailable ({type(exc).__name__})")
+    try:
+        context = cp.timeline_context(str(corr_id or ""))
+    except Exception as exc:  # noqa: BLE001 - measurement may not change a successful work result
+        context = {"complete": False, "incomplete_reasons": ["delivery_context_unavailable"]}
+        log(f"ops: terminal timeline context unavailable ({type(exc).__name__})")
+    return context, reasons
+
+
 def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
               session_id: str | None = None) -> dict[str, Any]:
     """Execute the whole chain. Returns {step_id: {port: str(path)}} for the caller to inspect.
@@ -1084,12 +1111,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
             "chain_s": round(time.monotonic() - t_chain, 3),
             "steps": [t.wire() for t in list(timings)],
         }
-        timeline_reasons: list[str] = []
-        try:
-            context = cp.timeline_context(str(corr_id or ""))
-        except Exception as exc:  # noqa: BLE001 - a measurement may not change a successful work result
-            context = {"complete": False, "incomplete_reasons": ["delivery_context_unavailable"]}
-            log(f"ops: terminal timeline context unavailable ({type(exc).__name__})")
+        context, timeline_reasons = _terminal_timeline_context(cp, corr_id=corr_id)
         timeline_reasons.extend(str(reason) for reason in context.get("incomplete_reasons", []))
         step_rows = [
             timing.timeline_wire(job_id=str(chain.job_id), corr_id=str(corr_id or ""))

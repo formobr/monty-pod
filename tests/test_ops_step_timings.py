@@ -64,6 +64,45 @@ class _CP:
         return self.events[-1]
 
 
+class _TerminalClockCP(_CP):
+    def __init__(self, *, sync_ok: bool = True, sync_raises: bool = False) -> None:
+        super().__init__()
+        self.sync_ok = sync_ok
+        self.sync_raises = sync_raises
+        self.sync_calls = 0
+        self.clock_sync = [{
+            "pod_clock_id": "pod-clock-1", "seq": 1, "wire_attempt": 1,
+            "client_send_mono_ns": 1, "server_recv_unix_ns": 11,
+            "server_send_unix_ns": 12, "client_recv_mono_ns": 3,
+            "theta_min_ns": 9, "theta_max_ns": 10,
+        }]
+
+    def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+        self.events.append(payload)
+        if payload.get("phase") != "timeline_sync":
+            return True
+        assert wait is True, "the terminal clock sample must be ACK-backed"
+        self.sync_calls += 1
+        if self.sync_raises:
+            raise RuntimeError("ACK unavailable")
+        if self.sync_ok:
+            self.clock_sync.append({
+                "pod_clock_id": "pod-clock-1", "seq": 99, "wire_attempt": 1,
+                "client_send_mono_ns": 61_000_000_000,
+                "server_recv_unix_ns": 61_000_000_010,
+                "server_send_unix_ns": 61_000_000_012,
+                "client_recv_mono_ns": 61_000_000_003,
+                "theta_min_ns": 9,
+                "theta_max_ns": 10,
+            })
+        return self.sync_ok
+
+    def timeline_context(self, corr_id: str) -> dict:
+        context = super().timeline_context(corr_id)
+        context["clock_sync"] = list(self.clock_sync)
+        return context
+
+
 class _Step:
     def __init__(self, sid: str, op: str, src: Path, out_port: str) -> None:
         self.id, self.op, self.params, self.needs, self.optional = sid, op, {}, [], False
@@ -167,7 +206,7 @@ def test_live_events_keep_starts_plus_one_step_closure_while_terminal_keeps_deta
 
 
 def test_success_event_count_has_a_small_constant_per_step(monkeypatch, wired, op):
-    """NEGATIVE/perf: restoring three phase-finished boundaries changes 5N+6 back to 8N+6 and makes the
+    """NEGATIVE/perf: restoring three phase-finished boundaries changes 5N+7 back to 8N+7 and makes the
     durable stream itself the critical path for wide b-roll chains."""
     src, required = wired
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
@@ -175,10 +214,46 @@ def test_success_event_count_has_a_small_constant_per_step(monkeypatch, wired, o
     count = 8
     runner.run_chain(_Chain([_Step(f"s{i}", op.op, src, required) for i in range(count)]), cp)
 
-    assert len(cp.events) == 5 * count + 6, [e.get("phase") for e in cp.events]
+    assert len(cp.events) == 5 * count + 7, [e.get("phase") for e in cp.events]
+    assert [e.get("phase") for e in cp.events].count("timeline_sync") == 1
     terminal = cp.terminal["timings"]["steps"]
     assert len(terminal) == count
     assert all(set(row["legs"]) >= {"slot_wait", "bind", "run", "put"} for row in terminal)
+
+
+def test_long_silent_chain_gets_one_terminal_near_ack_clock_sample(monkeypatch, wired, op):
+    """A claim ACK is stale at the far end of a >60 s chain; the terminal sync supplies the second anchor."""
+    src, required = wired
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
+    cp = _TerminalClockCP()
+
+    runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp, corr_id="corr", session_id="sess")
+
+    timeline = cp.terminal["timeline"]["pod"]
+    assert cp.sync_calls == 1
+    sync_event = next(event for event in cp.events if event.get("phase") == "timeline_sync")
+    assert sync_event == {
+        "stage": "ops", "status": "step", "phase": "timeline_sync", "corr_id": "corr"}
+    assert [row["seq"] for row in timeline["sync"]] == [1, 99]
+    assert timeline["sync"][-1]["client_recv_mono_ns"] - timeline["sync"][0]["client_recv_mono_ns"] > 60e9
+    assert not any("clock_sync" in reason for reason in timeline["incomplete_reasons"])
+
+
+@pytest.mark.parametrize("failure", ["false", "raise"])
+def test_terminal_clock_ack_failure_degrades_only_measurement(monkeypatch, wired, op, failure):
+    src, required = wired
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
+    cp = _TerminalClockCP(sync_ok=False, sync_raises=failure == "raise")
+
+    outputs = runner.run_chain(
+        _Chain([_Step("s1", op.op, src, required)]), cp, corr_id="corr", session_id="sess")
+
+    assert required in outputs["s1"], "clock evidence must not change the successful product result"
+    assert cp.results[-1]["status"] == "ok"
+    timeline = cp.terminal["timeline"]["pod"]
+    assert timeline["complete"] is False
+    assert "terminal_clock_sync_unavailable" in timeline["incomplete_reasons"]
+    assert cp.sync_calls == 1
 
 
 def test_completed_sibling_is_durably_closed_while_another_sibling_hangs(monkeypatch, wired, op):

@@ -52,16 +52,18 @@ only the suffix that has not received a terminal ACK. Contract v12 stamps every
 wire attempt with `client_send_mono_ns`; the ACK returns server receive/send Unix
 nanoseconds, so the pod stores offset bounds rather than inventing one shared
 clock. Each pushed job is durably answered by a `job_ack` carrying its exact
-claim `attempt_id` and pod receive boundary. A successful N-step ops chain emits
-`5N+6` event frames; its `job_ack`, result and durable `result_acked` boundary
-make `5N+9` total client frames on the transport.
+claim `attempt_id` and pod receive boundary. Immediately before an ops terminal,
+one product-payload-free `timeline_sync` event waits for its bounded ACK so long chains have
+a terminal-near clock anchor. A successful N-step ops chain emits `5N+7` event
+frames; its `job_ack`, result and durable `result_acked` boundary make `5N+10`
+total client frames on the transport.
 
 An ops terminal also carries an additive `timeline`: chain and phase intervals
 on one pod monotonic clock, repeated handler legs, and every PUT permit wait,
 wire attempt and retry. Existing second totals are unchanged. Timeline rows use
 semantic object IDs derived only from run/correlation/step/direction/port/index;
 presigned URLs, query strings and workspace paths never enter the receipt. If a
-recorder or clock sample is unavailable, the work still succeeds but the
+recorder or terminal clock sample is unavailable, the work still succeeds but the
 timeline is explicitly incomplete and cannot be used as a performance baseline.
 
 The WebSocket structure and its v12 version come from the deterministic

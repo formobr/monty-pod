@@ -957,6 +957,35 @@ def test_ack_records_four_timestamps_and_bounded_offset_after_delayed_delivery(t
     assert sample["wire_attempt"] == 1 and sample["seq"] == seen[0]["seq"]
 
 
+def test_waited_terminal_sync_is_in_timeline_context_before_result_build(tmp_path: Path) -> None:
+    corr = "terminal-sync"
+    frames: list[dict[str, Any]] = []
+
+    def handler(ws: Any) -> None:
+        ws.send(json.dumps(_job(corr)))
+        for _ in range(2):
+            frame = json.loads(ws.recv())
+            frames.append(frame)
+            ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert stream.claim(1.0)["corr_id"] == corr
+        assert stream.send_event(
+            {"stage": "ops", "status": "step", "corr_id": corr, "phase": "timeline_sync"},
+            wait=True,
+        )
+        context = stream.timeline_context(corr)
+        stream.close()
+
+    assert [frame["type"] for frame in frames] == ["job_ack", "event"]
+    assert frames[-1]["event"] == {
+        "stage": "ops", "status": "step", "corr_id": corr, "phase": "timeline_sync"}
+    assert [sample["seq"] for sample in context["clock_sync"]] == [
+        frames[0]["seq"], frames[1]["seq"]]
+    assert context["clock_sync"][-1]["client_recv_mono_ns"] >= frames[-1]["client_send_mono_ns"]
+
+
 def test_job_replay_has_one_work_item_two_exact_receipts_and_no_secret_timeline(tmp_path: Path) -> None:
     corr = "work/infer/result.json"
     receipts: list[dict[str, Any]] = []
