@@ -4,6 +4,7 @@ string — `source_axis` binds the master in three chains, so one stage moved th
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import threading
@@ -17,6 +18,10 @@ MAX_GB_ENV = "OPS_INPUT_CACHE_MAX_GB"
 MAX_GB_DEFAULT = 24.0
 DONE = ".complete"
 RETAINED = ".retained"
+# Share of the ONE cap (MAX_GB_ENV) retention may hold. A module constant, not an env read: the box writes
+# the pod's environment whole, so a second budget nobody assigns could only ever be its default — the exact
+# shape `tests/test_knob_registry.py` exists to refuse. Half leaves the ordinary cache half its working set.
+RETAINED_SHARE = 0.5
 
 RETENTION_WHY = """
 A PUT EXISTS SO A LATER READER CAN FIND THE BYTES. WHEN EVERY LATER READER IS THIS SAME BOX, IT BUYS NOTHING.
@@ -29,14 +34,37 @@ claim the caller makes per output and the runner refuses to guess.
 
 THE MARKER IS THE DIFFERENCE BETWEEN A CACHE AND A STORE. An ordinary entry may be evicted at any moment: the
 remote copy is the truth and a miss costs one download. A retained entry IS the truth — evicting it would
-delete the only copy of a master, so a retained slot is never pruned and the cap is measured over the rest.
-The marker also names the worker that holds it, which is what lets a refusal say WHERE the bytes are instead
-of only that they are missing.
+delete the only copy of a master, so a retained slot is never a pruning CANDIDATE. The marker also names the
+worker that holds it and the object key it was adopted under, which is what lets a refusal say WHERE the bytes
+are, and what lets a newer run recognise the generation it supersedes.
+
+"NEVER EVICTED" IS NOT "NOT COUNTED", AND THE FIRST DRAFT CONFLATED THEM. Retained slots were skipped by
+`_entries`, so `prune` summed a total of ZERO over an empty candidate list and freed nothing: 25 runs of a
+1 GB master under 25 distinct work prefixes left 25 GB on a box whose cap says 24, and the failure was ENOSPC
+rather than an eviction. Three things close it, and none of them is a new knob (the box writes the pod's
+environment whole, so a second budget nobody assigns would only ever be its default):
+
+  · retained bytes are IN the one cap that already exists. `prune` counts them into the total and evicts
+    ordinary entries against them, so retention squeezes the cache instead of the filesystem.
+  · retention may claim at most `RETAINED_SHARE` of that cap, and an adoption that would cross the line is
+    REFUSED, loudly, naming the tally and the ceiling. A step that fails is recoverable; a full disk takes
+    the whole box down with every chain on it.
+  · a retained object is scoped to the RUN that wrote it. The object key's directory is the work prefix and
+    a re-run's prefix is new, so an adoption of the same basename under a different prefix RELEASES the older
+    generation — nobody can read it (its readers name their own run's address) and nothing will re-upload it.
+    A marker whose holder is not this process's identity is released for the same reason: the lease that
+    could have claimed those bytes is gone.
+
+THE POD STILL LEARNS NOTHING. "Same artifact, newer run" is read off the key's own shape — basename under a
+different directory — never off a slug, a job id or anything else that would make this box know what it holds.
 """
 
 _lock = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
 _slot_locks: dict[str, threading.Lock] = {}
+# Serialises the read-tally → check-ceiling → adopt sequence, so two concurrent retained outputs cannot both
+# measure themselves against a budget the other is about to spend (RETENTION_WHY).
+_retain_lock = threading.Lock()
 
 
 def enabled() -> bool:
@@ -187,6 +215,103 @@ class RetentionUnavailable(RuntimeError):
     swallowed failure here is an object that exists nowhere and a later chain that 404s far from the cause."""
 
 
+def _generation(key: str) -> tuple[str, str]:
+    """(work prefix, basename) for an object key. The prefix IS the run — a re-run mints a new one — and the
+    basename is the artifact within it, so "same artifact, newer run" is readable off the key's own shape."""
+    scope, _, name = key.rpartition("/")
+    return scope, name
+
+
+def _read_marker(slot: Path) -> dict[str, str] | None:
+    try:
+        raw = json.loads((slot / RETAINED).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return {"holder": str(raw.get("holder", "")), "key": str(raw.get("key", ""))} if isinstance(raw, dict) \
+        else None
+
+
+def _retained_rows() -> list[tuple[int, Path, dict[str, str]]]:
+    """(bytes, slot, marker) for every COMPLETE retained entry. Never a pruning candidate; always counted."""
+    rows: list[tuple[int, Path, dict[str, str]]] = []
+    for slot in root().glob("*"):
+        payload = slot / "payload"
+        if not (slot / DONE).exists() or not payload.is_file() or not (slot / RETAINED).exists():
+            continue
+        marker = _read_marker(slot)
+        if marker is None:
+            continue
+        try:
+            rows.append((payload.stat().st_size, slot, marker))
+        except OSError:
+            continue
+    return rows
+
+
+def retained_bytes() -> int:
+    """THE TALLY, and it is the number a refusal quotes. Not derived from anything a caller passes in: a
+    budget you cannot read is a budget you cannot be refused against."""
+    if not enabled():
+        return 0
+    return sum(size for size, _slot, _m in _retained_rows())
+
+
+def retained_cap(keep_bytes: int | None = None) -> int:
+    """The hard ceiling retention may hold — a share of the ONE cap, never a second budget."""
+    total = keep_bytes if keep_bytes is not None else int(
+        float(os.environ.get(MAX_GB_ENV) or MAX_GB_DEFAULT) * 1e9)
+    return int(max(0, total) * RETAINED_SHARE)
+
+
+def _release_slot(slot: Path, why: str, log=None) -> int:
+    """Drop a retained entry that nothing can read any more. Marker FIRST: if the rmtree half fails, what is
+    left is an ordinary evictable entry, never a slot that is both unreadable and unprunable."""
+    import shutil
+    lock = _slot_lock(slot)
+    if not lock.acquire(blocking=False):
+        return 0                      # in use by an adoption/read right now; the next sweep gets it
+    try:
+        try:
+            size = (slot / "payload").stat().st_size
+        except OSError:
+            size = 0
+        (slot / RETAINED).unlink(missing_ok=True)
+        shutil.rmtree(slot, ignore_errors=True)
+    except OSError:
+        return 0
+    finally:
+        lock.release()
+    if log:
+        log(f"[input-cache] released retained {slot.name} ({size / 1e6:.0f} MB) — {why}")
+    return size
+
+
+def release_superseded(key: str, holder: str, log=None) -> int:
+    """Free every retained entry the arrival of `key` under `holder` makes unreadable, and say why.
+
+    TWO WAYS AN ENTRY DIES, both of which mean nobody can ever claim it again:
+      · a NEWER RUN of the same artifact — same basename, different work prefix. Its readers bind their own
+        run's address, so the old generation is bytes with no address pointing at them.
+      · a CHANGED LEASE — the marker names a worker this process is not. A reader declaring `retained_on`
+        for that worker would be refused here anyway, so the bytes are already unreachable.
+    """
+    if not enabled():
+        return 0
+    scope, name = _generation(key)
+    freed = 0
+    for _size, slot, marker in _retained_rows():
+        if marker["key"] == key:
+            continue                  # this very object; adoption replaces it in place under its own lock
+        if marker["holder"] != holder:
+            freed += _release_slot(slot, f"held by {marker['holder'] or 'nobody'}, this worker is {holder}",
+                                   log=log)
+            continue
+        old_scope, old_name = _generation(marker["key"])
+        if old_name == name and old_scope != scope:
+            freed += _release_slot(slot, f"superseded by a newer run of {name} under {scope}", log=log)
+    return freed
+
+
 def adopt_local(url: str, src: Path, *, holder: str, log=None) -> Path:
     """Make `src` the local object-cache entry for `url`'s key WITHOUT uploading it (RETENTION_WHY).
 
@@ -207,29 +332,52 @@ def adopt_local(url: str, src: Path, *, holder: str, log=None) -> Path:
             f"uploaded this object, so there is no remote copy to fall back to — re-run without retain")
     slot = _slot(key)
     payload, sentinel, marker = slot / "payload", slot / DONE, slot / RETAINED
-    with _key_lock(key):
-        snapshot = slot / f"payload.{os.getpid()}.{threading.get_ident()}.retain-snapshot"
-        try:
-            slot.mkdir(parents=True, exist_ok=True)
-            _copy_or_reflink(src, snapshot)
-            snapshot.chmod(0o444)
-            digest = _sha256(snapshot)
-            sentinel.unlink(missing_ok=True)
-            snapshot.replace(payload)
-            # Marker BEFORE the sentinel: a reader that sees a usable entry must already see that it is the
-            # only copy, or the pruner could evict what nothing can re-download.
-            marker.write_text(holder, encoding="utf-8")
-            sentinel.write_text(digest, encoding="ascii")
-        except Exception as exc:
-            _invalidate_locked(slot, log=log)
+    try:
+        incoming = src.stat().st_size
+    except OSError as exc:
+        raise RetentionUnavailable(f"retained output for {key} could not be weighed "
+                                   f"({type(exc).__name__})") from exc
+    # ONE adoption at a time, so the tally a refusal quotes is the tally the next adoption is measured
+    # against. Nothing takes this while holding an object lock, so the order below cannot deadlock.
+    with _retain_lock:
+        release_superseded(key, holder, log=log)
+        held = retained_bytes()
+        # This object's own previous generation (same key) is replaced in place, so it is not new weight.
+        already = next((size for size, _s, m in _retained_rows() if m["key"] == key), 0)
+        ceiling = retained_cap()
+        if held - already + incoming > ceiling:
             raise RetentionUnavailable(
-                f"retained output for {key} could not be adopted ({type(exc).__name__}); nothing uploaded "
-                f"it, so this object now exists nowhere") from exc
-        finally:
+                f"retained output for {key} ({incoming / 1e9:.2f} GB) would put this worker's retained set at "
+                f"{(held - already + incoming) / 1e9:.2f} GB against a ceiling of {ceiling / 1e9:.2f} GB "
+                f"({RETAINED_SHARE:.0%} of {MAX_GB_ENV}). REFUSING the adoption instead of filling the disk: "
+                f"a failed step is recoverable, a full box takes every chain on it down. Re-run this chain "
+                f"without retain, or let the older runs' masters go.")
+        with _key_lock(key):
+            snapshot = slot / f"payload.{os.getpid()}.{threading.get_ident()}.retain-snapshot"
             try:
-                snapshot.unlink(missing_ok=True)
-            except OSError:
-                pass
+                slot.mkdir(parents=True, exist_ok=True)
+                _copy_or_reflink(src, snapshot)
+                snapshot.chmod(0o444)
+                digest = _sha256(snapshot)
+                sentinel.unlink(missing_ok=True)
+                snapshot.replace(payload)
+                # Marker BEFORE the sentinel: a reader that sees a usable entry must already see that it is
+                # the only copy, or the pruner could evict what nothing can re-download. It carries the KEY
+                # as well as the holder, because a slot name is a digest and the generation this supersedes
+                # can only be read off the key's own shape.
+                marker.write_text(json.dumps({"holder": holder, "key": key}, sort_keys=True),
+                                  encoding="utf-8")
+                sentinel.write_text(digest, encoding="ascii")
+            except Exception as exc:
+                _invalidate_locked(slot, log=log)
+                raise RetentionUnavailable(
+                    f"retained output for {key} could not be adopted ({type(exc).__name__}); nothing "
+                    f"uploaded it, so this object now exists nowhere") from exc
+            finally:
+                try:
+                    snapshot.unlink(missing_ok=True)
+                except OSError:
+                    pass
     if log:
         try:
             mb = payload.stat().st_size / 1e6
@@ -252,10 +400,8 @@ def retained_holder(url: str) -> str | None:
     slot = _slot(key)
     if not ((slot / DONE).exists() and (slot / "payload").is_file()):
         return None
-    try:
-        return (slot / RETAINED).read_text(encoding="utf-8").strip() or None
-    except OSError:
-        return None
+    marker = _read_marker(slot)
+    return (marker["holder"] or None) if marker else None
 
 
 def _sha256(path: Path) -> str:
@@ -286,12 +432,22 @@ def _entries() -> list[tuple[float, int, Path]]:
 
 def prune(keep_bytes: int | None = None, log=None) -> int:
     """Evict oldest-first until the cache fits. A pod's disk is smaller than the media it sees in a shift,
-    so an unbounded cache trades one bug for a fuller one."""
+    so an unbounded cache trades one bug for a fuller one.
+
+    RETAINED BYTES ARE COUNTED BUT NEVER EVICTED (RETENTION_WHY). Skipping them from the total too was the
+    bug: an all-retained cache summed to ZERO, compared clean against the cap and freed nothing while the
+    disk filled. Counting them means retention squeezes the ordinary cache, which is the pressure that
+    SHOULD arrive first — a re-download is what a cache is for.
+    """
     import shutil
     cap = keep_bytes if keep_bytes is not None else int(
         float(os.environ.get(MAX_GB_ENV) or MAX_GB_DEFAULT) * 1e9)
     entries = sorted(_entries())
-    total = sum(size for _m, size, _s in entries)
+    held = sum(size for size, _slot, _m in _retained_rows())
+    total = sum(size for _m, size, _s in entries) + held
+    if log and held and total > cap:
+        log(f"[input-cache] {held / 1e9:.2f} GB retained (unevictable) of a {cap / 1e9:.2f} GB cap — "
+            f"evicting cached objects against it")
     freed = 0
     for _mtime, size, slot in entries:
         if total <= cap:

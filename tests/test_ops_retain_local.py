@@ -181,6 +181,112 @@ def test_the_pruner_never_evicts_what_nothing_uploaded(tmp_path):
     assert inputcache.retained_holder("https://r2.example/other.bin") is None
 
 
+def test_retained_bytes_are_counted_by_the_pruner_even_though_they_are_never_evicted(tmp_path):
+    """THE COUNTEREXAMPLE, kept: 25 runs of a 1 GB master under 25 distinct work prefixes used to leave the
+    candidate list EMPTY, so `prune` summed a total of zero, compared clean against the cap and freed nothing
+    while the disk filled. Never-evicted is not the same as not-counted. Drop `held` from the total in
+    `prune` and this goes red — and the real failure it stands for is ENOSPC, not an eviction."""
+    for run in range(5):
+        src = tmp_path / f"m{run}.bin"
+        src.write_bytes(b"m" * 1000)
+        inputcache.adopt_local(f"https://r2.example/monty/jobs/run{run}/other{run}.cut.mp4", src, holder=ME)
+    assert inputcache.retained_bytes() == 5000
+
+    cached = tmp_path / "c.bin"
+    cached.write_bytes(b"c" * 4000)
+    inputcache.get("https://r2.example/plain.bin", lambda _u, d: d.write_bytes(b"c" * 4000),
+                   lease=tmp_path / "lease")
+
+    # A cap BELOW what retention alone holds: the retained set stays and the ordinary entry is what pays.
+    freed = inputcache.prune(keep_bytes=4500)
+    assert freed == 4000, "the pruner did not evict against the retained weight"
+    assert inputcache.retained_bytes() == 5000, "a retained object was evicted"
+
+
+def test_a_newer_runs_adoption_releases_the_generation_it_supersedes(tmp_path):
+    """A re-run mints a NEW work prefix, so the previous run's master is bytes with no address pointing at
+    them: its readers bind their own run's key. Without this release, every re-run of a slug adds a whole
+    master to a set nothing ever frees. The prefix is read off the object key's own shape — this box still
+    learns no slug and no job id."""
+    first, second = (f"https://r2.example/monty/jobs/{r}/slug.cut.mp4" for r in ("run-a", "run-b"))
+    for url in (first, second):
+        src = tmp_path / "m.bin"
+        src.write_bytes(b"m" * 1000)
+        inputcache.adopt_local(url, src, holder=ME)
+    assert inputcache.retained_holder(first) is None, "the superseded run's master was kept"
+    assert inputcache.retained_holder(second) == ME
+    assert inputcache.retained_bytes() == 1000
+
+
+def test_a_different_artifact_of_the_same_run_is_not_superseded(tmp_path):
+    """NEGATIVE on the release rule: it keys on the BASENAME under a different prefix. Match on the prefix
+    alone and one chain's second retained output would delete its own sibling."""
+    src = tmp_path / "m.bin"
+    src.write_bytes(b"m" * 500)
+    a = "https://r2.example/monty/jobs/run-a/slug.cut.mp4"
+    b = "https://r2.example/monty/jobs/run-a/slug.audio.m4a"
+    inputcache.adopt_local(a, src, holder=ME)
+    inputcache.adopt_local(b, src, holder=ME)
+    assert inputcache.retained_holder(a) == ME and inputcache.retained_holder(b) == ME
+
+
+def test_a_marker_from_a_dead_lease_is_released_rather_than_held_forever(tmp_path):
+    """A retained entry whose holder is not this process is unclaimable — a reader naming that worker is
+    refused here anyway — so holding its bytes is pure loss. This is the restart/re-lease case."""
+    src = tmp_path / "m.bin"
+    src.write_bytes(b"m" * 800)
+    stale = "https://r2.example/monty/jobs/old-run/slug.cut.mp4"
+    inputcache.adopt_local(stale, src, holder=SOMEONE_ELSE)
+    assert inputcache.retained_bytes() == 800
+
+    inputcache.adopt_local("https://r2.example/monty/jobs/new-run/unrelated.mp4", src, holder=ME)
+    assert inputcache.retained_holder(stale) is None, "a dead lease's retained bytes were kept"
+    assert inputcache.retained_bytes() == 800, "only the live entry should remain"
+
+
+def test_the_ceiling_refuses_a_new_adoption_LOUDLY_instead_of_filling_the_disk(tmp_path, monkeypatch):
+    """THE bound. A step that fails is recoverable; a full box takes every chain on it down with an ENOSPC
+    that names nothing. The refusal quotes the tally and the ceiling, because a budget you cannot read is a
+    budget you cannot be refused against. Remove the check and the disk is the only limit left."""
+    monkeypatch.setenv(inputcache.MAX_GB_ENV, "0.00001")     # 10 kB cap -> 5 kB retained ceiling
+    assert inputcache.retained_cap() == 5000
+    src = tmp_path / "m.bin"
+    src.write_bytes(b"m" * 4000)
+    inputcache.adopt_local("https://r2.example/monty/jobs/run-a/one.mp4", src, holder=ME)
+
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"b" * 4000)
+    with pytest.raises(inputcache.RetentionUnavailable) as e:
+        inputcache.adopt_local("https://r2.example/monty/jobs/run-a/two.mp4", big, holder=ME)
+    said = str(e.value)
+    assert "ceiling" in said and "REFUSING" in said and "without retain" in said
+    assert inputcache.retained_bytes() == 4000, "a refused adoption must leave nothing behind"
+
+
+def test_the_ceiling_refusal_reaches_the_caller_as_a_failed_step(tmp_path, monkeypatch, wired):
+    """The refusal is only a bound if it STOPS the work: the output was not uploaded, so a step that reports
+    ok after a refused adoption has delivered a file that is nowhere."""
+    monkeypatch.setenv(inputcache.MAX_GB_ENV, "0.0000000001")
+    step = OpChain(job_id="j", pack=_PACK, steps=[_cut_step(retain=True)]).steps[0]
+    with pytest.raises(runner.ChainError, match="retain=local"):
+        runner._run_step(step, runner.Workspace(tmp_path / "ws"), {})
+    puts, _gets = wired
+    assert puts == [], "a refused retention must not silently fall back to an upload nobody asked for"
+
+
+def test_replacing_the_SAME_object_does_not_count_twice_against_the_ceiling(tmp_path, monkeypatch):
+    """NEGATIVE on the accounting: a step re-run under the same address replaces its payload in place. Count
+    the incoming bytes without discounting what that key already holds and the second attempt at an
+    unchanged master is refused for being its own weight."""
+    monkeypatch.setenv(inputcache.MAX_GB_ENV, "0.00001")     # 5 kB retained ceiling
+    src = tmp_path / "m.bin"
+    src.write_bytes(b"m" * 4000)
+    url = "https://r2.example/monty/jobs/run-a/one.mp4"
+    inputcache.adopt_local(url, src, holder=ME)
+    inputcache.adopt_local(url, src, holder=ME)
+    assert inputcache.retained_bytes() == 4000
+
+
 def test_a_real_put_over_a_retained_key_hands_eviction_back(tmp_path):
     """Retention is a claim about THIS object's only copy. Once something genuinely uploads it the claim is
     over, and leaving the marker behind would make the slot unevictable forever."""
