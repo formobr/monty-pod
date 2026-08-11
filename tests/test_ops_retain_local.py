@@ -372,3 +372,21 @@ def test_there_is_no_override_knob_for_the_worker_name(monkeypatch):
     monkeypatch.setenv("JOB_TOKEN", _bearer(ME))
     identity._reset()
     assert identity.worker_identity() == ME
+
+
+def test_the_terminal_names_the_holder_exactly_when_a_step_retained(tmp_path, wired):
+    """The consumer half's premise: the box learns WHERE the bytes stayed only from the terminal. A retain
+    whose terminal stays silent is a master nobody can bind — the engine refuses the whole preview cut on it
+    (op_chains.require_retained_worker), so this seam is load-bearing on every preview."""
+    _puts, _gets = wired
+    kept = OpChain(job_id="j", pack=_PACK, steps=[_cut_step(retain=True)]).steps[0]
+    sink_kept: list[runner.StepTiming] = []
+    runner._run_step(kept, runner.Workspace(tmp_path / "a"), {}, sink_kept)
+    assert sink_kept and sink_kept[0].retained_ports == ["dst"]
+    assert runner.terminal_retained_on(sink_kept) == ME
+
+    plain = OpChain(job_id="j2", pack=_PACK, steps=[_cut_step(sid="cut2", retain=False)]).steps[0]
+    sink_plain: list[runner.StepTiming] = []
+    runner._run_step(plain, runner.Workspace(tmp_path / "b"), {}, sink_plain)
+    assert sink_plain and sink_plain[0].retained_ports == []
+    assert runner.terminal_retained_on(sink_plain) is None

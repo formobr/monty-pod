@@ -493,6 +493,9 @@ class StepTiming:
     handler_intervals: list[dict[str, Any]] = field(default_factory=list)
     puts: list[dict[str, Any]] = field(default_factory=list)
     incomplete_reasons: list[str] = field(default_factory=list)
+    # ports this step kept on THIS worker instead of uploading (RETAIN_WHY) — the terminal names the
+    # holder off these, because a reader on another worker can only be warned by a name it can bind
+    retained_ports: list[str] = field(default_factory=list)
 
     @property
     def seconds(self) -> float:
@@ -682,6 +685,12 @@ def _upload_arm(
     return waited, retried, traces
 
 
+def terminal_retained_on(timings) -> str | None:
+    """The holder the terminal must name when ANY step kept an output on this worker (RETAIN_WHY) — the
+    engine's require_retained_worker refuses a preview cut whose terminal cannot say WHERE the bytes are."""
+    return worker_identity() if any(getattr(t, "retained_ports", None) for t in timings) else None
+
+
 def _retain_outputs(step: Any, outputs: dict[str, Any]) -> list[str]:
     """Adopt every `retain: local` output under its own url's key instead of PUTting it (RETAIN_WHY).
 
@@ -856,6 +865,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     put_start_ns = time.monotonic_ns()
     try:
         if kept := _retain_outputs(step, outputs):
+            timing.retained_ports = kept
             log(f"op {step.op} [{step.id}] kept {kept} on this worker — no PUT (RETAIN_WHY)")
         timing.put_wait_s, timing.put_retry_s, timing.puts = _upload_outputs(step, outputs)
     except BaseException as exc:
@@ -1256,6 +1266,10 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
             "corr_id": corr_id,
             "timings": terminal_timings,
             "timeline": terminal_timeline,
+            # additive, like chain_s: an older control plane drops the key with a 202. Without it the box
+            # KNOWS a retain happened but not WHERE — and the engine refuses the cut rather than letting
+            # five later readers 404 (op_chains.require_retained_worker).
+            **({"retained_on": held} if (held := terminal_retained_on(timings)) else {}),
             **({"session_id": session_id} if session_id is not None else {}),
         })
         return {sid: {p: ([str(x) for x in v] if isinstance(v, list) else str(v))
