@@ -1,6 +1,6 @@
 {
   "op": "media.sheet",
-  "version": 1,
+  "version": 2,
   "summary": "Lay N already-rendered tiles into one labelled contact sheet: a grid of cells at a fixed geometry, each tile optionally composited onto a backplate whose tone is picked from the artwork's own luminance, with literal caption lines drawn under it and a header line across the top. Grid geometry and already-rendered strings in, one picture out. This is the picture a vision judge looks at, and it is the reason the last media exception existed: a URL can only be handed for an object already in the bus, and a sheet composed beside the caller never is.",
   "needs": [
     "video_encode"
@@ -8,7 +8,7 @@
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "PIL draws deterministically: the layout is integer arithmetic over (grid params, tile count), the plate tone is a pure function of the tile's own alpha-weighted mean luminance, and the glyphs come from one pinned face (fonts-dejavu-core, in the image). Over the same tile bytes the two transports write the same PNG — tests/test_op_media_sheet.py pins that as sha256 against the composite this op replaced, so a layout drift shows as a hash diff instead of as a different picture in front of a judge. THE TOLERANCE, stated because a sheet is SEEN: identical FreeType and zlib give byte-identical files; across Pillow major versions the compressor may repack the same raster, so the floor the parity claim actually stands on is PIXEL identity (RMSE 0), asserted alongside the hash. FAILURE IS PER CELL: an unbound or unreadable tile port leaves its cell empty and every sibling still ships — one chain carries a whole batch of candidates. `sheet` is NOT optional: a caller with no sheet has nothing to judge, and that is an error, not a quiet hold. `meta` is not optional either and it is the half that matters off-box: an empty cell and a rendered one are the same file to a caller that may never look at the pixels, so `drawn` names the cells that actually carry art and a fetch failure keeps its name without a byte of the picture coming back."
+    "note": "PIL draws deterministically: the layout is integer arithmetic over (grid params, tile count), the plate tone is a pure function of the tile's own alpha-weighted mean luminance, and the glyphs come from one pinned face (fonts-dejavu-core, in the image). Over the same tile bytes the two transports write the same PNG — tests/test_op_media_sheet.py pins that as sha256 against the composite this op replaced, so a layout drift shows as a hash diff instead of as a different picture in front of a judge. THE TOLERANCE, stated because a sheet is SEEN: identical FreeType and zlib give byte-identical files; across Pillow major versions the compressor may repack the same raster, so the floor the parity claim actually stands on is PIXEL identity (RMSE 0), asserted alongside the hash. FAILURE IS PER CELL: an unbound or unreadable tile port leaves its cell empty and every sibling still ships — one chain carries a whole batch of candidates. `sheet` is NOT optional: a caller with no sheet has nothing to judge, and that is an error, not a quiet hold. `meta` is not optional either and it is the half that matters off-box: an empty cell and a rendered one are the same file to a caller that may never look at the pixels, so `drawn` names the cells that actually carry art and a fetch failure keeps its name without a byte of the picture coming back. THE CROPPED PATH IS THE SAME CLAIM: `cells[i]` pastes a rect of the image bound to `tile{i}` instead of the whole file, and over an atlas media.image_tile itself packed at gap=0 that rect IS the standalone tile's pixels — asserted byte-for-byte against a sheet composed from the separate tiles. Absent `cells` nothing about the old path runs differently, and its sha256 pins are unchanged."
   },
   "inputs": [
     {
@@ -260,6 +260,23 @@
             "maximum": 512,
             "default": 12
           }
+        }
+      },
+      "cells": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 24,
+        "description": "OPTIONAL, one entry per CELL, parallel to `captions` and to the tile0..tile23 ports. `null` (or an absent `cells` entirely) is today's path: paste the whole file bound to that port. A rect `[x, y, w, h]` pastes THAT SLICE of it instead, which is what lets several ports bind the SAME packed atlas url — the runner downloads one object per URL however many ports name it, so 24 cells that were 24 GETs of tiles this pod had just uploaded become one. GEOMETRY, like every other param here: four integers on the picture's own axis, carrying nothing about which candidate landed in which slice. SINGLE-ROW ONLY — media.image_tile lays its cells in one row (cols=len(urls)), so a legitimate rect always spans the full height of its tile; anything else is refused LOUDLY for the whole call (a wrong slice under a caption is worse than no sheet), which is deliberately the opposite polarity from an unreadable tile.",
+        "items": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "items": {"type": "integer", "minimum": 0, "maximum": 65535}
+            }
+          ]
         }
       },
       "captions": {

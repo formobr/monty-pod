@@ -605,6 +605,14 @@ class OpBinding(BaseModel):
                   `from_port` picks WHICH of that step's outputs when the two ports are not named alike.
       path      — a working-set path already hydrated on the box.
 
+    `retain`/`retained_on` are the THIRD transport answer, for an artifact whose whole audience is later
+    chains on the SAME box. `from_step` cannot serve them (the runner rmtree's each chain's workspace) and a
+    url makes the box pay a PUT plus a GET for bytes that never leave it. An output that declares
+    `retain: "local"` is adopted into the pod's input cache under its `url`'s object key and NOT uploaded; a
+    later chain that binds that url declares `retained_on: "<worker>"` and is refused, by name, if it woke up
+    anywhere else. Both fields are optional and absent on every envelope that predates them, which is why
+    `contracts/VERSION` does not move.
+
     `from_step` is the whole point. docs/RENDER_FLEET_AND_4MIN_BUDGET.md measured a pipeline that runs
     ~9 min locally taking ~25 min split onto a pod, of which ~10 min was sequential per-stage R2 transport.
     Op granularity is FINER than stage granularity, so a design that gave every op its own round trip
@@ -627,6 +635,14 @@ class OpBinding(BaseModel):
     from_port: str | None = Field(default=None, min_length=1)
     path: str | None = Field(default=None, min_length=1)
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # OUTPUT only. "local" = adopt the produced file into THIS pod's input cache under `url`'s object key and
+    # do not upload it. A closed vocabulary of one: the value must name a retention POLICY, so a future
+    # "lease"/"session" scope is an enum member rather than a boolean that has to be reinterpreted.
+    retain: Literal["local"] | None = Field(default=None)
+    # INPUT only. The worker that retained this object, as the control plane names it. Present, it turns the
+    # bind into a fence: the bytes are on ONE box and a chain that woke up elsewhere must be told so by name
+    # rather than discover a 404 (or, worse, silently re-render).
+    retained_on: str | None = Field(default=None, min_length=1, pattern=r"^[A-Za-z0-9_.:-]+$")
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "OpBinding":
@@ -639,6 +655,17 @@ class OpBinding(BaseModel):
             raise ValueError(f"binding {self.port!r}: an empty address in urls addresses nothing")
         if self.from_port is not None and self.from_step is None:
             raise ValueError(f"binding {self.port!r} names from_port with no from_step to read it from")
+        # Both retention fields hang off the OBJECT KEY, which only a single `url` carries: `urls` is N keys
+        # with one flag between them, and from_step/path name no key at all.
+        if self.retain is not None and self.url is None:
+            raise ValueError(f"binding {self.port!r} declares retain={self.retain!r} but binds no `url` — "
+                             f"retention keys on the object address the file WOULD have had")
+        if self.retained_on is not None and self.url is None:
+            raise ValueError(f"binding {self.port!r} names retained_on with no `url` to identify the "
+                             f"retained object")
+        if self.retain is not None and self.retained_on is not None:
+            raise ValueError(f"binding {self.port!r} both retains and reads a retained object; one binding "
+                             f"is one end of one port")
         return self
 
 
@@ -671,7 +698,13 @@ class OpStep(BaseModel):
         for b in self.outputs:
             if b.from_step is not None or b.from_port is not None:
                 raise ValueError(f"step {self.id!r}: an output cannot bind from_step/from_port")
+            if b.retained_on is not None:
+                raise ValueError(f"step {self.id!r}: output {b.port!r} names retained_on — an output is "
+                                 f"where retention is DECLARED (`retain`), never where it is read")
         for b in self.inputs:
+            if b.retain is not None:
+                raise ValueError(f"step {self.id!r}: input {b.port!r} declares retain — only an output the "
+                                 f"handler actually produces can be kept on the box")
             # An input is ONE file: a port fed from N addresses has no defined order to be read in, and the
             # runner would have to invent one. N inputs are N ports.
             if b.urls is not None:

@@ -106,7 +106,9 @@ def test_the_browser_encode_profile_is_accepted_and_a_made_up_one_is_not():
 
 
 def test_the_op_version_moved_but_the_envelope_did_not():
-    """A param added to an existing op bumps THAT op; `contracts/VERSION` pins the envelope and stays put —
-    the split that makes a new tool cost two files instead of a release."""
-    assert _decl("media.scale")["version"] == 3
+    """A param added to an existing op bumps THAT op — and so does a change to the PIXELS it emits with the
+    params unchanged, because the result cache is keyed on `op_version` and would otherwise serve a proxy
+    encoded under the old filter order. `contracts/VERSION` pins the envelope and stays put — the split that
+    makes a new tool cost two files instead of a release."""
+    assert _decl("media.scale")["version"] == 4
     assert (CONTRACTS / "VERSION").read_text().strip() == "5"

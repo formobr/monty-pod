@@ -1,12 +1,12 @@
 {
   "op": "media.scale",
-  "version": 3,
+  "version": 4,
   "summary": "Downscale a video to a target height, preserving aspect, and re-encode at a named profile.",
   "needs": ["video_encode"],
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "Deterministic for a fixed ffmpeg build: libx264 at a pinned preset/crf over identical input bytes emits identical output bytes. The condition is the BUILD, not the box — local and pod run the same pinned ffmpeg, and tests/test_op_media_scale.py asserts the argv is a pure function of params so a drift shows as an argv diff rather than as mystery-different pixels. Across ffmpeg majors this degrades to perceptual; that is a version-pin problem and belongs to the image, not to this op."
+    "note": "Deterministic for a fixed ffmpeg build: libx264 at a pinned preset/crf over identical input bytes emits identical output bytes. The condition is the BUILD, not the box — local and pod run the same pinned ffmpeg, and tests/test_op_media_scale.py asserts the argv is a pure function of params so a drift shows as an argv diff rather than as mystery-different pixels. Across ffmpeg majors this degrades to perceptual; that is a version-pin problem and belongs to the image, not to this op. ORDER: the tonemap runs AFTER the scaler on this op and BEFORE it on media.normalize, and the two are deliberately not the same spelling of one rule. Normalize is INGEST — it keeps native resolution and ingest_normalize measures autograde THROUGH that exact prefix — while a proxy discards ~89% of the pixels a leading tonemap would convert (measured on run img-8010: 12.649 s for the one HDR source against 2.5-3.5 s for its SDR neighbours; 9.01 s -> 2.73 s replayed with the scale first). hable is non-linear, so scaling the tonemapped frame and tonemapping the scaled one differ below what a player shows but NOT bit-for-bit. That is why this bumped the op version: a result cache keyed on it must not hand back a proxy encoded under the old order."
   },
   "inputs": [
     {"id": "src", "kind": "video"}

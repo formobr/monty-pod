@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 
 from ..artifact import log
 from ..cp import download, put_trace, retry, upload
+from ..identity import worker_identity
 from ..sanitize import safe_error
 from . import inputcache, pack, registry, resultcache
 
@@ -207,6 +208,33 @@ class ChainError(RuntimeError):
     pass
 
 
+RETAIN_WHY: Final[str] = """
+THE PREVIEW MASTER WAS PUT SO THAT THE SAME BOX COULD GET IT BACK.
+
+`cut.apply` writes <slug>.cut.mp4 and five later chains bind it by R2 address. On the preview tier every one
+of those chains lands on the worker that produced it, so the PUT buys nothing but latency — and the pod's own
+input cache proves it: `upload_and_adopt` immediately turns the uploaded snapshot into the local entry those
+same chains then hit. The upload is the round trip; the adoption is the part that was load-bearing.
+
+`retain: "local"` keeps the adoption and drops the upload. What makes it safe is that the loss is NAMED. The
+object exists on exactly ONE box, so a chain that binds it declares `retained_on`, and this runner answers
+before it fetches anything:
+
+  · same worker, entry present  — a cache hit, which is what the chain would have got after the PUT anyway.
+  · DIFFERENT worker            — refused by name, at PREFLIGHT, before a byte moves or a frame decodes.
+  · same worker, entry gone     — refused by name too. Retained slots are exempt from pruning, so this means
+                                  the pod restarted or the cache was wiped; either way there is no remote
+                                  copy, and a silent re-render would be paid work nobody asked for.
+
+THE TWO FAILURES THIS REPLACES ARE BOTH SILENT. A plain bind of a never-uploaded key is a 404 several minutes
+and one rented box away from its cause; a "helpful" fallback that re-derives the master is the same money
+spent twice with nothing in the log to say so. Neither is a state this transport is allowed to reach.
+
+IT IS THE CALLER'S CLAIM, NOT AN INFERENCE. Nothing here decides which tier may retain — the flag arrives on
+the binding, and a final-tier step that does not carry it uploads exactly as it always did.
+"""
+
+
 class Workspace:
     """The chain's shared local disk. One directory, removed when the chain ends.
 
@@ -246,6 +274,49 @@ class Workspace:
         download(url, dest)
         with self._lock:
             return self._downloads.setdefault(url, dest)
+
+    def fetch_retained(self, url: str, holder: str) -> Path:
+        """An object that was never uploaded, read back on the box that kept it (RETAIN_WHY).
+
+        There is no remote fallback by construction, so every way this can fail is raised with the worker
+        names in it. A lease is still taken, exactly as `fetch` does: the persistent payload is never handed
+        to a handler that might outlive its slot.
+        """
+        assert_retained_here(url, holder)
+        with self._lock:
+            hit = self._downloads.get(url)
+        if hit is not None:
+            return hit
+        dest = self.root / "_in" / f"{abs(hash(url)):016x}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        def _never(_url: str, _dest: Path) -> None:      # a retained object has nowhere to be fetched from
+            raise ChainError(f"retained object {inputcache.object_key(_url)} was about to be DOWNLOADED; "
+                             f"nothing ever uploaded it, so that request could only 404")
+
+        lease = inputcache.get(url, _never, lease=dest, log=log)
+        if lease is None:
+            raise ChainError(
+                f"input binds an object retained on worker {holder}, but this pod's input cache is disabled "
+                f"({inputcache.DISABLE_ENV}) — retention has no other store. Re-run without retain.")
+        with self._lock:
+            return self._downloads.setdefault(url, lease)
+
+
+def assert_retained_here(url: str, holder: str, *, check_entry: bool = True) -> None:
+    """Refuse a retained bind this box cannot serve, by NAME (RETAIN_WHY). Pure identity check when
+    `check_entry` is false, which is what lets preflight refuse a mis-routed chain before it costs a claim."""
+    me = worker_identity()
+    if holder != me:
+        raise ChainError(
+            f"retained on worker {holder}, claimed on worker {me} — re-run without retain or route to the "
+            f"same worker. This object was deliberately NOT uploaded, so there is no address to fall back "
+            f"to; nothing was re-rendered and nothing 404'd silently.")
+    if check_entry and inputcache.retained_holder(url) is None:
+        raise ChainError(
+            f"retained on worker {holder}, which IS this worker, but its input cache no longer holds "
+            f"{inputcache.object_key(url)} — the agent restarted or the cache was wiped. Nothing uploaded "
+            f"this object, so it exists nowhere: re-run the producing chain without retain.")
 
 
 # A workspace path needs a real extension: ffmpeg picks its MUXER from the output suffix and fails with
@@ -326,7 +397,8 @@ def _bind_inputs(step: Any, op: registry.Op, ws: Workspace,
             bound[b.port] = p
         else:
             assert b.url is not None
-            bound[b.port] = ws.fetch(b.url)
+            held = getattr(b, "retained_on", None)
+            bound[b.port] = ws.fetch_retained(b.url, str(held)) if held else ws.fetch(b.url)
     missing = [p.id for p in op.inputs if not p.optional and p.id not in bound]
     if missing:
         raise ChainError(f"step {step.id!r}: op {op.op} requires inputs {missing}")
@@ -579,6 +651,8 @@ def _output_arms(step: Any, outputs: dict[str, Any]) -> list[list[tuple[str, Pat
     stays unnamed so its refusal reaches the caller exactly as the serial phase raised it."""
     arms: list[list[tuple[str, Path, str, str, int]]] = []
     for b in step.outputs:
+        if getattr(b, "retain", None) is not None:
+            continue                      # kept on the box under this url's key instead (RETAIN_WHY)
         if b.url is not None:
             if outputs[b.port].exists():
                 arms.append([(b.url, outputs[b.port], "", str(b.port), 0)])
@@ -606,6 +680,33 @@ def _upload_arm(
         waited, retried = max(waited, one_wait), retried + one_retry
         traces.append({"direction": "output", "port": port, "index": index, **trace})
     return waited, retried, traces
+
+
+def _retain_outputs(step: Any, outputs: dict[str, Any]) -> list[str]:
+    """Adopt every `retain: local` output under its own url's key instead of PUTting it (RETAIN_WHY).
+
+    Runs BEFORE the uploads: it is a local copy that fails in milliseconds, and a retention that cannot be
+    made readable must not be discovered after a sibling port has already crossed the wire.
+    """
+    kept: list[str] = []
+    for b in step.outputs:
+        if getattr(b, "retain", None) is None:
+            continue
+        path = outputs[b.port]
+        if isinstance(path, list):
+            raise ChainError(f"step {step.id!r}: output {b.port!r} is a LIST port and cannot be retained — "
+                             f"retention keys on ONE object address (ARITY_WHY)")
+        if not path.exists():
+            # An optional output the handler chose not to write has nothing to keep; the port's own
+            # `optional` flag already ruled on whether that is legal.
+            continue
+        try:
+            inputcache.adopt_local(str(b.url), path, holder=worker_identity(), log=log)
+        except inputcache.RetentionUnavailable as exc:
+            raise ChainError(f"step {step.id!r}: output {b.port!r} was not uploaded because it declares "
+                             f"retain=local, and it could not be kept either ({safe_error(exc)})") from exc
+        kept.append(str(b.port))
+    return kept
 
 
 def _upload_outputs(step: Any, outputs: dict[str, Any]) -> tuple[float, float, list[dict[str, Any]]]:
@@ -754,6 +855,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     t_put = time.monotonic()
     put_start_ns = time.monotonic_ns()
     try:
+        if kept := _retain_outputs(step, outputs):
+            log(f"op {step.op} [{step.id}] kept {kept} on this worker — no PUT (RETAIN_WHY)")
         timing.put_wait_s, timing.put_retry_s, timing.puts = _upload_outputs(step, outputs)
     except BaseException as exc:
         live("upload_error", started=t_put, exc=exc)
@@ -805,6 +908,11 @@ def preflight_chain(chain: Any) -> None:
         # be run, and learning it after the decode costs the decode
         assert_output_arity(step, registry.get(step.op))
         for b in step.inputs:
+            # WHICH BOX holds a retained object is knowable at claim, and learning it after the chain has
+            # rented, pulled and decoded costs all three for a fact that was true before the first byte
+            # moved. Identity only — whether the ENTRY is still there is a disk question, asked at bind.
+            if (held := getattr(b, "retained_on", None)) is not None:
+                assert_retained_here(str(b.url), str(held), check_entry=False)
             if b.from_port is None:
                 continue
             # a hand-off that names a port its producer does not declare is knowable now, and knowing it

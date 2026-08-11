@@ -16,6 +16,23 @@ DISABLE_ENV = "OPS_INPUT_CACHE_OFF"
 MAX_GB_ENV = "OPS_INPUT_CACHE_MAX_GB"
 MAX_GB_DEFAULT = 24.0
 DONE = ".complete"
+RETAINED = ".retained"
+
+RETENTION_WHY = """
+A PUT EXISTS SO A LATER READER CAN FIND THE BYTES. WHEN EVERY LATER READER IS THIS SAME BOX, IT BUYS NOTHING.
+
+`upload_and_adopt` already proves the shape: after a durable PUT the same immutable snapshot becomes the local
+object-cache entry, so the next chain that binds that address pays no transfer. Retention keeps the second
+half and drops the first — the produced file is adopted under its canonical object key WITHOUT crossing the
+wire. That is only legal when the object's whole audience is chains that will land on THIS worker, which is a
+claim the caller makes per output and the runner refuses to guess.
+
+THE MARKER IS THE DIFFERENCE BETWEEN A CACHE AND A STORE. An ordinary entry may be evicted at any moment: the
+remote copy is the truth and a miss costs one download. A retained entry IS the truth — evicting it would
+delete the only copy of a master, so a retained slot is never pruned and the cap is measured over the rest.
+The marker also names the worker that holds it, which is what lets a refusal say WHERE the bytes are instead
+of only that they are missing.
+"""
 
 _lock = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
@@ -85,6 +102,8 @@ def _invalidate_locked(slot: Path, log=None) -> None:
     try:
         sentinel.unlink(missing_ok=True)
         payload.unlink(missing_ok=True)
+        # The marker outliving its payload would make an empty slot permanently unevictable.
+        (slot / RETAINED).unlink(missing_ok=True)
     except OSError as exc:
         if log:
             log(f"[input-cache] stale slot invalidation failed ({type(exc).__name__})")
@@ -135,6 +154,9 @@ def upload_and_adopt(url: str, src: Path, upload, log=None) -> None:
                 # No reader/pruner can observe the payload without the checksum that names its PUT body:
                 # all three use this same object lock, and sentinel absence means cache miss.
                 sentinel.unlink(missing_ok=True)
+                # A durable PUT gives this object a remote truth, so any earlier retention claim on the
+                # same key is over and the entry becomes evictable again.
+                (slot / RETAINED).unlink(missing_ok=True)
                 snapshot.replace(payload)
                 sentinel.write_text(before, encoding="ascii")
             except Exception as exc:  # cache maintenance cannot reverse a successful durable PUT
@@ -160,6 +182,82 @@ def upload_and_adopt(url: str, src: Path, upload, log=None) -> None:
             log(f"[input-cache] prune failed after PUT ({type(exc).__name__}); object remains durable")
 
 
+class RetentionUnavailable(RuntimeError):
+    """A retained output could not be made readable locally. LOUD by construction: nothing uploaded it, so a
+    swallowed failure here is an object that exists nowhere and a later chain that 404s far from the cause."""
+
+
+def adopt_local(url: str, src: Path, *, holder: str, log=None) -> Path:
+    """Make `src` the local object-cache entry for `url`'s key WITHOUT uploading it (RETENTION_WHY).
+
+    Same snapshot→adopt order as the PUT path, minus the PUT: the payload is an immutable copy, so later
+    workspace mutation cannot change what a reader gets, and the sentinel lands only over a complete file.
+    Returns the payload path. Raises RetentionUnavailable — a retained object has no remote fallback.
+    """
+    key = object_key(url)
+    if key is None:
+        raise RetentionUnavailable(
+            f"retained output binds {url[:60]!r}, which names no cacheable object — retention keys on the "
+            f"object a presigned URL addresses (host + path), so a non-http binding cannot be retained")
+    if not src.is_file():
+        raise RetentionUnavailable(f"retained output for {key} is not a file at {src}")
+    if not enabled():
+        raise RetentionUnavailable(
+            f"retained output for {key} cannot be adopted: the input cache is OFF ({DISABLE_ENV}). Nothing "
+            f"uploaded this object, so there is no remote copy to fall back to — re-run without retain")
+    slot = _slot(key)
+    payload, sentinel, marker = slot / "payload", slot / DONE, slot / RETAINED
+    with _key_lock(key):
+        snapshot = slot / f"payload.{os.getpid()}.{threading.get_ident()}.retain-snapshot"
+        try:
+            slot.mkdir(parents=True, exist_ok=True)
+            _copy_or_reflink(src, snapshot)
+            snapshot.chmod(0o444)
+            digest = _sha256(snapshot)
+            sentinel.unlink(missing_ok=True)
+            snapshot.replace(payload)
+            # Marker BEFORE the sentinel: a reader that sees a usable entry must already see that it is the
+            # only copy, or the pruner could evict what nothing can re-download.
+            marker.write_text(holder, encoding="utf-8")
+            sentinel.write_text(digest, encoding="ascii")
+        except Exception as exc:
+            _invalidate_locked(slot, log=log)
+            raise RetentionUnavailable(
+                f"retained output for {key} could not be adopted ({type(exc).__name__}); nothing uploaded "
+                f"it, so this object now exists nowhere") from exc
+        finally:
+            try:
+                snapshot.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if log:
+        try:
+            mb = payload.stat().st_size / 1e6
+        except OSError:
+            mb = 0.0
+        log(f"[input-cache] RETAINED {key} ({mb:.0f} MB) on {holder} — not uploaded")
+    try:
+        prune(log=log)
+    except (OSError, ValueError) as exc:
+        if log:
+            log(f"[input-cache] prune failed after retain ({type(exc).__name__})")
+    return payload
+
+
+def retained_holder(url: str) -> str | None:
+    """The worker named on this object's retention marker, or None if this box holds no retained copy."""
+    key = object_key(url)
+    if key is None or not enabled():
+        return None
+    slot = _slot(key)
+    if not ((slot / DONE).exists() and (slot / "payload").is_file()):
+        return None
+    try:
+        return (slot / RETAINED).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -169,11 +267,14 @@ def _sha256(path: Path) -> str:
 
 
 def _entries() -> list[tuple[float, int, Path]]:
-    """(mtime, bytes, slot) for every COMPLETE entry — a half-written one is nobody's to evict."""
+    """(mtime, bytes, slot) for every EVICTABLE entry — a half-written one is nobody's to evict, and neither
+    is a RETAINED one: nothing uploaded it, so eviction is deletion, not a re-download (RETENTION_WHY)."""
     out: list[tuple[float, int, Path]] = []
     for slot in root().glob("*"):
         payload = slot / "payload"
         if not (slot / DONE).exists() or not payload.is_file():
+            continue
+        if (slot / RETAINED).exists():
             continue
         try:
             st = payload.stat()
@@ -204,6 +305,8 @@ def prune(keep_bytes: int | None = None, log=None) -> int:
             payload = slot / "payload"
             if not (slot / DONE).exists() or not payload.is_file():
                 continue
+            if (slot / RETAINED).exists():
+                continue      # adopted between _entries and here: its only copy is not ours to delete
             actual = payload.stat().st_size
             shutil.rmtree(slot, ignore_errors=True)
             total -= actual
