@@ -33,7 +33,11 @@ def _claim_jid(token: str) -> str:
     body = token.rsplit(".", 1)[0]
     try:
         claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-    except Exception:      # noqa: BLE001 — an unreadable bearer is not an identity, and never an exception
+    # An unreadable bearer is not an identity, and never an exception — but the class is narrowed to what
+    # the two decode steps actually raise on malformed input: binascii.Error and json.JSONDecodeError are
+    # both ValueError subclasses, and a body that decodes to invalid UTF-8 raises UnicodeDecodeError, which
+    # is one too (bytes.decode() runs inside json.loads before the JSON parser ever sees it).
+    except ValueError:
         return ""
     jid = claims.get("jid") if isinstance(claims, dict) else None
     return str(jid).strip() if jid else ""

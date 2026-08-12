@@ -364,6 +364,26 @@ def test_an_unreadable_bearer_is_not_an_identity_and_never_an_exception(monkeypa
     assert identity.worker_identity() == "local:devbox"
 
 
+def test_a_malformed_base64_body_decodes_to_no_claim():
+    """NEGATIVE, at the narrowed clause directly: a body whose data-character count cannot be padded to a
+    multiple of 4 raises binascii.Error (a ValueError subclass) inside the decode itself — the except
+    must still catch it."""
+    assert identity._claim_jid("A.sig") == ""
+
+
+def test_a_body_that_decodes_but_is_not_json_gives_no_claim():
+    """NEGATIVE, same clause, a different raiser: base64 that decodes cleanly to bytes which are not valid
+    UTF-8 fails inside json.loads with UnicodeDecodeError (also a ValueError subclass), before the JSON
+    parser ever runs."""
+    garbage = base64.urlsafe_b64encode(bytes([0x9E, 0x8B, 0x6F, 0x6A])).rstrip(b"=").decode()
+    assert identity._claim_jid(f"{garbage}.sig") == ""
+
+
+def test_a_well_formed_token_still_yields_its_jid():
+    """The positive case the narrowed except must not have broken: a real bearer's claim still reads."""
+    assert identity._claim_jid(_bearer(ME)) == ME
+
+
 def test_there_is_no_override_knob_for_the_worker_name(monkeypatch):
     """NEGATIVE, and it is the pod-orphan gate's finding kept as a test: the box writes the pod's environment
     WHOLE, so an escape hatch nothing in the seam assigns can only ever be its default — a switch nobody can
