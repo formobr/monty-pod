@@ -61,14 +61,27 @@ def ops_chain_pool_size() -> int:
         return _OPS_MAX_CHAINS_DEFAULT
 
 
-def capacity_payload(*, rank_lanes: int, fetch_workers: int) -> dict[str, Any]:
-    """Advertise diagnostics and bounded credits for the three independent executors.
+CAPACITY_VRAM_WHY = """
+CLAIM_CAPACITY IS BOUNDED BY CLASS, NOT BY OPS_MAX_CHAINS ALONE: the API admits ops/rank/heavy separately so
+the ops pool can hold several workspaces without multiplying serial render/align work or the card-sized rank
+lane. Four is the transport/OOM ceiling even when OPS_MAX_CHAINS is larger; the runner's step semaphore stays
+the lower-level execution bound.
 
-    The API admits by class, so the ops pool can use several workspaces without multiplying serial render/
-    align work or the card-sized rank lane. Four is the transport/OOM ceiling even when OPS_MAX_CHAINS is
-    larger; the runner's step semaphore remains the lower-level execution bound.
-    """
-    return {
+VRAM_TOTAL_MB IS A FIXED FACT ABOUT THE RENTED CARD, read the same way infer_cliprank._free_vram_mb reads
+free VRAM — nvidia-smi, never a second device-reading tool.
+
+VRAM_PEAK_USED_MB IS DELIBERATELY ABSENT. nvidia-smi's memory.used is an instantaneous snapshot — "allocated
+by active contexts" right now — and this whole declaration runs ONCE, at boot, before any model has loaded.
+Publishing that snapshot under a name that promises a peak would be the exact "0.0 reads like somebody
+looked" failure rent_receipt.py exists to catch: a genuine peak needs a source that TRACKS one over the pod's
+life, and nvidia-smi has no such query. So: a real total, and a named absence rather than a mislabeled instant.
+"""
+
+
+def capacity_payload(*, rank_lanes: int, fetch_workers: int,
+                     vram_total_mb: float | None = None) -> dict[str, Any]:
+    """Advertise diagnostics, bounded per-class credits, and the card's VRAM total when known (CAPACITY_VRAM_WHY)."""
+    payload: dict[str, Any] = {
         "rank_lanes": int(rank_lanes),
         "fetch_workers": int(fetch_workers),
         "claim_capacity": {
@@ -77,6 +90,9 @@ def capacity_payload(*, rank_lanes: int, fetch_workers: int) -> dict[str, Any]:
             "heavy": 1,
         },
     }
+    if vram_total_mb is not None:
+        payload["vram_total_mb"] = float(vram_total_mb)
+    return payload
 
 
 def _log(msg: str) -> None:
@@ -678,9 +694,10 @@ def main() -> None:
         signal.signal(_sig, _stop_and_exit)
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
-    from .infer_cliprank import fetch_width, lane_width
+    from .infer_cliprank import fetch_width, lane_width, vram_total_mb
     rank_width = lane_width()
-    capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width())
+    capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width(),
+                                vram_total_mb=vram_total_mb())
     _capability_preflight(cp, capacity=capacity)
     # On reconnect the API resets credit. Replay the ACKed readiness verdict
     # together with capacity; this event is installed only after preflight.

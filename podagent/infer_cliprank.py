@@ -94,6 +94,20 @@ def _free_vram_mb() -> float | None:
     return max(vals) if vals else None
 
 
+def vram_total_mb() -> float | None:
+    """Installed VRAM, or None if unreadable — never a coerced 0. Same probe as _free_vram_mb, PUBLIC because
+    main.capacity_payload is a cross-module caller, self-contained because that caller has no guard of its own."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    vals = [float(ln.strip()) for ln in r.stdout.splitlines() if ln.strip().replace(".", "", 1).isdigit()]
+    return max(vals) if vals else None
+
+
 def _host_threads() -> int:
     """Hardware threads this process may use — a lane also decodes and preprocesses its tiles on the CPU."""
     return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4)

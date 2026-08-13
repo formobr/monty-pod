@@ -114,6 +114,33 @@ def test_an_unaskable_card_costs_one_lane_not_a_crashed_boot(monkeypatch):
     assert m.lane_width() == 1
 
 
+# ── vram_total_mb: the reading capacity_payload's VRAM total comes from ─────────────────────────────
+
+def test_vram_total_mb_reads_the_cards_installed_memory(monkeypatch):
+    class _Result:
+        returncode = 0
+        stdout = "24564\n"
+
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Result())
+    assert m.vram_total_mb() == 24564.0
+
+
+def test_vram_total_mb_is_none_not_zero_when_nvidia_smi_is_unreachable(monkeypatch):
+    """NEGATIVE: a GPU-less box must read as absent, never as a coerced 0 — self-contained, no caller guard."""
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no nvidia-smi")))
+    assert m.vram_total_mb() is None
+
+
+def test_vram_total_mb_is_none_when_the_card_answers_with_a_nonzero_exit(monkeypatch):
+    class _Result:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Result())
+    assert m.vram_total_mb() is None
+
+
 # ── the lane is a DIFFERENT pool, and only clip_rank rides it ────────────────────────────────────
 
 def test_a_running_render_does_not_block_a_clip_rank_envelope():
