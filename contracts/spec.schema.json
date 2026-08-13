@@ -17,7 +17,7 @@
   ],
   "properties": {
     "spec_version": {
-      "const": 5
+      "const": 6
     },
     "job_id": {
       "type": "string",
@@ -273,6 +273,9 @@
         },
         "finalize": {
           "$ref": "#/$defs/finalize"
+        },
+        "opener": {
+          "$ref": "#/$defs/opener"
         }
       }
     },
@@ -298,6 +301,47 @@
           "exclusiveMinimum": 0,
           "maximum": 2
         }
+      }
+    },
+    "opener": {
+      "description": "The pre-rendered cold-open clip and its film-burn junction assets, welded onto the front of the body. `cold`/`burn`/`clicks` are inputs[].id (mirrors stitch_coldopen.py's own args, whose `must_exist=True` applies to BOTH burn and clicks). `burn`/`clicks` are a PAIR — set both (the film-burn junction) or neither (a hard-cut concat); absence, never an explicit null, is how 'not carried' is spelled (same style as the accent's film_burn kind). `cold_trim` shortens the cold-open's tail (seconds); `gain` is the junction click's linear level.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cold"
+      ],
+      "properties": {
+        "cold": {
+          "type": "string",
+          "minLength": 1
+        },
+        "burn": {
+          "type": "string",
+          "minLength": 1
+        },
+        "clicks": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cold_trim": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "gain": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.4
+        }
+      },
+      "dependentRequired": {
+        "burn": [
+          "clicks"
+        ],
+        "clicks": [
+          "burn"
+        ]
       }
     },
     "broll_final": {
@@ -755,7 +799,7 @@
       }
     },
     "accent": {
-      "description": "One resolved frame-accent. The Director decided WHICH treatment fires WHERE and HOW HARD; the anchor phrase, the score and the reasoning that produced it never cross. `at` is on the FINAL output clock.",
+      "description": "One resolved frame-accent. The Director decided WHICH treatment fires WHERE and HOW HARD; the anchor phrase, the score and the reasoning that produced it never cross. `at` is on the FINAL output clock. `film_burn` is the only two-input accent: `burn`/`clicks` are inputs[].id of the burn overlay video and its click sound (mirrors overlays.opener's junction assets, body-side).",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -772,7 +816,8 @@
             "glitch",
             "zoom_blur",
             "rgb_split",
-            "pixelate"
+            "pixelate",
+            "film_burn"
           ]
         },
         "at": {
@@ -783,8 +828,52 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1
+        },
+        "burn": {
+          "type": "string",
+          "minLength": 1
+        },
+        "clicks": {
+          "type": "string",
+          "minLength": 1
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "film_burn"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "burn",
+              "clicks"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "burn"
+                  ]
+                },
+                {
+                  "required": [
+                    "clicks"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
     },
     "logo": {
       "description": "The persistent corner logo over the BODY. `asset` is an inputs[].id of the logo PNG — the pod holds no brand profile. `cover_hold` is the length of the cover end-card tail the logo must not cover (the end-card carries its own logo).",

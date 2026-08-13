@@ -45,7 +45,7 @@ def _run(cp, raw: dict) -> None:
 def _bad_request() -> dict:
     # clip_rank with no weights block fails InferRequest validation, i.e. raises before any service is
     # constructed — the failure path without a GPU.
-    return {"infer_version": 5, "job_id": "j1", "kind": "clip_rank",
+    return {"infer_version": 6, "job_id": "j1", "kind": "clip_rank",
             "model": "siglip", "put_url": "https://r2.example/out/j1/clip_rank.json"}
 
 

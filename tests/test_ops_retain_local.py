@@ -330,12 +330,14 @@ def test_retention_keys_on_one_object_address_and_refuses_to_key_on_none():
 
 
 def test_the_flag_is_additive_so_the_envelope_pin_does_not_move():
-    """THE justification for leaving `contracts/VERSION` at 5, asserted rather than claimed in a comment: an
-    envelope written before retention existed still validates, byte for byte unchanged."""
+    """THE justification for leaving `contracts/VERSION` unmoved BY THIS field, asserted rather than
+    claimed in a comment: an envelope written before retention existed still validates, byte for byte
+    unchanged. (The literal below tracks whatever VERSION render/infer changes have since pinned — v6 as
+    of E-W1's opener/film_burn addition; retention itself never bumped it.)"""
     contracts = Path(__file__).resolve().parents[1] / "contracts"
     doc = json.loads((contracts / "examples" / "pod_job.ops.json").read_text())
     OpChain.model_validate(doc["chain"])
-    assert (contracts / "VERSION").read_text().strip() == "5"
+    assert (contracts / "VERSION").read_text().strip() == "6"
     plain = OpChain(job_id="j", pack=_PACK, steps=[_cut_step(retain=False)])
     dumped = plain.model_dump(mode="json", exclude_none=True)
     assert "retain" not in json.dumps(dumped), "an absent flag must not appear on an old-shaped envelope"

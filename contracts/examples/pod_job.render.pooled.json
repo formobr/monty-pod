@@ -3,7 +3,7 @@
   "session_id": "tenant_7a1e",
   "corr_id": "9c3f5b2e8d1a4f60b7c8d9e0f1a2b3c4",
   "spec": {
-    "spec_version": 5,
+    "spec_version": 6,
     "job_id": "job_9f2c1a",
     "slug": "demo-clip",
     "mode": "preview",

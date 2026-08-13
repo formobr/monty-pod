@@ -1,5 +1,5 @@
 {
   "type": "ops",
   "chain": { "chain_version": 1, "job_id": "demo", "pack": {}, "steps": [] },
-  "spec": { "spec_version": 5 }
+  "spec": { "spec_version": 6 }
 }

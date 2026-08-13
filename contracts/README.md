@@ -20,7 +20,7 @@ Transport: the planner and the pod NEVER talk directly. Jobs, lifecycle events, 
 typed EventStream WebSocket; media payloads ride presigned URLs.
 The two EventStream schemas and their shared goldens are not copied into this directory: they come from
 `../vendor/monty-contracts/wire_bundle.json` and generate `../podagent/wire_generated.py`. This directory's
-`VERSION=5` therefore remains solely the render/infer domain pin; shared transport currently has its own v12.
+`VERSION=6` therefore remains solely the render/infer domain pin; shared transport currently has its own v12.
 
 ## The job envelope
 
@@ -134,6 +134,12 @@ HF-hub-shaped `<repo>/snapshots/<rev>/` tar both work), so re-exporting weights 
 together on ANY change; there is no back-compat — a mismatch is a loud fail on both sides.
 Goldens: every `examples/*.json` must validate, every `examples/invalid/*.json` must be rejected
 (`python validate.py`).
+
+- **v5→v6**: `overlays.opener` (the pre-rendered cold-open + its film-burn junction assets — `cold`
+  required, `burn`/`clicks` optional) and accent `kind: "film_burn"` (the same junction bundle, body-side;
+  its `burn`/`clicks` inputs are required together, forbidden on every other kind) — both single-pass prep
+  (E-W1). The pod REJECTS a v6 spec that carries either until `render_onepass` lands (W2); old pods reject
+  v6 outright on the version const.
 
 ## Clock conventions
 

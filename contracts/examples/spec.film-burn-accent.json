@@ -1,0 +1,72 @@
+{
+  "spec_version": 6,
+  "job_id": "job_fb4cc3nt",
+  "slug": "demo-film-burn",
+  "mode": "final",
+  "inputs": [
+    {
+      "id": "base",
+      "kind": "video",
+      "sha256": "cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2",
+      "url": "https://storage.example/o/base.mp4?sig=GET"
+    },
+    {
+      "id": "brand/film_burn.mp4",
+      "kind": "video",
+      "sha256": "859facc5a4c9b80ac2eef78916c1953bcccaab6014bb11b9de8337430ea34f0c",
+      "url": "https://storage.example/o/film_burn.mp4?sig=GET"
+    },
+    {
+      "id": "brand/film_burn_clicks.wav",
+      "kind": "audio",
+      "sha256": "72b40fb15edacca3004c434b2fae37a7688218c3f58afeeb8c43b6ffa9a1c7dd",
+      "url": "https://storage.example/o/film_burn_clicks.wav?sig=GET"
+    }
+  ],
+  "timeline": {
+    "fps": 30,
+    "width": 1080,
+    "height": 1920,
+    "segments": [
+      {
+        "src": "base",
+        "in": 0.0,
+        "out": 40.0,
+        "speed": 1.0
+      }
+    ]
+  },
+  "overlays": {
+    "finalize": {
+      "accents": [
+        {
+          "kind": "zoom_punch",
+          "at": 8.0,
+          "intensity": 0.5
+        },
+        {
+          "kind": "film_burn",
+          "at": 22.4,
+          "intensity": 0.6,
+          "burn": "brand/film_burn.mp4",
+          "clicks": "brand/film_burn_clicks.wav"
+        }
+      ]
+    }
+  },
+  "encode": {
+    "video": "h264_nvenc",
+    "preset": "p7",
+    "cq": 14,
+    "pix_fmt": "yuv420p",
+    "audio": "aac",
+    "audio_bitrate": "192k"
+  },
+  "outputs": [
+    {
+      "id": "master",
+      "kind": "master",
+      "put_url": "https://storage.example/o/film-burn-master.mp4?sig=PUT"
+    }
+  ]
+}

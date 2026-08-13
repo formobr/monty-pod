@@ -1,7 +1,7 @@
 {
   "type": "infer",
   "request": {
-    "infer_version": 5,
+    "infer_version": 6,
     "job_id": "j",
     "kind": "align",
     "model": "m",
@@ -17,7 +17,7 @@
     }
   },
   "spec": {
-    "spec_version": 5,
+    "spec_version": 6,
     "job_id": "j",
     "slug": "s",
     "mode": "preview",

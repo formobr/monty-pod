@@ -6,7 +6,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION: Final = 5
+SPEC_VERSION: Final = 6
 
 
 class SpecInput(BaseModel):
@@ -238,13 +238,67 @@ class SpecSfx(BaseModel):
 class SpecAccent(BaseModel):
     """One resolved frame-accent: WHICH treatment, WHERE on the final clock, HOW hard. The Director's
     reasoning (the anchor phrase, the score, why this beat earned an accent) never crosses — only
-    these three resolved values do."""
+    these three resolved values do. `film_burn` is the one two-input kind: `burn`/`clicks` are inputs[].id
+    of the burn overlay video and its click sound (mirrors overlays.opener's junction assets, body-side) —
+    required together on film_burn, forbidden on every other kind."""
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["camera_shake", "grain", "zoom_punch", "glitch", "zoom_blur", "rgb_split", "pixelate"]
+    kind: Literal["camera_shake", "grain", "zoom_punch", "glitch", "zoom_blur", "rgb_split", "pixelate",
+                  "film_burn"]
     at: float = Field(ge=0)
     intensity: float = Field(ge=0, le=1)
+    burn: str | None = Field(default=None, min_length=1)
+    clicks: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _film_burn_needs_both(self) -> "SpecAccent":
+        # burn/clicks are typed as plain `string` in the schema (no null in the union) — an EXPLICIT null
+        # is therefore as invalid as an unresolvable ref would be, and `model_fields_set` is the only way
+        # to see "the key was present" separately from "the value happens to be None" (the schema's
+        # `required` inside its film_burn/else allOf branches checks presence, not value).
+        burn_set, clicks_set = "burn" in self.model_fields_set, "clicks" in self.model_fields_set
+        if burn_set and self.burn is None:
+            raise ValueError("accent.burn must not be null — omit the key on kinds that don't carry it")
+        if clicks_set and self.clicks is None:
+            raise ValueError("accent.clicks must not be null — omit the key on kinds that don't carry it")
+        if self.kind == "film_burn":
+            if self.burn is None or self.clicks is None:
+                raise ValueError("film_burn accent requires both burn and clicks input ids")
+        elif burn_set or clicks_set:
+            raise ValueError(f"{self.kind} accent must not carry burn/clicks (film_burn only)")
+        return self
+
+
+class SpecOpener(BaseModel):
+    """The pre-rendered cold-open clip and its film-burn junction assets, welded onto the front of the
+    body (single-pass prep — E-W1; the pod does not execute it until render_onepass lands, W2). `cold`
+    is an inputs[].id (mirrors stitch_coldopen.py's own `cold` arg). `burn`/`clicks` are a PAIR — set
+    both (the film-burn junction, mirrors stitch_coldopen.py's own `must_exist=True` on both) or neither
+    (a hard-cut concat) — same style as the accent's two-input kind: plain strings, absence (never an
+    explicit null) means "not carried". `cold_trim` shortens the cold-open's tail (seconds); `gain` is
+    the junction click's linear level."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cold: str = Field(min_length=1)
+    burn: str | None = Field(default=None, min_length=1)
+    clicks: str | None = Field(default=None, min_length=1)
+    cold_trim: float = Field(default=0.0, ge=0)
+    gain: float = Field(default=0.4, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _junction_pair_or_neither(self) -> "SpecOpener":
+        burn_set, clicks_set = "burn" in self.model_fields_set, "clicks" in self.model_fields_set
+        if burn_set and self.burn is None:
+            raise ValueError("opener.burn must not be null — omit the key entirely for a hard-cut opener")
+        if clicks_set and self.clicks is None:
+            raise ValueError("opener.clicks must not be null — omit the key entirely for a hard-cut opener")
+        if burn_set != clicks_set:
+            raise ValueError(
+                "opener burn/clicks are a junction PAIR — set both (the film-burn junction) or neither "
+                "(a hard-cut concat)")
+        return self
 
 
 class SpecLogo(BaseModel):
@@ -324,6 +378,7 @@ class Overlays(BaseModel):
     trims: list[SpecTrim] | None = None
     sfx: list[SpecSfx] | None = None
     finalize: SpecFinalize | None = None
+    opener: SpecOpener | None = None
 
 
 class Encode(BaseModel):
@@ -348,7 +403,7 @@ class SpecOutput(BaseModel):
 class RenderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    spec_version: Literal[5]
+    spec_version: Literal[6]
     job_id: str = Field(min_length=1)
     slug: str = Field(min_length=1)
     mode: Literal["preview", "final"]
@@ -385,9 +440,27 @@ class RenderSpec(BaseModel):
                 if fin.watermark is not None:
                     refs += [("watermark.sting", fin.watermark.sting),
                              ("watermark.idle", fin.watermark.idle)]
+                for n, a in enumerate(fin.accents):
+                    if a.kind == "film_burn":
+                        # a.burn/a.clicks are `str | None`, but SpecAccent._film_burn_needs_both already
+                        # refused a film_burn kind with either unset — narrow explicitly (symmetry with
+                        # the engine mirror; this module is not in the mypy strict island itself, but the
+                        # assert is free and keeps the two copies byte-identical).
+                        assert a.burn is not None and a.clicks is not None
+                        refs += [(f"accents[{n}].burn", a.burn), (f"accents[{n}].clicks", a.clicks)]
                 for what, ref in refs:
                     if ref not in ids:
                         raise ValueError(f"finalize.{what} {ref!r} is not an inputs[].id")
+            op = self.overlays.opener
+            if op is not None:
+                op_refs = [("opener.cold", op.cold)]
+                if op.burn is not None:
+                    op_refs.append(("opener.burn", op.burn))
+                if op.clicks is not None:
+                    op_refs.append(("opener.clicks", op.clicks))
+                for what, ref in op_refs:
+                    if ref not in ids:
+                        raise ValueError(f"{what} {ref!r} is not an inputs[].id")
             if self.overlays.music is not None and self.overlays.music.track not in ids:
                 raise ValueError(f"music.track {self.overlays.music.track!r} is not an inputs[].id")
 
@@ -488,7 +561,7 @@ _NEEDS_WEIGHTS = ("align", "clip_rank")   # face_probe's YuNet is 227 KB and sta
 class InferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[5]
+    infer_version: Literal[6]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     model: str = Field(min_length=1)
@@ -530,7 +603,7 @@ class InferTiming(BaseModel):
 class InferResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[5]
+    infer_version: Literal[6]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]

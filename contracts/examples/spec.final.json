@@ -1,5 +1,5 @@
 {
-  "spec_version": 5,
+  "spec_version": 6,
   "job_id": "job_b81d02",
   "slug": "demo-clip",
   "mode": "final",
@@ -51,6 +51,24 @@
       "kind": "video",
       "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "url": "https://storage.example/i/wm-idle.webm?sig=GET"
+    },
+    {
+      "id": "opener/cold.mp4",
+      "kind": "video",
+      "sha256": "e272deecde720ffc773d7a6a81adabbc366ccbb64da5abdb6b26f52cd3f952cb",
+      "url": "https://storage.example/o/cold.mp4?sig=GET"
+    },
+    {
+      "id": "brand/film_burn.mp4",
+      "kind": "video",
+      "sha256": "859facc5a4c9b80ac2eef78916c1953bcccaab6014bb11b9de8337430ea34f0c",
+      "url": "https://storage.example/o/film_burn.mp4?sig=GET"
+    },
+    {
+      "id": "brand/film_burn_clicks.wav",
+      "kind": "audio",
+      "sha256": "72b40fb15edacca3004c434b2fae37a7688218c3f58afeeb8c43b6ffa9a1c7dd",
+      "url": "https://storage.example/o/film_burn_clicks.wav?sig=GET"
     }
   ],
   "timeline": {
@@ -190,6 +208,13 @@
         "b": 35.9
       }
     ],
+    "opener": {
+      "cold": "opener/cold.mp4",
+      "burn": "brand/film_burn.mp4",
+      "clicks": "brand/film_burn_clicks.wav",
+      "cold_trim": 0.1,
+      "gain": 0.4
+    },
     "finalize": {
       "accents": [
         {
@@ -201,6 +226,13 @@
           "kind": "glitch",
           "at": 31.0,
           "intensity": 0.45
+        },
+        {
+          "kind": "film_burn",
+          "at": 45.7,
+          "intensity": 0.6,
+          "burn": "brand/film_burn.mp4",
+          "clicks": "brand/film_burn_clicks.wav"
         }
       ],
       "logo": {

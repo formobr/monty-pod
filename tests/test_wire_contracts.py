@@ -131,7 +131,7 @@ def test_shared_model_invalid_goldens_are_rejected_by_facade(name: str, surface:
 
 
 def test_local_render_infer_contract_version_remains_independent() -> None:
-    assert (ROOT / "contracts" / "VERSION").read_text(encoding="utf-8").strip() == "5"
+    assert (ROOT / "contracts" / "VERSION").read_text(encoding="utf-8").strip() == "6"
 
 
 def test_generated_models_preserve_the_established_v12_encoder_order() -> None:

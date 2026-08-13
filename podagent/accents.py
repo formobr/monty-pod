@@ -347,8 +347,10 @@ BUILDERS = {
     "rgb_split": rgb_split_filter,
     "pixelate": pixelate_filter,
 }
-# The contract's accent-kind enum is exactly these keys; spec validation rejects anything else, so an
-# unknown kind can never reach a builder (it dies at the seam, not as a silently-dropped accent).
+# The contract's accent-kind enum is these keys PLUS "film_burn" (contract v6, single-pass prep — E-W1):
+# render.render_spec refuses a spec whose finalize.accents carries film_burn before this module ever
+# runs, so a kind reaching build_chain_filter is always one of the keys below (an unhandled kind would
+# otherwise KeyError here, deep past the seam, instead of at the loud NotImplementedError render.py raises).
 
 
 def _namespace_labels(sub: str, tag: str, src_in: str, dst_out: str) -> str:

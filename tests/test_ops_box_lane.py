@@ -111,4 +111,4 @@ def test_the_op_version_moved_but_the_envelope_did_not():
     encoded under the old filter order. `contracts/VERSION` pins the envelope and stays put — the split that
     makes a new tool cost two files instead of a release."""
     assert _decl("media.scale")["version"] == 4
-    assert (CONTRACTS / "VERSION").read_text().strip() == "5"
+    assert (CONTRACTS / "VERSION").read_text().strip() == "6"

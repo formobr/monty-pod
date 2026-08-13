@@ -17,7 +17,7 @@ _TIMELINE = {"fps": 30, "width": 1080, "height": 1920,
 
 def _spec(clip: dict) -> RenderSpec:
     return RenderSpec.model_validate({
-        "spec_version": 5, "job_id": "j", "slug": "s", "mode": "final",
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
         "inputs": [_BASE_INPUT, _CLIP_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
         "overlays": {"broll_final": {"broll": [clip]}},
@@ -56,7 +56,7 @@ def test_broll_kenburns_preset_direction():
 
 def test_no_broll_keeps_vout_directly():
     spec = RenderSpec.model_validate({
-        "spec_version": 5, "job_id": "j", "slug": "s", "mode": "preview",
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
         "inputs": [_BASE_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
     })
@@ -92,21 +92,44 @@ def test_dissolve_is_alpha_fade_not_overlay_move():
     assert "overlay=enable=" in g  # no x/y move for a dissolve
 
 
-def test_render_spec_fails_loud_on_unimplemented_overlays():
-    # trims are the last overlay still unimplemented on the pod (broll/music/cover/sfx/captions/mograph are done)
+@pytest.mark.parametrize("overlays,expected", [
+    pytest.param({"trims": [{"a": 1.0, "b": 2.0}]}, "trims", id="trims"),
+    pytest.param({"opener": {"cold": "base"}}, "opener", id="opener"),
+    pytest.param(
+        {"finalize": {"accents": [{"kind": "film_burn", "at": 1.0, "intensity": 0.5,
+                                   "burn": "base", "clicks": "base"}]}},
+        "film_burn", id="film_burn_accent"),
+])
+def test_render_spec_fails_loud_on_unimplemented_overlays(monkeypatch, overlays, expected):
+    """trims/opener/film_burn are the overlays still unimplemented on the pod (broll/music/cover/sfx/
+    captions/mograph are done; opener/film_burn are single-pass prep — E-W1 — that render_onepass, W2,
+    will execute). The refusal must fire BEFORE any execution-side call: monkeypatching gpu_probe/download
+    to explode, and a send_event stub that asserts it's never reached, proves the NotImplementedError
+    lands ahead of both — not a KeyError deep in accents.BUILDERS or a half-rendered master."""
     spec = RenderSpec.model_validate({
-        "spec_version": 5, "job_id": "j", "slug": "s", "mode": "final",
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
         "inputs": [_BASE_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
-        "overlays": {"trims": [{"a": 1.0, "b": 2.0}]},
+        "overlays": overlays,
     })
-    with pytest.raises(NotImplementedError, match="trims"):
-        render.render_spec(spec, None)  # type: ignore[arg-type]
+
+    def _boom(*_a, **_k):
+        raise AssertionError("execution-side call reached before the unimplemented-overlay refusal")
+
+    monkeypatch.setattr(render, "_gpu_available", _boom)
+    monkeypatch.setattr(render, "download", _boom)
+
+    class _StubCP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            raise AssertionError("send_event must not be reached before the refusal")
+
+    with pytest.raises(NotImplementedError, match=expected):
+        render.render_spec(spec, _StubCP())  # type: ignore[arg-type]
 
 
 def _music_spec() -> RenderSpec:
     return RenderSpec.model_validate({
-        "spec_version": 5, "job_id": "j", "slug": "s", "mode": "final",
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
         "inputs": [_BASE_INPUT, {"id": "music/t.mp3", "kind": "audio", "sha256": "2" * 64, "url": "u"}],
         "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
@@ -149,7 +172,7 @@ def test_unresolved_sfx_sound_reddens():
     from pydantic import ValidationError
     with pytest.raises(ValidationError, match="sfx"):
         RenderSpec.model_validate({
-            "spec_version": 5, "job_id": "j", "slug": "s", "mode": "final",
+            "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
             "inputs": [_BASE_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
             "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
             "overlays": {"sfx": [{"sound": "sfx/missing.wav", "at": 1.0, "gain": 0.4}]},

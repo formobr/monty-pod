@@ -69,7 +69,7 @@ timeline is explicitly incomplete and cannot be used as a performance baseline.
 The WebSocket structure and its v12 version come from the deterministic
 `vendor/monty-contracts/wire_bundle.json`; `podagent/wire_generated.py` is regenerated from that bundle.
 Only cross-field identity/clock rules remain handwritten in `podagent/stream_models.py`. This shared-wire
-version is independent of `contracts/VERSION=5`, which still owns only render, inference and op payloads.
+version is independent of `contracts/VERSION=6`, which still owns only render, inference and op payloads.
 
 At boot, the agent reports its diagnostic beacon, proves that `h264_nvenc`
 actually opens on the rented host, then synchronously sends and waits for ACK of a typed

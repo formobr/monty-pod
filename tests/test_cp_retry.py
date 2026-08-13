@@ -44,7 +44,7 @@ def _job(corr_id: str = "c", *, target_worker_id: str | None = None) -> dict[str
         "session_id": "s",
         "corr_id": corr_id,
         "request": {
-            "infer_version": 5,
+            "infer_version": 6,
             "job_id": "j",
             "kind": "face_probe",
             "model": "m",

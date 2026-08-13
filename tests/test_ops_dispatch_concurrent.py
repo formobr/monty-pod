@@ -15,7 +15,7 @@ from podagent import main as agent_main
 _CHAIN = {"chain_version": 1, "job_id": "j", "pack": {"url": "https://x/p.tar", "sha256": "a" * 64},
           "steps": [{"id": "s0", "op": "media.scale", "needs": [], "params": {}, "inputs": [], "outputs": []}]}
 _SPEC = {
-    "spec_version": 5, "job_id": "j", "slug": "s", "mode": "preview",
+    "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
     "inputs": [{"id": "src", "kind": "video", "sha256": "0" * 64, "url": "u"}],
     "timeline": {"fps": 30, "width": 2, "height": 2,
                  "segments": [{"src": "src", "in": 0, "out": 1, "speed": 1}]},
