@@ -16,6 +16,7 @@ from . import mograph as _mograph
 from . import render as _render
 from .cp import upload
 from .models import RenderSpec
+from .render import body_duration
 from .sanitize import safe_error
 
 # The sync guard matches frames by argmin|ref-master| over GRAYSCALE at exactly this size
@@ -52,25 +53,21 @@ def _no_phase(_op: str):
 
 # --- the two composition primitives -------------------------------------------
 
-_PAD = re.compile(r"\[([^\[\]]*)\]")
 _EXTERNAL = re.compile(r"\d+:[av]")
 _INTERNAL = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 
 def rewire(fragment: str, tag: str, subst: dict[str, str]) -> str:
-    """ONE pass over the pad tokens: a declared boundary pad becomes its merged name, every other
-    internal pad is namespaced by `tag`. A CHAIN of str.replace would rewrite text an earlier replace
-    just inserted (accents._namespace_labels' defect), so this is a single re.sub and never that."""
-    def one(m: re.Match[str]) -> str:
-        name = m.group(1)
+    """A declared boundary pad becomes its merged name, every other internal pad is namespaced by
+    `tag`, and an input pad nobody allocated is an ERROR rather than another timeline's video. One
+    pass, through the same primitive the accent chainer uses — see accents.substitute_pads."""
+    def resolve(name: str) -> str:
         if name in subst:
-            return f"[{subst[name]}]"
+            return subst[name]
         if _EXTERNAL.fullmatch(name):
             raise ValueError(f"fragment {tag!r} reads input pad [{name}] that the allocator never handed out")
-        if _INTERNAL.fullmatch(name):
-            return f"[{name}__{tag}]"
-        return m.group(0)
-    return _PAD.sub(one, fragment)
+        return f"{name}__{tag}" if _INTERNAL.fullmatch(name) else None
+    return _accents.substitute_pads(fragment, resolve)
 
 
 class _Input(NamedTuple):
@@ -98,12 +95,6 @@ class Inputs:
 
 
 # --- 1. preflight -------------------------------------------------------------
-
-def body_duration(spec: RenderSpec) -> float:
-    """The ONE authoritative body length: the timeline's own arithmetic. There is no earlier pass left
-    to ffprobe, and probing the first SOURCE (as the audio pad does today) measures the wrong thing."""
-    return sum((s.out - s.in_) / s.speed for s in spec.timeline.segments)
-
 
 def preflight(spec: RenderSpec) -> None:
     """Refuse every non-goal BEFORE any subprocess — same exception type and same timing as
@@ -191,7 +182,8 @@ def _audio_mix(spec: RenderSpec, input_paths: dict, tmp: Path, dur: float, phase
     with phase("audio_prepare"):
         ids = _render.input_ids(spec)
         voice = input_paths[spec.timeline.segments[0].src]
-        dirty = _render._voice_is_dirty(voice) and not spec.base_voice_rescued
+        # The flag is read FIRST: _voice_is_dirty is a full decode whose answer is then thrown away.
+        dirty = not spec.base_voice_rescued and _render._voice_is_dirty(voice)
         clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
         vln = _render._measure_loudnorm(voice, clean)
         bed, bed_idx = None, None
@@ -312,9 +304,8 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
     if fin is not None and fin.logo is not None:
         lg = fin.logo
         logo_v = f"{inputs.add(p.input_paths[lg.asset])}:v"
-        # body_end is the WHOLE body: apply_logo subtracts cover_hold because it probes a master that
-        # already carries the welded end-card, and preflight refuses a cover here — subtracting it
-        # would blank the logo over live body (engine gate: test_body_logo_runs_to_the_end_without_a_cover).
+        # body_end is the WHOLE body: cover_hold reserves the welded end-card's tail, and preflight
+        # refuses a cover here, so there is no tail to reserve (apply_logo now holds it back too).
         frag = _finalize.body_logo_filter(lg.corner, lg.width, lg.opacity, lg.margin, p.duration,
                                           base_v=vlink, logo_v=logo_v, out_v=V_LOGO)
         chains.append(rewire(frag, "lgo", {vlink: vlink, logo_v: logo_v, V_LOGO: V_LOGO}))

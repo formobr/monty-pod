@@ -121,7 +121,8 @@ def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_
             f"[{base_v}][lg]overlay={x}:{y}:enable='lt(t,{body_end:.3f})'[{out_v}]")
 
 
-def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
+def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool, *,
+               cover_welded: bool = False) -> Path:
     """Bake the brand's persistent corner logo onto the master BODY. `logo` absent (partner /
     --no-logo) -> `src` unchanged."""
     logo = fin.logo
@@ -132,7 +133,9 @@ def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
         raise RuntimeError(f"finalize.logo.asset {logo.asset!r} is not a resolved inputs[] id")
     # body_end is derived from the master the pod itself just welded, not guessed upstream: the cover
     # tail is exactly `cover_hold` s long, and only this box knows the welded master's real duration.
-    body_end = max(0.0, _probe(src)[3] - logo.cover_hold)
+    # Held back unless a cover WAS welded — `src` is then pure body, and subtracting a tail that does
+    # not exist deletes the logo from the last `cover_hold` seconds of live picture.
+    body_end = max(0.0, _probe(src)[3] - (logo.cover_hold if cover_welded else 0.0))
     fc = body_logo_filter(logo.corner, logo.width, logo.opacity, logo.margin, body_end)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-i", str(asset),
            "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
@@ -203,7 +206,10 @@ def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> 
            "-c:v", "libvpx-vp9", "-i", str(sting),
            "-c:v", "libvpx-vp9", "-stream_loop", "-1", "-i", str(idle),
            "-filter_complex", fc, "-map", f"[{out_v}]"]
-    cmd += ["-map", f"[{out_a}]"] if out_a else ["-an"]
+    # No chime means the filter never TOUCHED the base audio, so there is no [out_a] to map and the
+    # master's own track is mapped straight from input 0. `-an` here shipped a silent deliverable.
+    audio_map = f"[{out_a}]" if out_a else ("0:a" if has_audio else None)
+    cmd += ["-map", audio_map] if audio_map else ["-an"]
     if not has_audio:
         cmd += ["-t", f"{_probe(src)[3]:.3f}"]
     cmd += [*(_FINAL_GPU if gpu else _FINAL_CPU),
@@ -264,13 +270,14 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
 
 # --- the tail -----------------------------------------------------------------
 
-def finalize(fin, master: Path, input_paths: dict, tmp: Path, gpu: bool) -> Path:
+def finalize(fin, master: Path, input_paths: dict, tmp: Path, gpu: bool, *,
+             cover_welded: bool = False) -> Path:
     """Run the delivery tail over `master`, returning the path to the finished deliverable.
 
     Each step returns its input unchanged when its block is absent, so a spec that carries only some
     of the tail (a partner deliverable with no logo and no watermark) walks the same code path — the
     two transports cannot diverge on which steps they honour, because there is only one of them."""
     out = apply_accents(fin, master, tmp / "fin_accents.mp4", gpu)
-    out = apply_logo(fin, out, tmp / "fin_logo.mp4", input_paths, gpu)
+    out = apply_logo(fin, out, tmp / "fin_logo.mp4", input_paths, gpu, cover_welded=cover_welded)
     out = apply_watermark(fin, out, tmp / "fin_wm.mp4", input_paths, gpu)
     return apply_loudnorm(fin, out, tmp / "fin_ln.mp4")

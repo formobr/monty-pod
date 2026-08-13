@@ -2,6 +2,8 @@
 slide/push (overlay x/y) and dissolve (alpha fade) transitions. Pure graph assertions, no ffmpeg."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from podagent import render
@@ -186,3 +188,81 @@ def test_sfx_without_music_skips_bed():
     assert "sidechaincompress" not in g  # no bed to duck
     assert "apad=whole_dur=60[amaster]" in g
     assert "amix=inputs=2:normalize=0:duration=first[mx]" in g
+
+
+# ── the mix is measured against the BODY, and the probes it does not need are not run ──────────────
+
+def _cut_music_spec() -> RenderSpec:
+    """A timeline that keeps 30 s out of a 60 s source, at two speeds — the shape where 'duration of
+    the source file' and 'duration of the body' are different numbers."""
+    return RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
+        "inputs": [_BASE_INPUT, {"id": "music/t.mp3", "kind": "audio", "sha256": "2" * 64, "url": "u"}],
+        "timeline": {"fps": 30, "width": 1080, "height": 1920, "segments": [
+            {"src": "base", "in": 0.0, "out": 20.0, "speed": 1.0},
+            {"src": "base", "in": 40.0, "out": 52.5, "speed": 1.25}]},
+        "encode": _ENCODE,
+        "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
+        "overlays": {"music": {"track": "music/t.mp3", "start": 30.0, "gain": 0.09}},
+    })
+
+
+def test_body_duration_is_the_timeline_not_the_source():
+    assert render.body_duration(_cut_music_spec()) == pytest.approx(30.0)
+
+
+class _Done:
+    # text=True on the probe passes (_voice_is_dirty, _measure_loudnorm) means stderr is a STR
+    returncode = 0
+    stderr = ""
+    stdout = ""
+
+
+def _run_render_spec(monkeypatch, spec):
+    """Drive render_spec with every boundary stubbed, returning the _AudioMix it built."""
+    seen = {}
+
+    class _CP:
+        def send_event(self, _payload: dict, *, wait: bool = False) -> bool: return True  # noqa: ARG002
+
+        def send_result(self, _payload: dict, *, wait: bool = True) -> bool: return True  # noqa: ARG002
+
+    monkeypatch.setattr(render, "download", lambda _u, dest: (dest.write_bytes(b"m"), dest)[1])
+    monkeypatch.setattr(render, "upload", lambda *_a, **_kw: None)
+    monkeypatch.setattr(render, "_gpu_available", lambda: False)
+    monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: _Done())
+    real = render.build_command
+    monkeypatch.setattr(render, "build_command",
+                        lambda *a, **kw: (seen.update(audio=a[5] if len(a) > 5 else kw.get("audio")),
+                                          real(*a, **kw))[1])
+    render.render_spec(spec, _CP())
+    return seen["audio"]
+
+
+def test_the_mix_is_padded_to_the_body_not_the_whole_source(monkeypatch):
+    """NEGATIVE: apad/whole_dur and the pre-rendered bed came from ffprobing the SOURCE, so every
+    second the cut dropped was padded back onto the master as silence."""
+    audio = _run_render_spec(monkeypatch, _cut_music_spec())
+    assert audio.dur == pytest.approx(30.0)
+
+
+def test_a_rescued_voice_is_never_probed_for_noise(monkeypatch):
+    """NEGATIVE: _voice_is_dirty is a full decode pass whose answer the rescue flag then discards."""
+    data = _cut_music_spec().model_dump(by_alias=True)
+    data["base_voice_rescued"] = True
+    monkeypatch.setattr(render, "_voice_is_dirty",
+                        lambda _p: pytest.fail("probed a voice the spec already declared rescued"))
+    audio = _run_render_spec(monkeypatch, RenderSpec.model_validate(data))
+    assert "afftdn" not in audio.clean
+
+
+def test_the_music_track_is_not_opened_as_an_input(monkeypatch):
+    """NEGATIVE: input_ids listed music.track, so ffmpeg opened a decoder for a file no filter reads —
+    the graph mixes the pre-rendered bed, which arrives as an extra_input after the spec inputs."""
+    spec = _cut_music_spec()
+    assert render.input_ids(spec) == ["base"]
+    audio = _run_render_spec(monkeypatch, spec)
+    assert audio.bed_idx == 1                      # the bed sits right after the spec inputs
+    cmd = render.build_command(spec, {"base": Path("/w/base"), "music/t.mp3": Path("/w/t.mp3")},
+                               Path("/w/o.mp4"), False, (Path("/w/bed.flac"),), audio)
+    assert [cmd[n + 1] for n, a in enumerate(cmd) if a == "-i"] == ["/w/base", "/w/bed.flac"]

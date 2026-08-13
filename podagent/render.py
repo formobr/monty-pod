@@ -113,16 +113,17 @@ def _atempo_chain(speed: float) -> list[str]:
 # --- graph & command ----------------------------------------------------------
 
 def input_ids(spec: RenderSpec) -> list[str]:
-    """Input ids the MAIN filtergraph consumes (timeline srcs, broll clips, music, sfx), in spec.inputs
+    """Input ids the MAIN filtergraph consumes (timeline srcs, broll clips, sfx), in spec.inputs
     order — an id's position is its ffmpeg -i index. Cover/caption ASSETS (fonts, logo) are downloaded
-    but NOT decoded here (the cover/caption passes read them off disk), so a TTF never becomes a bad -i."""
+    but NOT decoded here (the cover/caption passes read them off disk), so a TTF never becomes a bad -i.
+
+    The MUSIC TRACK is not here either: what the graph mixes is the pre-rendered bed (an extra_input),
+    so listing the track opened a decoder for a file no filter ever reads."""
     consumed: set[str] = {seg.src for seg in spec.timeline.segments}
     ov = spec.overlays
     if ov is not None:
         if ov.broll_final:
             consumed.update(c.clip for c in ov.broll_final.broll)
-        if ov.music:
-            consumed.add(ov.music.track)
         if ov.sfx:
             consumed.update(s.sound for s in ov.sfx)
     seen: list[str] = []
@@ -280,10 +281,10 @@ class _AudioMix(NamedTuple):
     sfx: tuple[tuple[int, float, float], ...] = ()   # (sound input index, start seconds, linear gain)
 
 
-def _probe_dur(path: Path) -> float:
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                          "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
-    return float(out.stdout.strip() or 0.0)
+def body_duration(spec: RenderSpec) -> float:
+    """The body's own length, from the timeline that defines it. Probing the first SOURCE measured the
+    whole recording instead — every second the cut dropped was padded onto the mix as silence."""
+    return sum((s.out - s.in_) / s.speed for s in spec.timeline.segments)
 
 
 def _voice_is_dirty(voice: Path) -> bool:
@@ -589,9 +590,10 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             with phase("audio_prepare"):
                 ids = input_ids(spec)
                 voice = input_paths[spec.timeline.segments[0].src]
-                dur = _probe_dur(voice)
-                # base already DFN3/MF2-rescued upstream → keep only the rumble cut, DROP afftdn
-                dirty = _voice_is_dirty(voice) and not spec.base_voice_rescued
+                dur = body_duration(spec)
+                # base already DFN3/MF2-rescued upstream → keep only the rumble cut, DROP afftdn.
+                # The flag is read FIRST: _voice_is_dirty is a full decode whose answer is then thrown away.
+                dirty = not spec.base_voice_rescued and _voice_is_dirty(voice)
                 clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
                 vln = _measure_loudnorm(voice, clean)
                 bed_idx: int | None = None
@@ -663,7 +665,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                 presync = master
                 if fin is not None:
                     from .finalize import finalize
-                    master = finalize(fin, master, input_paths, tmp, gpu)
+                    master = finalize(fin, master, input_paths, tmp, gpu,
+                                      cover_welded=cover is not None)
         else:
             presync = master
 

@@ -353,14 +353,32 @@ BUILDERS = {
 # otherwise KeyError here, deep past the seam, instead of at the loud NotImplementedError render.py raises).
 
 
+_PAD = re.compile(r"\[([^\[\]]*)\]")
+_INTERNAL_PAD = re.compile(r"[A-Za-z]\w*")
+
+
+def substitute_pads(graph: str, resolve) -> str:
+    """ONE pass over every `[pad]` token: `resolve(name)` gives the replacement name, or None to leave
+    the token exactly as it stands. A CHAIN of str.replace cannot express this — the second replace
+    rewrites text the first one just inserted, and the subgraph ends up reading its own output."""
+    return _PAD.sub(lambda m: m.group(0) if (r := resolve(m.group(1))) is None else f"[{r}]", graph)
+
+
+def _bare(label: str) -> str:
+    return label[1:-1] if label.startswith("[") and label.endswith("]") else label
+
+
 def _namespace_labels(sub: str, tag: str, src_in: str, dst_out: str) -> str:
     """Rewrite a self-contained `[0:v]…[vout]` subgraph so it can be CHAINED: its input becomes
     `src_in`, its output `dst_out`, and every INTERNAL pad label gets a `tag` suffix so two subgraphs
     in one filtergraph never collide on a shared name (base/sh/pre/mid/…)."""
-    internal = {m for m in re.findall(r"\[([A-Za-z][\w]*)\]", sub) if m not in ("0:v", "vout")}
-    for lbl in internal:
-        sub = re.sub(rf"\[{re.escape(lbl)}\]", f"[{lbl}_{tag}]", sub)
-    return sub.replace("[0:v]", src_in).replace("[vout]", dst_out)
+    def resolve(name: str) -> str | None:
+        if name == "0:v":
+            return _bare(src_in)
+        if name == "vout":
+            return _bare(dst_out)
+        return f"{name}_{tag}" if _INTERNAL_PAD.fullmatch(name) else None
+    return substitute_pads(sub, resolve)
 
 
 def build_chain_filter(accents, *, fps: float, w: int, h: int, gpu: bool = False) -> str | None:

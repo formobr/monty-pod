@@ -61,7 +61,7 @@ _BASE_SPEC = {
 }
 
 DUR = 10.0                       # (6-0)/1.0 + (15-10)/1.25
-MIX = render._AudioMix(voice_idx=0, bed_idx=2, clean="highpass=f=80",
+MIX = render._AudioMix(voice_idx=0, bed_idx=1, clean="highpass=f=80",
                        vln="loudnorm=I=-20:TP=-1.5:LRA=11", dur=DUR, sfx=())
 LAYERS = ({"mov": "/w/seq0.mov", "start": 2.0, "dur": 3.0, "glass": False},)
 LN_JSON = ('{ "input_i" : "-19.4", "input_tp" : "-2.1", "input_lra" : "7.2", '
@@ -208,7 +208,7 @@ _COMPOSITE = [
     '[0:v]trim=start=10:end=15,setpts=(PTS-STARTPTS)/1.25,scale=1080:1920:flags=lanczos,setsar=1[v1__cmp]',
     '[v0__cmp][v1__cmp]concat=n=2:v=1:a=0[vcomposite]',
     '[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,apad=whole_dur=10,asplit=2[vc1__cmp][vc2__cmp]',
-    '[2:a]volume=1.0[bg0__cmp]',
+    '[1:a]volume=1.0[bg0__cmp]',
     '[bg0__cmp][vc2__cmp]sidechaincompress=threshold=0.06:ratio=3:attack=20:release=500[bg__cmp]',
     '[vc1__cmp][bg__cmp]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[premix__cmp]',
     '[premix__cmp]aresample=192000,alimiter=limit=0.63:attack=5:release=50:level=false,'
@@ -298,8 +298,8 @@ def _no_chime(d):
 def test_golden_everything_present() -> None:
     graph, cmd = op.assemble(_prepared(_spec()))
     assert graph.split(";") == (
-        _COMPOSITE + _mograph_chains(3) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _ACCENT + _logo(4, "vaccents") + _watermark(5, 6, "vlogo"))
+        _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
+        + _ACCENT + _logo(3, "vaccents") + _watermark(4, 5, "vlogo"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
     _ins, outs = _argv(cmd)
     assert [_maps(o[0]) for o in outs] == [_MASTER_MAPS, _REF_MAPS]
@@ -309,31 +309,31 @@ def test_golden_no_mograph() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_drop_mograph), layers=()))
     assert graph.split(";") == (
         _COMPOSITE + [_CAPTIONS % "vcomposite"] + _fork("vcaptions")
-        + _ACCENT + _logo(3, "vaccents") + _watermark(4, 5, "vlogo"))
+        + _ACCENT + _logo(2, "vaccents") + _watermark(3, 4, "vlogo"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
 def test_golden_no_captions() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_drop_captions), ass=None, font_dir=None))
     assert graph.split(";") == (
-        _COMPOSITE + _mograph_chains(3) + _fork("vmograph")
-        + _ACCENT + _logo(4, "vaccents") + _watermark(5, 6, "vlogo"))
+        _COMPOSITE + _mograph_chains(2) + _fork("vmograph")
+        + _ACCENT + _logo(3, "vaccents") + _watermark(4, 5, "vlogo"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
 def test_golden_no_accents_no_logo() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_drop_accents_and_logo)))
     assert graph.split(";") == (
-        _COMPOSITE + _mograph_chains(3) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _watermark(4, 5, "vtail"))
+        _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
+        + _watermark(3, 4, "vtail"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
 def test_golden_no_watermark() -> None:
     graph, cmd = op.assemble(_prepared(_spec(_drop_watermark)))
     assert graph.split(";") == (
-        _COMPOSITE + _mograph_chains(3) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _ACCENT + _logo(4, "vaccents"))
+        _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
+        + _ACCENT + _logo(3, "vaccents"))
     assert_connected(graph, ["vlogo", "atail"] + _REF_MAPS)
     _ins, outs = _argv(cmd)
     assert [_maps(o[0]) for o in outs] == [["vlogo", "atail"], _REF_MAPS]
@@ -354,9 +354,9 @@ def test_golden_no_presync_output() -> None:
     full-body encode that render_body would then have nowhere to PUT."""
     graph, cmd = op.assemble(_prepared(_spec(_drop_presync)))
     assert graph.split(";") == (
-        _COMPOSITE + _mograph_chains(3) + [_CAPTIONS % "vmograph"]
+        _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"]
         + ['[vcaptions]split=2[base_a0__acc][px_a0__acc]'] + _ACCENT[1:]
-        + _logo(4, "vaccents") + _watermark(5, 6, "vlogo", base_a="acomposite"))
+        + _logo(3, "vaccents") + _watermark(4, 5, "vlogo", base_a="acomposite"))
     assert "vpresync" not in graph and "asplit=2[atail]" not in graph
     assert_connected(graph, _MASTER_MAPS)
     _ins, outs = _argv(cmd)
@@ -407,9 +407,9 @@ def test_reuse_mograph_builder(monkeypatch) -> None:
     monkeypatch.setattr(mograph, "overlay_filtergraph", spy)
     graph, _cmd = op.assemble(_prepared(_spec()))
     assert spy.calls[0][0][0] == list(LAYERS)
-    assert spy.calls[0][1] == {"base": "vcomposite", "layers_v": ["3:v"]}
-    real, last = mograph.overlay_filtergraph.real(list(LAYERS), base="vcomposite", layers_v=["3:v"])
-    assert _sub(graph, op.rewire(real, "mog", {"vcomposite": "vcomposite", "3:v": "3:v",
+    assert spy.calls[0][1] == {"base": "vcomposite", "layers_v": ["2:v"]}
+    real, last = mograph.overlay_filtergraph.real(list(LAYERS), base="vcomposite", layers_v=["2:v"])
+    assert _sub(graph, op.rewire(real, "mog", {"vcomposite": "vcomposite", "2:v": "2:v",
                                                last: "vmograph"}))
 
 
@@ -431,10 +431,10 @@ def test_reuse_logo_builder(monkeypatch) -> None:
     graph, _cmd = op.assemble(_prepared(_spec()))
     assert spy.calls[0][0][:4] == ("tr", 150, 0.55, 40)
     assert spy.calls[0][0][4] == pytest.approx(DUR)
-    assert spy.calls[0][1] == {"base_v": "vaccents", "logo_v": "4:v", "out_v": "vlogo"}
+    assert spy.calls[0][1] == {"base_v": "vaccents", "logo_v": "3:v", "out_v": "vlogo"}
     real = finalize.body_logo_filter.real("tr", 150, 0.55, 40, DUR, base_v="vaccents",
-                                          logo_v="4:v", out_v="vlogo")
-    assert _sub(graph, op.rewire(real, "lgo", {"vaccents": "vaccents", "4:v": "4:v",
+                                          logo_v="3:v", out_v="vlogo")
+    assert _sub(graph, op.rewire(real, "lgo", {"vaccents": "vaccents", "3:v": "3:v",
                                                "vlogo": "vlogo"}))
 
 
@@ -443,11 +443,11 @@ def test_reuse_watermark_builder(monkeypatch) -> None:
     monkeypatch.setattr(finalize, "watermark_filter", spy)
     graph, _cmd = op.assemble(_prepared(_spec()))
     kw = spy.calls[0][1]
-    assert kw == {"base_v": "vlogo", "sting_v": "5:v", "idle_v": "6:v", "width": 422,
-                  "overlay_xy": "(W-w)/2:H-h-60", "base_a": "atail", "chime_a": "5:a",
+    assert kw == {"base_v": "vlogo", "sting_v": "4:v", "idle_v": "5:v", "width": 422,
+                  "overlay_xy": "(W-w)/2:H-h-60", "base_a": "atail", "chime_a": "4:a",
                   "chime_vol": 0.4, "delay": 2.5, "out_v": "vwatermark", "out_a": "awatermark"}
     real, _v, _a = finalize.watermark_filter.real(**kw)
-    keep = {"vlogo": "vlogo", "5:v": "5:v", "6:v": "6:v", "5:a": "5:a", "atail": "atail",
+    keep = {"vlogo": "vlogo", "4:v": "4:v", "5:v": "5:v", "4:a": "4:a", "atail": "atail",
             "vwatermark": "vwatermark", "awatermark": "awatermark"}
     assert _sub(graph, op.rewire(real, "wmk", keep))
 
@@ -469,8 +469,8 @@ def test_audio_contract() -> None:
 
 
 def test_no_chime_still_maps_the_composite_audio() -> None:
-    """chime=false must NOT silence the master here: watermark_filter leaves the base audio alone,
-    so the composite mix is mapped straight through."""
+    """chime=false must NOT silence the master: watermark_filter leaves the base audio alone (it
+    returns no audio label), so the composite mix is mapped straight through."""
     graph, cmd = op.assemble(_prepared(_spec(_no_chime)))
     _ins, outs = _argv(cmd)
     (master_opts, _m), (ref_opts, _r) = outs
@@ -481,16 +481,34 @@ def test_no_chime_still_maps_the_composite_audio() -> None:
     assert_connected(graph, ["vwatermark", "atail"] + _REF_MAPS)
 
 
-def test_the_old_watermark_pass_stays_silent_on_no_chime(monkeypatch, tmp_path) -> None:
-    """The divergence is DELIBERATE and named: finalize.apply_watermark still emits -an (finalize.py
-    :160,174,203) and ships a silent master. The new path fixes it; the old one is left as it is."""
+@pytest.mark.parametrize("chime", [True, False])
+def test_the_multipass_watermark_maps_audio_too(chime, monkeypatch, tmp_path) -> None:
+    """NEGATIVE: apply_watermark emitted -an whenever the chime was off — a SILENT deliverable, on
+    the path that ships today. Both paths must map audio; neither may reach -an with a track present."""
     cmds = []
     monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
     monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
+
+    def mutate(d):
+        d["overlays"]["finalize"]["watermark"]["chime"] = chime
+    spec = _spec(mutate)
+    finalize.apply_watermark(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
+                             _paths(spec, tmp_path), False)
+    maps = _maps(tuple(cmds[0]))
+    assert "-an" not in cmds[0]
+    assert maps[1] == ("a" if chime else "0:a")
+
+
+def test_the_multipass_watermark_still_says_an_with_no_audio_at_all(monkeypatch, tmp_path) -> None:
+    """The one legitimate -an: a source with no audio stream has nothing to map."""
+    cmds = []
+    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: False)
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 10.0))
     spec = _spec(_no_chime)
     finalize.apply_watermark(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
                              _paths(spec, tmp_path), False)
-    assert "-an" in cmds[0]
+    assert "-an" in cmds[0] and "-t" in cmds[0]
 
 
 def test_encode_shape_per_output_clause() -> None:
@@ -566,13 +584,37 @@ def test_one_duration_computed_once_reaches_all_three_places(segments, want, mon
 
 
 def test_the_logo_runs_to_the_end_of_the_body() -> None:
-    """cover_hold is subtracted in apply_logo only because it probes a master carrying the welded
-    end-card; preflight refuses a cover here, so subtracting it would blank live body."""
     spec = _spec()
     assert spec.overlays.finalize.logo.cover_hold == 0.6
     graph, _cmd = op.assemble(_prepared(spec))
     assert "enable='lt(t,10.000)'" in graph
     assert "9.400" not in graph
+
+
+@pytest.mark.parametrize("cover_welded,want", [(False, "10.000"), (True, "9.400")])
+def test_the_multipass_logo_reserves_a_tail_only_when_one_was_welded(
+        cover_welded, want, monkeypatch, tmp_path) -> None:
+    """NEGATIVE: cover_hold reserves the welded end-card's tail. final_dispatch passes cover=None
+    unconditionally, so subtracting it unasked deleted the logo from the last 0.6s of live body."""
+    cmds = []
+    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 10.0))
+    spec = _spec()
+    finalize.apply_logo(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
+                        _paths(spec, tmp_path), False, cover_welded=cover_welded)
+    assert f"enable='lt(t,{want})'" in cmds[0][cmds[0].index("-filter_complex") + 1]
+
+
+def test_the_tail_defaults_to_no_cover(monkeypatch, tmp_path) -> None:
+    """finalize() is the only caller that knows whether render_cover ran; unasked, no tail exists."""
+    seen = {}
+    monkeypatch.setattr(finalize, "apply_accents", lambda _f, src, *_a, **_kw: src)
+    monkeypatch.setattr(finalize, "apply_logo",
+                        lambda _f, src, *_a, **kw: (seen.update(kw), src)[1])
+    monkeypatch.setattr(finalize, "apply_watermark", lambda _f, src, *_a, **_kw: src)
+    monkeypatch.setattr(finalize, "apply_loudnorm", lambda _f, src, *_a, **_kw: src)
+    finalize.finalize(_spec().overlays.finalize, tmp_path / "m.mp4", {}, tmp_path, False)
+    assert seen == {"cover_welded": False}
 
 
 def test_the_t_bound_survives_a_missing_watermark() -> None:
@@ -646,6 +688,26 @@ def test_the_connectivity_assertion_rejects_an_orphan_output() -> None:
     bad = "[0:v]anull[x];[1:v]anull[y];[x]anull[out]"
     with pytest.raises(AssertionError, match=r"outdegree 0"):
         assert_connected(bad, ["out"])
+
+
+def test_the_accent_chainer_never_rewrites_its_own_substitution() -> None:
+    """NEGATIVE: _namespace_labels ended in two sequential str.replace calls, so a src_in holding the
+    downstream label — [vout], which is exactly what build_filtergraph calls the composite — came
+    back rewritten, and the accent read its own output while the composite was dropped."""
+    sub = "[0:v]split=2[base][sh];[base][sh]overlay[vout]"
+    assert accents._namespace_labels(sub, "a0", "[vout]", "[fa0]") == (
+        "[vout]split=2[base_a0][sh_a0];[base_a0][sh_a0]overlay[fa0]")
+
+
+def test_the_merge_rewriter_never_rewrites_its_own_substitution() -> None:
+    assert op.rewire("[0:v]anull[vout]", "acc", {"0:v": "vout", "vout": "vaccents"}) == \
+        "[vout]anull[vaccents]"
+
+
+def test_a_pad_neither_side_declares_is_left_exactly_as_it_stands() -> None:
+    """substitute_pads is a REWRITER, not a validator: resolve() returning None must leave the token
+    byte-for-byte, which is what keeps a filter argument that merely looks like a pad safe."""
+    assert accents.substitute_pads("[a][1:v]x[b]", lambda _n: None) == "[a][1:v]x[b]"
 
 
 def test_the_connectivity_assertion_accepts_one_filter_with_two_distinct_pads() -> None:
