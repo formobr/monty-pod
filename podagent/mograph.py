@@ -224,13 +224,17 @@ _MARK_BACKING = {"glass": lambda i, src, b, s, e: mark_glass_filters(i, src, b, 
                  "shadow": None}
 
 
-def overlay_filtergraph(layers: list[dict]) -> tuple[str, str]:
-    """Pure: (-filter_complex string, final video label) compositing alpha layers onto [0:v]. Each layer is
+def overlay_filtergraph(layers: list[dict], *, base: str = "0:v",
+                        layers_v: list[str] | None = None) -> tuple[str, str]:
+    """Pure: (-filter_complex string, final video label) compositing alpha layers onto [base]. Each layer is
     shifted to its start and gated to [start,start+dur]; a glass layer blurs+darkens the frame behind it; a
     head_below layer slides the base head down first, so the layer's picture rides over the cleared top band."""
-    filters, src = [], "0:v"
+    # base/layers_v exist so a MERGED graph can hand real pad names: the defaults are this pass's own
+    # -i order, which stops being 0/1/2… the moment the composite's inputs sit in front of the layers.
+    filters, src = [], base
     for i, lay in enumerate(layers):
-        s, e, idx = lay["start"], lay["start"] + lay["dur"], i + 1
+        s, e = lay["start"], lay["start"] + lay["dur"]
+        idx = layers_v[i] if layers_v is not None else f"{i + 1}:v"
         if lay.get("glass"):
             # frosted-glass takeover: blur+darken the frame behind the card, gated to its window (parity with engine _composite).
             filters.append(f"[{src}]gblur=sigma=22:enable='between(t,{s},{e})',"
@@ -248,7 +252,7 @@ def overlay_filtergraph(layers: list[dict]) -> tuple[str, str]:
                            f"[hb{i}]trim=start={s}:end={e},setpts=PTS-STARTPTS+{s}/TB[hw{i}];"
                            f"[ha{i}][hw{i}]overlay=y='{yexpr}':enable='between(t,{s},{e})':eof_action=pass[hbv{i}]")
             src = f"hbv{i}"
-        filters.append(f"[{idx}:v]setpts=PTS-STARTPTS+{s}/TB[o{i}];"
+        filters.append(f"[{idx}]setpts=PTS-STARTPTS+{s}/TB[o{i}];"
                        f"[{src}][o{i}]overlay=enable='between(t,{s},{e})':eof_action=pass[v{i}]")
         src = f"v{i}"
     return ";".join(filters), src

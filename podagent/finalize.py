@@ -110,12 +110,15 @@ def apply_accents(fin, src: Path, out: Path, gpu: bool) -> Path:
 
 # --- 2. persistent body logo --------------------------------------------------
 
-def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_end: float) -> str:
+def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_end: float, *,
+                     base_v: str = "0:v", logo_v: str = "1:v", out_v: str = "vout") -> str:
     """Persistent corner logo over the BODY only (t < body_end); the cover end-card carries its own."""
+    # The three labels are parameters for the same reason watermark_filter's are: in a merged graph
+    # input 1 is another timeline SOURCE, so a hardcoded [1:v] alpha-blends a video clip as the "logo".
     x = f"W-w-{margin}" if corner in ("tr", "br") else f"{margin}"
     y = f"H-h-{margin}" if corner in ("bl", "br") else f"{margin}"
-    return (f"[1:v]format=rgba,colorchannelmixer=aa={opacity},scale={width}:-1:flags=lanczos[lg];"
-            f"[0:v][lg]overlay={x}:{y}:enable='lt(t,{body_end:.3f})'[vout]")
+    return (f"[{logo_v}]format=rgba,colorchannelmixer=aa={opacity},scale={width}:-1:flags=lanczos[lg];"
+            f"[{base_v}][lg]overlay={x}:{y}:enable='lt(t,{body_end:.3f})'[{out_v}]")
 
 
 def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
