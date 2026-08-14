@@ -241,6 +241,11 @@ class RetentionUnavailable(RuntimeError):
     swallowed failure here is an object that exists nowhere and a later chain that 404s far from the cause."""
 
 
+class LeaseIntegrityError(RuntimeError):
+    """A workspace lease's byte size does not match the cache slot it was copied from — a refusal, not a
+    heal, because the slot payload's own size is what this check trusts."""
+
+
 def _generation(key: str) -> tuple[str, str]:
     """(work prefix, basename) for an object key. The prefix IS the run — a re-run mints a new one — and the
     basename is the artifact within it, so "same artifact, newer run" is readable off the key's own shape."""
@@ -566,6 +571,9 @@ def get(url: str, download, *, lease: Path, log=None) -> Path | None:
                 log(f"[input-cache] stored {key} ({payload.stat().st_size / 1e6:.0f} MB)")
         elif log:
             log(f"[input-cache] hit {key} ({payload.stat().st_size / 1e6:.0f} MB) — no transfer")
+        # Read under the same per-object lock the copy runs under, so nothing between this stat and the
+        # lease copy below can move the slot the comparison trusts.
+        slot_size = payload.stat().st_size
         lease.parent.mkdir(parents=True, exist_ok=True)
         tmp_lease = lease.with_name(f".{lease.name}.{os.getpid()}.{threading.get_ident()}.lease-part")
         try:
@@ -573,5 +581,11 @@ def get(url: str, download, *, lease: Path, log=None) -> Path | None:
             tmp_lease.replace(lease)
         finally:
             tmp_lease.unlink(missing_ok=True)
+        lease_size = lease.stat().st_size
+        if lease_size != slot_size:
+            lease.unlink(missing_ok=True)
+            raise LeaseIntegrityError(
+                f"input-cache lease for {key} (slot={slot.name}) is {lease_size} bytes but the cache slot's "
+                f"payload is {slot_size} bytes — refusing a short/partial lease; the slot payload is untouched")
     prune(log=log)      # outside the per-object lock: eviction must not hold up another object's transfer
     return lease

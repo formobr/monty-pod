@@ -599,3 +599,48 @@ def test_overlapping_same_object_puts_and_adoptions_have_one_order(tmp_path):
     assert put_order == [b"first", b"second"]
     lease = inputcache.get(URL_A, _dl([]), lease=tmp_path / "final")
     assert lease.read_bytes() == put_order[-1] == b"second"
+
+
+def test_a_short_lease_copy_is_refused_loudly(tmp_path, monkeypatch):
+    """A copy that lands fewer bytes than the slot payload must never be handed to ffmpeg silently."""
+    seen: list[str] = []
+    inputcache.get(URL_A, _dl(seen), lease=tmp_path / "seed")  # slot now holds b"payload" (7 bytes)
+
+    def _truncating_copy(src, dst):
+        dst.write_bytes(src.read_bytes()[:3])
+
+    monkeypatch.setattr(inputcache, "_copy_or_reflink", _truncating_copy)
+    lease = tmp_path / "short"
+    with pytest.raises(inputcache.LeaseIntegrityError) as excinfo:
+        inputcache.get(URL_A, _dl(seen), lease=lease)
+    msg = str(excinfo.value)
+    assert "3 bytes" in msg and "7 bytes" in msg, f"refusal must name both sizes: {msg}"
+    assert not lease.exists(), "a short lease must not be left behind for a caller to open"
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    assert (slot / "payload").read_bytes() == b"payload", "the slot payload itself must be untouched"
+
+
+def test_a_healthy_lease_copy_is_unaffected_by_the_size_check(tmp_path):
+    """POSITIVE — the belt must not fire on the ordinary path."""
+    seen: list[str] = []
+    lease = inputcache.get(URL_A, _dl(seen), lease=tmp_path / "lease")
+    assert lease.read_bytes() == b"payload" and len(seen) == 1
+
+
+def test_an_enospc_shaped_copy_failure_raises_and_leaves_no_lease(tmp_path, monkeypatch):
+    """The fallback copy leg must not swallow a disk-full write into a short 'success'."""
+    import errno
+
+    inputcache.get(URL_A, _dl([]), lease=tmp_path / "seed")
+
+    def _enospc_copy(src, dst):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(inputcache, "_copy_or_reflink", _enospc_copy)
+    lease = tmp_path / "full-disk"
+    with pytest.raises(OSError) as excinfo:
+        inputcache.get(URL_A, _dl([]), lease=lease)
+    assert excinfo.value.errno == errno.ENOSPC
+    assert not lease.exists()
+    remnants = list(lease.parent.glob(f".{lease.name}.*.lease-part"))
+    assert not remnants, f"a failed copy left a partial lease fragment behind: {remnants}"
