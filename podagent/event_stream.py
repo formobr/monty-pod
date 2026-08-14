@@ -974,21 +974,13 @@ class EventStream:
             _log(f"open ✓ endpoint={safe_endpoint(self._url)} stream={self._stream_id}")
             return True
 
-    def _fail_connection(self, conn: Any, why: str) -> None:
-        with self._state:
-            if self._conn is conn:
-                self._conn = None
-                waiters = list(self._ack_waiters.values())
-            else:
-                # A reader from the previous socket may observe its close after a reconnect already installed
-                # new ACK waiters under the same frame identities. It must not wake the new connection's window.
-                waiters = []
-        for waiter in waiters:
-            waiter.set()
+    @staticmethod
+    def _shutdown_conn(conn: Any) -> None:
+        """Go straight to the socket: `Connection.close()` takes the same protocol mutex as send(), so a
+        wedged writer would make an ordinary close() unbounded too — this is the one bounded exit both the
+        failure path and a deliberate shutdown share."""
         raw_socket = getattr(conn, "socket", None)
         if raw_socket is not None:
-            # `Connection.close()` takes the same protocol mutex as send(). A wedged send owns that mutex, so
-            # only shutting down the underlying socket can guarantee that this failure path itself is bounded.
             try:
                 raw_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -1008,6 +1000,19 @@ class EventStream:
 
             threading.Thread(
                 target=close_connection, name="pod-stream-force-close", daemon=True).start()
+
+    def _fail_connection(self, conn: Any, why: str) -> None:
+        with self._state:
+            if self._conn is conn:
+                self._conn = None
+                waiters = list(self._ack_waiters.values())
+            else:
+                # A reader from the previous socket may observe its close after a reconnect already installed
+                # new ACK waiters under the same frame identities. It must not wake the new connection's window.
+                waiters = []
+        for waiter in waiters:
+            waiter.set()
+        self._shutdown_conn(conn)
         _log(f"socket closed ({safe_text(why)}); {self.pending_count()} durable frame(s) pending")
 
     def claim(self, wall: float) -> dict[str, Any] | None:
@@ -1050,10 +1055,7 @@ class EventStream:
             pending = len(self._outbox)
             self._work.notify_all()
         if conn is not None:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001 - shutdown is best effort; outbox is already durable
-                pass
+            self._shutdown_conn(conn)     # bounded — see _shutdown_conn's WHY; never conn.close() here
         self._sender.join(timeout=2.0)
         if pending:
             _log(f"closed with {pending} durable frame(s) pending at {self._path}; startup will replay them")

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import contextlib
+import json
 import os
 import signal
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -51,6 +53,10 @@ _SVC_LOAD_LOCK = threading.Lock()
 
 BOOT_T0 = time.monotonic()
 
+# Minted once per process START, never per request: execv() replaces the process image and re-imports this
+# module, which is what lets a receipt reader tell "still the incarnation that warmed" from "restarted since".
+BOOT_ID = uuid.uuid4().hex
+
 
 def ops_chain_pool_size() -> int:
     """How many ops chains may be IN FLIGHT. Not a work budget — the runner's step slots are that; this only
@@ -89,6 +95,7 @@ def capacity_payload(*, rank_lanes: int, fetch_workers: int,
             "rank": 1,
             "heavy": 1,
         },
+        "boot_id": BOOT_ID,
     }
     if vram_total_mb is not None:
         payload["vram_total_mb"] = float(vram_total_mb)
@@ -517,16 +524,22 @@ def _tag(ev: dict[str, Any], corr_id: str | None, session_id: str | None) -> dic
     return ev
 
 
-def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str) -> None:
-    """Run an op chain. There is NO per-op branch here and there must never be one: the op names its
-    handler in contracts/ops/<op>.json, the pack provides it, and dispatch is a registry LOOKUP. Adding a
-    tool costs a declaration and a handler — this file is not one of the files that changes.
-    tests/test_ops_dispatch_is_a_lookup.py keeps it that way."""
-    from .ops.runner import run_chain
+def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str,
+             coordinator: "RestartCoordinator | None" = None) -> None:
+    """Run an op chain. Dispatch is a registry LOOKUP, never a per-op branch (tests/test_ops_dispatch_is_a_lookup.py).
+    A RESTART_REQUIRED return means the pack generation flipped; coordinator hears about it, no terminal is built."""
+    from .ops.runner import RESTART_REQUIRED, run_chain
 
     try:
         with _llm_correlation(corr_id):
-            run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
+            result = run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
+        if result is RESTART_REQUIRED:
+            reason = f"chain {chain.job_id} names ops-pack {chain.pack.sha256[:12]}, this process activated a different one"
+            if coordinator is None:
+                raise RuntimeError(f"pack generation change with no restart coordinator to tell: {reason}")
+            coordinator.request_restart(reason, target_pack=chain.pack.sha256)
+            _log(f"restart requested: {reason}")
+        return
     except BaseException as e:
         if isinstance(e, TransportUnhealthy):
             raise
@@ -578,6 +591,10 @@ _LIVE_MARK = Path("/tmp/podagent.alive")
 _OOM_FILES = (Path("/sys/fs/cgroup/memory.events"),                 # cgroup v2
               Path("/sys/fs/cgroup/memory/memory.oom_control"))     # v1, older hosts
 
+# A generation-flip execv() leaves _LIVE_MARK standing (same PID, no _mark_stopped call) — an env var, not
+# a file, so a FAILED exec can never leave a stale "planned" signal for a later, unrelated process to read.
+_PLANNED_RESTART_ENV = "PODAGENT_PLANNED_RESTART"
+
 
 def _oom_from(text: str) -> str | None:
     """The `oom_kill` count in one cgroup file's body, or None if this file does not carry one. Pure, so the
@@ -604,11 +621,20 @@ def _oom_kills() -> str:
 def _post_mortem() -> str:
     """What happened to the PREVIOUS agent in this container, as a phrase for the boot beacon."""
     oom = _oom_kills()
+    planned = _consume_planned_restart_mark()
+    if planned is not None:
+        return f"prev=PLANNED-RESTART ({planned}) · oom_kills={oom}"
     try:
         died = _LIVE_MARK.read_text().strip()
     except OSError:
         return f"prev=none (first boot in this container) · oom_kills={oom}"
     return f"prev=UNCLEAN (mark from {died} survived — the last agent was taken, not stopped) · oom_kills={oom}"
+
+
+def _consume_planned_restart_mark() -> str | None:
+    """Read-then-clear THIS process's own environment — consumed on the boot that inherited it, so a
+    later crash+respawn (fresh env, no execv) can never see a stale "planned" signal."""
+    return os.environ.pop(_PLANNED_RESTART_ENV, None)
 
 
 def _mark_alive() -> None:
@@ -629,6 +655,15 @@ def _mark_stopped() -> None:
     except OSError as e:
         _log(f"⚠ could not clear the liveness mark ({type(e).__name__}: {e}) — the next boot will read this "
              f"clean stop as a crash")
+
+
+def _mark_planned_restart(reason: str, abandoned: list[str]) -> None:
+    """Set in THIS process's own environment, right before execv() — inherited by the next incarnation
+    ONLY if the exec itself succeeds (os.environ, not a file: see _PLANNED_RESTART_ENV)."""
+    body = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} · {safe_text(reason)}"
+    if abandoned:
+        body += f" · abandoned={abandoned}"
+    os.environ[_PLANNED_RESTART_ENV] = body
 
 
 def _stop_and_exit(signum: int, _frame: Any) -> None:
@@ -678,6 +713,160 @@ def _guarded(fn: Any, cp: ControlPlane, meta: dict[str, str | None] | None = Non
         else:
             cp.note({"stage": "dispatch", "status": "error", "phase": "work_finished",
                      "error": safe_error(e)})
+
+
+# DERIVED: above the largest known single-arm budget (montyops/patience.py ARM_S, cut_apply.py
+# CUT_APPLY_SEG_S — both 900s), capped at the brain's own "ops" patience (pod_lane.DEFAULT_WORK_BUDGET_S=1800s).
+_RESTART_DRAIN_S_ENV = "POD_RESTART_DRAIN_S"
+_RESTART_DRAIN_S_DEFAULT = 1800.0
+
+# A rate limit on the flip ITSELF, durable across execv: the drain-wall size above closes the common
+# cause; 3 generations in one hour is the backstop reading as ping-pong, not convergence.
+_FLIP_HISTORY_MARK = Path("/tmp/podagent.pack-flip-history.json")
+_FLIP_MAX_PER_HOUR = 3
+_FLIP_WINDOW_S = 3600.0
+
+
+class RestartRefused(RuntimeError):
+    """Too many ops-pack generation flips in too short a window — this is ping-pong, not convergence."""
+
+
+def _restart_drain_s() -> float:
+    try:
+        v = float(os.environ.get(_RESTART_DRAIN_S_ENV, "") or _RESTART_DRAIN_S_DEFAULT)
+    except ValueError:
+        return _RESTART_DRAIN_S_DEFAULT
+    return v if v > 0 else _RESTART_DRAIN_S_DEFAULT
+
+
+def _flip_history(now: float) -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(_FLIP_HISTORY_MARK.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [row for row in raw if isinstance(row, dict) and isinstance(row.get("t"), (int, float))
+            and now - float(row["t"]) < _FLIP_WINDOW_S]
+
+
+def _record_flip_or_refuse(target_pack: str, *, now: float) -> None:
+    """Append this restart to the durable trailing-hour history, or raise RestartRefused instead."""
+    history = _flip_history(now)
+    if len(history) >= _FLIP_MAX_PER_HOUR:
+        raise RestartRefused(
+            f"{len(history)} ops-pack generation flip(s) in the last hour (max {_FLIP_MAX_PER_HOUR}) — "
+            f"refusing another restart toward {target_pack[:12] or 'unknown'}")
+    history.append({"t": now, "pack": target_pack[:12]})
+    try:
+        _FLIP_HISTORY_MARK.parent.mkdir(parents=True, exist_ok=True)
+        _FLIP_HISTORY_MARK.write_text(json.dumps(history))
+    except OSError as e:
+        _log(f"⚠ could not persist the flip-history marker ({type(e).__name__}: {e}) — the flip-count "
+             f"guard may undercount across this restart")
+
+
+def _kill_orphan_children() -> None:
+    """Never exec with live child processes: best effort, /proc-only. montyops.patience.run starts each op
+    subprocess in its own session, so killing its GROUP takes any grandchildren it spawned too."""
+    try:
+        raw = Path(f"/proc/self/task/{os.getpid()}/children").read_text()
+    except OSError:
+        return
+    for pid_s in raw.split():
+        try:
+            pid = int(pid_s)
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            continue
+
+
+class RestartCoordinator:
+    """One process-wide latch a pack-generation flip trips, plus the future registry the drain waits on."""
+
+    _POOLS = ("ops", "heavy", "rank")
+
+    def __init__(self) -> None:
+        self._latch = threading.Event()
+        self._lock = threading.Lock()
+        self._reason = ""
+        self._target_pack = ""
+        # Keyed by the future's OWN identity — a label (corr_id) can repeat and a second future silently
+        # overwriting the first's slot would drop it from `pending` early, not just at completion.
+        self._futures: dict[str, dict[int, tuple[str, "cf.Future[Any]"]]] = {p: {} for p in self._POOLS}
+
+    def request_restart(self, reason: str, *, target_pack: str = "") -> None:
+        with self._lock:
+            if not self._latch.is_set():
+                self._reason = reason
+                self._target_pack = target_pack
+        self._latch.set()
+
+    def restart_requested(self) -> bool:
+        return self._latch.is_set()
+
+    @property
+    def reason(self) -> str:
+        with self._lock:
+            return self._reason
+
+    @property
+    def target_pack(self) -> str:
+        with self._lock:
+            return self._target_pack
+
+    def track(self, pool: str, label: str, future: "cf.Future[Any]") -> None:
+        """A future drops itself out on completion — a long-lived process must never outgrow this registry."""
+        key = id(future)
+        with self._lock:
+            self._futures[pool][key] = (label, future)
+
+        def _untrack(_f: "cf.Future[Any]", pool: str = pool, key: int = key) -> None:
+            with self._lock:
+                self._futures[pool].pop(key, None)
+
+        future.add_done_callback(_untrack)
+
+    def pending(self) -> dict[str, list[str]]:
+        with self._lock:
+            return {pool: sorted(label for label, _fut in entries.values())
+                    for pool, entries in self._futures.items() if entries}
+
+
+def _drain_and_restart(cp: ControlPlane, coordinator: RestartCoordinator, *,
+                       drain_s: float | None = None, sleep: Any = time.sleep,
+                       execv: Any = os.execv, now: Any = time.time,
+                       kill_orphans: Any = None) -> None:
+    """flip-guard → close_stream() → bounded drain → kill orphans → mark → execv(), inside main()'s `with`
+    so it precedes the pools' unconditional wait=True shutdown. RestartRefused and a failed execv both
+    propagate loud on purpose — neither is a restart."""
+    reason = coordinator.reason
+    target = coordinator.target_pack
+    _record_flip_or_refuse(target, now=now())
+    _log(f"ops-pack generation changed ({reason}) — closing admission and draining before restart")
+    cp.close_stream()
+    deadline = time.monotonic() + (drain_s if drain_s is not None else _restart_drain_s())
+    abandoned: list[str] = []
+    while True:
+        pending = coordinator.pending()
+        if not pending:
+            break
+        if time.monotonic() >= deadline:
+            abandoned = [f"{pool}:{key}" for pool, keys in pending.items() for key in keys]
+            _log(f"restart drain deadline expired with {len(abandoned)} chain(s) still in flight: {abandoned}")
+            break
+        sleep(0.1)
+    (kill_orphans or _kill_orphan_children)()
+    _mark_planned_restart(reason, abandoned)
+    argv = [sys.executable, "-m", "podagent.main"]
+    try:
+        execv(sys.executable, argv)
+    except OSError as e:
+        os.environ.pop(_PLANNED_RESTART_ENV, None)
+        _log(f"⚠ execv failed ({type(e).__name__}: {e}) — this incarnation cannot restart; exiting "
+             f"immediately, not waiting on any executor")
+        os._exit(1)
 
 
 def main() -> None:
@@ -736,13 +925,17 @@ def main() -> None:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None
-            spec_raw = pod_job.spec.model_dump(by_alias=True, mode="json")
+            spec_raw = pod_job.spec.model_dump(by_alias=True, exclude_none=True, mode="json")
             _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
 
+    coordinator = RestartCoordinator()
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
             cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool, \
             cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool:
-        _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy)
+        _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy, coordinator=coordinator)
+        if coordinator.restart_requested():
+            # Runs INSIDE this `with` on purpose — see _drain_and_restart's docstring.
+            _drain_and_restart(cp, coordinator)
 
 
 def _is_clip_rank(pod_job: PodJob) -> bool:
@@ -751,9 +944,12 @@ def _is_clip_rank(pod_job: PodJob) -> bool:
 
 
 def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: Any, heavy: Any,
-                   once: bool = False) -> None:
-    """Claim envelopes and hand them to a pool. `once` is the test seam — the production loop never returns."""
+                   once: bool = False, coordinator: "RestartCoordinator | None" = None) -> None:
+    """Claim envelopes and hand them to a pool. `once` is the test seam — the production loop never returns
+    on its own; a set restart latch is the one other way out, checked before every new claim wait."""
     while True:
+        if coordinator is not None and coordinator.restart_requested():
+            return
         try:
             t_poll = time.monotonic()
             job = cp.poll_job()          # a wait on the live socket, not a request (cp.poll_job WHY)
@@ -781,15 +977,22 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
             if pod_job.type == "ops":
                 assert pod_job.chain is not None
                 chain, corr, sid = pod_job.chain, pod_job.corr_id, pod_job.session_id
-                ops_pool.submit(_guarded,
-                                lambda c=chain, r=corr, s=sid, m=raw_meta, q=queued_at:
+                ops_kwargs = {"coordinator": coordinator} if coordinator is not None else {}
+                fut = ops_pool.submit(_guarded,
+                                lambda c=chain, r=corr, s=sid, m=raw_meta, q=queued_at, k=ops_kwargs:
                                 _with_lifecycle(
-                                    cp, m, q, lambda: _run_ops(c, cp, corr_id=r, session_id=s)), cp, raw_meta)
+                                    cp, m, q, lambda: _run_ops(
+                                        c, cp, corr_id=r, session_id=s, **k)), cp, raw_meta)
+                if coordinator is not None:
+                    coordinator.track("ops", str(corr or raw_meta.get("job_id") or "?"), fut)
             else:
                 pool = rank_pool if _is_clip_rank(pod_job) else heavy_pool
-                pool.submit(_guarded,
+                fut = pool.submit(_guarded,
                             lambda j=pod_job, m=raw_meta, q=queued_at:
                             _with_lifecycle(cp, m, q, lambda: heavy(j)), cp, raw_meta)
+                if coordinator is not None:
+                    pool_name = "rank" if pool is rank_pool else "heavy"
+                    coordinator.track(pool_name, str(raw_meta.get("corr_id") or raw_meta.get("job_id") or "?"), fut)
             if once:
                 return
         except requests.RequestException as e:

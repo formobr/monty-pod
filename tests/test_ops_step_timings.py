@@ -138,7 +138,7 @@ def wired(monkeypatch, tmp_path, op):
     monkeypatch.setattr(runner.registry, "validate_params", lambda *a, **k: None)
     monkeypatch.setattr(runner.registry, "assert_pod_safe", lambda *a, **k: None)
     monkeypatch.setattr(runner, "preflight_chain", lambda chain: None)
-    monkeypatch.setattr(runner.pack, "activate", lambda ref: tmp_path)
+    monkeypatch.setattr(runner.pack, "activate_or_mismatch", lambda ref: tmp_path)
     monkeypatch.setattr(runner, "log", lambda *a, **k: None)
     return src, required
 

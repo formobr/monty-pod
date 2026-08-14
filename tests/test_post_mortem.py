@@ -18,6 +18,9 @@ import pytest
 def mark(tmp_path, monkeypatch):
     p = tmp_path / "podagent.alive"
     monkeypatch.setattr(M, "_LIVE_MARK", p)
+    # monkeypatch owns this env var for the test's lifetime and restores it after — an inherited real
+    # PODAGENT_PLANNED_RESTART could otherwise leak a PLANNED-RESTART verdict into an unrelated test.
+    monkeypatch.delenv(M._PLANNED_RESTART_ENV, raising=False)
     return p
 
 
@@ -70,3 +73,30 @@ def test_a_mark_that_cannot_be_written_is_said_out_loud(monkeypatch, capsys, tmp
     monkeypatch.setattr(M.Path, "mkdir", lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs")))
     M._mark_alive()
     assert "could not write the liveness mark" in capsys.readouterr().err
+
+
+# ── a generation-flip execv() is not the same death as an UNCLEAN one (R2/O1) ──────────────────────
+
+def test_a_planned_restart_reads_as_planned_not_unclean(mark, monkeypatch):
+    """_LIVE_MARK survives an execv() untouched (same PID, no _mark_stopped call) — without the separate
+    planned marker this would misreport as prev=UNCLEAN."""
+    monkeypatch.setattr(M, "_oom_kills", lambda: "0")
+    M._mark_alive()  # the surviving liveness mark from the incarnation that is about to restart
+    M._mark_planned_restart("ops-pack generation changed", abandoned=[])
+    got = M._post_mortem()
+    assert "prev=PLANNED-RESTART" in got and "prev=UNCLEAN" not in got
+    assert "ops-pack generation changed" in got
+
+
+def test_the_planned_restart_marker_is_consumed_once(mark):
+    """A marker that outlived its one reincarnation must not explain a LATER genuine crash."""
+    M._mark_planned_restart("pack flip", abandoned=[])
+    assert M._consume_planned_restart_mark() is not None
+    assert M._consume_planned_restart_mark() is None
+
+
+def test_a_planned_restart_names_abandoned_chains(mark, monkeypatch):
+    monkeypatch.setattr(M, "_oom_kills", lambda: "0")
+    M._mark_planned_restart("pack flip", abandoned=["ops:corr-1", "heavy:corr-2"])
+    got = M._post_mortem()
+    assert "corr-1" in got and "corr-2" in got

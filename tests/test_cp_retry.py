@@ -458,6 +458,35 @@ def test_hanging_send_is_force_closed_inside_frame_wall_and_keeps_durable_admiss
     stream.close()
 
 
+def test_close_never_calls_the_unbounded_protocol_close(tmp_path: Path) -> None:
+    """codex#2: close() (the restart coordinator's close_stream) must go straight to the socket, exactly
+    like _fail_connection's wedged-send recovery — never the higher-level conn.close() a wedged writer
+    could hold forever."""
+    shutdown_called = threading.Event()
+
+    class _Socket:
+        def shutdown(self, how: int) -> None:
+            assert how == event_stream.socket.SHUT_RDWR
+            shutdown_called.set()
+
+        def close(self) -> None:
+            pass
+
+    class _WedgedConn:
+        socket = _Socket()
+
+        def close(self) -> None:
+            raise AssertionError("close() must never reach the protocol-mutex conn.close()")
+
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
+    with stream._state:
+        stream._conn = _WedgedConn()
+    started = time.monotonic()
+    stream.close()
+    assert time.monotonic() - started < 1.0
+    assert shutdown_called.is_set()
+
+
 def test_result_and_its_ack_event_cannot_overtake_prior_or_already_appended_frames(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[dict[str, Any]] = []

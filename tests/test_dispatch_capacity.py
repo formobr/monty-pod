@@ -52,6 +52,7 @@ def test_capacity_advertises_worker_credit_limits(monkeypatch):
         "rank_lanes": 3,
         "fetch_workers": 7,
         "claim_capacity": {"ops": 4, "rank": 1, "heavy": 1},
+        "boot_id": agent_main.BOOT_ID,
     }
 
 
@@ -73,6 +74,27 @@ def test_capacity_never_fabricates_vram_for_a_box_with_no_reading():
     """NEGATIVE: a GPU-less box (or a card nvidia-smi could not read) must publish neither key — never 0."""
     capacity = agent_main.capacity_payload(rank_lanes=1, fetch_workers=1, vram_total_mb=None)
     assert "vram_total_mb" not in capacity and "vram_peak_used_mb" not in capacity
+
+
+# ── boot_id: stable within a process, distinct across an execv-minted one (R3/U3) ──────────────────
+
+def test_boot_id_is_stable_within_one_process():
+    a = agent_main.capacity_payload(rank_lanes=1, fetch_workers=1)["boot_id"]
+    b = agent_main.capacity_payload(rank_lanes=1, fetch_workers=1)["boot_id"]
+    assert a == b == agent_main.BOOT_ID
+
+
+def test_a_fresh_process_mints_a_different_boot_id():
+    """execv() re-imports this module; the module-level constant is what makes that a NEW boot_id, not a
+    thing anyone has to remember to reset."""
+    import subprocess
+    import sys
+
+    got = subprocess.run(
+        [sys.executable, "-c", "from podagent import main; print(main.BOOT_ID)"],
+        capture_output=True, text=True, check=True, cwd=agent_main.__file__.rsplit("/podagent/", 1)[0],
+    ).stdout.strip()
+    assert got != agent_main.BOOT_ID and len(got) == 32
 
 
 def test_capacity_has_no_way_to_spell_a_peak_reading_at_all():

@@ -100,6 +100,24 @@ def active_sha() -> str | None:
         return _loaded_sha
 
 
+def activate_or_mismatch(ref: Any) -> Path | None:
+    """Check-and-activate as ONE lock acquisition — closes the race a separate active_sha() check leaves
+    open. `None` (never a raise) tells the caller to signal a restart instead of running the wrong code."""
+    global _loaded_sha
+    with _lock:
+        if _loaded_sha is not None and _loaded_sha != ref.sha256:
+            return None
+        root = ensure(ref)
+        if _loaded_sha == ref.sha256:
+            return root
+        p = str(root)
+        if p not in sys.path:
+            sys.path.insert(0, p)
+        _loaded_sha = ref.sha256
+        log(f"ops-pack {ref.sha256[:12]} on sys.path → {root}")
+        return root
+
+
 LEGS_MODULE = "montyops.legs"
 """The pack's OPTIONAL leg stopwatch. A handler is handed typed params and local paths and returns nothing —
 deliberately, so it cannot depend on where it runs — which leaves the runner able to time the WHOLE call and

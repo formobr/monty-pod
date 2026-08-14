@@ -1095,11 +1095,15 @@ def _terminal_timeline_context(
     return context, reasons
 
 
+# A checked, non-exception signal: pack.activate() would raise on a second pack, turning a still-claimed
+# chain into a lost result the box cannot afford — the caller must build no terminal for this sentinel.
+RESTART_REQUIRED: Final[object] = object()
+
+
 def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
               session_id: str | None = None) -> dict[str, Any]:
-    """Execute the whole chain. Returns {step_id: {port: str(path)}} for the caller to inspect.
-
-    corr_id/session_id are echoed from the claimed envelope onto every event/terminal (pool demux)."""
+    """Execute the whole chain. Returns {step_id: {port: str(path)}}, or RESTART_REQUIRED when this process
+    activated a different ops-pack than the chain names. corr_id/session_id echo onto every event/terminal."""
 
     def _event(**payload: Any) -> None:
         payload.setdefault("job_id", chain.job_id)
@@ -1147,7 +1151,11 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
     with chain_phase("preflight"):
         preflight_chain(chain)      # FIRST: an unrunnable chain must cost nothing but the claim
     with chain_phase("pack_activate"):
-        pack.activate(chain.pack)
+        activated = pack.activate_or_mismatch(chain.pack)
+    if activated is None:
+        # Still no terminal: the chain stays durably claimed, and a fresh incarnation of this same
+        # process will see it replayed and run it under the pack it actually names.
+        return RESTART_REQUIRED
 
     tmp = Path(tempfile.mkdtemp(prefix="opchain_"))
     ws = Workspace(tmp)

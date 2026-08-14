@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from podagent.models import PodJob
+from podagent.models import PodJob, RenderSpec
 
 _ALIGN_REQUEST = {
     "infer_version": 6,
@@ -26,6 +26,14 @@ _PREVIEW_SPEC = {
     "timeline": {"fps": 30, "width": 2, "height": 2, "segments": [{"src": "src", "in": 0, "out": 1, "speed": 1}]},
     "encode": {"video": "libx264", "preset": "p4", "cq": 29, "pix_fmt": "yuv420p", "audio": "aac", "audio_bitrate": "192k"},
     "outputs": [{"id": "proxy", "kind": "proxy", "put_url": "p"}],
+}
+
+
+_FINAL_SPEC_WITH_ACCENT = {
+    **_PREVIEW_SPEC,
+    "mode": "final",
+    "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
+    "overlays": {"finalize": {"accents": [{"kind": "zoom_punch", "at": 1.0, "intensity": 0.7}]}},
 }
 
 
@@ -76,6 +84,23 @@ def test_mismatched_block_rejected() -> None:
 def test_missing_block_rejected() -> None:
     with pytest.raises(ValidationError):
         PodJob.model_validate({"type": "render", "session_id": "s", "corr_id": "c"})
+
+
+def test_dispatch_redump_of_a_zoom_punch_accent_carries_no_burn_or_clicks_keys() -> None:
+    """NEGATIVE: main._heavy re-dumps pod_job.spec before _run_render re-validates it. A dump that
+    resurrects the unset burn/clicks defaults as explicit nulls makes the pod refuse its own valid
+    envelope ("accent.burn must not be null"), so the dispatch dump must exclude_none."""
+    job = PodJob.model_validate({
+        "type": "render", "session_id": "s", "corr_id": "c", "spec": _FINAL_SPEC_WITH_ACCENT})
+    assert job.spec is not None
+    naive = job.spec.model_dump(by_alias=True, mode="json")
+    assert naive["overlays"]["finalize"]["accents"][0]["burn"] is None
+    with pytest.raises(ValidationError, match="must not be null"):
+        RenderSpec.model_validate(naive)
+    raw = job.spec.model_dump(by_alias=True, exclude_none=True, mode="json")
+    accent = raw["overlays"]["finalize"]["accents"][0]
+    assert "burn" not in accent and "clicks" not in accent
+    assert RenderSpec.model_validate(raw).overlays is not None
 
 
 def test_unknown_type_rejected() -> None:
