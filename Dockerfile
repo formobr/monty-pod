@@ -70,7 +70,10 @@ RUN set -eux; \
     # It belongs on THIS line and not only in pyproject for the reason stated above — the app is
     # installed --no-deps, so a pyproject dependency never reaches the image. Missing it makes the image
     # unusable: there is deliberately no HTTP fallback.
-    python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy requests pydantic huggingface_hub soundfile Pillow jsonschema websockets; \
+    # requests/urllib3 FLOORED here for the same --no-deps reason as transformers above: pyproject's deps
+    # never reach the image. urllib3 1.x has enforce_content_length but defaults it OFF; 2.x flips the
+    # default to ON, so the floor is what makes cp.py's short-body detection load-bearing, not optional.
+    python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy 'requests>=2.32,<3' 'urllib3>=2,<3' pydantic huggingface_hub soundfile Pillow jsonschema websockets; \
     SP=/usr/local/lib/python3.11/dist-packages; \
     bucket() { n="$1"; shift; for p in "$@"; do d="/stage/$n/$(dirname "$p")"; mkdir -p "$d"; mv "$SP/$p" "$d/"; done; }; \
     bucket 01 nvidia/cudnn; \

@@ -223,38 +223,161 @@ class _DeadlineBody:
                     f"{sent} of {self._size} bytes sent")
 
 
-def download(url: str, dest: Path) -> Path:
-    """Presigned GET → file, streamed, 3 attempts, RESUMING via Range. A file:// url copies from local disk.
+class ShortBody(requests.RequestException):
+    """A framed byte count (Content-Length/Content-Range total) the body didn't deliver, no transport error."""
 
-    A fetch that raises unwinds through the whole step chain and discards every sibling step's finished work,
-    so a dropped connection must cost the remaining bytes, never the job."""
+
+class _RestartRequired(requests.RequestException):
+    """An untrustworthy resume (416 / unsolicited 206 / mismatched Content-Range / changed ETag / a Range
+    request answered by neither 200 nor 206) — never appended to."""
+
+
+def _safe_int(raw: str, what: str) -> int | None:
+    """A header integer requests never validates for us; malformed degrades to unknown framing, not a crash."""
+    try:
+        return int(raw)
+    except ValueError:
+        _log(f"download: malformed {what} {raw!r} — treating as unknown framing")
+        return None
+
+
+def _resume_range(headers: Any, have: int, pinned_total: int | None) -> tuple[int, int, int | None]:
+    """Parse+validate a 206's Content-Range: start==have, start<=end<ceiling (the PIN if one exists, else
+    this response's own total). A total that DISAGREES with an already-pinned one is untrustworthy, same as
+    a bad start. Returns (start, end, total-or-None-for-'*')."""
+    cr = headers.get("Content-Range")
+    if not cr:
+        raise _RestartRequired("206 resume response carried no Content-Range")
+    try:
+        unit, spec = cr.strip().split(" ", 1)
+        span, total_s = spec.split("/", 1)
+        start_s, end_s = span.split("-", 1)
+        start, end = int(start_s), int(end_s)
+    except (ValueError, AttributeError) as exc:
+        raise _RestartRequired(f"206 resume response carried an unparseable Content-Range: {cr!r}") from exc
+    if unit.lower() != "bytes" or start != have:
+        raise _RestartRequired(
+            f"206 resume response Content-Range start does not match the requested offset "
+            f"({cr!r} vs bytes={have}-)")
+    if total_s == "*":
+        if end < start:
+            raise _RestartRequired(f"206 resume response carried an inconsistent Content-Range: {cr!r}")
+        return start, end, None
+    total = _safe_int(total_s, "Content-Range total")
+    if total is not None and pinned_total is not None and total != pinned_total:
+        raise _RestartRequired(
+            f"Content-Range total changed mid-transfer ({pinned_total} -> {total}) — refusing to splice")
+    ceiling = pinned_total if pinned_total is not None else total
+    if ceiling is not None and not (start <= end < ceiling):
+        raise _RestartRequired(f"206 resume response carried an inconsistent Content-Range: {cr!r}")
+    return start, end, total
+
+
+def download(url: str, dest: Path) -> Path:
+    """Presigned GET → file, streamed, 3 attempts, RESUMING via Range (file:// copies locally). A raise
+    unwinds the whole step chain, so a dropped connection costs the remaining bytes, never the job. A byte
+    count FRAMED by the origin is PINNED on first sight, never silently overridden; unframed is NOT covered."""
     assert_fetchable(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
     local = _file_path(url)
     if local is not None:
         shutil.copyfile(local, dest)
         return dest
+    pinned_total: int | None = None
+    pinned_etag: str | None = None
+    etag_warned = False
     for attempt in range(_XFER_ATTEMPTS):
         # attempt 0 always truncates: only bytes THIS call wrote are known to belong to this object.
         have = dest.stat().st_size if attempt and dest.exists() else 0
-        headers = {"Range": f"bytes={have}-"} if have else {}
+        headers: dict[str, str] = {"Range": f"bytes={have}-"} if have else {}
+        if have and pinned_etag:
+            headers["If-Range"] = pinned_etag
         try:
             with _store.get(url, stream=True, timeout=_TIMEOUT, headers=headers) as r:
+                if r.status_code == 416:
+                    raise _RestartRequired(f"416 Range Not Satisfiable at offset {have} — restarting from 0")
                 r.raise_for_status()
+                if not have and r.status_code == 206:
+                    # nobody asked for a Range: never trust an unsolicited partial response as complete.
+                    raise _RestartRequired("unsolicited 206 on a request with no Range header")
                 resumed = bool(have) and r.status_code == 206
-                if have and not resumed:
-                    _log(f"download: server ignored Range (status {r.status_code}) — restarting from 0, "
-                         f"{have} bytes discarded")
-                    have = 0
-                with dest.open("ab" if resumed else "wb") as f:
-                    _pump(r, f, have)
-            return dest
+                encoded = r.headers.get("Content-Encoding")
+                if resumed:
+                    if encoded:
+                        # a Range offset addresses the DECODED stream; a transcoded resume can't honour that.
+                        raise _RestartRequired("Content-Encoding on a resumed 206 — cannot resume a "
+                                                "transcoded stream, restarting from 0")
+                    start, end, total_resp = _resume_range(r.headers, have, pinned_total)
+                    new_etag = r.headers.get("ETag")
+                    if pinned_etag and new_etag and new_etag != pinned_etag:
+                        raise _RestartRequired(
+                            f"ETag changed between attempts ({pinned_etag!r} -> {new_etag!r}) — refusing "
+                            f"to splice")
+                    if total_resp is not None:
+                        pinned_total = total_resp
+                    if new_etag:
+                        pinned_etag = new_etag
+                    span = end - start + 1
+                    with dest.open("ab") as f:
+                        moved = _pump(r, f, have)
+                    if moved > span:
+                        raise _RestartRequired(
+                            f"206 delivered more bytes ({moved}) than its declared span ({span}) — "
+                            f"refusing to trust it, restarting from 0")
+                    if moved < span:
+                        _log(f"download: 206 delivered {moved} of {span} declared bytes — treating like a "
+                             f"dropped connection, keeping the {moved}-byte prefix")
+                else:
+                    if have and r.status_code != 206:
+                        _log(f"download: server ignored Range (status {r.status_code}) — restarting from 0, "
+                             f"{have} bytes discarded")
+                        have = 0
+                    if r.status_code != 200:
+                        raise _RestartRequired(
+                            f"non-resumed response was HTTP {r.status_code}, expected 200")
+                    content_length = r.headers.get("Content-Length")
+                    total_this: int | None = None
+                    if encoded:
+                        _log("download: Content-Encoding present — size enforcement skipped")
+                    elif content_length is not None:
+                        total_this = _safe_int(content_length, "Content-Length")
+                        if total_this is None:
+                            _log("download: unverifiable body (no framing)")
+                    else:
+                        _log("download: unverifiable body (no framing)")
+                    pinned_total = total_this  # a full GET re-establishes the pin fresh, it doesn't merge
+                    new_etag = r.headers.get("ETag")
+                    if new_etag:
+                        pinned_etag = new_etag
+                    elif pinned_etag is None and not etag_warned:
+                        _log("download: splice guard unavailable (no ETag on the origin's response)")
+                        etag_warned = True
+                    with dest.open("wb") as f:
+                        moved = _pump(r, f, have)
+                    if pinned_total is not None and moved != pinned_total:
+                        dest.unlink(missing_ok=True)
+                        raise ShortBody(
+                            f"download: expected {pinned_total} bytes, got {moved} (torn body, no "
+                            f"transport error) — deleting so the next attempt starts clean")
+            have_now = dest.stat().st_size if dest.exists() else 0
+            if pinned_total is None or have_now >= pinned_total:
+                return dest
+            # pinned_total known but not yet reached: a range-capping origin answered a shorter span than
+            # asked for, or this attempt only made partial progress — resume from the new `have` next time.
         except requests.RequestException as e:
+            if isinstance(e, _RestartRequired):
+                dest.unlink(missing_ok=True)
+                pinned_total = None
+                pinned_etag = None
             if attempt + 1 == _XFER_ATTEMPTS:
                 raise
             _log(f"download failed (attempt {attempt + 1}/{_XFER_ATTEMPTS}): {safe_error(e)} — resuming from "
                  f"{dest.stat().st_size if dest.exists() else 0} bytes")
             time.sleep(2**attempt)
+    final = dest.stat().st_size if dest.exists() else 0
+    if pinned_total is not None and final < pinned_total:
+        dest.unlink(missing_ok=True)
+        raise ShortBody(f"download: attempts exhausted with {final}/{pinned_total} bytes on disk")
     return dest
 
 

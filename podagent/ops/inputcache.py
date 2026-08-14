@@ -66,6 +66,32 @@ _slot_locks: dict[str, threading.Lock] = {}
 # measure themselves against a budget the other is about to spend (RETENTION_WHY).
 _retain_lock = threading.Lock()
 
+# A sentinel too old to carry a size record: legacy adopt-path bodies were a bare sha256 hex digest.
+_LEGACY_NO_CHECK = object()
+
+
+def _sentinel_body(size: int, sha256: str | None = None) -> str:
+    """The sentinel going forward: a SIZE RECORD for O(1) HIT validation, not an integrity check — that lives
+    in cp.download's header enforcement, not here."""
+    body = {"size": size} if sha256 is None else {"sha256": sha256, "size": size}
+    return json.dumps(body, sort_keys=True)
+
+
+def _sentinel_size(raw: str):
+    """int to check against the payload, `_LEGACY_NO_CHECK` (a pre-size-record sha256, always valid), or None
+    (empty/corrupt — heal it, this is what let a torn download stay a permanent poisoned HIT)."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    if len(raw) == 64 and all(c in "0123456789abcdef" for c in raw):
+        return _LEGACY_NO_CHECK
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    size = parsed.get("size") if isinstance(parsed, dict) else None
+    return size if isinstance(size, int) else None
+
 
 def enabled() -> bool:
     return os.environ.get(DISABLE_ENV, "").strip().lower() not in ("1", "true", "yes")
@@ -186,7 +212,7 @@ def upload_and_adopt(url: str, src: Path, upload, log=None) -> None:
                 # same key is over and the entry becomes evictable again.
                 (slot / RETAINED).unlink(missing_ok=True)
                 snapshot.replace(payload)
-                sentinel.write_text(before, encoding="ascii")
+                sentinel.write_text(_sentinel_body(payload.stat().st_size, before), encoding="utf-8")
             except Exception as exc:  # cache maintenance cannot reverse a successful durable PUT
                 _invalidate_locked(slot, log=log)
                 if log:
@@ -367,7 +393,7 @@ def adopt_local(url: str, src: Path, *, holder: str, log=None) -> Path:
                 # can only be read off the key's own shape.
                 marker.write_text(json.dumps({"holder": holder, "key": key}, sort_keys=True),
                                   encoding="utf-8")
-                sentinel.write_text(digest, encoding="ascii")
+                sentinel.write_text(_sentinel_body(payload.stat().st_size, digest), encoding="utf-8")
             except Exception as exc:
                 _invalidate_locked(slot, log=log)
                 raise RetentionUnavailable(
@@ -491,14 +517,51 @@ def get(url: str, download, *, lease: Path, log=None) -> Path | None:
     payload, sentinel = slot / "payload", slot / DONE
     # per OBJECT, never globally: two chains pulling DIFFERENT inputs must still overlap
     with _key_lock(key):
-        hit = sentinel.exists() and payload.exists()
+        if (slot / RETAINED).exists():
+            # Retention gates HIT/MISS before the sentinel is even read — no remote fallback (RETENTION_WHY).
+            if not payload.is_file():
+                raise RetentionUnavailable(
+                    f"retained object for {key} has no payload on disk — nothing to serve and no remote "
+                    f"copy to fall back to")
+            hit = True
+        else:
+            hit = sentinel.exists() and payload.exists()
+            if hit:
+                try:
+                    raw = sentinel.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    raw = ""  # unreadable is exactly as trustworthy as empty
+                recorded = _sentinel_size(raw)
+                healthy = recorded is _LEGACY_NO_CHECK
+                if not healthy and recorded is not None:
+                    try:
+                        healthy = payload.stat().st_size == recorded
+                    except OSError:
+                        healthy = False
+                if not healthy:
+                    if log:
+                        try:
+                            actual = payload.stat().st_size
+                        except OSError:
+                            actual = -1
+                        log(f"[input-cache] healing {key}: sentinel recorded {recorded!r}, payload is "
+                            f"{actual} bytes — re-downloading")
+                    shutil.rmtree(slot, ignore_errors=True)
+                    hit = False
         if not hit:
             slot.mkdir(parents=True, exist_ok=True)
             tmp = slot / f"payload.{os.getpid()}.{threading.get_ident()}.part"
-            download(url, tmp)
-            # sentinel AFTER the rename: a fetch killed mid-write must read as ABSENT, never as usable
-            tmp.replace(payload)
-            sentinel.write_text("", encoding="utf-8")
+            ok = False
+            try:
+                download(url, tmp)
+                size = tmp.stat().st_size
+                # sentinel AFTER the rename: a fetch killed mid-write must read as ABSENT, never as usable
+                tmp.replace(payload)
+                ok = True
+            finally:
+                if not ok:
+                    tmp.unlink(missing_ok=True)
+            sentinel.write_text(_sentinel_body(size), encoding="utf-8")
             if log:
                 log(f"[input-cache] stored {key} ({payload.stat().st_size / 1e6:.0f} MB)")
         elif log:

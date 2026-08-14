@@ -2,6 +2,7 @@
 the per-chain memo keyed on the string. `source_axis` binds the master in three chains — three transfers."""
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -73,6 +74,146 @@ def test_a_killed_fetch_reads_as_absent(tmp_path):
     seen: list[str] = []
     p = inputcache.get(URL_A, _dl(seen), lease=tmp_path / "good")
     assert p.read_bytes() == b"payload" and len(seen) == 1, "a truncated fetch was served as a hit"
+
+
+def test_completed_download_writes_a_size_sentinel(tmp_path):
+    """X7 — the sentinel is a SIZE RECORD, and get() must leave a payload whose bytes the lease matches."""
+    seen: list[str] = []
+    lease = inputcache.get(URL_A, _dl(seen), lease=tmp_path / "lease")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    assert json.loads((slot / inputcache.DONE).read_text()) == {"size": len(b"payload")}
+    assert (slot / "payload").read_bytes() == lease.read_bytes() == b"payload"
+
+
+def test_adopt_paths_keep_sha256_and_gain_size(tmp_path):
+    """X7 — adopt-path sentinels keep the checksum they always wrote and now carry the size alongside it."""
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"master-bytes")
+    inputcache.upload_and_adopt(URL_A, src, lambda _p, _u: None)
+    body = json.loads((inputcache._slot(inputcache.object_key(URL_A)) / inputcache.DONE).read_text())
+    assert body == {"sha256": inputcache._sha256(src), "size": len(b"master-bytes")}
+    retained_slot = inputcache._slot(inputcache.object_key(URL_B))
+    inputcache.adopt_local(URL_B, src, holder="worker-1")
+    body2 = json.loads((retained_slot / inputcache.DONE).read_text())
+    assert body2 == {"sha256": inputcache._sha256(src), "size": len(b"master-bytes")}
+
+
+def test_a_poisoned_hit_with_a_wrong_recorded_size_heals(tmp_path):
+    """X5 — a slot whose sentinel size disagrees with the payload on disk is a torn download cached as a
+    whole file (the rc=183 mechanism), not a permanent poison: it must heal on the next touch."""
+    seen: list[str] = []
+    inputcache.get(URL_A, _dl(seen), lease=tmp_path / "seed")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / inputcache.DONE).write_text(json.dumps({"size": 999999}), encoding="utf-8")
+    p = inputcache.get(URL_A, _dl(seen), lease=tmp_path / "healed")
+    assert p.read_bytes() == b"payload" and len(seen) == 2, "a poisoned slot must heal, not stay a hit forever"
+
+
+def test_a_legacy_empty_sentinel_heals(tmp_path):
+    """X6 — the pre-fix download-path sentinel was empty text; it must heal exactly like a size mismatch."""
+    seen: list[str] = []
+    inputcache.get(URL_A, _dl(seen), lease=tmp_path / "seed")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / inputcache.DONE).write_text("", encoding="utf-8")
+    p = inputcache.get(URL_A, _dl(seen), lease=tmp_path / "healed")
+    assert p.read_bytes() == b"payload" and len(seen) == 2
+
+
+def test_a_legacy_sha256_only_sentinel_is_still_a_valid_hit(tmp_path):
+    """A bare-64-hex sentinel (the adopt path's shape before it gained a size) stays VALID, unchecked."""
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"master")
+    inputcache.upload_and_adopt(URL_A, src, lambda _p, _u: None)
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / inputcache.DONE).write_text(inputcache._sha256(src), encoding="ascii")
+    p = inputcache.get(URL_A, _dl([]), lease=tmp_path / "hit")
+    assert p.read_bytes() == b"master", "a legacy sha256-only sentinel must still be treated as a valid HIT"
+
+
+def test_a_retained_slot_is_never_healed_even_with_a_wrong_sentinel(tmp_path):
+    """F1/N4 — a retained slot has no remote fallback; a mismatched sentinel must never trigger rmtree."""
+    src = tmp_path / "master.mp4"
+    src.write_bytes(b"only-copy")
+    inputcache.adopt_local(URL_A, src, holder="worker-1")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / inputcache.DONE).write_text(json.dumps({"size": 999999}), encoding="utf-8")
+    p = inputcache.get(URL_A, _dl([]), lease=tmp_path / "lease")
+    assert p.read_bytes() == b"only-copy", "a retained slot must be served byte-for-byte, never healed"
+    assert (slot / inputcache.RETAINED).exists(), "healing must never remove a retained marker"
+
+
+def test_a_retained_slot_with_a_missing_sentinel_is_still_served(tmp_path):
+    """C-4 — retention gates HIT/MISS before the sentinel is even consulted: existence semantics."""
+    src = tmp_path / "master.mp4"
+    src.write_bytes(b"only-copy")
+    inputcache.adopt_local(URL_A, src, holder="worker-1")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / inputcache.DONE).unlink()
+    p = inputcache.get(URL_A, _dl([]), lease=tmp_path / "lease")
+    assert p.read_bytes() == b"only-copy", "a missing sentinel must never trigger a refetch of a retained slot"
+
+
+def test_a_retained_slot_with_a_missing_payload_raises_loudly(tmp_path):
+    """C-4 — a retained slot with no payload has no remote fallback either: RetentionUnavailable, not a miss."""
+    src = tmp_path / "master.mp4"
+    src.write_bytes(b"only-copy")
+    inputcache.adopt_local(URL_A, src, holder="worker-1")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / "payload").unlink()
+    with pytest.raises(inputcache.RetentionUnavailable):
+        inputcache.get(URL_A, _dl([]), lease=tmp_path / "lease")
+
+
+def test_a_failed_rename_after_download_leaves_no_part_file(tmp_path, monkeypatch):
+    """C-5 — the .part cleanup stays armed through tmp.replace(payload), not just through download()."""
+    original_replace = inputcache.Path.replace
+
+    def _boom_replace(path, target):
+        if path.name.endswith(".part"):
+            raise OSError("disk full")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(inputcache.Path, "replace", _boom_replace)
+    with pytest.raises(OSError):
+        inputcache.get(URL_A, _dl([]), lease=tmp_path / "bad")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    leftovers = list(slot.glob("*.part")) if slot.exists() else []
+    assert leftovers == [], f"a failed rename leaked a .part file: {leftovers}"
+
+
+def test_a_raising_download_leaves_no_part_file(tmp_path):
+    """X12 — download() raising must never leave an orphaned .part behind to eat disk silently."""
+    def _boom(_url, dest):
+        dest.write_bytes(b"half")
+        raise OSError("connection reset")
+
+    with pytest.raises(OSError):
+        inputcache.get(URL_A, _boom, lease=tmp_path / "bad")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    leftovers = list(slot.glob("*.part")) if slot.exists() else []
+    assert leftovers == [], f"a raising download leaked a .part file: {leftovers}"
+
+
+def test_a_healed_slot_is_a_clean_hit_on_the_next_touch(tmp_path):
+    """X15 — heal-then-redownload must not leave the slot re-poisoned: a THIRD get() must be a plain hit."""
+    seen: list[str] = []
+    inputcache.get(URL_A, _dl(seen), lease=tmp_path / "seed")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / inputcache.DONE).write_text(json.dumps({"size": 999999}), encoding="utf-8")
+    inputcache.get(URL_A, _dl(seen), lease=tmp_path / "healed")
+    assert len(seen) == 2
+    p = inputcache.get(URL_A, _dl(seen), lease=tmp_path / "third")
+    assert p.read_bytes() == b"payload" and len(seen) == 2, "a healed slot must stay a hit, not re-poison"
+
+
+def test_a_non_utf8_sentinel_heals_instead_of_crashing_get(tmp_path):
+    """D4 — an unreadable/undecodable sentinel degrades to legacy-empty (heal), never unwinds get()."""
+    seen: list[str] = []
+    inputcache.get(URL_A, _dl(seen), lease=tmp_path / "seed")
+    slot = inputcache._slot(inputcache.object_key(URL_A))
+    (slot / inputcache.DONE).write_bytes(b"\xff\xfe\x00\xff not utf-8")
+    p = inputcache.get(URL_A, _dl(seen), lease=tmp_path / "healed")
+    assert p.read_bytes() == b"payload" and len(seen) == 2, "an undecodable sentinel must heal, not raise"
 
 
 def test_a_non_http_binding_is_not_cached(tmp_path):
