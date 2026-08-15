@@ -69,24 +69,100 @@ def _stage_public(input_paths: dict, rd: Path) -> None:
             shutil.copy2(path, dest)
 
 
-def _render_concurrency() -> int:
-    """Chrome tabs to run in parallel. Fixed at 4 this box's size never mattered: a 28-core host idled at 14%
-    while a 2-core one thrashed. Each tab needs ~2 GB, so RAM caps it as hard as cores do."""
-    cores = os.cpu_count() or 4
-    ram_gb = 0.0
+_CGROUP_MEM_LIMIT = (Path("/sys/fs/cgroup/memory.max"),                      # cgroup v2
+                     Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))    # cgroup v1
+_CGROUP_MEM_CURRENT = (Path("/sys/fs/cgroup/memory.current"),
+                       Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+_OFFTHREAD_CACHE_ENV = "MONTY_OFFTHREAD_CACHE_MB"
+
+
+def _cgroup_bytes(paths: tuple[Path, ...]) -> int | None:
+    """First readable numeric value among `paths`; None = no limit set ("max") or nothing readable."""
+    for p in paths:
+        try:
+            raw = p.read_text().strip()
+        except OSError:
+            continue
+        if raw.isdigit():
+            return int(raw)
+    return None
+
+
+def _effective_ram_bytes() -> int:
+    """RAM THIS CONTAINER may actually use: the cgroup limit when it is below the machine total.
+    sysconf answers for the whole rented host — sizing Chrome off it is how the kernel ends up
+    OOM-killing the render on a memory-capped pod."""
+    host = 0
     try:
-        ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30)
-    except (ValueError, OSError):
+        host = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
         pass
+    lim = _cgroup_bytes(_CGROUP_MEM_LIMIT)
+    if lim is not None and (host <= 0 or lim < host):
+        return lim
+    return host
+
+
+def _render_concurrency() -> int:
+    """Chrome tabs to run in parallel, sized to the box: a 28-core host idled at 14% when this was fixed
+    at 4, a 2-core one thrashed. Each tab needs ~2 GB, so RAM caps it as hard as cores do — container
+    (cgroup/cpuset) numbers, not the host's."""
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cores = os.cpu_count() or 4
+    ram_gb = _effective_ram_bytes() / (1 << 30)
     by_ram = int(ram_gb // 2) if ram_gb else cores
     return max(2, min(cores - 2, by_ram, 16))
 
 
+def _offthread_cache_bytes() -> int:
+    """Explicit OffthreadVideo frame-cache bound handed to render_batch.mjs. Unset, Remotion's compositor
+    sizes it from host meminfo (cgroup-blind) — with a 4K source that alone can eat the container. A 4K
+    RGBA frame is ~33 MB, so even the 512 MiB floor holds ~15 frames of lookahead."""
+    if raw := os.environ.get(_OFFTHREAD_CACHE_ENV):
+        try:
+            if (mb := int(raw)) > 0:
+                return mb << 20
+        except ValueError:
+            pass
+    return max(512 << 20, min(2 << 30, _effective_ram_bytes() // 8))
+
+
+def _oom_count() -> int | None:
+    """The container's kernel oom_kill counter as a number, None when the cgroup will not say."""
+    from . import main as _main   # lazy: keep mograph importable without the agent's boot wiring
+    got = _main._oom_kills()
+    return int(got) if got.isdigit() else None
+
+
+def _box_facts(oom_before: int | None, conc: int, cache: int, tmp: Path) -> str:
+    """The box's state at the moment a render died, compact enough to SURVIVE THE SEAM: safe_error cuts
+    the message at 500 chars, so anything that must reach the control plane rides the front, not a tail."""
+    after = _oom_count()
+    if oom_before is None or after is None:
+        oom = "oom=?"
+    else:
+        oom = f"oom+{after - oom_before}" if after > oom_before else "oom+0"
+    cur = _cgroup_bytes(_CGROUP_MEM_CURRENT)
+    lim = _effective_ram_bytes()
+    mem = f"mem={'?' if cur is None else f'{cur / (1 << 30):.1f}'}/{lim / (1 << 30):.1f}GiB"
+    try:
+        du = shutil.disk_usage(tmp)
+        disk = f"tmp={du.free / (1 << 30):.1f}GiB-free"
+    except OSError:
+        disk = "tmp=?"
+    return f"{oom} {mem} {disk} tabs={conc} cache={cache >> 20}MiB"
+
+
 def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) -> None:
-    body = {"concurrency": _render_concurrency(), "items": items}
+    conc = _render_concurrency()
+    cache = _offthread_cache_bytes()
+    body = {"concurrency": conc, "offthreadVideoCacheSizeInBytes": cache, "items": items}
     if entry_point:
         body["entryPoint"] = entry_point
     spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+    oom_before = _oom_count()
     r = subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, capture_output=True)
     # JUDGE THE FRAMES, NOT THE EXIT CODE: headless Chrome aborts on teardown often enough (SIGABRT after every
     # sequence is already on disk) that a rc check throws away finished work and fails the whole master.
@@ -96,8 +172,10 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
             print(f"mograph: render_batch exited {r.returncode} AFTER writing every sequence "
                   f"(Chrome teardown) — keeping the frames", file=sys.stderr)
         return
-    tail = ((r.stderr or b"") + (r.stdout or b""))[-3000:].decode("utf-8", "replace")
-    raise RuntimeError(f"render_batch exited {r.returncode} with no frames for {', '.join(missing)}: {tail}")
+    full = ((r.stderr or b"") + (r.stdout or b"")).decode("utf-8", "replace")
+    print(f"mograph: render_batch stderr+stdout follows\n{full[-3000:]}", file=sys.stderr)
+    raise RuntimeError(f"render_batch exited {r.returncode} with no frames for {', '.join(missing)} "
+                       f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]: {full[-280:]}")
 
 
 def _pack(metas: list[dict], tmp: Path) -> list[dict]:

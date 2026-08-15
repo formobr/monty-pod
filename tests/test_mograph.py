@@ -1,6 +1,7 @@
 """podagent.mograph — the overlay filtergraph + public-staging (no node/chrome/ffmpeg execution)."""
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -77,16 +78,82 @@ def test_batch_with_a_missing_sequence_still_fails_loud(tmp_path: Path, monkeypa
         mograph._run_batch(rd, items, tmp_path / "spec.json", None)
 
 
-def test_render_concurrency_follows_the_box(monkeypatch) -> None:
-    """Fixed at 4, a 28-core host idled while a 2-core one thrashed — and Remotion time IS the final render."""
-    from podagent import mograph
-    monkeypatch.setattr(mograph.os, "cpu_count", lambda: 28)
-    monkeypatch.setattr(mograph.os, "sysconf", lambda k: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 16 * (1 << 30) // 4096}[k])
-    assert mograph._render_concurrency() == 8      # 16 GB RAM caps it below the 26 cores allow
+def test_render_concurrency_follows_the_container_not_the_host(monkeypatch) -> None:
+    """A rented pod is a cgroup slice of someone's machine: sizing Chrome tabs off the HOST's cores/RAM is
+    how 2 of 3 paid runs died OOM. These are negative tests — the host numbers must LOSE."""
+    monkeypatch.setattr(mograph.os, "sched_getaffinity", lambda pid: set(range(28)))
+    monkeypatch.setattr(mograph.os, "sysconf",
+                        lambda k: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 256 * (1 << 30) // 4096}[k])
+    monkeypatch.setattr(mograph, "_cgroup_bytes",
+                        lambda paths: (16 << 30) if paths is mograph._CGROUP_MEM_LIMIT else None)
+    assert mograph._render_concurrency() == 8      # 16 GiB cgroup limit caps it, not the 256 GiB host
 
-    monkeypatch.setattr(mograph.os, "cpu_count", lambda: 2)
-    assert mograph._render_concurrency() == 2      # never below 2, never (cores-2)=0
+    monkeypatch.setattr(mograph, "_cgroup_bytes", lambda paths: None)
+    assert mograph._render_concurrency() == 16     # no limit → host total, hard ceiling 16
 
-    monkeypatch.setattr(mograph.os, "cpu_count", lambda: 64)
-    monkeypatch.setattr(mograph.os, "sysconf", lambda k: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 256 * (1 << 30) // 4096}[k])
-    assert mograph._render_concurrency() == 16     # hard ceiling: Chrome stops scaling long before 62
+    monkeypatch.setattr(mograph.os, "sched_getaffinity", lambda pid: {0, 1})
+    assert mograph._render_concurrency() == 2      # cpuset of 2 caps regardless of RAM; never below 2
+
+
+def test_a_v1_unlimited_sentinel_does_not_beat_the_host_total(monkeypatch) -> None:
+    """cgroup v1 'no limit' is a huge number, not 'max' — reading it as the budget re-opens the OOM."""
+    monkeypatch.setattr(mograph.os, "sysconf",
+                        lambda k: {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 32 * (1 << 30) // 4096}[k])
+    monkeypatch.setattr(mograph, "_cgroup_bytes",
+                        lambda paths: (1 << 62) if paths is mograph._CGROUP_MEM_LIMIT else None)
+    assert mograph._effective_ram_bytes() == 32 << 30
+
+
+def test_cgroup_max_sentinel_is_not_a_number(tmp_path: Path) -> None:
+    v2 = tmp_path / "memory.max"; v2.write_text("max\n")
+    assert mograph._cgroup_bytes((v2,)) is None                    # "max" = no limit, NOT zero
+    v1 = tmp_path / "limit_in_bytes"; v1.write_text("17179869184\n")
+    assert mograph._cgroup_bytes((v2, v1)) == 17179869184          # falls through to the readable file
+
+
+def test_offthread_cache_is_clamped_and_overridable(monkeypatch) -> None:
+    monkeypatch.delenv("MONTY_OFFTHREAD_CACHE_MB", raising=False)
+    monkeypatch.setattr(mograph, "_effective_ram_bytes", lambda: 64 << 30)
+    assert mograph._offthread_cache_bytes() == 2 << 30             # ceiling: ram/8 would be 8 GiB
+    monkeypatch.setattr(mograph, "_effective_ram_bytes", lambda: 2 << 30)
+    assert mograph._offthread_cache_bytes() == 512 << 20           # floor: ram/8 would be 256 MiB
+    monkeypatch.setenv("MONTY_OFFTHREAD_CACHE_MB", "1024")
+    assert mograph._offthread_cache_bytes() == 1 << 30             # explicit knob wins
+
+
+def test_batch_spec_carries_an_explicit_offthread_cache(tmp_path: Path, monkeypatch) -> None:
+    """A spec WITHOUT the bound reverts Remotion to host-meminfo cache sizing — the exact OOM this kills."""
+    rd = tmp_path / "rd"; rd.mkdir()
+    items = _batch_items(tmp_path, ["Compare"])
+    monkeypatch.setattr(mograph, "_offthread_cache_bytes", lambda: 1 << 30)
+    monkeypatch.setattr(mograph, "_oom_count", lambda: 0)
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, b"", b""))
+    spec = tmp_path / "spec.json"
+    mograph._run_batch(rd, items, spec, None)
+    assert json.loads(spec.read_text())["offthreadVideoCacheSizeInBytes"] == 1 << 30
+
+
+def test_a_frameless_failure_carries_the_box_facts_up_front(tmp_path: Path, monkeypatch) -> None:
+    """safe_error cuts the wire message at 500 chars; facts buried behind a 3000-byte Chrome tail never
+    reached the control plane — that blindness is the diagnostic half of this wave."""
+    rd = tmp_path / "rd"; rd.mkdir()
+    items = _batch_items(tmp_path, ["SplitScreen", "TitleFX"], write_frames=False)
+    samples = iter([3, 5])
+    monkeypatch.setattr(mograph, "_oom_count", lambda: next(samples))
+    monkeypatch.setattr(mograph, "_render_concurrency", lambda: 6)
+    monkeypatch.setattr(mograph, "_offthread_cache_bytes", lambda: 1536 << 20)
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, b"", b"x" * 5000 + b"crashed"))
+    with pytest.raises(RuntimeError) as ei:
+        mograph._run_batch(rd, items, tmp_path / "spec.json", None)
+    msg = str(ei.value)
+    assert "no frames for SplitScreen, TitleFX" in msg
+    assert "oom+2" in msg and "tabs=6" in msg and "cache=1536MiB" in msg
+    assert msg.index("cache=1536MiB") < 500        # facts must SURVIVE safe_error's 500-char cut
+
+
+def test_an_unreadable_oom_counter_is_not_reported_as_zero(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(mograph, "_oom_count", lambda: None)
+    facts = mograph._box_facts(None, 4, 512 << 20, tmp_path)
+    assert "oom=?" in facts and "oom+" not in facts
