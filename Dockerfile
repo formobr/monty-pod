@@ -102,8 +102,8 @@ ENV REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
 # under driver <610.00 — newer than any host our providers rent, so that image could not encode at all and
 # every render died. A moving ffmpeg is a supply chain, and this one has to be pinned like any other.
 # Bumping it: verify the new build opens h264_nvenc against the fleet's driver BEFORE publishing an image pin.
-ARG FFMPEG_BUILD=autobuild-2026-08-01-13-21
-ARG FFMPEG_ASSET=ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1.tar.xz
+ARG FFMPEG_BUILD=autobuild-2026-08-15-13-02
+ARG FFMPEG_ASSET=ffmpeg-n8.1.2-44-g7c533d0f86-linux64-gpl-8.1.tar.xz
 # `/releases/download/<tag>/`, NOT `/releases/latest/download/`: the second means "the newest release",
 # which on any day BtbN cuts a dated autobuild carries only version-stamped asset names — the URL 404s, curl
 # without --fail writes the error page, and tar dies with "File format not recognized" three lines later.
