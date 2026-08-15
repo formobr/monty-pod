@@ -24,10 +24,11 @@ _BT709 = ("-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt
 
 # Twin of scripts/montyops/camera_apply.py.VULKAN_PROBE and podagent.main.VULKAN_PROBE; pinned in the
 # superproject parity test because the baked camera and live preview must ask the same question.
+# NVENC min frame dimension on newer GPUs exceeds 32; a tiny probe frame false-fails the whole GPU.
 VULKAN_PROBE = (
     "ffmpeg", "-hide_banner", "-loglevel", "error", "-init_hw_device", "vulkan",
-    "-f", "lavfi", "-i", "testsrc=duration=0.1:size=64x64:rate=10",
-    "-vf", "format=yuv420p,hwupload,libplacebo=w=32:h=32,hwdownload,format=yuv420p",
+    "-f", "lavfi", "-i", "testsrc=duration=0.1:size=256x256:rate=10",
+    "-vf", "format=yuv420p,hwupload,libplacebo=w=256:h=256,hwdownload,format=yuv420p",
     "-c:v", "h264_nvenc", "-f", "null", "-",
 )
 
