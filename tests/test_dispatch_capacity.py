@@ -53,6 +53,7 @@ def test_capacity_advertises_worker_credit_limits(monkeypatch):
         "fetch_workers": 7,
         "claim_capacity": {"ops": 4, "rank": 1, "heavy": 1},
         "boot_id": agent_main.BOOT_ID,
+        "vulkan": False,
     }
 
 
@@ -106,6 +107,7 @@ def test_capacity_has_no_way_to_spell_a_peak_reading_at_all():
 
 
 def test_existing_callers_that_never_pass_vram_are_unaffected():
-    """The default is additive: a caller written before this field existed gets the exact old shape."""
+    """The default keeps the new capability fact explicit when no probe verdict was supplied yet."""
     capacity = agent_main.capacity_payload(rank_lanes=3, fetch_workers=7)
     assert "vram_total_mb" not in capacity and "vram_peak_used_mb" not in capacity
+    assert capacity["vulkan"] is False

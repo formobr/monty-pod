@@ -33,6 +33,45 @@ def _run(returncode: int = 0, stderr: bytes = b"") -> object:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=b"", stderr=stderr)
 
 
+def test_a_vulkan_probe_warns_and_returns_false_when_the_camera_path_is_unavailable(monkeypatch):
+    cp = _CP()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _run(1, b"first detail\nVK_ERROR_INCOMPATIBLE_DRIVER\n"))
+    assert agent_main._vulkan_preflight(cp) is False
+    warnings = [e for e in cp.events if e.get("status") == "step"]
+    assert warnings and warnings[0]["step"].startswith("WARNING VULKAN UNAVAILABLE: exit 1:")
+    assert "VK_ERROR_INCOMPATIBLE_DRIVER" in warnings[0]["step"]
+    assert cp.waits == [True]
+
+
+def test_vulkan_probe_warning_keeps_head_and_tail_and_vulkaninfo_summary(monkeypatch):
+    cp = _CP()
+    root = b"VK_ERROR_INCOMPATIBLE_DRIVER\n"
+    stderr = root + (b"middle-noise\n" * 200) + b"generic ffmpeg tail\n"
+    seen: list[tuple[list[str], int]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        seen.append((list(cmd), kwargs["timeout"]))
+        if str(cmd[0]).endswith("vulkaninfo"):
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"GPU0: NVIDIA summary\n", stderr=b"")
+        return _run(1, stderr)
+
+    monkeypatch.setattr(agent_main.shutil, "which", lambda name: "/usr/bin/vulkaninfo" if name == "vulkaninfo" else None)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert agent_main._vulkan_preflight(cp) is False
+    step = cp.events[0]["step"]
+    assert "VK_ERROR_INCOMPATIBLE_DRIVER" in step
+    assert "generic ffmpeg tail" in step
+    assert "vulkaninfo: GPU0: NVIDIA summary" in step
+    assert len(step) < 1400
+    assert seen[0][1] == 120 and seen[1][0] == ["/usr/bin/vulkaninfo", "--summary"]
+    assert cp.waits == [True]
+
+
+def test_capacity_publishes_the_vulkan_capability_fact():
+    payload = agent_main.capacity_payload(rank_lanes=1, fetch_workers=1, vulkan=False)
+    assert payload["vulkan"] is False
+
+
 def test_a_working_encoder_lets_the_pod_go_on(monkeypatch):
     cp = _CP()
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _run(0))
@@ -144,8 +183,9 @@ def test_ready_is_sent_synchronously_only_after_a_successful_probe(monkeypatch):
     cp = _OrderedCP()
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: timeline.append("boot"))
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: timeline.append("probe"))
+    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: timeline.append("vulkan"))
     agent_main._capability_preflight(cp)
-    assert timeline == ["boot", "probe", "ready"]
+    assert timeline == ["boot", "probe", "vulkan", "ready"]
     assert cp.events == [{
         "stage": "boot", "status": "step", "phase": "ready",
         "step": "capability preflight passed",
@@ -156,6 +196,7 @@ def test_ready_is_sent_synchronously_only_after_a_successful_probe(monkeypatch):
 def test_a_failed_probe_never_emits_ready(monkeypatch):
     cp = _CP()
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: pytest.fail("vulkan probe reached"))
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _run(218, b"driver mismatch"))
     with pytest.raises(SystemExit):
         agent_main._capability_preflight(cp)
@@ -185,6 +226,7 @@ def test_main_never_reaches_dispatch_when_ready_ack_is_ambiguous(monkeypatch):
     monkeypatch.setattr(agent_main, "_log_gpu_status", lambda: None)
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_dispatch_loop", _dispatch)
 
     with pytest.raises(agent_main.DeliveryPending, match="readiness ACK remains ambiguous"):

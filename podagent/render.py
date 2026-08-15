@@ -4,6 +4,7 @@ module only translates those numbers into a filtergraph and an argv."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,6 +21,15 @@ from .models import MotionKeyframe, RenderSpec, SpecBrollClip, SpecTransition
 _P_STYLE = re.compile(r"p\d+")  # NVENC preset names (p1..p7); libx264 can't take these
 # delivery signal: TAG bt709 (no convert — untagged made platforms guess the colourspace)
 _BT709 = ("-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709")
+
+# Twin of scripts/montyops/camera_apply.py.VULKAN_PROBE and podagent.main.VULKAN_PROBE; pinned in the
+# superproject parity test because the baked camera and live preview must ask the same question.
+VULKAN_PROBE = (
+    "ffmpeg", "-hide_banner", "-loglevel", "error", "-init_hw_device", "vulkan",
+    "-f", "lavfi", "-i", "testsrc=duration=0.1:size=64x64:rate=10",
+    "-vf", "format=yuv420p,hwupload,libplacebo=w=32:h=32,hwdownload,format=yuv420p",
+    "-c:v", "h264_nvenc", "-f", "null", "-",
+)
 
 
 def _venc(enc, gpu: bool) -> list[str]:
@@ -493,15 +503,11 @@ def _gpu_available() -> bool:
     """One cached REAL smoke render — an encoder merely being listed proves nothing about the
     Vulkan/libplacebo/NVENC path actually working on this box."""
     global _GPU
+    if os.environ.get("MONTY_GPU_MOTION") == "0":
+        return False
     if _GPU is None:
         try:
-            probe = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-init_hw_device", "vulkan",
-                 "-f", "lavfi", "-i", "testsrc=duration=0.1:size=64x64:rate=10",
-                 "-vf", "format=yuv420p,hwupload,libplacebo=w=32:h=32,hwdownload,format=yuv420p",
-                 "-c:v", "h264_nvenc", "-f", "null", "-"],
-                capture_output=True, timeout=30,
-            )
+            probe = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=120)
             _GPU = probe.returncode == 0
         except (OSError, subprocess.SubprocessError):
             _GPU = False
@@ -569,10 +575,20 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                 f"landed — W2): {unimplemented}")
 
     with phase("gpu_probe"):
-        gpu = _gpu_available()
+        cpu_requested = os.environ.get("MONTY_OPS_CPU_ENCODE") == "1"
+        motion_disabled = os.environ.get("MONTY_GPU_MOTION") == "0"
+        deliberate_cpu = cpu_requested or motion_disabled
+        gpu = not deliberate_cpu and _gpu_available()
     if not gpu and spec.motion is not None and spec.motion.segments:
-        print("no NVENC: camera motion degrades to a static crop at the first keyframe",
-              file=sys.stderr)
+        if deliberate_cpu:
+            print("no NVENC: camera motion degrades to a static crop at the first keyframe", file=sys.stderr)
+        elif os.environ.get("MONTY_ALLOW_STATIC_CAMERA") != "1":
+            raise RuntimeError(
+                "camera.apply: GPU (Vulkan+libplacebo+NVENC) unavailable — refusing a static-crop master; "
+                "set MONTY_ALLOW_STATIC_CAMERA=1 to accept degradation")
+        else:
+            print("camera.apply: GPU unavailable — degrading to a static crop at the first keyframe "
+                  "(MONTY_ALLOW_STATIC_CAMERA=1)", file=sys.stderr)
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

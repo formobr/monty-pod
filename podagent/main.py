@@ -7,6 +7,7 @@ import concurrent.futures as cf
 import contextlib
 import json
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -47,6 +48,15 @@ _OPS_MAX_CHAINS_ENV = "OPS_MAX_CHAINS"
 _OPS_MAX_CHAINS_DEFAULT = 8
 _OPS_CLAIM_MAX = 4
 
+# Twin of podagent.render.VULKAN_PROBE and scripts/montyops/camera_apply.py.VULKAN_PROBE; pin all three
+# copies in the superproject parity test.
+VULKAN_PROBE = (
+    "ffmpeg", "-hide_banner", "-loglevel", "error", "-init_hw_device", "vulkan",
+    "-f", "lavfi", "-i", "testsrc=duration=0.1:size=64x64:rate=10",
+    "-vf", "format=yuv420p,hwupload,libplacebo=w=32:h=32,hwdownload,format=yuv420p",
+    "-c:v", "h264_nvenc", "-f", "null", "-",
+)
+
 # Two pools now run infer and both can miss the SAME weights hash at the same instant — a second 4.6 GB
 # SigLIP is an OOM, not a cache miss.
 _SVC_LOAD_LOCK = threading.Lock()
@@ -85,7 +95,8 @@ life, and nvidia-smi has no such query. So: a real total, and a named absence ra
 
 
 def capacity_payload(*, rank_lanes: int, fetch_workers: int,
-                     vram_total_mb: float | None = None) -> dict[str, Any]:
+                     vram_total_mb: float | None = None,
+                     vulkan: bool = False) -> dict[str, Any]:
     """Advertise diagnostics, bounded per-class credits, and the card's VRAM total when known (CAPACITY_VRAM_WHY)."""
     payload: dict[str, Any] = {
         "rank_lanes": int(rank_lanes),
@@ -96,6 +107,7 @@ def capacity_payload(*, rank_lanes: int, fetch_workers: int,
             "heavy": 1,
         },
         "boot_id": BOOT_ID,
+        "vulkan": bool(vulkan),
     }
     if vram_total_mb is not None:
         payload["vram_total_mb"] = float(vram_total_mb)
@@ -305,6 +317,49 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
         _log(f"NVENC refusal delivery failed: {safe_error(e)}")
     _mark_stopped()
     sys.exit(3)
+
+
+def _vulkan_preflight(cp: "ControlPlane") -> bool:
+    """Return Vulkan verdict; an absent GPU is a routable fact, not a boot refusal."""
+    import subprocess
+    # Twin of podagent.render.VULKAN_PROBE and scripts/montyops/camera_apply.py.VULKAN_PROBE.
+    try:
+        r = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        detail = f"{type(e).__name__}: {e}"
+    else:
+        if r.returncode == 0:
+            _log("vulkan/libplacebo probe OK — motion path opens on this host")
+            return True
+        detail = f"exit {r.returncode}: {_bounded_stderr(r.stderr or b'')}"
+    if summary := _vulkaninfo_summary():
+        detail = f"{detail} · {summary}"
+    warning = f"WARNING VULKAN UNAVAILABLE: {safe_text(detail)}"
+    _log(warning)
+    try:
+        cp.send_event({"stage": "boot", "status": "step", "phase": "work_finished", "step": warning},
+                      wait=True)
+    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
+        _log(f"Vulkan warning delivery failed: {safe_error(e)}")
+    return False
+
+
+def _vulkaninfo_summary() -> str:
+    """Return one useful vulkaninfo line, if the image carries the diagnostic binary."""
+    import subprocess
+    exe = shutil.which("vulkaninfo")
+    if not exe:
+        return ""
+    try:
+        r = subprocess.run([exe, "--summary"], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    raw = r.stdout or r.stderr or b""
+    lines = [safe_text(line.strip()) for line in raw.decode("utf-8", "replace").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    line = next((line for line in lines if any(k in line for k in ("deviceName", "GPU", "driverName"))), lines[-1])
+    return f"vulkaninfo: {line}"
 
 
 def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None) -> None:
@@ -695,6 +750,10 @@ def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, Any] | None =
     """Report the boot, prove the encoder, then make readiness an ACKed admission barrier."""
     _report_boot(cp)
     _nvenc_or_refuse(cp)
+    if capacity is not None:
+        capacity["vulkan"] = _vulkan_preflight(cp)
+    else:
+        _vulkan_preflight(cp)
     _report_ready(cp, capacity=capacity)
 
 

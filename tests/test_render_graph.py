@@ -71,6 +71,53 @@ def test_gpu_vs_cpu_motion() -> None:
     assert "crop=w=iw*0.8:h=ih*0.8:x=iw*0.1:y=ih*0.05" in c
 
 
+def test_motion_refuses_static_crop_without_explicit_escape(monkeypatch) -> None:
+    spec = _spec("spec.preview.json")
+    events: list[dict] = []
+    monkeypatch.delenv("MONTY_ALLOW_STATIC_CAMERA", raising=False)
+    monkeypatch.setattr(render, "_gpu_available", lambda: False)
+
+    class _CP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            events.append(payload)
+            return True
+
+    with pytest.raises(RuntimeError, match="refusing a static-crop master"):
+        render.render_spec(spec, _CP())
+    assert any(e.get("phase") == "gpu_probe_finished" for e in events)
+    assert not any(e.get("op") == "download" for e in events)
+
+
+def test_motion_deliberate_switch_keeps_the_old_degrade_path(monkeypatch, capsys) -> None:
+    spec = _spec("spec.preview.json")
+    monkeypatch.delenv("MONTY_ALLOW_STATIC_CAMERA", raising=False)
+    monkeypatch.setenv("MONTY_GPU_MOTION", "0")
+    monkeypatch.setattr(render, "_gpu_available", lambda: pytest.fail("deliberate switch must skip probe"))
+
+    class _CP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            return True
+
+        def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+            return True
+
+    def fake_download(_url: str, dest: Path) -> Path:
+        dest.write_bytes(b"media")
+        return dest
+
+    class _Done:
+        returncode = 0
+        stderr = b""
+
+    monkeypatch.setattr(render, "download", fake_download)
+    monkeypatch.setattr(render, "upload", lambda *_a, **_kw: None)
+    monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: _Done())
+    render.render_spec(spec, _CP())
+    assert capsys.readouterr().err.splitlines()[0] == (
+        "no NVENC: camera motion degrades to a static crop at the first keyframe"
+    )
+
+
 def test_build_command_encode_flags() -> None:
     spec = _spec("spec.preview.json")
     ipaths = {i.id: Path(f"/work/{i.id}") for i in spec.inputs}
@@ -128,6 +175,7 @@ def test_multi_source_input_order() -> None:
 
 def test_render_download_ffmpeg_upload_boundaries_are_structured(monkeypatch, tmp_path) -> None:
     spec = _spec("spec.preview.json")
+    monkeypatch.setenv("MONTY_ALLOW_STATIC_CAMERA", "1")
     events: list[dict] = []
     results: list[dict] = []
 

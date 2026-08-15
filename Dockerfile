@@ -27,14 +27,15 @@ ENV PYTHONUNBUFFERED=1
 # what we actually need. A host too old for the kernels we load fails loudly in the boot beacon instead.
 ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
 
-# --- system: python3.11 (via deadsnakes, ubuntu22.04 ships 3.10) + headless-chrome's runtime deps
-# (standard puppeteer list). fontconfig stays: libass resolves caption fonts through it. librsvg2-bin is
+# --- system: python3.11 (via deadsnakes, ubuntu22.04 ships 3.10) + bundled-browser runtime deps
+# (standard Remotion list). fontconfig stays: libass resolves caption fonts through it. librsvg2-bin is
 # the SVG rasteriser media.still needs: without one on the box, every vector artwork fails to materialise
 # and the job ships a black card instead — a failure nothing errors on. ~2 MB on top of the cairo/pango
-# libraries chrome already pulls in. ------------------------------------------------------------------
+# libraries the bundled browser uses. ------------------------------------------------------------------
+# libvulkan1 is the Vulkan loader ffmpeg libplacebo dlopen's; vulkan-tools supplies vulkaninfo diagnostics.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common curl xz-utils ca-certificates gnupg \
-        fonts-dejavu-core fontconfig librsvg2-bin \
+        fonts-dejavu-core fontconfig librsvg2-bin libvulkan1 vulkan-tools \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3.11-distutils \
@@ -89,19 +90,11 @@ RUN set -eux; \
 # ── the shipped image ────────────────────────────────────────────────────────────────────────────────
 FROM base
 
-# --- node 20 + chrome stable: the RUNTIME for mograph. ~243 MB, and unlike the bundle it is genuinely
-# image-shaped — it is a binary toolchain, not content, so it neither churns with our code nor differs
-# per brand. The bundle it executes (node_modules + src, 506 MB) is NOT here: that arrives per job as a
-# presigned tar cached by content hash, so a pod that renders no mograph pays for none of it. -------
+# --- node 20: the Remotion runtime; its pinned headless shell arrives inside each content-addressed bundle.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && curl -L -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
-    && rm -rf /tmp/chrome.deb /var/lib/apt/lists/*
-# Remotion must use the chrome we installed, never download its own at render time: a rented pod may have
-# blocked egress, and a silent per-job browser fetch is exactly the cold-start cost this lane exists to avoid.
-ENV REMOTION_CHROME_EXECUTABLE=/usr/bin/google-chrome-stable \
-    REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
+    && rm -rf /var/lib/apt/lists/*
+ENV REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
 
 # --- ffmpeg: BtbN static build (NVENC + libplacebo, not in ubuntu22.04 apt) -
 # PINNED to a dated autobuild's RELEASE-BRANCH asset, not the rolling `master-latest`. Master is built against
@@ -169,7 +162,7 @@ COPY podagent/ ./podagent/
 COPY contracts/ ./contracts/
 RUN python3 -m pip install --no-cache-dir --no-deps .
 
-# mograph is now COMPLETE on the pod: node+chrome above are the runtime, and the Remotion bundle
+# mograph is now COMPLETE on the pod: node above is the runtime, and the Remotion bundle
 # (node_modules + src + render_batch.mjs) is delivered per job as `motion_plan.bundle` — a presigned tar
 # cached under REMOTION_BUNDLE_CACHE by content hash, same shape as weights (podagent/bundle.py). The
 # contract refuses sections without a bundle, so a mis-deployed pod fails loud instead of quietly
