@@ -56,19 +56,25 @@ _POS = {
 }
 WM_CANVAS_W = 1200
 WM_CANVAS_H = 600
+FILM_BURN_RENDER_TIMEOUT_S = 1800
 
 
-def _run(cmd: list[str], what: str) -> None:
+def _run(cmd: list[str], what: str, *, timeout_s: int | None = None) -> None:
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        if timeout_s is None:
+            subprocess.run(cmd, check=True, capture_output=True)
+        else:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout_s)
     except subprocess.CalledProcessError as exc:
         tail = (exc.stderr or b"")[-2000:]
         detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
         raise RuntimeError(f"{what} ffmpeg exited {exc.returncode}: {detail}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{what} ffmpeg timed out after {timeout_s}s") from exc
 
 
-def _probe(path: Path) -> tuple[int, int, float, float]:
-    """(width, height, fps, duration) of the master — the accent macros need the real canvas + rate."""
+def _probe(path: Path) -> tuple[int, int, float, int, int, float]:
+    """(width, height, fps, fps_num, fps_den, duration) of the master."""
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height,r_frame_rate", "-of", "default=nw=1:nk=1", str(path)],
@@ -79,7 +85,7 @@ def _probe(path: Path) -> tuple[int, int, float, float]:
     dur = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
         capture_output=True, text=True, check=True).stdout.strip()
-    return w, h, fps, float(dur)
+    return w, h, fps, int(num), int(den), float(dur)
 
 
 def _has_audio(path: Path) -> bool:
@@ -91,11 +97,60 @@ def _has_audio(path: Path) -> bool:
 
 # --- 1. frame accents ---------------------------------------------------------
 
-def apply_accents(fin, src: Path, out: Path, gpu: bool) -> Path:
+def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
+    burns = [a for a in fin.accents if a.kind == "film_burn"]
+    singles = [a for a in fin.accents if a.kind != "film_burn"]
+    burn_ids = {a.burn for a in burns}
+    if len(burn_ids) != 1:
+        raise RuntimeError("all film_burn accents must share one burn input id")
+    intensities = {float(a.intensity) for a in burns}
+    if len(intensities) != 1:
+        raise RuntimeError("all film_burn accents must share one intensity")
+    burn_id = next(iter(burn_ids))
+    burn_path = input_paths.get(burn_id)
+    if burn_path is None:
+        raise RuntimeError(f"film_burn accent burn input {burn_id!r} is not resolved")
+
+    boundaries = sorted(float(a.at) for a in burns)
+    if len(boundaries) > _accents.MAX_FILM_BURN_BOUNDARIES:
+        raise RuntimeError(
+            f"film_burn boundary count {len(boundaries)} exceeds cap "
+            f"{_accents.MAX_FILM_BURN_BOUNDARIES}; registry law: film burns are a RARE accent, 2-3/video"
+        )
+    w, h, fps, fps_num, fps_den, _ = _probe(src)
+    flares = _accents.detect_flares(burn_path)
+    if singles:
+        fc = _accents.build_chain_filter(singles, fps=fps, w=w, h=h, gpu=gpu)
+        if fc is None:
+            raise RuntimeError("ordinary accent chain unexpectedly empty")
+        prefix, terminal = fc.rsplit("[vout]", 1)
+        parts = [prefix + "[preburn]" + terminal]
+        prev = "[preburn]"
+    else:
+        parts, prev = [], "[0:v]"
+    parts, prev = _accents.add_offset_jump(parts, prev, boundaries, w=w, h=h)
+    parts, prev = _accents.add_filmburn(
+        parts, prev, 1, boundaries, flares, opacity=float(burns[0].intensity), w=w, h=h,
+        fps=_accents.FPS if (fps_num, fps_den) == (60000, 1001) else f"{fps:.4f}",
+    )
+    script = out.with_name(out.name + ".filter_complex")
+    script.write_text(";".join(parts) + "\n", encoding="utf-8")
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           *( ["-init_hw_device", "vulkan"] if gpu else []), "-i", str(src),
+           "-stream_loop", "-1", "-i", str(burn_path), "-filter_complex_script", str(script),
+           "-map", prev, "-map", "0:a?",
+           *(_MID_GPU if gpu else _MID_CPU),
+           "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
+    _run(cmd, "film burn accents", timeout_s=FILM_BURN_RENDER_TIMEOUT_S)
+    return out
+
+def apply_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
     """Chain the resolved frame-accents over the FULL master in one pass. No accents -> `src` unchanged."""
     if not fin.accents:
         return src
-    w, h, fps, _ = _probe(src)
+    if any(a.kind == "film_burn" for a in fin.accents):
+        return _apply_film_burn_accents(fin, src, out, input_paths, gpu)
+    w, h, fps, _, _, _ = _probe(src)
     fc = _accents.build_chain_filter(fin.accents, fps=fps, w=w, h=h, gpu=gpu)
     if fc is None:
         return src
@@ -135,7 +190,7 @@ def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool, *,
     # tail is exactly `cover_hold` s long, and only this box knows the welded master's real duration.
     # Held back unless a cover WAS welded — `src` is then pure body, and subtracting a tail that does
     # not exist deletes the logo from the last `cover_hold` seconds of live picture.
-    body_end = max(0.0, _probe(src)[3] - (logo.cover_hold if cover_welded else 0.0))
+    body_end = max(0.0, _probe(src)[5] - (logo.cover_hold if cover_welded else 0.0))
     fc = body_logo_filter(logo.corner, logo.width, logo.opacity, logo.margin, body_end)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-i", str(asset),
            "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
@@ -211,7 +266,7 @@ def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> 
     audio_map = f"[{out_a}]" if out_a else ("0:a" if has_audio else None)
     cmd += ["-map", audio_map] if audio_map else ["-an"]
     if not has_audio:
-        cmd += ["-t", f"{_probe(src)[3]:.3f}"]
+        cmd += ["-t", f"{_probe(src)[5]:.3f}"]
     cmd += [*(_FINAL_GPU if gpu else _FINAL_CPU),
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
     _run(cmd, "watermark")
@@ -277,7 +332,7 @@ def finalize(fin, master: Path, input_paths: dict, tmp: Path, gpu: bool, *,
     Each step returns its input unchanged when its block is absent, so a spec that carries only some
     of the tail (a partner deliverable with no logo and no watermark) walks the same code path — the
     two transports cannot diverge on which steps they honour, because there is only one of them."""
-    out = apply_accents(fin, master, tmp / "fin_accents.mp4", gpu)
+    out = apply_accents(fin, master, tmp / "fin_accents.mp4", input_paths, gpu)
     out = apply_logo(fin, out, tmp / "fin_logo.mp4", input_paths, gpu, cover_welded=cover_welded)
     out = apply_watermark(fin, out, tmp / "fin_wm.mp4", input_paths, gpu)
     return apply_loudnorm(fin, out, tmp / "fin_ln.mp4")

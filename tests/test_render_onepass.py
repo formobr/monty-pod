@@ -504,7 +504,7 @@ def test_the_multipass_watermark_still_says_an_with_no_audio_at_all(monkeypatch,
     cmds = []
     monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
     monkeypatch.setattr(finalize, "_has_audio", lambda _p: False)
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 10.0))
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
     spec = _spec(_no_chime)
     finalize.apply_watermark(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
                              _paths(spec, tmp_path), False)
@@ -598,7 +598,7 @@ def test_the_multipass_logo_reserves_a_tail_only_when_one_was_welded(
     unconditionally, so subtracting it unasked deleted the logo from the last 0.6s of live body."""
     cmds = []
     monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 10.0))
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
     spec = _spec()
     finalize.apply_logo(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
                         _paths(spec, tmp_path), False, cover_welded=cover_welded)

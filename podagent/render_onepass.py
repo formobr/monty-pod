@@ -113,6 +113,8 @@ def preflight(spec: RenderSpec) -> None:
         unimplemented.append("cover")
     fin = ov.finalize
     if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
+        # Production film-burn compositing belongs to finalize's multi-pass graph; this one-pass
+        # graph intentionally keeps refusing the junction until it can composite that graph safely.
         unimplemented.append("finalize.accents[kind=film_burn]")
     if unimplemented:
         raise NotImplementedError(

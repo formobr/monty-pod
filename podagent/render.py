@@ -565,16 +565,11 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         if spec.overlays.opener is not None:
             unimplemented.append("opener")
         fin = spec.overlays.finalize
-        if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
-            unimplemented.append("finalize.accents[kind=film_burn]")
         if unimplemented:
-            # opener/film_burn (contract v6, E-W1) declare the single-pass junction assets but this
-            # module is still the multi-pass translator — landing render_onepass (W2) is what actually
-            # executes them. Refusing here (not a KeyError deep in accents.BUILDERS) keeps a v6 spec
-            # from silently half-rendering on a pod that cannot weld the opener or burn the body seam.
+            # opener (contract v6) declares a junction asset, but this multi-pass translator still
+            # cannot weld it. Refuse before execution rather than half-rendering a v6 spec.
             raise NotImplementedError(
-                f"final overlay(s) not yet composited on the pod (single-pass render_onepass not "
-                f"landed — W2): {unimplemented}")
+                f"final overlay(s) not yet composited on the pod multi-pass path: {unimplemented}")
 
     with phase("gpu_probe"):
         cpu_requested = os.environ.get("MONTY_OPS_CPU_ENCODE") == "1"

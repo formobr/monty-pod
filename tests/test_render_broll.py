@@ -97,15 +97,11 @@ def test_dissolve_is_alpha_fade_not_overlay_move():
 @pytest.mark.parametrize("overlays,expected", [
     pytest.param({"trims": [{"a": 1.0, "b": 2.0}]}, "trims", id="trims"),
     pytest.param({"opener": {"cold": "base"}}, "opener", id="opener"),
-    pytest.param(
-        {"finalize": {"accents": [{"kind": "film_burn", "at": 1.0, "intensity": 0.5,
-                                   "burn": "base", "clicks": "base"}]}},
-        "film_burn", id="film_burn_accent"),
 ])
 def test_render_spec_fails_loud_on_unimplemented_overlays(monkeypatch, overlays, expected):
-    """trims/opener/film_burn are the overlays still unimplemented on the pod (broll/music/cover/sfx/
-    captions/mograph are done; opener/film_burn are single-pass prep — E-W1 — that render_onepass, W2,
-    will execute). The refusal must fire BEFORE any execution-side call: monkeypatching gpu_probe/download
+    """trims/opener are the overlays still unimplemented on the pod (broll/music/cover/sfx/
+    captions/mograph and multi-pass film_burn are done). The refusal must fire BEFORE any execution-side call:
+    monkeypatching gpu_probe/download
     to explode, and a send_event stub that asserts it's never reached, proves the NotImplementedError
     lands ahead of both — not a KeyError deep in accents.BUILDERS or a half-rendered master."""
     spec = RenderSpec.model_validate({

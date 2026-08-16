@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import random
 import re
+import subprocess
 
 SS = 2  # supersample factor for any zoompan x/y move
 _PI = 3.14159265358979
+
+W, H = 1080, 1920
+FPS = "60000/1001"
 
 
 def _clamp01(x: float) -> float:
@@ -336,6 +340,143 @@ def pixelate_filter(at: float, *, intensity: float = 0.6, frames: int = 10, fps:
     )
 
 
+# --- film_burn -----------------------------------------------------------------
+
+FILM_BURN_PROBE_TIMEOUT_S = 30
+FILM_BURN_DECODE_TIMEOUT_S = 120
+MAX_FILM_BURN_BOUNDARIES = 8
+
+def _subprocess_error(what: str, result) -> RuntimeError:
+    detail = getattr(result, "stderr", b"") or b""
+    if isinstance(detail, bytes):
+        detail = detail.decode("utf-8", "replace")
+    return RuntimeError(f"film_burn {what} failed: {str(detail)[-2000:]}")
+
+
+def detect_flares(clip: str) -> list[float]:
+    """Find bright flare moments in a burn clip; malformed media is a hard error."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(clip)],
+            capture_output=True, text=True, timeout=FILM_BURN_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"film_burn duration probe failed: timed out after {FILM_BURN_PROBE_TIMEOUT_S}s") from exc
+    if probe.returncode != 0:
+        raise _subprocess_error("duration probe", probe)
+    try:
+        dur = float((probe.stdout or "").strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("film_burn duration probe returned an undecodable duration") from exc
+    try:
+        raw_result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(clip),
+             "-vf", "scale=8:8,format=gray", "-f", "rawvideo", "-"],
+            capture_output=True, timeout=FILM_BURN_DECODE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"film_burn flare decode failed: timed out after {FILM_BURN_DECODE_TIMEOUT_S}s") from exc
+    if raw_result.returncode != 0:
+        raise _subprocess_error("flare decode", raw_result)
+    raw = raw_result.stdout or b""
+    if dur <= 0 or len(raw) < 3 * 64 or len(raw) % 64:
+        raise RuntimeError("film_burn asset is empty or undecodable")
+    n = len(raw) // 64
+    vals = [sum(raw[i * 64:(i + 1) * 64]) / 64.0 for i in range(n)]
+    fps = n / dur
+    th = max(vals) * 0.4
+    flares: list[float] = []
+    for i in range(1, n - 1):
+        if vals[i] > th and vals[i] >= vals[i - 1] and vals[i] >= vals[i + 1]:
+            t = i / fps
+            if not flares or t - flares[-1] > 0.4:
+                flares.append(round(t, 2))
+    return flares or [0.0]
+
+
+def add_filmburn(parts: list, prev: str, burn_idx: int, boundaries: list, flares=None,
+                 lead: float = 0.42, post: float = 0.22, flare_lead: float = 0.18,
+                 opacity: float = 1.0, *, w: int = W, h: int = H, fps: str = FPS):
+    """Alpha-composite the luma-shaped burn over each boundary; engine recipe port."""
+    if not boundaries:
+        return parts, prev
+    k = len(boundaries)
+    if k > MAX_FILM_BURN_BOUNDARIES:
+        raise RuntimeError(
+            f"film_burn boundary count {k} exceeds cap {MAX_FILM_BURN_BOUNDARIES}; "
+            "registry law: film burns are a RARE accent, 2-3/video"
+        )
+    labels = "".join(f"[bn{j}]" for j in range(k))
+    parts.append(
+        f"[{burn_idx}:v]scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={w}:{h},fps={fps},format=gbrp,split=2[bc][bl];"
+        f"[bl]format=gray,curves=all='0/0.05 0.12/0.5 1/0.8',"
+        f"colorchannelmixer=aa={opacity}[bm];"
+        f"[bc][bm]alphamerge,format=yuva420p,split={k}{labels}"
+    )
+    flares = flares or [lead]
+    dur = lead + post
+    fin, fout = 0.14, 0.20
+    for j, t in enumerate(boundaries):
+        st = max(0.0, t - lead)
+        win = round(max(0.0, flares[j % len(flares)] - lead + flare_lead), 2)
+        parts.append(
+            f"[bn{j}]trim=start={win:.2f}:duration={dur:.3f},setpts=PTS-STARTPTS,"
+            f"fade=t=in:st=0:d={fin:.3f}:alpha=1,"
+            f"fade=t=out:st={dur - fout:.3f}:d={fout:.3f}:alpha=1,"
+            f"setpts=PTS-STARTPTS+{st:.3f}/TB[bs{j}]"
+        )
+        out = f"[g{j}]"
+        parts.append(f"{prev}[bs{j}]overlay=enable='between(t,{st:.3f},{t + post:.3f})'{out}")
+        prev = out
+    return parts, prev
+
+
+def _pw_linear(T: float, pts: list) -> str:
+    """Piecewise-linear ffmpeg expression for the held frame slip."""
+    segs = []
+    for (ta, va), (tb, vb) in zip(pts, pts[1:], strict=False):
+        a, b = T + ta, T + tb
+        segs.append(
+            f"between(t,{a:.3f},{b:.3f})*({va:.0f}+({vb - va:.0f})*(t-{a:.3f})/{b - a:.5f})"
+        )
+    return "+".join(segs)
+
+
+def add_offset_jump(parts: list, prev: str, boundaries: list, lead: float = 0.42, seed: int = 42,
+                    *, w: int = W, h: int = H):
+    """Apply the deterministic wraparound frame jump before the burn overlay."""
+    if not boundaries:
+        return parts, prev
+    rng = random.Random(seed)
+    exprs = []
+    for T in boundaries:
+        pts = [(-lead, 0.0)]
+        cur = -lead
+        sign = rng.choice([1, -1])
+        for _ in range(rng.choice([3, 4])):
+            ramp = rng.uniform(0.006, 0.018)
+            hold = rng.uniform(0.050, 0.120)
+            amp = rng.uniform(95, 180) * sign
+            if cur + ramp + hold > -0.03:
+                break
+            cur += ramp
+            pts.append((round(cur, 3), round(amp, 1)))
+            cur += hold
+            pts.append((round(cur, 3), round(amp, 1)))
+            sign = -sign
+        settle = min(0.0, cur + rng.uniform(0.03, 0.05))
+        pts.append((round(settle, 3), 0.0))
+        if settle < 0.0:
+            pts.append((0.0, 0.0))
+        exprs.append(_pw_linear(T, pts))
+    jy = "+".join(f"({e})" for e in exprs)
+    parts.append(f"{prev}split=2[jc0][jc1];[jc0][jc1]vstack=inputs=2[jstk]")
+    parts.append(f"[jstk]crop={w}:{h}:0:y='mod(({jy})+{100 * h},{h})'[vout]")
+    return parts, "[vout]"
+
+
 # --- chaining -----------------------------------------------------------------
 
 BUILDERS = {
@@ -347,10 +488,9 @@ BUILDERS = {
     "rgb_split": rgb_split_filter,
     "pixelate": pixelate_filter,
 }
-# The contract's accent-kind enum is these keys PLUS "film_burn" (contract v6, single-pass prep — E-W1):
-# render.render_spec refuses a spec whose finalize.accents carries film_burn before this module ever
-# runs, so a kind reaching build_chain_filter is always one of the keys below (an unhandled kind would
-# otherwise KeyError here, deep past the seam, instead of at the loud NotImplementedError render.py raises).
+# The contract's accent-kind enum is these keys PLUS "film_burn" (contract v6): multi-pass finalize
+# composites film_burn; render_onepass refuses it. A kind reaching build_chain_filter is always one of
+# the keys below (an unhandled kind would otherwise KeyError deep past the seam).
 
 
 _PAD = re.compile(r"\[([^\[\]]*)\]")
