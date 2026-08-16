@@ -140,7 +140,7 @@ def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: 
            "-stream_loop", "-1", "-i", str(burn_path), "-filter_complex_script", str(script),
            "-map", prev, "-map", "0:a?",
            *(_MID_GPU if gpu else _MID_CPU),
-           "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
+           "-pix_fmt", "yuv420p", *_BT709, "-c:a", "copy", "-movflags", "+faststart", str(out)]
     _run(cmd, "film burn accents", timeout_s=FILM_BURN_RENDER_TIMEOUT_S)
     return out
 

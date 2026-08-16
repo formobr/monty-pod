@@ -48,6 +48,10 @@ def test_film_burn_command_uses_script_and_copies_audio(monkeypatch, tmp_path, g
     profile = finalize._MID_GPU if gpu else finalize._MID_CPU
     for token in profile:
         assert token in cmd
+    assert "-color_primaries" in cmd
+    assert cmd[cmd.index("-color_primaries") + 1] == "bt709"
+    for token in finalize._BT709:
+        assert token in cmd
 
 
 def test_film_burn_never_enters_single_input_builders(monkeypatch, tmp_path):
