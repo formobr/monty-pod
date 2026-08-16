@@ -98,9 +98,9 @@ ENV REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
 
 # --- ffmpeg: BtbN static build (NVENC + libplacebo, not in ubuntu22.04 apt) -
 # n8.x libplacebo expression graphs hang forever (measured, 3-keyframe repro).
-ARG FFMPEG_BUILD=latest
+ARG FFMPEG_BUILD=autobuild-2026-08-15-13-02
 # The n7.1 `latest` tag is BtbN's stable branch and is never rotated away.
-ARG FFMPEG_ASSET=ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz
+ARG FFMPEG_ASSET=ffmpeg-n7.1.5-16-g9a4bb2c579-linux64-gpl-7.1.tar.xz
 # `/releases/download/<tag>/`, NOT `/releases/latest/download/`: the second means "the newest release",
 # which on any day BtbN cuts a dated autobuild carries only version-stamped asset names — the URL 404s, curl
 # without --fail writes the error page, and tar dies with "File format not recognized" three lines later.
