@@ -14,6 +14,7 @@ from collections import namedtuple
 from pathlib import Path
 
 FPS = 30
+_BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
 _STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/<rel> (public/ fonts+media, src/ bespoke)
 
 # HEAD BELOW (any media riding over a slid-down head): the live head slides DOWN so its face clears the top-band
@@ -186,7 +187,7 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
             continue
         mov = tmp / f"{m['seqdir'].name}.mov"
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-framerate", str(FPS), "-pattern_type", "glob",
-                        "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", str(mov)], check=True)
+                        "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", *_BT709, str(mov)], check=True)
         layers.append({"mov": str(mov), "start": m["start"], "dur": len(pngs) / FPS,
                        "glass": m["glass"], "head_below": m.get("head_below", False),
                        "backing": m.get("backing")})

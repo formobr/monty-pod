@@ -34,11 +34,11 @@ from pathlib import Path
 
 from . import accents as _accents
 
-# Intermediate finalize passes: cq/crf 16, matching the engine's fx/logo chain.
-_MID_GPU = ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-cq", "16"]
-_MID_CPU = ["-c:v", "libx264", "-preset", "medium", "-crf", "16"]
 # bt709 SIGNAL (tag, no convert) — an untagged master makes platforms GUESS the colourspace.
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
+# Intermediate finalize passes: cq/crf 16, matching the engine's fx/logo chain.
+_MID_GPU = ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-cq", "16", *_BT709]
+_MID_CPU = ["-c:v", "libx264", "-preset", "medium", "-crf", "16", *_BT709]
 # TERMINAL encode (the watermark pass): cq14 + unclamped maxrate/bufsize so busy frames aren't
 # starved, since the platform re-compresses whatever we ship.
 _FINAL_GPU = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-cq", "14",
@@ -140,7 +140,7 @@ def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: 
            "-stream_loop", "-1", "-i", str(burn_path), "-filter_complex_script", str(script),
            "-map", prev, "-map", "0:a?",
            *(_MID_GPU if gpu else _MID_CPU),
-           "-pix_fmt", "yuv420p", *_BT709, "-c:a", "copy", "-movflags", "+faststart", str(out)]
+           "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
     _run(cmd, "film burn accents", timeout_s=FILM_BURN_RENDER_TIMEOUT_S)
     return out
 

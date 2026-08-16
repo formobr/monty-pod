@@ -531,9 +531,13 @@ def test_the_spec_encode_rung_never_reaches_the_deliverable() -> None:
     _ins, outs = _argv(op.assemble(_prepared(spec))[1])
     assert "23" not in outs[0][0]
     assert _has_seq(outs[0][0], ["-crf", "14"])
+    assert _has_seq(outs[0][0], finalize._BT709)
+    assert _has_seq(outs[1][0], finalize._BT709)
     gpu_outs = _argv(op.assemble(_prepared(spec, gpu=True))[1])[1]
     assert _has_seq(gpu_outs[0][0], finalize._FINAL_GPU)
     assert _has_seq(gpu_outs[1][0], op._REF_VIDEO)
+    assert _has_seq(gpu_outs[0][0], finalize._BT709)
+    assert _has_seq(gpu_outs[1][0], finalize._BT709)
 
 
 def test_input_side_decoder_and_loop_flags() -> None:

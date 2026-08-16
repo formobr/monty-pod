@@ -63,6 +63,30 @@ def test_film_burn_never_enters_single_input_builders(monkeypatch, tmp_path):
                            {"burn.mp4": tmp_path / "b.mp4"}, False)
 
 
+@pytest.mark.parametrize("gpu", [False, True], ids=["cpu", "gpu"])
+def test_finalize_video_reencodes_are_bt709_tagged(monkeypatch, tmp_path, gpu):
+    commands = []
+    monkeypatch.setattr(finalize, "_run", lambda cmd, *_a, **_kw: commands.append(cmd))
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: False)
+    monkeypatch.setattr(finalize._accents, "build_chain_filter", lambda *_a, **_kw: "[0:v]null[vout]")
+    monkeypatch.setattr(finalize, "watermark_filter", lambda **_kw: ("[0:v]null[v]", "v", None))
+
+    finalize.apply_accents(_fin(SimpleNamespace(kind="pixelate")), tmp_path / "m.mp4",
+                           tmp_path / "a.mp4", {}, gpu)
+    finalize.apply_logo(SimpleNamespace(logo=SimpleNamespace(
+        asset="logo.png", corner="tr", width=100, opacity=0.5, margin=10, cover_hold=0.6,
+    )), tmp_path / "a.mp4", tmp_path / "l.mp4", {"logo.png": tmp_path / "logo.png"}, gpu)
+    finalize.apply_watermark(SimpleNamespace(watermark=SimpleNamespace(
+        sting="sting.webm", idle="idle.webm", width=100, x=None, y=None,
+        position="bottom-right", margin=10, chime=False, chime_volume=1.0, delay=0.0,
+    )), tmp_path / "l.mp4", tmp_path / "w.mp4",
+    {"sting.webm": tmp_path / "sting.webm", "idle.webm": tmp_path / "idle.webm"}, gpu)
+
+    assert len(commands) == 3
+    assert all(all(token in cmd for token in finalize._BT709) for cmd in commands)
+
+
 def test_different_burn_ids_refuse_before_probe(monkeypatch, tmp_path):
     monkeypatch.setattr(finalize, "_probe", lambda *_a: pytest.fail("probe ran before refusal"))
     with pytest.raises(RuntimeError, match="share one burn input id"):

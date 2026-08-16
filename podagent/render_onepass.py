@@ -25,7 +25,7 @@ from .sanitize import safe_error
 _REF_W, _REF_H = 80, 142
 # libx264 at both rungs on purpose: h264_nvenc has a minimum encode width an 80-px frame is under,
 # and at this size the encoder choice costs nothing anyway.
-_REF_VIDEO = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28"]
+_REF_VIDEO = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", *_finalize._BT709]
 _REF_AUDIO = ["-c:a", "aac", "-b:a", "128k"]
 _MASTER_AUDIO = ["-c:a", "aac", "-b:a", "192k"]
 

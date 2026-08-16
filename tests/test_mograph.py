@@ -49,6 +49,18 @@ def test_stage_public_copies_by_prefix(tmp_path: Path) -> None:
     assert not (rd / "public" / "x").exists()                             # non-prefixed input NOT staged
 
 
+def test_qtrle_layer_encode_sets_bt709(monkeypatch, tmp_path: Path) -> None:
+    seqdir = tmp_path / "seq"; seqdir.mkdir()
+    (seqdir / "frame.png").write_bytes(b"png")
+    commands = []
+    monkeypatch.setattr(mograph.subprocess, "run", lambda cmd, **_kw: commands.append(cmd))
+
+    layers = mograph._pack([{"seqdir": seqdir, "start": 0.0, "glass": False}], tmp_path)
+
+    assert layers and len(commands) == 1
+    assert all(token in commands[0] for token in mograph._BT709)
+
+
 def _batch_items(tmp_path: Path, comps, *, write_frames=True):
     items = []
     for i, c in enumerate(comps):

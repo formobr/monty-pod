@@ -126,10 +126,12 @@ def test_build_command_encode_flags() -> None:
     cpu = render.build_command(spec, ipaths, out, gpu=False)
     assert "libx264" in cpu and "-crf" in cpu
     assert "-movflags" in cpu and "+faststart" in cpu
+    assert all(token in cpu for token in render._BT709)
 
     gpu = render.build_command(spec, ipaths, out, gpu=True)
     assert "h264_nvenc" in gpu and "-cq" in gpu
     assert "-movflags" in gpu and "+faststart" in gpu
+    assert all(token in gpu for token in render._BT709)
 
 
 def test_final_overlays_not_implemented() -> None:

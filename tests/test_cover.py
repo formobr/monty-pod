@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from podagent import cover
 
 
@@ -40,3 +42,15 @@ def test_compose_no_headline_still_renders(tmp_path: Path):
     out = tmp_path / "c.png"
     cover.compose(base, {"frame_at": 0.0, "headline": {"lines": []}, "colors": {}}, {}, out, 216, 384)
     assert out.is_file()
+
+
+@pytest.mark.parametrize("gpu", [False, True], ids=["cpu", "gpu"])
+def test_weld_video_reencodes_set_bt709(monkeypatch, tmp_path: Path, gpu):
+    commands = []
+    monkeypatch.setattr(cover, "_probe", lambda _p: ("30", "48000", "2"))
+    monkeypatch.setattr(cover.subprocess, "run", lambda cmd, **_kw: commands.append(cmd))
+    cover.weld(tmp_path / "master.mp4", tmp_path / "cover.png", tmp_path / "out.mp4", 0.6, gpu, 216, 384)
+
+    assert len(commands) == 2
+    assert all(any("setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709" in token
+                   for token in cmd) for cmd in commands)
