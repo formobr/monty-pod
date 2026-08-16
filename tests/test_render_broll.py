@@ -167,7 +167,7 @@ def test_sfx_mix_delays_sounds_over_master_with_limiter():
     assert "[2:a]adelay=12560:all=1,volume=0.4[sx0]" in g
     assert "[3:a]adelay=52870:all=1,volume=0.5[sx1]" in g
     assert "[amaster][sx0][sx1]amix=inputs=3:normalize=0:duration=first[mx]" in g
-    assert "alimiter=limit=0.84" in g and g.endswith("[aout]")
+    assert "alimiter=limit=0.79" in g and g.endswith("[aout]")
 
 
 def test_unresolved_sfx_sound_reddens():
