@@ -368,7 +368,8 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
             labels.append(f"[sx{i}]")
         # amix SUMS sfx onto the master → cap the tips with a lookahead limiter (peak-safe last stage).
         chains.append(f"[amaster]{''.join(labels)}amix=inputs={len(a.sfx) + 1}:normalize=0:duration=first[mx]")
-        chains.append("[mx]alimiter=limit=0.84:attack=5:release=50:level=false[aout]")
+        # 0.79 (−2.05 dB) not 0.84: this limiter runs at 48k without the 192k oversample the premix one has, and inter-sample peaks overshoot ~0.5 dB past the sample ceiling — measured −0.93 dBTP against the −1.0 gate
+        chains.append("[mx]alimiter=limit=0.79:attack=5:release=50:level=false[aout]")
     else:
         chains.append("[amaster]anull[aout]")
     return chains
