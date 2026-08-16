@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -27,7 +29,44 @@ def test_preview_golden_graph() -> None:
     assert "setpts=(PTS-STARTPTS)/1.5" in g
     assert "atempo=1.5" in g
     assert "concat=n=2:v=1:a=1" in g
-    assert g.rstrip().endswith("[vout][aout]")
+    assert g.rstrip().endswith(f"[vout]{render._BT709_SET_PARAMS}[vout]")
+
+
+@pytest.mark.integration
+def test_real_cpu_master_output_is_bt709(tmp_path: Path) -> None:
+    """Run the real main graph and inspect encoded stream metadata, not argv intent."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+
+    source = tmp_path / "synthetic.mp4"
+    output = tmp_path / "master.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=16x16:rate=8",
+        "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=8000",
+        "-t", "4", "-frames:v", "32", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", str(source),
+    ], check=True)
+    spec = RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "colour-proof", "slug": "colour-proof", "mode": "preview",
+        "inputs": [{"id": "source", "kind": "video", "sha256": "0" * 64, "url": "unused"}],
+        "timeline": {"fps": 8, "width": 16, "height": 16,
+                      "segments": [{"src": "source", "in": 0.0, "out": 4.0, "speed": 1.0}]},
+        "encode": {"video": "libx264", "preset": "medium", "cq": 23, "pix_fmt": "yuv420p",
+                    "audio": "aac", "audio_bitrate": "96k"},
+        "outputs": [{"id": "master", "kind": "master", "put_url": "unused"}],
+    })
+    subprocess.run(render.build_command(spec, {"source": source}, output, gpu=False), check=True,
+                   capture_output=True)
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=color_space,color_primaries,color_transfer",
+        "-of", "json", str(output),
+    ], check=True, capture_output=True, text=True)
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["color_space"] == "bt709"
+    assert stream["color_primaries"] == "bt709"
+    assert stream["color_transfer"] == "bt709"
 
 
 def test_anim_expr_smoothstep_and_constant() -> None:

@@ -145,7 +145,7 @@ def test_music_audio_graph_mixes_voice_and_bed():
     assert "[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,apad=whole_dur=60" in g
     assert "sidechaincompress=threshold=0.06:ratio=3" in g  # locked DUCK
     assert "amix=inputs=2:duration=first:dropout_transition=0:normalize=0" in g
-    assert "[bg0]" in g and g.strip().endswith("[aout]")
+    assert "[bg0]" in g and g.strip().endswith(f"[vout]{render._BT709_SET_PARAMS}[vout]")
 
 
 def test_no_audio_keeps_segment_audio_concat():

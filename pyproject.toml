@@ -38,3 +38,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["podagent"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: executes real external media tools",
+]

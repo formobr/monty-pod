@@ -21,6 +21,7 @@ from .models import MotionKeyframe, RenderSpec, SpecBrollClip, SpecTransition
 _P_STYLE = re.compile(r"p\d+")  # NVENC preset names (p1..p7); libx264 can't take these
 # delivery signal: TAG bt709 (no convert — untagged made platforms guess the colourspace)
 _BT709 = ("-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709")
+_BT709_SET_PARAMS = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
 
 # Twin of scripts/montyops/camera_apply.py.VULKAN_PROBE and podagent.main.VULKAN_PROBE; pinned in the
 # superproject parity test because the baked camera and live preview must ask the same question.
@@ -379,7 +380,8 @@ def _music_of(spec: RenderSpec) -> "object | None":
     return spec.overlays.music if (spec.mode == "final" and spec.overlays is not None) else None
 
 
-def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = None) -> str:
+def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = None,
+                      terminal_bt709: bool = True) -> str:
     """Pure: the -filter_complex string trimming, speed-adjusting, motion-treating and concatenating
     every timeline segment into [vout]/[aout], compositing final b-roll, and mixing music when `audio`."""
     idx = {iid: n for n, iid in enumerate(input_ids(spec))}
@@ -423,6 +425,9 @@ def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = Non
         chains += _broll_chains(spec, idx, base_v)
     if audio is not None:
         chains += _audio_mix_chains(audio)
+    # Frame-level metadata wins over the encoder context, especially on the Vulkan/NVENC path.
+    if terminal_bt709:
+        chains.append(f"[vout]{_BT709_SET_PARAMS}[vout]")
     return ";".join(chains)
 
 

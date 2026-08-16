@@ -263,7 +263,9 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         n = inputs.add(p.bed)
         spec_pads[f"{n}:a"] = f"{n}:a"
 
-    chains = [rewire(_render.build_filtergraph(spec, gpu, p.audio), "cmp",
+    # This graph is a reusable subgraph; stamp the final merged output once below, not the
+    # [vout] boundary here (rewire would otherwise produce the same merged pad twice).
+    chains = [rewire(_render.build_filtergraph(spec, gpu, p.audio, terminal_bt709=False), "cmp",
                      {**spec_pads, "vout": V_COMPOSITE, "aout": A_COMPOSITE})]
     vlink = V_COMPOSITE
 

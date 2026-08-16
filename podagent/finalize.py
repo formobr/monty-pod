@@ -36,6 +36,7 @@ from . import accents as _accents
 
 # bt709 SIGNAL (tag, no convert) — an untagged master makes platforms GUESS the colourspace.
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
+_BT709_SET_PARAMS = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
 # Intermediate finalize passes: cq/crf 16, matching the engine's fx/logo chain.
 _MID_GPU = ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-cq", "16", *_BT709]
 _MID_CPU = ["-c:v", "libx264", "-preset", "medium", "-crf", "16", *_BT709]
@@ -95,6 +96,11 @@ def _has_audio(path: Path) -> bool:
     return bool(r.stdout.strip())
 
 
+def _terminal_bt709(fc: str, out_v: str) -> str:
+    """Stamp frame metadata on the actual video pad consumed by the encoder."""
+    return f"{fc};[{out_v}]{_BT709_SET_PARAMS}[{out_v}]"
+
+
 # --- 1. frame accents ---------------------------------------------------------
 
 def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
@@ -134,7 +140,7 @@ def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: 
         fps=_accents.FPS if (fps_num, fps_den) == (60000, 1001) else f"{fps:.4f}",
     )
     script = out.with_name(out.name + ".filter_complex")
-    script.write_text(";".join(parts) + "\n", encoding="utf-8")
+    script.write_text(_terminal_bt709(";".join(parts), prev[1:-1]) + "\n", encoding="utf-8")
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
            *( ["-init_hw_device", "vulkan"] if gpu else []), "-i", str(src),
            "-stream_loop", "-1", "-i", str(burn_path), "-filter_complex_script", str(script),
@@ -154,6 +160,7 @@ def apply_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Pa
     fc = _accents.build_chain_filter(fin.accents, fps=fps, w=w, h=h, gpu=gpu)
     if fc is None:
         return src
+    fc = _terminal_bt709(fc, "vout")
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
            *(["-init_hw_device", "vulkan"] if gpu else []), "-i", str(src),
            "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
@@ -191,7 +198,7 @@ def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool, *,
     # Held back unless a cover WAS welded — `src` is then pure body, and subtracting a tail that does
     # not exist deletes the logo from the last `cover_hold` seconds of live picture.
     body_end = max(0.0, _probe(src)[5] - (logo.cover_hold if cover_welded else 0.0))
-    fc = body_logo_filter(logo.corner, logo.width, logo.opacity, logo.margin, body_end)
+    fc = _terminal_bt709(body_logo_filter(logo.corner, logo.width, logo.opacity, logo.margin, body_end), "vout")
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-i", str(asset),
            "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
            *(_MID_GPU if gpu else _MID_CPU),
@@ -257,6 +264,7 @@ def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> 
         base_v="0:v", sting_v="1:v", idle_v="2:v", width=wm.width, overlay_xy=overlay_xy,
         base_a=("0:a" if has_audio else None), chime_a=("1:a" if wm.chime else None),
         chime_vol=wm.chime_volume, delay=wm.delay, out_v="v", out_a="a")
+    fc = _terminal_bt709(fc, out_v)
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
            "-c:v", "libvpx-vp9", "-i", str(sting),
            "-c:v", "libvpx-vp9", "-stream_loop", "-1", "-i", str(idle),

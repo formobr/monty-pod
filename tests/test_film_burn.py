@@ -37,6 +37,7 @@ def test_film_burn_command_uses_script_and_copies_audio(monkeypatch, tmp_path, g
     assert cmd[burn_i - 3:burn_i] == ["-stream_loop", "-1", "-i"]
     assert "-filter_complex_script" in cmd
     graph = Path(cmd[cmd.index("-filter_complex_script") + 1]).read_text()
+    assert finalize._BT709_SET_PARAMS in graph
     assert graph.index("[jstk]crop") < graph.index("[1:v]scale")
     assert "aa=0.7" in graph
     assert "-af" not in cmd and "clicks" not in graph
@@ -85,6 +86,8 @@ def test_finalize_video_reencodes_are_bt709_tagged(monkeypatch, tmp_path, gpu):
 
     assert len(commands) == 3
     assert all(all(token in cmd for token in finalize._BT709) for cmd in commands)
+    assert all(finalize._BT709_SET_PARAMS in cmd[cmd.index("-filter_complex") + 1]
+               for cmd in commands)
 
 
 def test_different_burn_ids_refuse_before_probe(monkeypatch, tmp_path):

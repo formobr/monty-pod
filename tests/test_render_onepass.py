@@ -397,7 +397,7 @@ def test_reuse_composite_builder(monkeypatch) -> None:
     monkeypatch.setattr(render, "build_filtergraph", spy)
     graph, _cmd = op.assemble(_prepared(spec))
     assert spy.calls[0][0][0] is spec and spy.calls[0][0][1] is False and spy.calls[0][0][2] is MIX
-    real = render.build_filtergraph.real(spec, False, MIX)
+    real = render.build_filtergraph.real(spec, False, MIX, terminal_bt709=False)
     ext = {f"{n}:{s}": f"{n}:{s}" for n in (0, 1, 2) for s in "va"}
     assert _sub(graph, op.rewire(real, "cmp", {**ext, "vout": "vcomposite", "aout": "acomposite"}))
 
