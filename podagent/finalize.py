@@ -323,7 +323,8 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     if af is None:
         return src
     r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src),
-                        "-af", af, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out), "-y"],
+                        "-af", af, "-ar", "48000", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        str(out), "-y"],
                        capture_output=True)
     if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
         print(f"[finalize] master loudnorm exit {r.returncode} -> left at source level")
