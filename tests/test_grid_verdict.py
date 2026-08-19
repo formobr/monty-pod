@@ -4,6 +4,7 @@ allows (before any subprocess); grid_verdict runs AFTER an already-paid-for enco
 from __future__ import annotations
 
 import math
+import subprocess
 from fractions import Fraction
 
 import pytest
@@ -97,6 +98,70 @@ def test_grid_verdict_never_raises_on_an_audio_probe_failure(monkeypatch, tmp_pa
     def boom(_p):
         raise RuntimeError("ffprobe exploded")
     monkeypatch.setattr(finalize, "_probe_audio", boom)
+    defect = finalize.grid_verdict(tmp_path / "m.mp4", 30.0)
+    assert defect is not None and "audio_probe_failed" in defect
+
+
+def test_probe_carries_a_deadline(monkeypatch, tmp_path) -> None:
+    """A hang here holds a ~20-GPU-minute master's delivery tail open forever; the probe must bound it."""
+    timeouts = []
+
+    def fake_run(cmd, **kw):
+        timeouts.append(kw.get("timeout"))
+        if "width,height,r_frame_rate" in cmd[cmd.index("-show_entries") + 1]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="1080 1920 30/1", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="10.0", stderr="")
+    monkeypatch.setattr(finalize.subprocess, "run", fake_run)
+    finalize._probe(tmp_path / "master.mp4")
+    assert timeouts and all(timeouts)
+
+
+def test_probe_audio_carries_a_deadline(monkeypatch, tmp_path) -> None:
+    timeouts = []
+
+    def fake_run(cmd, **kw):
+        timeouts.append(kw.get("timeout"))
+        return subprocess.CompletedProcess(cmd, 0, stdout="48000 10.0", stderr="")
+    monkeypatch.setattr(finalize.subprocess, "run", fake_run)
+    finalize._probe_audio(tmp_path / "master.mp4")
+    assert timeouts and all(timeouts)
+
+
+def test_probe_timeout_is_the_same_refusal_as_any_other_probe_failure(monkeypatch, tmp_path) -> None:
+    """_probe already just propagates on failure (check=True -> CalledProcessError); a timeout must
+    propagate the same way, not hang — TimeoutExpired IS a raise, the existing refusal path."""
+    def timeout(cmd, **_kw):
+        raise subprocess.TimeoutExpired(cmd, 20)
+    monkeypatch.setattr(finalize.subprocess, "run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        finalize._probe(tmp_path / "hung.mp4")
+
+
+def test_probe_audio_timeout_is_the_same_refusal_as_any_other_probe_failure(monkeypatch, tmp_path) -> None:
+    def timeout(cmd, **_kw):
+        raise subprocess.TimeoutExpired(cmd, 20)
+    monkeypatch.setattr(finalize.subprocess, "run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        finalize._probe_audio(tmp_path / "hung.mp4")
+
+
+def test_grid_verdict_never_raises_when_probe_times_out(monkeypatch, tmp_path) -> None:
+    """The critical case: grid_verdict runs after a paid-for encode and must NEVER raise — a video probe
+    that hangs and finally times out must become a defect record, exactly like any other probe failure."""
+    def timeout(_p):
+        raise subprocess.TimeoutExpired(["ffprobe"], 20)
+    monkeypatch.setattr(finalize, "_probe", timeout)
+    defect = finalize.grid_verdict(tmp_path / "m.mp4", 30.0)
+    assert defect is not None and "probe_failed" in defect
+
+
+def test_grid_verdict_never_raises_when_audio_probe_times_out(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
+
+    def timeout(_p):
+        raise subprocess.TimeoutExpired(["ffprobe"], 20)
+    monkeypatch.setattr(finalize, "_probe_audio", timeout)
     defect = finalize.grid_verdict(tmp_path / "m.mp4", 30.0)
     assert defect is not None and "audio_probe_failed" in defect
 

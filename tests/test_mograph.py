@@ -222,3 +222,24 @@ def test_probe_grid_refuses_an_unmeasurable_fps(monkeypatch, tmp_path: Path) -> 
                         lambda *_a, **_kw: subprocess.CompletedProcess([], 0, stdout="", stderr=""))
     with pytest.raises(RuntimeError, match="could not measure the delivery grid"):
         mograph._probe_grid(tmp_path / "silent.mp4")
+
+
+def test_probe_grid_carries_a_deadline(monkeypatch, tmp_path: Path) -> None:
+    """A hang here holds a GPU render's grid decision open forever; the probe must bound its wait."""
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        captured["timeout"] = kw.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout="30000/1001", stderr="")
+    monkeypatch.setattr(mograph.subprocess, "run", fake_run)
+    mograph._probe_grid(tmp_path / "clip.mp4")
+    assert captured["timeout"]
+
+
+def test_probe_grid_on_timeout_hits_the_same_unmeasurable_refusal(monkeypatch, tmp_path: Path) -> None:
+    """A timeout must NOT invent a new failure mode — it joins the existing empty-stdout refusal."""
+    def timeout(cmd, **_kw):
+        raise subprocess.TimeoutExpired(cmd, 20)
+    monkeypatch.setattr(mograph.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match="could not measure the delivery grid"):
+        mograph._probe_grid(tmp_path / "hung.mp4")

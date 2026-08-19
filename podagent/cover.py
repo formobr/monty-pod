@@ -265,13 +265,20 @@ def compose(base_frame: Path, cover: dict[str, Any], input_paths: dict[str, Path
 _DELIVERY_SAMPLE_RATE = 48000  # matches finalize._DELIVERY_SAMPLE_RATE — the weld ships at this rate, never inherited
 
 
+_PROBE_TIMEOUT_S = 20  # header-only ffprobe; matches the engine's own precedent (scripts/tag_music.py:_duration)
+
+
 def _probe(video: Path) -> tuple[str, str]:
     """(fps, channels) of `video`'s own streams. An unmeasurable fps refuses rather than substituting a
     literal, parity with scripts/add_cover.py's probe() after it deleted its own "30" fallback."""
     def q(stream: str, entries: str) -> list[str]:
-        return subprocess.run(["ffprobe", "-v", "error", "-select_streams", stream,
-                               "-show_entries", entries, "-of", "default=nw=1:nk=1", str(video)],
-                              capture_output=True, text=True).stdout.strip().splitlines()
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", stream,
+                                  "-show_entries", entries, "-of", "default=nw=1:nk=1", str(video)],
+                                 capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S).stdout
+        except subprocess.TimeoutExpired:
+            return []  # a hang reads as no output — v:0 refuses below, a:0 keeps its existing "2" fallback
+        return out.strip().splitlines()
     v = q("v:0", "stream=r_frame_rate")
     if not v or not v[0] or v[0] in ("0/0", "N/A"):
         raise RuntimeError(f"could not measure the delivery grid from {video} — no r_frame_rate")

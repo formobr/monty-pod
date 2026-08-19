@@ -337,11 +337,17 @@ def overlay_filtergraph(layers: list[dict], *, base: str = "0:v",
     return ";".join(filters), src
 
 
+_PROBE_TIMEOUT_S = 20  # header-only ffprobe; matches the engine's own precedent (scripts/tag_music.py:_duration)
+
+
 def _probe_grid(video: Path) -> str:
     """Exact -r rational for `video`'s OWN video stream — no literal fallback, an unmeasurable rate refuses."""
-    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                          "-show_entries", "stream=r_frame_rate", "-of", "default=nw=1:nk=1", str(video)],
-                         capture_output=True, text=True).stdout.strip()
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=r_frame_rate", "-of", "default=nw=1:nk=1", str(video)],
+                             capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S).stdout.strip()
+    except subprocess.TimeoutExpired:
+        out = ""  # a hang is as unmeasurable as empty stdout — same refusal below, not a new outcome
     if not out or out in ("0/0", "N/A"):
         raise RuntimeError(f"could not measure the delivery grid from {video} — no r_frame_rate")
     return out

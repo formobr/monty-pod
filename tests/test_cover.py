@@ -80,3 +80,37 @@ def test_probe_refuses_an_unmeasurable_fps_instead_of_defaulting(monkeypatch, tm
                         lambda *_a, **_kw: subprocess.CompletedProcess([], 0, stdout="", stderr=""))
     with pytest.raises(RuntimeError, match="could not measure the delivery grid"):
         cover._probe(tmp_path / "silent.mp4")
+
+
+def test_probe_carries_a_deadline(monkeypatch, tmp_path: Path):
+    """A hang here holds a finished weld open forever; the probe must bound its wait."""
+    timeouts = []
+
+    def fake_run(cmd, **kw):
+        timeouts.append(kw.get("timeout"))
+        return subprocess.CompletedProcess(cmd, 0, stdout="30\n", stderr="")
+    monkeypatch.setattr(cover.subprocess, "run", fake_run)
+    cover._probe(tmp_path / "clip.mp4")
+    assert timeouts and all(timeouts)
+
+
+def test_probe_fps_query_timeout_hits_the_same_unmeasurable_refusal(monkeypatch, tmp_path: Path):
+    """A timeout on the fps query must NOT invent a new failure mode — same refusal as empty stdout."""
+    def timeout(cmd, **_kw):
+        raise subprocess.TimeoutExpired(cmd, 20)
+    monkeypatch.setattr(cover.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match="could not measure the delivery grid"):
+        cover._probe(tmp_path / "hung.mp4")
+
+
+def test_probe_channels_query_timeout_keeps_the_existing_stereo_fallback(monkeypatch, tmp_path: Path):
+    """The channels query already tolerates empty output by defaulting to stereo; a timeout on THAT
+    query must land on the same fallback, not raise."""
+    def flaky_run(cmd, **_kw):
+        if "a:0" in cmd:
+            raise subprocess.TimeoutExpired(cmd, 20)
+        return subprocess.CompletedProcess(cmd, 0, stdout="30\n", stderr="")
+    monkeypatch.setattr(cover.subprocess, "run", flaky_run)
+    fps, ch = cover._probe(tmp_path / "clip.mp4")
+    assert fps == "30"
+    assert ch == "2"

@@ -77,18 +77,21 @@ def _run(cmd: list[str], what: str, *, timeout_s: int | None = None) -> None:
         raise RuntimeError(f"{what} ffmpeg timed out after {timeout_s}s") from exc
 
 
+_PROBE_TIMEOUT_S = 20  # header-only ffprobe; matches the engine's own precedent (scripts/tag_music.py:_duration)
+
+
 def _probe(path: Path) -> tuple[int, int, float, int, int, float]:
     """(width, height, fps, fps_num, fps_den, duration) of the master."""
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height,r_frame_rate", "-of", "default=nw=1:nk=1", str(path)],
-        capture_output=True, text=True, check=True).stdout.split()
+        capture_output=True, text=True, check=True, timeout=_PROBE_TIMEOUT_S).stdout.split()
     w, h = int(out[0]), int(out[1])
     num, den = out[2].split("/")
     fps = float(num) / float(den or 1)
     dur = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True, check=True).stdout.strip()
+        capture_output=True, text=True, check=True, timeout=_PROBE_TIMEOUT_S).stdout.strip()
     return w, h, fps, int(num), int(den), float(dur)
 
 
@@ -132,7 +135,7 @@ def _probe_audio(path: Path) -> tuple[int, float]:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
          "-show_entries", "stream=sample_rate,duration", "-of", "default=nw=1:nk=1", str(path)],
-        capture_output=True, text=True, check=True).stdout.split()
+        capture_output=True, text=True, check=True, timeout=_PROBE_TIMEOUT_S).stdout.split()
     return int(out[0]), float(out[1])
 
 
