@@ -97,8 +97,10 @@ life, and nvidia-smi has no such query. So: a real total, and a named absence ra
 
 def capacity_payload(*, rank_lanes: int, fetch_workers: int,
                      vram_total_mb: float | None = None,
-                     vulkan: bool = False) -> dict[str, Any]:
-    """Advertise diagnostics, bounded per-class credits, and the card's VRAM total when known (CAPACITY_VRAM_WHY)."""
+                     vulkan: bool = False,
+                     artifact_fetch_workers: int | None = None) -> dict[str, Any]:
+    """Advertise diagnostics and bounded per-class credits (CAPACITY_VRAM_WHY). `fetch_workers` is the
+    clip_rank tile pool; `artifact_fetch_workers` is the separate weights/bundle ranged-download pool."""
     payload: dict[str, Any] = {
         "rank_lanes": int(rank_lanes),
         "fetch_workers": int(fetch_workers),
@@ -112,6 +114,8 @@ def capacity_payload(*, rank_lanes: int, fetch_workers: int,
     }
     if vram_total_mb is not None:
         payload["vram_total_mb"] = float(vram_total_mb)
+    if artifact_fetch_workers is not None:
+        payload["artifact_fetch_workers"] = int(artifact_fetch_workers)
     return payload
 
 
@@ -943,10 +947,12 @@ def main() -> None:
         signal.signal(_sig, _stop_and_exit)
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
+    from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, vram_total_mb
     rank_width = lane_width()
     capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width(),
-                                vram_total_mb=vram_total_mb())
+                                vram_total_mb=vram_total_mb(),
+                                artifact_fetch_workers=range_fetch_width())
     _capability_preflight(cp, capacity=capacity)
     # On reconnect the API resets credit. Replay the ACKed readiness verdict
     # together with capacity; this event is installed only after preflight.

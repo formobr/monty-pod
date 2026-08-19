@@ -17,12 +17,14 @@ the second one is broken.
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import hashlib
 import os
 import shutil
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Protocol
@@ -130,6 +132,158 @@ def url_to_path(url: str) -> Path:
     return Path(unquote(urlparse(url).path))
 
 
+# Not OPS_MAX_TRANSFERS (cp.py): that sizes the box-wide connection pool across many small concurrent ops
+# steps (16-64); here N connections split ONE object, so it gets its own, smaller-default knob.
+_FETCH_WORKERS_ENV = "ARTIFACT_FETCH_WORKERS"
+_FETCH_WORKERS_DEFAULT = 6
+
+# Below this, one more range costs more in extra TCP+TLS handshakes than the parallelism saves.
+_MIN_PART_BYTES = 32 << 20
+
+_RANGE_PROBE_TIMEOUT = (10, 20)
+
+
+def range_fetch_width() -> int:
+    """Parallel byte-range connections for one artifact (env ARTIFACT_FETCH_WORKERS, default 6) — not
+    `fetch_width`: `infer_cliprank.fetch_width()` already owns that name for the unrelated tile pool."""
+    raw = os.environ.get(_FETCH_WORKERS_ENV, "").strip()
+    try:
+        return max(1, int(raw)) if raw else _FETCH_WORKERS_DEFAULT
+    except ValueError:
+        return _FETCH_WORKERS_DEFAULT
+
+
+def _range_probe(url: str) -> int | None:
+    """Total size if `url` answers a byte-range GET with 206, else None — a HEAD alone cannot prove a
+    presigned GET-only signature will also honour Range, so the probe IS the real request shape."""
+    if url.startswith("file://"):
+        return None
+    try:
+        resp = requests.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=_RANGE_PROBE_TIMEOUT)
+    except requests.RequestException:
+        return None
+    with resp:
+        if resp.status_code != 206:
+            return None
+        try:
+            return int(resp.headers.get("Content-Range", "").rsplit("/", 1)[-1])
+        except ValueError:
+            return None
+
+
+def _content_range_start(headers: dict) -> int | None:
+    try:
+        return int(headers.get("Content-Range", "").split(" ", 1)[1].split("-", 1)[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _fetch_range(url: str, dst: Path, start: int, end: int, counter: list[int], lock: threading.Lock,
+                 abort: threading.Event) -> None:
+    """One byte range straight into `dst` at its own offset — bounded memory (one `_CHUNK` per worker);
+    `abort` is checked between chunks so a live sibling stops within about one chunk of a fatal sibling."""
+    with requests.get(url, headers={"Range": f"bytes={start}-{end}"}, stream=True, timeout=(30, 600)) as resp:
+        if resp.status_code != 206:
+            raise TransferStalled(f"range {start}-{end} lost 206 mid-fetch (got {resp.status_code})")
+        # a wrong offset is a BAD HOST, not corrupt bytes — catch it now, not as a sha256 mismatch 4.6 GB later
+        if _content_range_start(resp.headers) != start:
+            raise TransferStalled(f"range {start}-{end}: origin answered from a different offset")
+        got = 0
+        with open(dst, "r+b") as fh:
+            fh.seek(start)
+            for chunk in resp.iter_content(_CHUNK):
+                if abort.is_set():
+                    return
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                got += len(chunk)
+                with lock:
+                    counter[0] += len(chunk)
+    if abort.is_set():
+        return
+    expected = end - start + 1
+    if got != expected:
+        raise TransferStalled(f"range {start}-{end} delivered {got} of {expected} bytes")
+
+
+def _download_ranged(ref: TarRef, dst: Path, total: int, progress: "Progress | None", label: str) -> int:
+    """N ranged GETs run concurrently into `dst`. NEVER `with ex:` — `abort` (checked between chunks) stops
+    a live sibling fast; `shutdown(wait=False)` below stays non-blocking regardless, for one that never
+    gets another chunk to check it on."""
+    width = min(range_fetch_width(), max(1, total // _MIN_PART_BYTES))
+    part = -(-total // width)
+    bounds = [(i * part, min((i + 1) * part, total) - 1) for i in range(width) if i * part < total]
+    # safe to pre-size: the only caller stages into a dir ensure_tree always removes on any failure
+    with dst.open("wb") as fh:
+        fh.truncate(total)
+    counter = [0]
+    lock = threading.Lock()
+    abort = threading.Event()
+    t0 = last = time.monotonic()
+    at_last = 0
+    ex = cf.ThreadPoolExecutor(max_workers=len(bounds), thread_name_prefix="artifact-range")
+    try:
+        pending = {ex.submit(_fetch_range, ref.url, dst, start, end, counter, lock, abort)
+                   for start, end in bounds}
+        while pending:
+            done, pending = cf.wait(pending, timeout=_PROGRESS_EVERY_S, return_when=cf.FIRST_EXCEPTION)
+            for fut in done:
+                exc = fut.exception(timeout=0)
+                if exc is not None:
+                    abort.set()
+                    for other in pending:
+                        other.cancel()
+                    raise exc
+            now = time.monotonic()
+            total_now = counter[0]
+            window_s = now - last
+            window_rate = (total_now - at_last) / max(window_s, 1e-6)
+            # a window with zero bytes so far is TTFB/connect, not a rate — download_verified structurally
+            # cannot run its check before a chunk exists (:275); this mirrors that instead of firing on 0/0
+            first_byte_tick = at_last == 0 and total_now > 0
+            last, at_last = now, total_now
+            if pending and total_now > 0 and not first_byte_tick and window_rate < _MIN_BYTES_PER_S:
+                abort.set()
+                raise TransferStalled(
+                    f"{label or 'artifact'} moved {window_rate / 1e6:.2f} MB/s over the last "
+                    f"{window_s:.0f}s ({total_now / 1e6:.0f} MB so far, {len(bounds)} parallel parts) — "
+                    f"below the {_MIN_BYTES_PER_S / 1e6:.2f} MB/s floor; the source has stalled")
+            if progress is not None:
+                pct = f" ({100 * total_now / total:.0f}%)" if total else ""
+                progress(f"{label or 'artifact'} fetch {total_now / 1e6:.0f} MB{pct} · "
+                         f"{total_now / 1e6 / max(now - t0, 1e-6):.1f} MB/s avg · "
+                         f"{window_rate / 1e6:.1f} MB/s now")
+        return total
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
+def _verify(dst: Path, ref: TarRef, total: int) -> int:
+    """Hash the assembled file in one sequential pass — parallel parts land out of write order across
+    threads, so the digest can only be taken over the finished file, never streamed part-by-part."""
+    digest = hashlib.sha256()
+    with dst.open("rb") as fh:
+        while chunk := fh.read(_CHUNK):
+            digest.update(chunk)
+    got = digest.hexdigest()
+    if got != ref.sha256:
+        raise ValueError(f"sha256 mismatch: expected {ref.sha256}, got {got} ({total} bytes)")
+    if ref.size is not None and total != ref.size:
+        raise ValueError(f"size mismatch: expected {ref.size} bytes, got {total}")
+    return total
+
+
+def fetch_verified(ref: TarRef, dst: Path, progress: "Progress | None" = None, label: str = "") -> int:
+    """Ranged-parallel when the origin proves it (206 to a probe GET, size worth splitting), else exactly
+    today's single-stream download_verified — a missing capability costs speed, never a failure."""
+    total = _range_probe(ref.url)
+    if total is None or total < 2 * _MIN_PART_BYTES:
+        return download_verified(ref, dst, progress, label)
+    got = _download_ranged(ref, dst, total, progress, label)
+    return _verify(dst, ref, got)
+
+
 def download_verified(ref: TarRef, dst: Path, progress: "Progress | None" = None,
                       label: str = "") -> int:
     """Stream the tar to `dst`, hashing as we go. A digest mismatch raises — we never extract unverified
@@ -193,7 +347,7 @@ def ensure_tree(ref: TarRef, root: Path, label: str = "", progress: "Progress | 
     staging = Path(tempfile.mkdtemp(dir=root, prefix=f".{ref.sha256[:12]}-"))
     try:
         tar_path = staging / "artifact.tar"
-        total = download_verified(ref, tar_path, progress, what)
+        total = fetch_verified(ref, tar_path, progress, what)
         unpacked = staging / "d"
         unpacked.mkdir()
         if progress is not None:

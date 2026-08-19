@@ -57,6 +57,14 @@ def test_capacity_advertises_worker_credit_limits(monkeypatch):
     }
 
 
+def test_capacity_advertises_the_artifact_pool_separately_from_the_tile_pool(monkeypatch):
+    """artifact.range_fetch_width and infer_cliprank.fetch_width are two different pools; the payload
+    must name both or an operator reading `fetch_workers` alone under-reads the pod's real connections."""
+    capacity = agent_main.capacity_payload(rank_lanes=3, fetch_workers=7, artifact_fetch_workers=6)
+    assert capacity["fetch_workers"] == 7
+    assert capacity["artifact_fetch_workers"] == 6
+
+
 def test_capacity_never_advertises_more_ops_claims_than_executor(monkeypatch):
     monkeypatch.setenv("OPS_MAX_CHAINS", "2")
     assert agent_main.capacity_payload(rank_lanes=9, fetch_workers=9)["claim_capacity"] == {

@@ -150,10 +150,11 @@ def test_a_warm_pod_fetches_the_same_checkpoint_exactly_once(served):
     ref = _ref(payload)
 
     first = weights.ensure(ref, "acme/model")
+    assert len(calls) == 2, f"a miss is one range-probe GET plus one fallback GET, got {len(calls)}"
     second = weights.ensure(ref, "acme/model")
 
     assert first == second
-    assert len(calls) == 1, f"warm pod re-fetched the weights: {len(calls)} downloads"
+    assert len(calls) == 2, f"warm pod re-fetched the weights: {len(calls)} calls after the warm ensure()"
 
 
 def test_a_changed_checkpoint_is_a_cache_MISS_even_under_the_same_model_name(served, monkeypatch):
@@ -207,7 +208,7 @@ def test_a_cache_dir_without_the_completion_sentinel_is_not_a_hit(served):
 
     got = weights.ensure(ref, "acme/model")
 
-    assert len(calls) == 1, "an unfinished cache directory was served as a hit"
+    assert len(calls) == 2, "an unfinished cache directory was served as a hit, or fetched more than once"
     assert (got / "model.safetensors").read_text() == "REAL"
 
 

@@ -52,6 +52,9 @@ def serve(monkeypatch, tmp_path):
 
     def install(payload: bytes, *, truncate_at: int | None = None):
         class _Resp:
+            status_code = 200      # not 206: the range-probe GET this origin also receives must fall back
+            headers = {}
+
             def __enter__(self): return self
             def __exit__(self, *a): return False
             def raise_for_status(self): pass
