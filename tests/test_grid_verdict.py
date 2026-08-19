@@ -22,6 +22,17 @@ def test_declared_grid_emits_the_exact_rational_not_a_rounded_float() -> None:
     assert finalize.declared_grid(30000 / 1001) == "30000/1001"
 
 
+@pytest.mark.parametrize("fps, expected", [
+    (29.97, "30000/1001"), (23.976, "24000/1001"), (59.94, "60000/1001"),
+    (30.0, "30"), (25.0, "25"),
+])
+def test_declared_grid_snaps_ntsc_decimals_to_the_broadcast_rational(fps, expected) -> None:
+    """NEGATIVE (finding 5): plain limit_denominator(1001) round-trips 29.97 to 2997/100, a rational a
+    real NTSC master (30000/1001) never measures as — the verdict was blind to the exact drift it exists
+    to catch."""
+    assert finalize.declared_grid(fps) == expected
+
+
 def test_grid_verdict_emits_nothing_on_a_clean_match(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
     monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
@@ -78,3 +89,15 @@ def test_grid_verdict_never_raises_on_an_audio_probe_failure(monkeypatch, tmp_pa
     monkeypatch.setattr(finalize, "_probe_audio", boom)
     defect = finalize.grid_verdict(tmp_path / "m.mp4", 30.0)
     assert defect is not None and "audio_probe_failed" in defect
+
+
+def test_grid_verdict_never_raises_when_has_audio_itself_raises(monkeypatch, tmp_path) -> None:
+    """NEGATIVE (finding 3): _has_audio carries no guard of its own — it is the whole-body wrap around
+    grid_verdict, not a per-call try/except, that keeps the docstring's NEVER-raises promise."""
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
+
+    def boom(_p):
+        raise RuntimeError("ffprobe exploded")
+    monkeypatch.setattr(finalize, "_has_audio", boom)
+    defect = finalize.grid_verdict(tmp_path / "m.mp4", 30.0)
+    assert defect is not None and "probe_failed" in defect

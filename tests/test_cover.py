@@ -2,6 +2,7 @@
 using the system fallback font (no brand font needed). ffmpeg weld is a smoke concern, not here."""
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -47,10 +48,35 @@ def test_compose_no_headline_still_renders(tmp_path: Path):
 @pytest.mark.parametrize("gpu", [False, True], ids=["cpu", "gpu"])
 def test_weld_video_reencodes_set_bt709(monkeypatch, tmp_path: Path, gpu):
     commands = []
-    monkeypatch.setattr(cover, "_probe", lambda _p: ("30", "48000", "2"))
+    monkeypatch.setattr(cover, "_probe", lambda _p: ("30", "2"))
     monkeypatch.setattr(cover.subprocess, "run", lambda cmd, **_kw: commands.append(cmd))
     cover.weld(tmp_path / "master.mp4", tmp_path / "cover.png", tmp_path / "out.mp4", 0.6, gpu, 216, 384)
 
     assert len(commands) == 2
     assert all(any("setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709" in token
                    for token in cmd) for cmd in commands)
+
+
+@pytest.mark.parametrize("gpu", [False, True], ids=["cpu", "gpu"])
+def test_weld_declares_grid_and_delivery_sample_rate(monkeypatch, tmp_path: Path, gpu):
+    """Finding 2/6: neither output clause may pass an inherited sample rate through, and both must
+    pin a CFR grid rather than leaving the rate to whatever ffmpeg negotiates."""
+    commands = []
+    monkeypatch.setattr(cover, "_probe", lambda _p: ("30000/1001", "2"))
+    monkeypatch.setattr(cover.subprocess, "run", lambda cmd, **_kw: commands.append(cmd))
+    cover.weld(tmp_path / "master.mp4", tmp_path / "cover.png", tmp_path / "out.mp4", 0.6, gpu, 216, 384)
+
+    assert len(commands) == 2
+    for cmd in commands:
+        assert "-r" in cmd and cmd[cmd.index("-r") + 1] == "30000/1001"
+        assert "-fps_mode" in cmd and cmd[cmd.index("-fps_mode") + 1] == "cfr"
+        assert "-ar" in cmd and cmd[cmd.index("-ar") + 1] == "48000"
+    assert "aresample=48000" in commands[1][commands[1].index("-filter_complex") + 1]
+
+
+def test_probe_refuses_an_unmeasurable_fps_instead_of_defaulting(monkeypatch, tmp_path: Path):
+    """Finding 2: the old '30' literal fallback is gone — an unmeasurable rate must raise."""
+    monkeypatch.setattr(cover.subprocess, "run",
+                        lambda *_a, **_kw: subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+    with pytest.raises(RuntimeError, match="could not measure the delivery grid"):
+        cover._probe(tmp_path / "silent.mp4")

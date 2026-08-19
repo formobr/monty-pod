@@ -337,7 +337,17 @@ def overlay_filtergraph(layers: list[dict], *, base: str = "0:v",
     return ";".join(filters), src
 
 
-def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc) -> Path:
+def _probe_grid(video: Path) -> str:
+    """Exact -r rational for `video`'s OWN video stream — no literal fallback, an unmeasurable rate refuses."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                          "-show_entries", "stream=r_frame_rate", "-of", "default=nw=1:nk=1", str(video)],
+                         capture_output=True, text=True).stdout.strip()
+    if not out or out in ("0/0", "N/A"):
+        raise RuntimeError(f"could not measure the delivery grid from {video} — no r_frame_rate")
+    return out
+
+
+def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc, grid: str) -> Path:
     """Composite alpha layers onto base in one ffmpeg pass (mirrors the engine _composite)."""
     cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(base)]
     for lay in layers:
@@ -345,7 +355,7 @@ def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc) -> Path:
     fc, last = overlay_filtergraph(layers)
     from .render import _venc
     cmd += ["-filter_complex", fc, "-map", f"[{last}]", "-map", "0:a?"]
-    cmd += _venc(enc, gpu) + ["-c:a", "copy", str(out)]
+    cmd += ["-r", grid, "-fps_mode", "cfr"] + _venc(enc, gpu) + ["-c:a", "copy", str(out)]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as exc:
@@ -355,8 +365,13 @@ def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc) -> Path:
     return out
 
 
-def composite(motion_plan, base: Path, input_paths: dict, out: Path, gpu: bool, enc, tmp: Path) -> Path:
-    """Render motion_plan.sections and overlay them onto `base`. Returns `base` unchanged if nothing rendered."""
+def composite(motion_plan, base: Path, input_paths: dict, out: Path, gpu: bool, enc, tmp: Path,
+             grid: str | None = None) -> Path:
+    """Render motion_plan.sections and overlay them onto `base`. Returns `base` unchanged if nothing
+    rendered. `grid` is the spec's declared -r rational; falling back to probing `base` itself covers
+    the (untested-in-prod) case of a caller with no spec reachable here."""
     layers = _render_layers(motion_plan.sections, motion_plan.brand.model_dump() if motion_plan.brand else None,
                             input_paths, tmp, getattr(motion_plan, "bundle", None))
-    return _overlay(base, layers, out, gpu, enc) if layers else base
+    if not layers:
+        return base
+    return _overlay(base, layers, out, gpu, enc, grid if grid is not None else _probe_grid(base))

@@ -262,19 +262,29 @@ def compose(base_frame: Path, cover: dict[str, Any], input_paths: dict[str, Path
     base.convert("RGB").save(out_png)
 
 
-def _probe(video: Path) -> tuple[str, str, str]:
+_DELIVERY_SAMPLE_RATE = 48000  # matches finalize._DELIVERY_SAMPLE_RATE — the weld ships at this rate, never inherited
+
+
+def _probe(video: Path) -> tuple[str, str]:
+    """(fps, channels) of `video`'s own streams. An unmeasurable fps refuses rather than substituting a
+    literal, parity with scripts/add_cover.py's probe() after it deleted its own "30" fallback."""
     def q(stream: str, entries: str) -> list[str]:
         return subprocess.run(["ffprobe", "-v", "error", "-select_streams", stream,
                                "-show_entries", entries, "-of", "default=nw=1:nk=1", str(video)],
                               capture_output=True, text=True).stdout.strip().splitlines()
     v = q("v:0", "stream=r_frame_rate")
-    a = q("a:0", "stream=sample_rate,channels")
-    return (v[0] if v else "30"), (a[0] if a else "48000"), (a[1] if len(a) > 1 else "2")
+    if not v or not v[0] or v[0] in ("0/0", "N/A"):
+        raise RuntimeError(f"could not measure the delivery grid from {video} — no r_frame_rate")
+    a = q("a:0", "stream=channels")
+    return v[0], (a[0] if a else "2")
 
 
 def weld(video: Path, cover_png: Path, out: Path, hold: float, gpu: bool, w: int, h: int) -> None:
-    """Hold the cover `hold` s and concat it to the END of the video (one re-encode; gapless, seekable)."""
-    fps, sr, ch = _probe(video)
+    """Hold the cover `hold` s and concat it to the END of the video (one re-encode; gapless, seekable).
+    Audio always lands at the delivery rate — resampling to the master's OWN inherited rate here is how
+    a 96k source stayed 96k across the weld."""
+    fps, ch = _probe(video)
+    sr = _DELIVERY_SAMPLE_RATE
     layout = "stereo" if ch == "2" else "mono"
     bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
     venc = (["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "14", "-maxrate", "24M", "-bufsize", "32M"] if gpu
@@ -284,16 +294,17 @@ def weld(video: Path, cover_png: Path, out: Path, hold: float, gpu: bool, w: int
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                         "-loop", "1", "-i", str(cover_png),
                         "-f", "lavfi", "-i", f"anullsrc=channel_layout={layout}:sample_rate={sr}",
-                        "-t", str(hold), "-r", fps,
+                        "-t", str(hold), "-r", fps, "-fps_mode", "cfr",
                         "-vf", f"scale={w}:{h},setsar=1,format=yuv420p,{bt709}",
-                        *venc, "-profile:v", "high", "-c:a", "aac", "-ar", sr, "-ac", ch,
+                        *venc, "-profile:v", "high", "-c:a", "aac", "-ar", str(sr), "-ac", ch,
                         "-video_track_timescale", "90000", "-shortest", str(clip)], check=True)
         norm = f"fps={fps},scale={w}:{h},setsar=1,format=yuv420p,{bt709}"
         fc = (f"[0:v]{norm}[v0];[1:v]{norm}[v1];[v0][v1]concat=n=2:v=1:a=0[v];"
               f"[0:a]aresample={sr}[a0];[1:a]aresample={sr}[a1];[a0][a1]concat=n=2:v=0:a=1[a]")
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                         "-i", str(video), "-i", str(clip), "-filter_complex", fc,
-                        "-map", "[v]", "-map", "[a]", *venc, "-c:a", "aac", "-ar", sr,
+                        "-map", "[v]", "-map", "[a]", *venc, "-c:a", "aac", "-ar", str(sr),
+                        "-r", fps, "-fps_mode", "cfr",
                         "-movflags", "+faststart", str(out)], check=True)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -169,3 +170,55 @@ def test_an_unreadable_oom_counter_is_not_reported_as_zero(tmp_path: Path, monke
     monkeypatch.setattr(mograph, "_oom_count", lambda: None)
     facts = mograph._box_facts(None, 4, 512 << 20, tmp_path)
     assert "oom=?" in facts and "oom+" not in facts
+
+
+def test_overlay_output_clause_declares_the_grid(monkeypatch, tmp_path: Path) -> None:
+    """Finding 1: mograph is upstream of every finalize pass that re-declares its grid from a probe of
+    its own output — a rate lost HERE is re-stamped as authoritative three more times downstream."""
+    commands = []
+    monkeypatch.setattr(mograph.subprocess, "run", lambda cmd, **_kw: commands.append(cmd))
+    enc = SimpleNamespace(preset="medium", cq=23, pix_fmt="yuv420p")
+    layers = [{"start": 0.0, "dur": 1.0, "glass": False, "mov": "layer.mov"}]
+    mograph._overlay(tmp_path / "base.mp4", layers, tmp_path / "out.mp4", False, enc, "30000/1001")
+
+    assert len(commands) == 1
+    cmd = commands[0]
+    assert cmd[cmd.index("-r") + 1] == "30000/1001"
+    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
+    assert "-ar" not in cmd  # -c:a copy stays untouched — no new -ar on a copied track
+
+
+def test_composite_threads_the_caller_supplied_grid(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(mograph, "_render_layers", lambda *_a, **_k: [{"mov": "x"}])
+    captured = {}
+
+    def fake_overlay(base, layers, out, gpu, enc, grid):
+        captured["grid"] = grid
+        return out
+    monkeypatch.setattr(mograph, "_overlay", fake_overlay)
+    motion_plan = SimpleNamespace(sections=["s"], brand=None, bundle=None)
+    mograph.composite(motion_plan, tmp_path / "base.mp4", {}, tmp_path / "out.mp4", False, None, tmp_path,
+                      grid="24000/1001")
+    assert captured["grid"] == "24000/1001"
+
+
+def test_composite_falls_back_to_probing_its_own_input_when_no_grid_given(monkeypatch, tmp_path: Path) -> None:
+    """The spec's declared grid is preferred (test above); this is ONLY the no-spec-reachable escape hatch."""
+    monkeypatch.setattr(mograph, "_render_layers", lambda *_a, **_k: [{"mov": "x"}])
+    monkeypatch.setattr(mograph, "_probe_grid", lambda _p: "60000/1001")
+    captured = {}
+
+    def fake_overlay(base, layers, out, gpu, enc, grid):
+        captured["grid"] = grid
+        return out
+    monkeypatch.setattr(mograph, "_overlay", fake_overlay)
+    motion_plan = SimpleNamespace(sections=["s"], brand=None, bundle=None)
+    mograph.composite(motion_plan, tmp_path / "base.mp4", {}, tmp_path / "out.mp4", False, None, tmp_path)
+    assert captured["grid"] == "60000/1001"
+
+
+def test_probe_grid_refuses_an_unmeasurable_fps(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *_a, **_kw: subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+    with pytest.raises(RuntimeError, match="could not measure the delivery grid"):
+        mograph._probe_grid(tmp_path / "silent.mp4")

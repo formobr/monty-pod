@@ -645,7 +645,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             from .mograph import composite
             with phase("mograph"):
                 master = composite(
-                    _mp, master, input_paths, tmp / "render_mograph.mp4", gpu, spec.encode, tmp)
+                    _mp, master, input_paths, tmp / "render_mograph.mp4", gpu, spec.encode, tmp,
+                    grid=_finalize.declared_grid(spec.timeline.fps))
 
         # captions burn (libass) BEFORE the cover weld — the subtitle track covers the whole body.
         caps = _mp.captions if _mp is not None else None
@@ -700,14 +701,18 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             print(f"[render] grid_verify: {msg}", file=sys.stderr)
             # outcome MUST stay "ok" with no error/error_type: the cabinet frontend keys "failed" off
             # outcome alone (progress.mjs isErrorActivity), and a delivered master is not a failure.
-            cp.send_event({k: v for k, v in {
-                **common,
-                "status": "step",
-                "op": "grid_verify",
-                "phase": "grid_verify_degraded",
-                "outcome": "ok",
-                "timings": {"grid_defect": defect},
-            }.items() if v is not None})
+            try:
+                cp.send_event({k: v for k, v in {
+                    **common,
+                    "status": "step",
+                    "op": "grid_verify",
+                    "phase": "grid_verify_degraded",
+                    "outcome": "ok",
+                    "timings": {"grid_defect": defect},
+                }.items() if v is not None})
+            except Exception as exc:
+                # master is already encoded (~20 GPU-min paid) — a stream failure here must not cost it
+                print(f"[render] grid_verify: event send failed, swallowed: {safe_error(exc)}", file=sys.stderr)
 
         done: list[str] = []
         with phase("upload"):

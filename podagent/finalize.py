@@ -102,11 +102,20 @@ _DELIVERY_SAMPLE_RATE = 48000
 _AV_DELTA_FRAME_TOLERANCE = 2.0
 
 
+# A caller-supplied decimal (29.97) is closer to 2997/100 than to 30000/1001, so limit_denominator alone
+# would round-trip it wrong and grid_verdict would agree with its own bad declaration; snap first.
+_NTSC_DROP_FRAME = (Fraction(30000, 1001), Fraction(24000, 1001), Fraction(60000, 1001))
+_NTSC_SNAP_EPS = 1e-4  # float round-trip error on 29.97/23.976/59.94 vs the true rational is ~3e-5
+
+
 def declared_grid(fps: float) -> str:
     """The exact -r rational for a DECLARED timeline.fps. Absent/zero/NaN/infinite cannot become a
     grid, so it refuses HERE (before any subprocess) rather than negotiating one downstream."""
     if fps is None or not math.isfinite(fps) or fps <= 0:
         raise ValueError(f"timeline.fps must be a finite, positive number, got {fps!r}")
+    for std in _NTSC_DROP_FRAME:
+        if abs(fps - float(std)) < _NTSC_SNAP_EPS:
+            return str(std)
     return str(Fraction(fps).limit_denominator(1001))
 
 
@@ -128,12 +137,16 @@ def _probe_audio(path: Path) -> tuple[int, float]:
 
 def grid_verdict(master: Path, declared_fps: float) -> dict | None:
     """Header-only: measured master grid vs the DECLARED one. None on a clean match (zero-cost case),
-    else a machine-readable defect record — NEVER raises, a probe failure becomes a defect too."""
+    else a machine-readable defect record — NEVER raises, ANY exception below becomes a defect."""
     try:
-        declared = declared_grid(declared_fps)
-        _w, _h, _fps, m_num, m_den, v_dur = _probe(master)
+        return _grid_verdict(master, declared_fps)
     except Exception as exc:
         return {"probe_failed": safe_error(exc)}
+
+
+def _grid_verdict(master: Path, declared_fps: float) -> dict | None:
+    declared = declared_grid(declared_fps)
+    _w, _h, _fps, m_num, m_den, v_dur = _probe(master)
     defect: dict = {}
     measured = _grid_rate(m_num, m_den)
     if measured != declared:
