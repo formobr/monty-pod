@@ -1,7 +1,8 @@
-"""render.render_spec — every event send is a best-effort ping once the render is running; a broken
-control-plane stream must never cost an already-paid-for encode (skip the PUT or misreport a delivered
-master as failed)."""
+"""render.render_spec — past a successful encode, event sends are best-effort (a broken stream must
+never cost the paid master); before it they stay fatal (nothing spent yet, so fail fast is cheap)."""
 from __future__ import annotations
+
+import pytest
 
 from podagent import render
 from podagent.models import RenderSpec
@@ -35,17 +36,26 @@ def _wire_happy_path(monkeypatch, uploaded: list, grid_defect: dict | None = Non
     monkeypatch.setattr(render._finalize, "grid_verdict", lambda *_a, **_kw: grid_defect)
 
 
-def test_a_control_plane_that_raises_on_every_event_still_delivers_and_reports(
+def test_a_control_plane_that_fails_from_the_encode_onward_still_delivers_and_reports(
     monkeypatch, tmp_path, capsys,
 ):
-    """The property that matters: even a control plane whose send_event ALWAYS raises must not stop a
-    successful encode from reaching the PUT or reporting a terminal result."""
+    """The property that matters: a control plane whose send_event raises for every event FROM THE
+    SUCCESSFUL ENCODE ONWARD must not stop the PUT or the terminal result. ffmpeg_finished itself is
+    the flag flip, not a raise site — it is the pre-encode path's own (still-fatal) exit event."""
     uploaded: list = []
     results: list = []
 
     class _CP:
+        def __init__(self) -> None:
+            self.encode_done = False
+
         def send_event(self, payload, *, wait=False):
-            raise RuntimeError(f"stream write failed ({payload.get('phase')})")
+            if payload.get("phase") == "ffmpeg_finished":
+                self.encode_done = True
+                return True
+            if self.encode_done:
+                raise RuntimeError(f"stream write failed ({payload.get('phase')})")
+            return True
 
         def send_result(self, payload, *, wait=True):
             results.append(payload)
@@ -61,6 +71,28 @@ def test_a_control_plane_that_raises_on_every_event_still_delivers_and_reports(
     assert "upload_started: event send failed, swallowed" in err
     assert "upload_finished: event send failed, swallowed" in err
     assert "work_finished: event send failed, swallowed" in err
+
+
+def test_a_control_plane_that_fails_pre_encode_aborts_before_ffmpeg_runs(monkeypatch, tmp_path):
+    """The other half of the boundary: a stream failure BEFORE the encode stays fatal and never reaches
+    ffmpeg — spending ~20 GPU-min on a render nobody can be told about is the same loss, only pricier."""
+    ffmpeg_calls: list = []
+
+    class _CP:
+        def send_event(self, payload, *, wait=False):
+            raise RuntimeError("stream unreachable")
+
+        def send_result(self, payload, *, wait=True):
+            raise AssertionError("send_result must not be reached: encode never ran")
+
+    monkeypatch.setattr(render, "download", lambda _u, dest: (dest.write_bytes(b"m"), dest)[1])
+    monkeypatch.setattr(render, "_gpu_available", lambda: False)
+    monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: (ffmpeg_calls.append(1), _Done())[1])
+
+    with pytest.raises(RuntimeError):
+        render.render_spec(_spec(), _CP())
+
+    assert ffmpeg_calls == []
 
 
 def test_a_failed_grid_verify_send_does_not_block_the_put(monkeypatch, tmp_path, capsys):

@@ -543,16 +543,17 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
     common = {"job_id": spec.job_id, "session_id": session_id, "corr_id": corr_id, "stage": "render"}
 
     @contextmanager
-    def phase(op: str):
-        # Any phase can be the one that runs right after the encode succeeds, so all go through the
-        # swallow-and-log seam: a real step failure still `raise`s below regardless of its own report.
+    def phase(op: str, *, guarded: bool = False):
+        # guarded=True is the post-spend path: nothing is worth protecting before the encode succeeds,
+        # so only a phase entirely at-or-after that point may swallow its own event-send failure.
         base = {**common, "status": "step", "op": op}
-        _safe_send_event(cp, {k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
+        send = (lambda ev: _safe_send_event(cp, ev)) if guarded else cp.send_event
+        send({k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
         started = time.monotonic()
         try:
             yield
         except BaseException as exc:
-            _safe_send_event(cp, {
+            send({
                 k: v for k, v in {
                     **base,
                     "phase": f"{op}_error",
@@ -564,7 +565,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             })
             raise
         else:
-            _safe_send_event(cp, {
+            send({
                 k: v for k, v in {
                     **base,
                     "phase": f"{op}_finished",
@@ -722,7 +723,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             }.items() if v is not None})
 
         done: list[str] = []
-        with phase("upload"):
+        with phase("upload", guarded=True):
             for o in spec.outputs:
                 if o.kind == "cache":
                     print(f"cache output {o.id!r} skipped (v1)", file=sys.stderr)
