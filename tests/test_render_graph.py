@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from podagent import render
+from podagent import finalize, render
 from podagent.models import MotionKeyframe, RenderSpec
 
 _EXAMPLES = Path(__file__).resolve().parents[1] / "contracts" / "examples"
@@ -173,6 +173,44 @@ def test_build_command_encode_flags() -> None:
     assert all(token in gpu for token in render._BT709)
 
 
+def test_build_command_declares_the_measured_grid() -> None:
+    """render.build_command is the LIVE multi-pass master encode — a missing -r/-fps_mode/-ar here is
+    exactly the bug that shipped a 25fps/96kHz master from a 30fps/48kHz source."""
+    spec = _spec("spec.preview.json")
+    ipaths = {i.id: Path(f"/work/{i.id}") for i in spec.inputs}
+    cmd = render.build_command(spec, ipaths, Path("/work/out.mp4"), gpu=False)
+    assert cmd[cmd.index("-r") + 1] == "30"
+    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
+    assert cmd[cmd.index("-ar") + 1] == "48000"
+
+
+def test_build_command_emits_the_exact_rational_not_a_rounded_float() -> None:
+    data = _data("spec.preview.json")
+    data["timeline"]["fps"] = 30000 / 1001
+    spec = RenderSpec.model_validate(data)
+    ipaths = {i.id: Path(f"/work/{i.id}") for i in spec.inputs}
+    cmd = render.build_command(spec, ipaths, Path("/work/out.mp4"), gpu=False)
+    assert cmd[cmd.index("-r") + 1] == "30000/1001"
+
+
+def test_burn_captions_declares_the_grid_but_never_touches_audio(monkeypatch, tmp_path) -> None:
+    """The captions pass RE-ENCODES video (libass burn) but copies audio through — it must declare
+    -r/-fps_mode and must NOT declare -ar next to a -c:a copy clause."""
+    spec = _spec("spec.final.json")
+    mp = spec.overlays.motion_plan
+    input_paths = {"caption_font": Path("/work/caption_font")}
+    cmds: list[list[str]] = []
+    monkeypatch.setattr(render.subprocess, "run", lambda cmd, **_kw: cmds.append(cmd))
+    render._burn_captions(mp.captions, mp, Path("/work/src.mp4"), input_paths, tmp_path / "out.mp4",
+                          False, spec.timeline.width, spec.timeline.height, spec.encode,
+                          spec.timeline.fps)
+    cmd = cmds[0]
+    assert cmd[cmd.index("-r") + 1] == "30"
+    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "-ar" not in cmd
+
+
 def test_final_overlays_not_implemented() -> None:
     spec = _spec("spec.final.json")
 
@@ -181,6 +219,21 @@ def test_final_overlays_not_implemented() -> None:
             raise AssertionError("send_event must not be reached before the render runs")
 
     with pytest.raises(NotImplementedError):
+        render.render_spec(spec, _StubCP())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("fps", [0.0, -1.0, float("nan"), float("inf"), None])
+def test_render_spec_refuses_an_unusable_grid_before_any_subprocess(fps, monkeypatch) -> None:
+    """The ONLY refusal a lost render is worse than — it must fire before gpu_probe's own subprocess."""
+    spec = _spec("spec.preview.json")
+    spec.timeline.fps = fps
+    monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: pytest.fail("subprocess ran"))
+
+    class _StubCP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            raise AssertionError("send_event must not be reached before the grid is refused")
+
+    with pytest.raises(ValueError):
         render.render_spec(spec, _StubCP())  # type: ignore[arg-type]
 
 
@@ -252,3 +305,127 @@ def test_render_download_ffmpeg_upload_boundaries_are_structured(monkeypatch, tm
     ]
     assert all(e["corr_id"] == "c" and e["session_id"] == "s" for e in phases)
     assert results and results[0]["session_id"] == "s"
+
+
+# --- the post-render grid verdict: loud, never a reason to withhold the PUT ---
+
+class _Done:
+    returncode = 0
+    stderr = b""
+
+
+def _wire_render_spec(monkeypatch, puts: list) -> None:
+    def fake_download(_url: str, dest: Path) -> Path:
+        dest.write_bytes(b"media")
+        return dest
+    monkeypatch.setattr(render, "download", fake_download)
+    monkeypatch.setattr(render, "upload", lambda path, url, _mime: puts.append((path, url)))
+    monkeypatch.setattr(render, "_gpu_available", lambda: False)
+    monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: _Done())
+    monkeypatch.setenv("MONTY_ALLOW_STATIC_CAMERA", "1")
+
+
+def test_render_spec_reports_a_grid_mismatch_but_still_puts_the_master(monkeypatch) -> None:
+    """NEGATIVE: the verdict is loud but must never withhold an already-paid-for master."""
+    spec = _spec("spec.preview.json")
+    events: list[dict] = []
+    results: list[dict] = []
+    puts: list = []
+
+    class _CP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            events.append(payload)
+            return True
+
+        def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+            results.append(payload)
+            return True
+
+    _wire_render_spec(monkeypatch, puts)
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 25.0, 25, 1, 4.0))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: False)
+
+    render.render_spec(spec, _CP())
+
+    grid_events = [e for e in events if e.get("op") == "grid_verify"]
+    assert len(grid_events) == 1
+    ev = grid_events[0]
+    assert ev["status"] == "step" and ev["outcome"] == "ok"
+    assert ev["phase"] == "grid_verify_degraded"
+    assert ev["timings"]["grid_defect"] == {"video_rate": {"declared": "30", "measured": "25"}}
+    assert puts, "the master PUT must still happen despite the mismatch"
+    assert results and results[0]["status"] == "ok"
+    assert results[0]["defects"] == [{"video_rate": {"declared": "30", "measured": "25"}}]
+
+
+def test_render_spec_never_reports_a_delivered_master_as_a_failed_job(monkeypatch) -> None:
+    """The cabinet frontend keys 'failed' off outcome=='error' alone (progress.mjs isErrorActivity),
+    not off the phase name — a degraded-but-delivered master must never set outcome/error/error_type."""
+    spec = _spec("spec.preview.json")
+    events: list[dict] = []
+    puts: list = []
+
+    class _CP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            events.append(payload)
+            return True
+
+        def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+            return True
+
+    _wire_render_spec(monkeypatch, puts)
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 25.0, 25, 1, 4.0))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: False)
+
+    render.render_spec(spec, _CP())
+
+    assert not any(e.get("outcome") == "error" for e in events)
+    assert not any("error" in e or "error_type" in e for e in events if e.get("op") == "grid_verify")
+
+
+def test_render_spec_emits_no_event_on_a_matching_grid(monkeypatch) -> None:
+    spec = _spec("spec.preview.json")
+    events: list[dict] = []
+    results: list[dict] = []
+    puts: list = []
+
+    class _CP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            events.append(payload)
+            return True
+
+        def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+            results.append(payload)
+            return True
+
+    _wire_render_spec(monkeypatch, puts)
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 4.0))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
+    monkeypatch.setattr(finalize, "_probe_audio", lambda _p: (48000, 4.0))
+
+    render.render_spec(spec, _CP())
+
+    assert not any(e.get("op") == "grid_verify" for e in events)
+    assert "defects" not in results[0]
+
+
+def test_render_spec_survives_a_post_render_probe_failure(monkeypatch) -> None:
+    """NEGATIVE: a probe raising on the FINISHED master must not cost the render its PUT."""
+    spec = _spec("spec.preview.json")
+    puts: list = []
+
+    class _CP:
+        def send_event(self, payload: dict, *, wait: bool = False) -> bool:
+            return True
+
+        def send_result(self, payload: dict, *, wait: bool = True) -> bool:
+            return True
+
+    def boom(_p):
+        raise RuntimeError("ffprobe exploded")
+
+    _wire_render_spec(monkeypatch, puts)
+    monkeypatch.setattr(finalize, "_probe", boom)
+
+    render.render_spec(spec, _CP())  # must not raise
+    assert puts

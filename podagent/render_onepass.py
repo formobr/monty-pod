@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,7 @@ _REF_W, _REF_H = 80, 142
 _REF_VIDEO = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", *_finalize._BT709]
 _REF_AUDIO = ["-c:a", "aac", "-b:a", "128k"]
 _MASTER_AUDIO = ["-c:a", "aac", "-b:a", "192k"]
+
 
 # -stream_loop -1 on the idle input plus shortest=1 means `-t` is the ONLY thing that ends this
 # process, so the wait is bounded by the WORK: a wedge is infinite, and any finite bound catches it.
@@ -99,6 +101,7 @@ class Inputs:
 def preflight(spec: RenderSpec) -> None:
     """Refuse every non-goal BEFORE any subprocess — same exception type and same timing as
     render.render_spec (render.py:552-568), so a v6 spec cannot half-render through this door either."""
+    _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
     ov = spec.overlays if spec.mode == "final" else None
     if ov is None:
         return
@@ -165,12 +168,14 @@ class Prepared:
 @dataclass(frozen=True)
 class Delivered:
     """What the door actually PUT. `master` is the loudnorm's output, which is a DIFFERENT file from
-    the encode's — two-pass loudnorm measures a finished file, so it can never join the graph."""
+    the encode's — two-pass loudnorm measures a finished file, so it can never join the graph.
+    `defect` is the post-render grid verdict — None on a clean master, never a reason to withhold the PUT."""
 
     prepared: Prepared
     master: Path
     presync: Path | None
     outputs: list[str] = field(default_factory=list)
+    defect: dict | None = None
 
 
 def _audio_mix(spec: RenderSpec, input_paths: dict, tmp: Path, dur: float, phase):
@@ -252,6 +257,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
     ov = spec.overlays if spec.mode == "final" else None
     fin = ov.finalize if ov is not None else None
     w, h, fps = spec.timeline.width, spec.timeline.height, spec.timeline.fps
+    grid = _finalize.declared_grid(fps)
 
     inputs = Inputs()
     spec_pads: dict[str, str] = {}
@@ -326,7 +332,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         frag, _out_v, out_a = _finalize.watermark_filter(
             base_v=vlink, sting_v=f"{sting}:v", idle_v=f"{idle}:v", width=wm.width, overlay_xy=xy,
             base_a=alink, chime_a=chime_a, chime_vol=wm.chime_volume, delay=wm.delay,
-            out_v=V_WATERMARK, out_a=A_WATERMARK)
+            grid=grid, sample_rate=48000, out_v=V_WATERMARK, out_a=A_WATERMARK)
         subst = {vlink: vlink, alink: alink, f"{sting}:v": f"{sting}:v", f"{idle}:v": f"{idle}:v",
                  V_WATERMARK: V_WATERMARK, A_WATERMARK: A_WATERMARK}
         if chime_a is not None:
@@ -346,11 +352,16 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
     # Output options bind to the output they PRECEDE, so each destination carries its whole clause;
     # -t bounds each (shortest=1 over a -stream_loop'ed idle is not a lifetime).
     cmd += ["-map", f"[{vlink}]", "-map", f"[{alink}]",
-            *(_finalize._FINAL_GPU if gpu else _finalize._FINAL_CPU), *_MASTER_AUDIO,
+            "-r", grid, "-fps_mode", "cfr",
+            *(_finalize._FINAL_GPU if gpu else _finalize._FINAL_CPU),
+            "-ar", "48000", *_MASTER_AUDIO,
             "-movflags", "+faststart", "-t", t, str(p.master_out)]
     if wants_ref:
+        # check_sync.py all_frames matches ref against master by frame INDEX, so a different grid here
+        # compares different instants — the ref carries the master's OWN -r, never its own.
         cmd += ["-map", f"[{V_PRESYNC}]", "-map", f"[{aref}]",
-                *_REF_VIDEO, *_REF_AUDIO, "-t", t, str(p.presync_out)]
+                "-r", grid, "-fps_mode", "cfr",
+                *_REF_VIDEO, "-ar", "48000", *_REF_AUDIO, "-t", t, str(p.presync_out)]
     return ";".join(chains), cmd
 
 
@@ -397,6 +408,11 @@ def render_body(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
         # spec, and shipping the encode raw is every deliverable ~6 dB under the brand target.
         with phase("finalize"):
             master = _finalize.apply_loudnorm(fin, master, Path(tmp) / "fin_ln.mp4")
+    # Header-only, after the paid-for encode and before the PUT: never withholds the master, only
+    # reports on it (see grid_verdict's own contract for why it cannot raise).
+    defect = _finalize.grid_verdict(master, spec.timeline.fps)
+    if defect is not None:
+        print(f"[render_onepass] grid verdict: declared vs measured mismatch {defect}", file=sys.stderr)
     done: list[str] = []
     with phase("upload"):
         for o in spec.outputs:
@@ -409,4 +425,4 @@ def render_body(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
             done.append(o.id)
     return Delivered(prepared=p, master=master,
                      presync=p.presync_out if any(o.kind == "presync" for o in spec.outputs) else None,
-                     outputs=done)
+                     outputs=done, defect=defect)

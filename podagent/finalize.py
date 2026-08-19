@@ -28,11 +28,14 @@ bitrate/colour signal.
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 from . import accents as _accents
+from .sanitize import safe_error
 
 # bt709 SIGNAL (tag, no convert) — an untagged master makes platforms GUESS the colourspace.
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
@@ -89,11 +92,65 @@ def _probe(path: Path) -> tuple[int, int, float, int, int, float]:
     return w, h, fps, int(num), int(den), float(dur)
 
 
+def _grid_rate(fps_num: int, fps_den: int) -> str:
+    """Exact rational for -r, built from the probe's num/den — routing it through the rounded float
+    `fps` first would reintroduce the drift this declaration exists to kill."""
+    return str(Fraction(fps_num, fps_den))
+
+
+_DELIVERY_SAMPLE_RATE = 48000
+_AV_DELTA_FRAME_TOLERANCE = 2.0
+
+
+def declared_grid(fps: float) -> str:
+    """The exact -r rational for a DECLARED timeline.fps. Absent/zero/NaN/infinite cannot become a
+    grid, so it refuses HERE (before any subprocess) rather than negotiating one downstream."""
+    if fps is None or not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"timeline.fps must be a finite, positive number, got {fps!r}")
+    return str(Fraction(fps).limit_denominator(1001))
+
+
 def _has_audio(path: Path) -> bool:
     r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
                         "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
                        capture_output=True, text=True)
     return bool(r.stdout.strip())
+
+
+def _probe_audio(path: Path) -> tuple[int, float]:
+    """(sample_rate, duration) of the first audio stream — header-only, same cost class as _probe."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate,duration", "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True, check=True).stdout.split()
+    return int(out[0]), float(out[1])
+
+
+def grid_verdict(master: Path, declared_fps: float) -> dict | None:
+    """Header-only: measured master grid vs the DECLARED one. None on a clean match (zero-cost case),
+    else a machine-readable defect record — NEVER raises, a probe failure becomes a defect too."""
+    try:
+        declared = declared_grid(declared_fps)
+        _w, _h, _fps, m_num, m_den, v_dur = _probe(master)
+    except Exception as exc:
+        return {"probe_failed": safe_error(exc)}
+    defect: dict = {}
+    measured = _grid_rate(m_num, m_den)
+    if measured != declared:
+        defect["video_rate"] = {"declared": declared, "measured": measured}
+    if _has_audio(master):
+        try:
+            a_rate, a_dur = _probe_audio(master)
+        except Exception as exc:
+            defect["audio_probe_failed"] = safe_error(exc)
+        else:
+            if a_rate != _DELIVERY_SAMPLE_RATE:
+                defect["audio_rate"] = {"declared": _DELIVERY_SAMPLE_RATE, "measured": a_rate}
+            tolerance_ms = _AV_DELTA_FRAME_TOLERANCE * 1000.0 / declared_fps
+            delta_ms = abs(v_dur - a_dur) * 1000.0
+            if delta_ms > tolerance_ms:
+                defect["av_duration_delta_ms"] = round(delta_ms, 1)
+    return defect or None
 
 
 def _terminal_bt709(fc: str, out_v: str) -> str:
@@ -141,10 +198,12 @@ def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: 
     )
     script = out.with_name(out.name + ".filter_complex")
     script.write_text(_terminal_bt709(";".join(parts), prev[1:-1]) + "\n", encoding="utf-8")
+    grid = _grid_rate(fps_num, fps_den)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
            *( ["-init_hw_device", "vulkan"] if gpu else []), "-i", str(src),
            "-stream_loop", "-1", "-i", str(burn_path), "-filter_complex_script", str(script),
            "-map", prev, "-map", "0:a?",
+           "-r", grid, "-fps_mode", "cfr",
            *(_MID_GPU if gpu else _MID_CPU),
            "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
     _run(cmd, "film burn accents", timeout_s=FILM_BURN_RENDER_TIMEOUT_S)
@@ -156,14 +215,16 @@ def apply_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Pa
         return src
     if any(a.kind == "film_burn" for a in fin.accents):
         return _apply_film_burn_accents(fin, src, out, input_paths, gpu)
-    w, h, fps, _, _, _ = _probe(src)
+    w, h, fps, fps_num, fps_den, _ = _probe(src)
     fc = _accents.build_chain_filter(fin.accents, fps=fps, w=w, h=h, gpu=gpu)
     if fc is None:
         return src
     fc = _terminal_bt709(fc, "vout")
+    grid = _grid_rate(fps_num, fps_den)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
            *(["-init_hw_device", "vulkan"] if gpu else []), "-i", str(src),
            "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
+           "-r", grid, "-fps_mode", "cfr",
            *(_MID_GPU if gpu else _MID_CPU),
            "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
     _run(cmd, "frame accents")
@@ -197,10 +258,13 @@ def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool, *,
     # tail is exactly `cover_hold` s long, and only this box knows the welded master's real duration.
     # Held back unless a cover WAS welded — `src` is then pure body, and subtracting a tail that does
     # not exist deletes the logo from the last `cover_hold` seconds of live picture.
-    body_end = max(0.0, _probe(src)[5] - (logo.cover_hold if cover_welded else 0.0))
+    _w, _h, _fps, fps_num, fps_den, src_dur = _probe(src)
+    body_end = max(0.0, src_dur - (logo.cover_hold if cover_welded else 0.0))
     fc = _terminal_bt709(body_logo_filter(logo.corner, logo.width, logo.opacity, logo.margin, body_end), "vout")
+    grid = _grid_rate(fps_num, fps_den)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-i", str(asset),
            "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
+           "-r", grid, "-fps_mode", "cfr",
            *(_MID_GPU if gpu else _MID_CPU),
            "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
     _run(cmd, "body logo")
@@ -211,11 +275,12 @@ def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool, *,
 
 def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, overlay_xy: str,
                      base_a: str | None, chime_a: str | None, chime_vol: float, delay: float,
+                     grid: str, sample_rate: int,
                      out_v: str = "wmv", out_a: str = "wma") -> tuple[str, str, str | None]:
     """The watermark filtergraph, parameterised by input LABELS so it composes into any filter_complex.
     The sting uses the original 1200x600 canvas so the spring overshoot is not clipped; the shorter
-    idle is padded to that canvas before concat, anchored left so the animation is preserved."""
-    normalize = f"pad={WM_CANVAS_W}:{WM_CANVAS_H}:0:(oh-ih)/2:color=black@0"
+    idle is padded, anchored left. `grid`/`sample_rate` conform the 60fps/44.1kHz brand assets."""
+    normalize = f"pad={WM_CANVAS_W}:{WM_CANVAS_H}:0:(oh-ih)/2:color=black@0,fps={grid}"
     f = (f"[{sting_v}]{normalize},setpts=PTS-STARTPTS[i];"
          f"[{idle_v}]{normalize},setpts=PTS-STARTPTS[d];"
          "[i][d]concat=n=2:v=1:a=0[wm0];"
@@ -227,14 +292,14 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
         f += f";[{base_v}][wm]overlay={overlay_xy}:shortest=1:format=auto[{out_v}]"
     ret_a: str | None = None
     if chime_a is not None:
-        ops = []
+        ops = [f"aresample={sample_rate}"]
         if abs(chime_vol - 1.0) > 1e-3:
             ops.append(f"volume={chime_vol}")
         if delay > 0:
             ms = int(delay * 1000)
             ops.append(f"adelay={ms}|{ms}")
-        ch = f"[{chime_a}]{','.join(ops)}[chm];" if ops else ""
-        cha = "[chm]" if ch else f"[{chime_a}]"
+        ch = f"[{chime_a}]{','.join(ops)}[chm];"
+        cha = "[chm]"
         if base_a is not None:
             f += f";{ch}[{base_a}]{cha}amix=inputs=2:duration=first:dropout_transition=0:normalize=0[{out_a}]"
         else:
@@ -258,12 +323,15 @@ def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> 
             raise RuntimeError(f"finalize.watermark asset {ref!r} is not a resolved inputs[] id")
     sting, idle = input_paths[wm.sting], input_paths[wm.idle]
     has_audio = _has_audio(src)
+    _w, _h, _fps, fps_num, fps_den, src_dur = _probe(src)
+    grid = _grid_rate(fps_num, fps_den)
     overlay_xy = (f"{wm.x}:{wm.y}" if wm.x is not None and wm.y is not None
                   else _POS[wm.position].format(m=wm.margin))
     fc, out_v, out_a = watermark_filter(
         base_v="0:v", sting_v="1:v", idle_v="2:v", width=wm.width, overlay_xy=overlay_xy,
         base_a=("0:a" if has_audio else None), chime_a=("1:a" if wm.chime else None),
-        chime_vol=wm.chime_volume, delay=wm.delay, out_v="v", out_a="a")
+        chime_vol=wm.chime_volume, delay=wm.delay, grid=grid, sample_rate=48000,
+        out_v="v", out_a="a")
     fc = _terminal_bt709(fc, out_v)
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
            "-c:v", "libvpx-vp9", "-i", str(sting),
@@ -274,9 +342,10 @@ def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> 
     audio_map = f"[{out_a}]" if out_a else ("0:a" if has_audio else None)
     cmd += ["-map", audio_map] if audio_map else ["-an"]
     if not has_audio:
-        cmd += ["-t", f"{_probe(src)[5]:.3f}"]
-    cmd += [*(_FINAL_GPU if gpu else _FINAL_CPU),
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
+        cmd += ["-t", f"{src_dur:.3f}"]
+    cmd += ["-r", grid, "-fps_mode", "cfr",
+            *(_FINAL_GPU if gpu else _FINAL_CPU),
+            "-ar", "48000", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
     _run(cmd, "watermark")
     return out
 

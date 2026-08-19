@@ -249,13 +249,13 @@ def _logo(idx: int, base: str) -> list[str]:
 
 def _watermark(sting: int, idle: int, base: str, base_a: str = "atail") -> list[str]:
     return [
-        '[%d:v]pad=1200:600:0:(oh-ih)/2:color=black@0,setpts=PTS-STARTPTS[i__wmk]' % sting,
-        '[%d:v]pad=1200:600:0:(oh-ih)/2:color=black@0,setpts=PTS-STARTPTS[d__wmk]' % idle,
+        '[%d:v]pad=1200:600:0:(oh-ih)/2:color=black@0,fps=30,setpts=PTS-STARTPTS[i__wmk]' % sting,
+        '[%d:v]pad=1200:600:0:(oh-ih)/2:color=black@0,fps=30,setpts=PTS-STARTPTS[d__wmk]' % idle,
         '[i__wmk][d__wmk]concat=n=2:v=1:a=0[wm0__wmk]',
         '[wm0__wmk]scale=422:-1[wm__wmk]',
         '[wm__wmk]setpts=PTS+2.5/TB[wmd__wmk]',
         "[%s][wmd__wmk]overlay=(W-w)/2:H-h-60:enable='gte(t,2.5)':shortest=1:format=auto[vwatermark]" % base,
-        '[%d:a]volume=0.4,adelay=2500|2500[chm__wmk]' % sting,
+        '[%d:a]aresample=48000,volume=0.4,adelay=2500|2500[chm__wmk]' % sting,
         '[%s][chm__wmk]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[awatermark]' % base_a,
     ]
 
@@ -445,7 +445,8 @@ def test_reuse_watermark_builder(monkeypatch) -> None:
     kw = spy.calls[0][1]
     assert kw == {"base_v": "vlogo", "sting_v": "4:v", "idle_v": "5:v", "width": 422,
                   "overlay_xy": "(W-w)/2:H-h-60", "base_a": "atail", "chime_a": "4:a",
-                  "chime_vol": 0.4, "delay": 2.5, "out_v": "vwatermark", "out_a": "awatermark"}
+                  "chime_vol": 0.4, "delay": 2.5, "grid": "30", "sample_rate": 48000,
+                  "out_v": "vwatermark", "out_a": "awatermark"}
     real, _v, _a = finalize.watermark_filter.real(**kw)
     keep = {"vlogo": "vlogo", "4:v": "4:v", "5:v": "5:v", "4:a": "4:a", "atail": "atail",
             "vwatermark": "vwatermark", "awatermark": "awatermark"}
@@ -488,6 +489,7 @@ def test_the_multipass_watermark_maps_audio_too(chime, monkeypatch, tmp_path) ->
     cmds = []
     monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
     monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
 
     def mutate(d):
         d["overlays"]["finalize"]["watermark"]["chime"] = chime
@@ -511,7 +513,56 @@ def test_the_multipass_watermark_still_says_an_with_no_audio_at_all(monkeypatch,
     assert "-an" in cmds[0] and "-t" in cmds[0]
 
 
+def test_the_multipass_watermark_declares_the_probed_grid(monkeypatch, tmp_path) -> None:
+    """The terminal encode of the multipass tail (watermark's own sting/idle are 60fps assets) must
+    declare -r from the PROBE, not inherit whatever the sting/idle branches negotiate."""
+    cmds = []
+    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 60000 / 1001, 60000, 1001, 10.0))
+    spec = _spec()
+    finalize.apply_watermark(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
+                             _paths(spec, tmp_path), False)
+    cmd = cmds[0]
+    assert cmd[cmd.index("-r") + 1] == "60000/1001"
+    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
+    assert cmd[cmd.index("-ar") + 1] == "48000"
+    assert "fps=60000/1001" in cmd[cmd.index("-filter_complex") + 1]
+    assert "aresample=48000" in cmd[cmd.index("-filter_complex") + 1]
+
+
+def test_the_multipass_logo_declares_the_probed_grid(monkeypatch, tmp_path) -> None:
+    """The body-logo re-encode must declare -r from the probe, matching the master's own measured grid."""
+    cmds = []
+    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30000 / 1001, 30000, 1001, 10.0))
+    spec = _spec()
+    finalize.apply_logo(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
+                        _paths(spec, tmp_path), False, cover_welded=False)
+    cmd = cmds[0]
+    assert cmd[cmd.index("-r") + 1] == "30000/1001"
+    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
+    assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "-ar" not in cmd
+
+
+def test_the_multipass_accents_declare_the_probed_grid(monkeypatch, tmp_path) -> None:
+    """The ordinary (non film-burn) accent re-encode must declare -r from the probe too."""
+    cmds = []
+    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 25.0, 25, 1, 10.0))
+    spec = _spec()
+    finalize.apply_accents(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4", {}, False)
+    cmd = cmds[0]
+    assert cmd[cmd.index("-r") + 1] == "25"
+    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
+    assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "-ar" not in cmd
+
+
 def test_encode_shape_per_output_clause() -> None:
+    """The ref rung carries the SAME -r as the master (not the old contract's bare absence): the sync
+    oracle diffs the two rungs by frame INDEX, so a different grid compares different instants."""
     _ins, outs = _argv(op.assemble(_prepared(_spec()))[1])
     (master_opts, _m), (ref_opts, _r) = outs
     assert _has_seq(master_opts, finalize._FINAL_CPU)
@@ -520,7 +571,50 @@ def test_encode_shape_per_output_clause() -> None:
     assert _has_seq(ref_opts, op._REF_VIDEO)
     assert _has_seq(ref_opts, ["-c:a", "aac", "-b:a", "128k"])
     assert not _has_seq(ref_opts, finalize._FINAL_CPU)
-    assert "-r" not in ref_opts and "-vf" not in ref_opts
+    assert "-vf" not in ref_opts
+    master_r = master_opts[master_opts.index("-r") + 1]
+    ref_r = ref_opts[ref_opts.index("-r") + 1]
+    assert master_r == ref_r == "30"
+
+
+def test_master_clause_declares_the_measured_grid() -> None:
+    """The grid is DECLARED from spec.timeline.fps, never inherited from whichever input branch ffmpeg
+    negotiates — that inheritance is the root cause of a 25fps/96kHz master shipping from a
+    30fps/48kHz source."""
+    _ins, outs = _argv(op.assemble(_prepared(_spec()))[1])
+    (master_opts, _m), _ref = outs
+    assert _has_seq(master_opts, ["-r", "30", "-fps_mode", "cfr"])
+    assert _has_seq(master_opts, ["-ar", "48000"])
+
+
+def test_presync_clause_shares_the_masters_grid() -> None:
+    """A ref on a different grid from the master makes check_sync.py's frame-index comparison
+    meaningless — it must declare cfr and the master's own -ar too."""
+    _ins, outs = _argv(op.assemble(_prepared(_spec()))[1])
+    (master_opts, _m), (ref_opts, _r) = outs
+    assert master_opts[master_opts.index("-r") + 1] == ref_opts[ref_opts.index("-r") + 1]
+    assert _has_seq(ref_opts, ["-fps_mode", "cfr"])
+    assert _has_seq(ref_opts, ["-ar", "48000"])
+
+
+def test_non_integer_grid_emits_the_exact_rational_not_a_rounded_float() -> None:
+    """29.97002997 must ship as 30000/1001, not ffmpeg's `-r 29.97` rounding, which drifts the
+    delivered duration by whole frames over a long body."""
+    spec = _spec(lambda d: d["timeline"].__setitem__("fps", 30000 / 1001))
+    _ins, outs = _argv(op.assemble(_prepared(spec))[1])
+    (master_opts, _m), _ref = outs
+    assert master_opts[master_opts.index("-r") + 1] == "30000/1001"
+
+
+def test_every_reencoding_output_clause_declares_the_grid() -> None:
+    """NEGATIVE: a delivery clause that skips -r inherits whatever grid ffmpeg negotiates from its
+    OWN inputs (60fps sting/idle assets, mismatched audio rates) — exactly the root cause of this wave."""
+    _ins, outs = _argv(op.assemble(_prepared(_spec()))[1])
+    assert outs, "no output clauses to check — the fixture stopped exercising the delivery tail"
+    for opts, _dst in outs:
+        if _has_seq(list(opts), ["-c:v", "copy"]):
+            continue
+        assert "-r" in opts and "-fps_mode" in opts
 
 
 def test_the_spec_encode_rung_never_reaches_the_deliverable() -> None:
@@ -758,6 +852,16 @@ def test_a_clean_body_spec_passes_preflight() -> None:
     op.preflight(_spec())
 
 
+@pytest.mark.parametrize("fps", [0.0, -1.0, float("nan"), float("inf"), None])
+def test_preflight_refuses_an_unusable_grid_before_any_subprocess(fps, monkeypatch) -> None:
+    """The ONLY refusal a lost render is worse than — it must fire before the encode ever starts."""
+    spec = _spec()
+    spec.timeline.fps = fps
+    _no_subprocess(monkeypatch)
+    with pytest.raises(ValueError):
+        op.preflight(spec)
+
+
 # --- prepare ------------------------------------------------------------------
 
 def _stub_prepare_passes(monkeypatch, tmp_path):
@@ -899,3 +1003,31 @@ def test_the_door_runs_with_nobody_listening(monkeypatch, tmp_path) -> None:
     _runs, _puts, d = _door(monkeypatch, tmp_path, _spec(_drop_presync))
     assert d.presync is None
     assert d.outputs == ["master"]
+
+
+# --- the post-render grid verdict: loud, never a reason to withhold the PUT ---
+
+def test_render_body_ships_the_master_on_a_measured_grid_mismatch(monkeypatch, tmp_path) -> None:
+    """NEGATIVE: the verdict is loud but must never withhold an already-paid-for master."""
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 25.0, 25, 1, DUR))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: False)
+    _runs, puts, d = _door(monkeypatch, tmp_path, _spec(_drop_mograph))
+    assert d.defect == {"video_rate": {"declared": "30", "measured": "25"}}
+    assert puts, "the PUT must still happen despite the mismatch"
+
+
+def test_render_body_reports_no_defect_on_a_matching_grid(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, DUR))
+    monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
+    monkeypatch.setattr(finalize, "_probe_audio", lambda _p: (48000, DUR))
+    _runs, puts, d = _door(monkeypatch, tmp_path, _spec(_drop_mograph))
+    assert d.defect is None
+    assert puts
+
+
+def test_render_body_survives_a_post_render_probe_failure(monkeypatch, tmp_path) -> None:
+    """_FakeFFmpeg answers every ffprobe with garbage; grid_verdict must turn that into a defect
+    entry rather than an exception that would cost the render its PUT."""
+    _runs, puts, d = _door(monkeypatch, tmp_path, _spec(_drop_mograph))
+    assert d.defect is not None and "probe_failed" in d.defect
+    assert puts

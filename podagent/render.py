@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
+from . import finalize as _finalize
 from .cp import ControlPlane, download, upload
 from .sanitize import safe_error
 from .models import MotionKeyframe, RenderSpec, SpecBrollClip, SpecTransition
@@ -439,6 +440,7 @@ def build_command(
     named encoder is only a hint; a CPU fallback overriding it is allowed mechanics. extra_inputs
     (the pre-rendered music bed) append after the spec inputs, at the indices `audio` references."""
     enc = spec.encode
+    grid = _finalize.declared_grid(spec.timeline.fps)
     cmd = ["ffmpeg", "-y", "-hide_banner"]
     if gpu:
         cmd += ["-init_hw_device", "vulkan"]  # libplacebo runs on a Vulkan device; hwupload derives from it
@@ -448,8 +450,9 @@ def build_command(
         cmd += ["-i", str(extra)]
     cmd += ["-filter_complex", build_filtergraph(spec, gpu, audio)]
     cmd += ["-map", "[vout]", "-map", "[aout]"]
+    cmd += ["-r", grid, "-fps_mode", "cfr"]
     cmd += _venc(enc, gpu)
-    cmd += ["-c:a", "aac", "-b:a", enc.audio_bitrate, "-movflags", "+faststart", str(out_path)]
+    cmd += ["-c:a", "aac", "-b:a", enc.audio_bitrate, "-ar", "48000", "-movflags", "+faststart", str(out_path)]
     return cmd
 
 
@@ -478,7 +481,7 @@ def _caption_colours(caps, motion_plan) -> tuple[str, str]:
 
 
 def _burn_captions(caps, motion_plan, src: Path, input_paths: dict, out_path: Path, gpu: bool,
-                   w: int, h: int, enc) -> None:
+                   w: int, h: int, enc, fps: float) -> None:
     """Burn the subtitle track onto `src` via libass (one re-encode, audio copied through)."""
     from .captions import build_ass
     if not caps.font or caps.font not in input_paths:
@@ -490,9 +493,10 @@ def _burn_captions(caps, motion_plan, src: Path, input_paths: dict, out_path: Pa
     ass.write_text(build_ass(words, font=font, w=w, h=h, fg=fg, accent=accent,
                              center_y=caps.centerY if caps.centerY is not None else 0.76,
                              style=caps.style or "oneword"), encoding="utf-8")
+    grid = _finalize.declared_grid(fps)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(src),
            "-vf", f"subtitles={ass}:fontsdir={font.parent}"]
-    cmd += _venc(enc, gpu) + ["-c:a", "copy", str(out_path)]
+    cmd += ["-r", grid, "-fps_mode", "cfr"] + _venc(enc, gpu) + ["-c:a", "copy", str(out_path)]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as exc:
@@ -527,17 +531,11 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
 
     corr_id/session_id are echoed from the claimed envelope onto the terminal (pool result demux)."""
     work_started = time.monotonic()
+    common = {"job_id": spec.job_id, "session_id": session_id, "corr_id": corr_id, "stage": "render"}
 
     @contextmanager
     def phase(op: str):
-        base = {
-            "job_id": spec.job_id,
-            "session_id": session_id,
-            "corr_id": corr_id,
-            "stage": "render",
-            "status": "step",
-            "op": op,
-        }
+        base = {**common, "status": "step", "op": op}
         cp.send_event({k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
         started = time.monotonic()
         try:
@@ -575,6 +573,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             # cannot weld it. Refuse before execution rather than half-rendering a v6 spec.
             raise NotImplementedError(
                 f"final overlay(s) not yet composited on the pod multi-pass path: {unimplemented}")
+
+    _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
 
     with phase("gpu_probe"):
         cpu_requested = os.environ.get("MONTY_OPS_CPU_ENCODE") == "1"
@@ -653,7 +653,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             captioned = tmp / "render_caps.mp4"
             with phase("captions"):
                 _burn_captions(caps, _mp, master, input_paths, captioned, gpu,
-                               spec.timeline.width, spec.timeline.height, spec.encode)
+                               spec.timeline.width, spec.timeline.height, spec.encode,
+                               spec.timeline.fps)
             master = captioned
 
         # cover is the LAST step: extract the base frame, compose the still, weld it onto the master tail.
@@ -691,6 +692,23 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         # The COMPOSITE is complete here; everything below is the delivery tail. `presync` pins this
         # exact frame: it is the video-identical reference the origin's A/V-sync guard measures the
         # finished master against, so the guard can attribute any drift to the tail and nothing else.
+        # Header-only, on the paid-for master, before any PUT — a probe failure becomes a defect
+        # entry (finalize.grid_verdict), never an exception that would cost the render.
+        defect = _finalize.grid_verdict(master, spec.timeline.fps)
+        if defect is not None:
+            msg = f"declared vs measured mismatch: {defect}"
+            print(f"[render] grid_verify: {msg}", file=sys.stderr)
+            # outcome MUST stay "ok" with no error/error_type: the cabinet frontend keys "failed" off
+            # outcome alone (progress.mjs isErrorActivity), and a delivered master is not a failure.
+            cp.send_event({k: v for k, v in {
+                **common,
+                "status": "step",
+                "op": "grid_verify",
+                "phase": "grid_verify_degraded",
+                "outcome": "ok",
+                "timings": {"grid_defect": defect},
+            }.items() if v is not None})
+
         done: list[str] = []
         with phase("upload"):
             for o in spec.outputs:
@@ -735,4 +753,5 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         "corr_id": corr_id,
         "outputs": done,
         **({"session_id": session_id} if session_id is not None else {}),
+        **({"defects": [defect]} if defect is not None else {}),
     })
