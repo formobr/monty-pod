@@ -102,10 +102,11 @@ _DELIVERY_SAMPLE_RATE = 48000
 _AV_DELTA_FRAME_TOLERANCE = 2.0
 
 
-# A caller-supplied decimal (29.97) is closer to 2997/100 than to 30000/1001, so limit_denominator alone
-# would round-trip it wrong and grid_verdict would agree with its own bad declaration; snap first.
-_NTSC_DROP_FRAME = (Fraction(30000, 1001), Fraction(24000, 1001), Fraction(60000, 1001))
-_NTSC_SNAP_EPS = 1e-4  # float round-trip error on 29.97/23.976/59.94 vs the true rational is ~3e-5
+# Keyed by the CONVENTIONAL literal (29.97), not the rational's own float — 29.9701 is ~2e-6 relative
+# off 29.97, far past the tolerance below, so a genuinely different rate keeps its own exact conversion.
+_NTSC_DROP_FRAME = ((29.97, Fraction(30000, 1001)), (23.976, Fraction(24000, 1001)),
+                    (59.94, Fraction(60000, 1001)))
+_NTSC_SNAP_REL_TOL = 1e-9
 
 
 def declared_grid(fps: float) -> str:
@@ -113,8 +114,8 @@ def declared_grid(fps: float) -> str:
     grid, so it refuses HERE (before any subprocess) rather than negotiating one downstream."""
     if fps is None or not math.isfinite(fps) or fps <= 0:
         raise ValueError(f"timeline.fps must be a finite, positive number, got {fps!r}")
-    for std in _NTSC_DROP_FRAME:
-        if abs(fps - float(std)) < _NTSC_SNAP_EPS:
+    for alias, std in _NTSC_DROP_FRAME:
+        if math.isclose(fps, alias, rel_tol=_NTSC_SNAP_REL_TOL):
             return str(std)
     return str(Fraction(fps).limit_denominator(1001))
 

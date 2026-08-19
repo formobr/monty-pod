@@ -507,6 +507,15 @@ def _burn_captions(caps, motion_plan, src: Path, input_paths: dict, out_path: Pa
 
 # --- I/O orchestration --------------------------------------------------------
 
+def _safe_send_event(cp: ControlPlane, event: dict) -> None:
+    """Swallow+log, never raise: past this seam the master is already encoded (~20 GPU-min paid)."""
+    try:
+        cp.send_event(event)
+    except Exception as exc:
+        label = event.get("phase") or event.get("op") or "event"
+        print(f"[render] {label}: event send failed, swallowed: {safe_error(exc)}", file=sys.stderr)
+
+
 _GPU: bool | None = None
 
 
@@ -535,13 +544,15 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
 
     @contextmanager
     def phase(op: str):
+        # Any phase can be the one that runs right after the encode succeeds, so all go through the
+        # swallow-and-log seam: a real step failure still `raise`s below regardless of its own report.
         base = {**common, "status": "step", "op": op}
-        cp.send_event({k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
+        _safe_send_event(cp, {k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
         started = time.monotonic()
         try:
             yield
         except BaseException as exc:
-            cp.send_event({
+            _safe_send_event(cp, {
                 k: v for k, v in {
                     **base,
                     "phase": f"{op}_error",
@@ -553,7 +564,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             })
             raise
         else:
-            cp.send_event({
+            _safe_send_event(cp, {
                 k: v for k, v in {
                     **base,
                     "phase": f"{op}_finished",
@@ -701,18 +712,14 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             print(f"[render] grid_verify: {msg}", file=sys.stderr)
             # outcome MUST stay "ok" with no error/error_type: the cabinet frontend keys "failed" off
             # outcome alone (progress.mjs isErrorActivity), and a delivered master is not a failure.
-            try:
-                cp.send_event({k: v for k, v in {
-                    **common,
-                    "status": "step",
-                    "op": "grid_verify",
-                    "phase": "grid_verify_degraded",
-                    "outcome": "ok",
-                    "timings": {"grid_defect": defect},
-                }.items() if v is not None})
-            except Exception as exc:
-                # master is already encoded (~20 GPU-min paid) — a stream failure here must not cost it
-                print(f"[render] grid_verify: event send failed, swallowed: {safe_error(exc)}", file=sys.stderr)
+            _safe_send_event(cp, {k: v for k, v in {
+                **common,
+                "status": "step",
+                "op": "grid_verify",
+                "phase": "grid_verify_degraded",
+                "outcome": "ok",
+                "timings": {"grid_defect": defect},
+            }.items() if v is not None})
 
         done: list[str] = []
         with phase("upload"):
@@ -745,7 +752,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         terminal["session_id"] = session_id
     # Observability and wake-up are separate typed frames. An event may be replayed without ever creating a
     # second business result; the correlated result is the only terminal the awaiting brain consumes.
-    cp.send_event({
+    _safe_send_event(cp, {
         **terminal,
         "phase": "work_finished",
         "outcome": "ok",

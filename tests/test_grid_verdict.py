@@ -4,6 +4,7 @@ allows (before any subprocess); grid_verdict runs AFTER an already-paid-for enco
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 
 import pytest
 
@@ -31,6 +32,15 @@ def test_declared_grid_snaps_ntsc_decimals_to_the_broadcast_rational(fps, expect
     real NTSC master (30000/1001) never measures as — the verdict was blind to the exact drift it exists
     to catch."""
     assert finalize.declared_grid(fps) == expected
+
+
+@pytest.mark.parametrize("fps", [29.9701, 29.96995])
+def test_declared_grid_does_not_snap_a_rate_merely_near_ntsc(fps) -> None:
+    """NEGATIVE (HIGH): 29.9701/29.96995 are legitimately different measured rates, not float round-trips
+    of 30000/1001 — snapping them would make grid_verdict compare a declared lie against the truth."""
+    grid = finalize.declared_grid(fps)
+    assert grid not in ("30000/1001", "24000/1001", "60000/1001")
+    assert grid == str(Fraction(fps).limit_denominator(1001))
 
 
 def test_grid_verdict_emits_nothing_on_a_clean_match(monkeypatch, tmp_path) -> None:
