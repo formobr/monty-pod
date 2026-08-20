@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from podagent.wire_generated import WIRE_CONTRACT_VERSION
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -49,6 +51,6 @@ def test_canonical_helper_and_local_spec_v5_are_outside_the_refusal(tmp_path: Pa
 def test_a_hand_owned_wire_version_literal_is_rejected(tmp_path: Path) -> None:
     gate = _gate()
     path = tmp_path / "bad_version.py"
-    path.write_text("WIRE_VERSION = 12\n", encoding="utf-8")
+    path.write_text(f"WIRE_VERSION = {WIRE_CONTRACT_VERSION}\n", encoding="utf-8")
     found = gate.problems([path])
     assert len(found) == 1 and "numeric shared-wire version" in found[0].message

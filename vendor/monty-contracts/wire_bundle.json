@@ -1,7 +1,7 @@
 {
   "bundle_format": 1,
-  "bundle_sha256": "989f7c2935b3ad12370d0bc52ed57f4c7604e235b34d3a46d4932d654597dab5",
-  "contract_version": 12,
+  "bundle_sha256": "20a06cb4c796d75eadc06186bf3f9004e67084550c5e0e618320b814912301a0",
+  "contract_version": 13,
   "fixtures": {
     "event.pod": {
       "classification": "valid",
@@ -20,7 +20,7 @@
           "dst": "work/out.mp4"
         },
         "phase": "put",
-        "schema_version": 12,
+        "schema_version": 13,
         "session_id": "session-7",
         "skipped": [],
         "stage": "ops",
@@ -40,7 +40,7 @@
         },
         "ts": "2026-08-07T10:15:30Z"
       },
-      "sha256": "adacf1be8d7ad9185e6785e1c372c7c2fccbb318e1f58346148fcf39d96bf9c5",
+      "sha256": "551c2abc46f04c9692b77ee6a57934fa9e3c2f0ea1f70f5fc309dfb47730a8ce",
       "source_path": "examples/event.pod.json",
       "surface": "event"
     },
@@ -49,12 +49,12 @@
       "document": {
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "pct": 47.5,
-        "schema_version": 12,
+        "schema_version": 13,
         "stage": "head_motion",
         "status": "running",
         "ts": "2026-06-28T10:15:30Z"
       },
-      "sha256": "92e6b8e37a61e08195c01367c9dbf4774200793c47f38dc154026e45bae4df3e",
+      "sha256": "8c419b841e595c14502696a89ab8fe9d1c4c54f8ad179bd2bcdefc20f46de436",
       "source_path": "examples/event.running.json",
       "surface": "event"
     },
@@ -63,12 +63,12 @@
       "document": {
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "reason": "optional",
-        "schema_version": 12,
+        "schema_version": 13,
         "stage": "resolve_broll",
         "status": "skipped",
         "timing_seconds": 0.0
       },
-      "sha256": "f94e86e453b25b9c100216fb4034680c3d4a84d3333a565bf86972d678ff5e43",
+      "sha256": "5a8a68c5272078ae2dcfb923d2d502d039115e5b9834056273e45f051aae71fe",
       "source_path": "examples/event.skipped.json",
       "surface": "event"
     },
@@ -76,11 +76,11 @@
       "classification": "invalid",
       "document": {
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-        "schema_version": 12,
+        "schema_version": 13,
         "stage": "head_motion",
         "status": "almost-done"
       },
-      "sha256": "095afbd17c20a40c46c38bf6f758aefd2d136e03ba0d754aa655dce25791d40b",
+      "sha256": "f697f9d4bf62dfb59205a97497f66066415afb1154060cdb96e6744610a1783a",
       "source_path": "examples/invalid/event.bad-status.json",
       "surface": "event"
     },
@@ -95,14 +95,14 @@
         "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
         "provider": "subscription",
         "render_tier": "hd",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/x?sig=1",
         "tenant_id": "tenant_abc123",
         "type": "render_preview",
         "work_prefix": "work/tenant_abc123/job1/"
       },
-      "sha256": "c82584541c923efea9486d03c10ed53ef58fd9e368640d5ecf367c04f8c7b4f1",
+      "sha256": "d45a36effda421508144cbb9db9199dc09f4e7486561c60a69d8656dd2a6ec42",
       "source_path": "examples/invalid/job.bad-render-tier.json",
       "surface": "job"
     },
@@ -116,14 +116,14 @@
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
         "provider": "subscription",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/x?sig=1",
         "tenant_id": "tenant_abc123",
         "type": "transcode",
         "work_prefix": "work/tenant_abc123/job1/"
       },
-      "sha256": "211636e7f24903ee4b17b0289400a5e8504f210892cd4e13f4d1fd5cfa6b9420",
+      "sha256": "83861dfb728efd1e3d911a9133bf848dd07e438fc655cb0498696c71327f38bc",
       "source_path": "examples/invalid/job.bad-type.json",
       "surface": "job"
     },
@@ -137,14 +137,14 @@
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
         "provider": "subscription",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/x?sig=1",
         "tenant_id": "tenant_abc123",
         "type": "montage",
         "work_prefix": "work/tenant_abc123/job1/"
       },
-      "sha256": "532af85cbabaeec63b81995e39ac1f14cd08a43e0bbe70da572f393a78a6cafa",
+      "sha256": "5b5441bdd975a4faef1cf946c9f012c6f1b4e2933f03c52fbcbd533b822e40c0",
       "source_path": "examples/invalid/job.dead-montage.json",
       "surface": "job"
     },
@@ -163,14 +163,14 @@
         },
         "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
         "provider": "subscription",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
         "tenant_id": "tenant_abc123",
         "type": "plan",
         "work_prefix": "work/tenant_abc123/f47ac10b-58cc-4372-a567-0e02b2c3d479/"
       },
-      "sha256": "0848c645b244b8f7c30d356eeb51ed82a945f014de91d631daa989bbcd51242b",
+      "sha256": "6c450e7c97c893288dfabbd162974c638877c1a57709e29ef30a042355be4f95",
       "source_path": "examples/invalid/job.empty-brand.json",
       "surface": "job"
     },
@@ -185,14 +185,14 @@
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
         "provider": "subscription",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/x?sig=1",
         "tenant_id": "tenant_abc123",
         "type": "plan",
         "work_prefix": "work/tenant_abc123/job1/"
       },
-      "sha256": "6010fc883cfa4c30816af690ce2e1ee4ed891e0f68ede724e88bbca5a4c80697",
+      "sha256": "547b15f91c03dbe684b39c6f7b50e0a73f4f28bea5827cc90f2923544e413fb0",
       "source_path": "examples/invalid/job.empty-chain-id.json",
       "surface": "job"
     },
@@ -206,7 +206,7 @@
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
         "provider": "subscription",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_key": "",
         "source_url": "https://r2.example.com/x?sig=1",
@@ -214,7 +214,7 @@
         "type": "plan",
         "work_prefix": "work/tenant_abc123/job1/"
       },
-      "sha256": "bc3b0f833eab098a7b91985644fbb53db65426a0648b73beaa27758ad57460ef",
+      "sha256": "99e6939de55d8c7912b9fcf796f37ab40d7c44e18a8328daa94e4cf040fdd03d",
       "source_path": "examples/invalid/job.empty-source-key.json",
       "surface": "job"
     },
@@ -229,14 +229,14 @@
         "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
         "provider": "subscription",
         "render_tier": "final",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/x?sig=1",
         "tenant_id": "tenant_abc123",
         "type": "render_final",
         "work_prefix": "work/tenant_abc123/job1/"
       },
-      "sha256": "d85d39ad6aea0164628f33db1d8d90fb051f9806a495743dc489ddee67103c39",
+      "sha256": "794812aa4de8cbd709f26f39aa16eb51d53a607c8180c7319483e9d2c0dcbdbe",
       "source_path": "examples/invalid/job.render-final-no-plan.json",
       "surface": "job"
     },
@@ -250,7 +250,7 @@
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "output_prefix": "deliverables/tenant_abc123/zapis-iyun/",
         "provider": "subscription",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "sourceUrl": "https://typo.example.com/should-fail",
         "source_url": "https://r2.example.com/x?sig=1",
@@ -258,7 +258,7 @@
         "type": "plan",
         "work_prefix": "work/tenant_abc123/job1/"
       },
-      "sha256": "d31450e060f97e2450ff968b1c8ed6b522f1709031bae3cd26aa3aee2b032f7a",
+      "sha256": "83e547d1a50ecdbf569d4b3adc076d0a2e5d0fd5da24963d2e6aee7ac88d29b5",
       "source_path": "examples/invalid/job.typo-key.json",
       "surface": "job"
     },
@@ -270,10 +270,10 @@
           "body": "Сегодня разберём, что реально движет ценой — и почему паника в чате всегда опаздывает на день.",
           "title": "Почему биткоин падает"
         },
-        "schema_version": 12,
+        "schema_version": 13,
         "status": "done"
       },
-      "sha256": "b10474ed164adf2dfee6c21b09f365fc7226bd1331d43b7d7db8fbce36fc2027",
+      "sha256": "0b67ef7e8c0d1ee056ea86ed426bab34cdad82f8f1c8a2f4227f19e1bfb6bdb1",
       "source_path": "examples/invalid/manifest.scenario-missing-field.json",
       "surface": "manifest"
     },
@@ -282,12 +282,12 @@
       "document": {
         "artifacts": [],
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-        "schema_version": 12,
+        "schema_version": 13,
         "stage": "job",
         "status": "done",
         "timing_seconds": 512.3
       },
-      "sha256": "323ee81b9a5dad2808f666ae0de3f2cc9d788b7ca4a1ab7e03fc6c7fd912d08b",
+      "sha256": "036a51545afb1d9e8dbad90fe461a36ebba14ea7b90b4c8f0d7ca02a7026797c",
       "source_path": "examples/invalid/manifest.with-stage.json",
       "surface": "manifest"
     },
@@ -299,10 +299,10 @@
         "enqueue_max_unix_ns": 120,
         "enqueue_min_unix_ns": 110,
         "ok": true,
-        "schema_version": 12,
+        "schema_version": 13,
         "server_recv_unix_ns": 100
       },
-      "sha256": "5fd5630060d1564e4e67c6665b2195dc71938b280a0c536e2e16dbc91a414735",
+      "sha256": "087d5ead6326555377949afe1d56712a243fe184a6c3f6d39ccefd8255ef2340",
       "source_path": "examples/invalid/pod_enqueue_ack.missing-bound.json",
       "surface": "pod_enqueue_ack"
     },
@@ -584,13 +584,13 @@
         "replayed": false,
         "result_commit_max_unix_ns": 510,
         "result_commit_min_unix_ns": 500,
-        "schema_version": 12,
+        "schema_version": 13,
         "seq": 3,
         "socket_write_max_unix_ns": 150,
         "socket_write_min_unix_ns": 140,
         "stream_id": "pod-boot-a"
       },
-      "sha256": "790ec8c39266ddeb3efcd7fb8db38da02bb8772728663a9bb7fc934ecb76f990",
+      "sha256": "0cc636851f9ea7f676c0ffac06e882d2673bb43e5df7b5ec44fcd6c53f92fc6d",
       "source_path": "examples/invalid/pod_transport_receipt.unknown-field.json",
       "surface": "pod_transport_receipt"
     },
@@ -609,11 +609,11 @@
           },
           "tokens": {}
         },
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "tenant_id": "tenant_abc123"
       },
-      "sha256": "813af37d202dd4930a66af612acfb0870d1a81f4b7867875062ffbf7a8bd354b",
+      "sha256": "a60f18fb49dc8a24287029eccc55eb663e865caebd0de75288fc3bb6c8eb1bd5",
       "source_path": "examples/invalid/publish_job.no-job-id.json",
       "surface": "publish_job"
     },
@@ -638,11 +638,11 @@
             "youtube"
           ]
         },
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "tenant_id": "tenant_abc123"
       },
-      "sha256": "cb4f6366eecf7bd055261ffca95d14b7f5f53d7f513ead30cd1abf05123717f9",
+      "sha256": "dd5089c1a531fe20c6bb12b9bc89ac8cd3fa1a7a5b2677c4c3d0e37589fc7094",
       "source_path": "examples/invalid/publish_job.typo-key.json",
       "surface": "publish_job"
     },
@@ -662,7 +662,7 @@
         "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
         "provider": "subscription",
         "render_tier": "preview",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_key": "uploads/tenant_abc123/0f9c1d2e-zapis-iyun.mkv",
         "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
@@ -670,7 +670,7 @@
         "type": "render_preview",
         "work_prefix": "work/tenant_abc123/7f1e2d3c-4b5a-4968-8877-665544332211/d4e5f607-1829-4304-b5c6-d7e8f9012345/"
       },
-      "sha256": "3ad30dd284323e7853cc754610e9b1a65e99f368b498b76849fe3f46a6870369",
+      "sha256": "514594dcaba3c8615dc3e0c9dcbc2f283bb22ae8295c0436752f416dd9624663",
       "source_path": "examples/job.chained.json",
       "surface": "job"
     },
@@ -702,14 +702,14 @@
           "music_mood": "dark high synth",
           "title": "Почему биткоин падает"
         },
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
         "tenant_id": "tenant_abc123",
         "type": "plan",
         "work_prefix": "work/tenant_abc123/f47ac10b-58cc-4372-a567-0e02b2c3d479/"
       },
-      "sha256": "99ba7ea1d185084c8f25412ddabfee43df1cb9f10a2da47cfd82e513d12e8d9f",
+      "sha256": "7f2e73d7c511dda214bcb08695187a8f5bc87f1e40d3c881cf4222ac04b20269",
       "source_path": "examples/job.ok.json",
       "surface": "job"
     },
@@ -729,7 +729,7 @@
         "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
         "provider": "subscription",
         "render_tier": "preview",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_key": "uploads/tenant_abc123/0f9c1d2e-zapis-iyun.mkv",
         "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
@@ -737,7 +737,7 @@
         "type": "palette",
         "work_prefix": "work/tenant_abc123/7f1e2d3c-4b5a-4968-8877-665544332211/e5f60718-2930-4415-a6b7-c8d9e0f12345/"
       },
-      "sha256": "91c71409abda6dd680f297f691346322f83beeecd81a884d74ca14fbc07e5fad",
+      "sha256": "f340e6ed6fa97000cad34b000fd9d6c4cbd6fd2b0e5fd12fb3b7352f6e880e1b",
       "source_path": "examples/job.palette.json",
       "surface": "job"
     },
@@ -774,14 +774,14 @@
         "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
         "provider": "subscription",
         "render_tier": "final",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
         "tenant_id": "tenant_abc123",
         "type": "render_final",
         "work_prefix": "work/tenant_abc123/c3d4e5f6-7081-4293-a4b5-c6d7e8f90123/"
       },
-      "sha256": "e48a4034dd6647988628b1f5c573a9fc10e44651c6fb6f0f9403f857f7e1f8c9",
+      "sha256": "8c03a3da242d457ecd89a4426b01046a1790e1bc61641eb801529de535f06268",
       "source_path": "examples/job.render-final.json",
       "surface": "job"
     },
@@ -802,7 +802,7 @@
         "project_id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
         "provider": "subscription",
         "render_tier": "preview",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_key": "uploads/tenant_abc123/0f9c1d2e-zapis-iyun.mkv",
         "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
@@ -810,7 +810,7 @@
         "type": "render_preview",
         "work_prefix": "work/tenant_abc123/b2c3d4e5-6f70-4182-93a4-b5c6d7e8f901/"
       },
-      "sha256": "c10e1ec6a1958b0d69392905f1cb2a91d63e74fcda0a308b9d41822010a62e16",
+      "sha256": "dc550f4aa6aeee5da9095e13ec85e9ffec717346d2a888b048a627e936f6818b",
       "source_path": "examples/job.render-preview.json",
       "surface": "job"
     },
@@ -840,15 +840,20 @@
             "key": "tenant_abc123/zapis-iyun/out/zapis-iyun.short1.mp4",
             "kind": "short",
             "width": 1080
+          },
+          {
+            "bytes": 3120,
+            "key": "tenant_abc123/zapis-iyun/out/zapis-iyun.publish.json",
+            "kind": "publish_meta"
           }
         ],
         "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "music_track": "music/dark/slimeyfox-hypermafia-543774.mp3",
-        "schema_version": 12,
+        "schema_version": 13,
         "status": "done",
         "timing_seconds": 512.3
       },
-      "sha256": "e71304ab13110844d14a57847265311412ad5a01c940dc1f1fb01c91218a68ef",
+      "sha256": "5fe0632866fc7894e1b0886b097ff7c135b5329be3f6462981f9785ece14198a",
       "source_path": "examples/manifest.ok.json",
       "surface": "manifest"
     },
@@ -861,11 +866,11 @@
           "music_mood": "dark high synth",
           "title": "Почему биткоин падает"
         },
-        "schema_version": 12,
+        "schema_version": 13,
         "status": "done",
         "timing_seconds": 41.7
       },
-      "sha256": "afc8ddfa23a6c0eea7e23a7434981d5448c7106c735cad677ca389952e59c61a",
+      "sha256": "ddae0efef8a4d63042f5cc65446da2954bb8a51c9acf936c9fbcc7f55ec40afe",
       "source_path": "examples/manifest.scenario.json",
       "surface": "manifest"
     },
@@ -882,14 +887,14 @@
         "params": {},
         "provider": "subscription",
         "render_tier": "preview",
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "source_url": "https://r2.example.com/tenant_abc123/zapis-iyun/source/raw.mkv?X-Amz-Signature=deadbeef",
         "tenant_id": "tenant_abc123",
         "type": "render_preview",
         "work_prefix": "work/tenant_abc123/d4e5f607-1829-4304-b5c6-d7e8f9012345/"
       },
-      "sha256": "a62966c727e4e35bc76a277e6ab6c24a0b40771abd119728d9d5cfabba24d336",
+      "sha256": "9babb2b0ac9bcd089ebba9975a59b0b6480289212db0295b817a8693c0cb9a22",
       "source_path": "examples/model-invalid/job.chain-id-not-in-work-prefix.json",
       "surface": "job"
     },
@@ -952,11 +957,11 @@
         "enqueue_max_unix_ns": 120,
         "enqueue_min_unix_ns": 110,
         "ok": true,
-        "schema_version": 12,
+        "schema_version": 13,
         "server_recv_unix_ns": 100,
         "server_send_unix_ns": 130
       },
-      "sha256": "e4914b608d60b7cd66d7bf4c2b9b9dcc512ac9e6be6cac579402b1ce2a127ffd",
+      "sha256": "e916aebe6bf560c7d1d9ab4b33e6a147759781b42e713d831525680444850509",
       "source_path": "examples/pod_enqueue_ack.ok.json",
       "surface": "pod_enqueue_ack"
     },
@@ -1098,13 +1103,13 @@
         "replayed": false,
         "result_commit_max_unix_ns": 510,
         "result_commit_min_unix_ns": 500,
-        "schema_version": 12,
+        "schema_version": 13,
         "seq": 3,
         "socket_write_max_unix_ns": 150,
         "socket_write_min_unix_ns": 140,
         "stream_id": "pod-boot-a"
       },
-      "sha256": "9b1f26441950b100335241fcdb19845a1e71f960d4a09018ef96a3b979a67c43",
+      "sha256": "a581d53edaacef856fa3521d173dcaa8ed0933dc9b210c259bcfba46f9fb5958",
       "source_path": "examples/pod_transport_receipt.ok.json",
       "surface": "pod_transport_receipt"
     },
@@ -1153,11 +1158,11 @@
             }
           }
         },
-        "schema_version": 12,
+        "schema_version": 13,
         "slug": "zapis-iyun",
         "tenant_id": "tenant_abc123"
       },
-      "sha256": "fb29591416d6bfb64155bd91799d8083cd3359ac00843cc025ff5ec2ab3096ed",
+      "sha256": "6f4245715fcf3dbc9cbdf493cc5c55366f15288123629aac4c2217cd0a8e3435",
       "source_path": "examples/publish_job.ok.json",
       "surface": "publish_job"
     }
@@ -1398,7 +1403,7 @@
           "type": "string"
         },
         "schema_version": {
-          "const": 12
+          "const": 13
         },
         "session_id": {
           "description": "pod-lane session that carried this event; optional for non-pod producers",
@@ -1592,7 +1597,7 @@
           "type": "object"
         },
         "schema_version": {
-          "const": 12
+          "const": 13
         },
         "slug": {
           "minLength": 1,
@@ -1648,7 +1653,7 @@
       "$id": "https://monty.fast/contracts/manifest.schema.json",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
-      "description": "Python worker -> Go control plane on completion. The deliverables a finished job produced in R2 (master/shorts/cover/thumbnail) — what Go meters for quota and hands the user via presigned URLs. Intermediates/sidecars are NOT in the boundary. DISCRIMINATOR: event and manifest share ONE Redis stream and are told apart by the presence of `stage` (contracts.IsEvent / cmd/api fold). That rule is only safe because this schema is closed AND declares no `stage` property — adding one here would make every manifest decode as an event and no job would ever reach a terminal state. examples/invalid/manifest.with-stage.json is the golden that holds it.",
+      "description": "Python worker -> Go control plane on completion. The deliverables a finished job produced in R2 (master/shorts/cover/thumbnail/publish_meta) — what Go meters for quota and hands the user via presigned URLs. `publish_meta` is the one non-video kind: a small per-network JSON sidecar (youtube/tiktok/instagram copy), not a deliverable Go meters against quota. Intermediates/sidecars are otherwise NOT in the boundary. DISCRIMINATOR: event and manifest share ONE Redis stream and are told apart by the presence of `stage` (contracts.IsEvent / cmd/api fold). That rule is only safe because this schema is closed AND declares no `stage` property — adding one here would make every manifest decode as an event and no job would ever reach a terminal state. examples/invalid/manifest.with-stage.json is the golden that holds it.",
       "properties": {
         "artifacts": {
           "items": {
@@ -1676,7 +1681,8 @@
                   "master",
                   "short",
                   "cover",
-                  "thumbnail"
+                  "thumbnail",
+                  "publish_meta"
                 ]
               },
               "width": {
@@ -1735,7 +1741,7 @@
           "type": "object"
         },
         "schema_version": {
-          "const": 12
+          "const": 13
         },
         "status": {
           "enum": [
@@ -1782,7 +1788,7 @@
           "const": true
         },
         "schema_version": {
-          "const": 12
+          "const": 13
         },
         "server_recv_unix_ns": {
           "minimum": 0,
@@ -1805,7 +1811,7 @@
       ],
       "title": "PodEnqueueAck",
       "type": "object",
-      "x-contract-version": 12
+      "x-contract-version": 13
     },
     "pod_stream": {
       "$defs": {
@@ -2127,7 +2133,7 @@
         }
       ],
       "title": "PodStreamClientFrame",
-      "x-contract-version": 12
+      "x-contract-version": 13
     },
     "pod_stream_server": {
       "$defs": {
@@ -2396,7 +2402,7 @@
         }
       ],
       "title": "PodStreamServerFrame",
-      "x-contract-version": 12
+      "x-contract-version": 13
     },
     "pod_token": {
       "$id": "monty/pod_token.schema.json",
@@ -2436,7 +2442,7 @@
       ],
       "title": "Monty pod bearer claims",
       "type": "object",
-      "x-contract-version": 12
+      "x-contract-version": 13
     },
     "pod_transport_receipt": {
       "$id": "https://monty.fast/contracts/pod_transport_receipt.schema.json",
@@ -2492,7 +2498,7 @@
           "type": "integer"
         },
         "schema_version": {
-          "const": 12
+          "const": 13
         },
         "seq": {
           "minimum": 1,
@@ -2534,7 +2540,7 @@
       ],
       "title": "PodTransportReceipt",
       "type": "object",
-      "x-contract-version": 12
+      "x-contract-version": 13
     },
     "publish_job": {
       "$id": "https://monty.fast/contracts/publish_job.schema.json",
@@ -2572,7 +2578,7 @@
           "type": "object"
         },
         "schema_version": {
-          "const": 12,
+          "const": 13,
           "description": "OPTIONAL on this lane: the worker addresses and validates the envelope without it, so requiring it would reject in-flight envelopes for nothing. Go stamps it so a version skew is visible in the payload."
         },
         "slug": {
@@ -2593,24 +2599,24 @@
     }
   },
   "source_sha256": {
-    "VERSION": "a1fb50e6c86fae1679ef3351296fd6713411a08cf8dd1790a4fd05fae8688164",
+    "VERSION": "3fdba35f04dc8c462986c992bcf875546257113072a909c162f7e470e581e278",
     "contract_surfaces.json": "d5f22942db5577a8076a6d0986d997470b9c39c34bc2de8bf05bf12f0e5ff045",
-    "event.schema.json": "88132fa8383dce0f60a42151fddf425e8a3aa8ae49651c89df4241567cd4df7f",
-    "examples/event.pod.json": "adacf1be8d7ad9185e6785e1c372c7c2fccbb318e1f58346148fcf39d96bf9c5",
-    "examples/event.running.json": "92e6b8e37a61e08195c01367c9dbf4774200793c47f38dc154026e45bae4df3e",
-    "examples/event.skipped.json": "f94e86e453b25b9c100216fb4034680c3d4a84d3333a565bf86972d678ff5e43",
-    "examples/invalid/event.bad-status.json": "095afbd17c20a40c46c38bf6f758aefd2d136e03ba0d754aa655dce25791d40b",
-    "examples/invalid/job.bad-render-tier.json": "c82584541c923efea9486d03c10ed53ef58fd9e368640d5ecf367c04f8c7b4f1",
-    "examples/invalid/job.bad-type.json": "211636e7f24903ee4b17b0289400a5e8504f210892cd4e13f4d1fd5cfa6b9420",
-    "examples/invalid/job.dead-montage.json": "532af85cbabaeec63b81995e39ac1f14cd08a43e0bbe70da572f393a78a6cafa",
-    "examples/invalid/job.empty-brand.json": "0848c645b244b8f7c30d356eeb51ed82a945f014de91d631daa989bbcd51242b",
-    "examples/invalid/job.empty-chain-id.json": "6010fc883cfa4c30816af690ce2e1ee4ed891e0f68ede724e88bbca5a4c80697",
-    "examples/invalid/job.empty-source-key.json": "bc3b0f833eab098a7b91985644fbb53db65426a0648b73beaa27758ad57460ef",
-    "examples/invalid/job.render-final-no-plan.json": "d85d39ad6aea0164628f33db1d8d90fb051f9806a495743dc489ddee67103c39",
-    "examples/invalid/job.typo-key.json": "d31450e060f97e2450ff968b1c8ed6b522f1709031bae3cd26aa3aee2b032f7a",
-    "examples/invalid/manifest.scenario-missing-field.json": "b10474ed164adf2dfee6c21b09f365fc7226bd1331d43b7d7db8fbce36fc2027",
-    "examples/invalid/manifest.with-stage.json": "323ee81b9a5dad2808f666ae0de3f2cc9d788b7ca4a1ab7e03fc6c7fd912d08b",
-    "examples/invalid/pod_enqueue_ack.missing-bound.json": "5fd5630060d1564e4e67c6665b2195dc71938b280a0c536e2e16dbc91a414735",
+    "event.schema.json": "76178e7cb1331dec2f11def0066ccc86ca0c47f52019036fffcbd4ecded19638",
+    "examples/event.pod.json": "551c2abc46f04c9692b77ee6a57934fa9e3c2f0ea1f70f5fc309dfb47730a8ce",
+    "examples/event.running.json": "8c419b841e595c14502696a89ab8fe9d1c4c54f8ad179bd2bcdefc20f46de436",
+    "examples/event.skipped.json": "5a8a68c5272078ae2dcfb923d2d502d039115e5b9834056273e45f051aae71fe",
+    "examples/invalid/event.bad-status.json": "f697f9d4bf62dfb59205a97497f66066415afb1154060cdb96e6744610a1783a",
+    "examples/invalid/job.bad-render-tier.json": "d45a36effda421508144cbb9db9199dc09f4e7486561c60a69d8656dd2a6ec42",
+    "examples/invalid/job.bad-type.json": "83861dfb728efd1e3d911a9133bf848dd07e438fc655cb0498696c71327f38bc",
+    "examples/invalid/job.dead-montage.json": "5b5441bdd975a4faef1cf946c9f012c6f1b4e2933f03c52fbcbd533b822e40c0",
+    "examples/invalid/job.empty-brand.json": "6c450e7c97c893288dfabbd162974c638877c1a57709e29ef30a042355be4f95",
+    "examples/invalid/job.empty-chain-id.json": "547b15f91c03dbe684b39c6f7b50e0a73f4f28bea5827cc90f2923544e413fb0",
+    "examples/invalid/job.empty-source-key.json": "99e6939de55d8c7912b9fcf796f37ab40d7c44e18a8328daa94e4cf040fdd03d",
+    "examples/invalid/job.render-final-no-plan.json": "794812aa4de8cbd709f26f39aa16eb51d53a607c8180c7319483e9d2c0dcbdbe",
+    "examples/invalid/job.typo-key.json": "83e547d1a50ecdbf569d4b3adc076d0a2e5d0fd5da24963d2e6aee7ac88d29b5",
+    "examples/invalid/manifest.scenario-missing-field.json": "0b67ef7e8c0d1ee056ea86ed426bab34cdad82f8f1c8a2f4227f19e1bfb6bdb1",
+    "examples/invalid/manifest.with-stage.json": "036a51545afb1d9e8dbad90fe461a36ebba14ea7b90b4c8f0d7ca02a7026797c",
+    "examples/invalid/pod_enqueue_ack.missing-bound.json": "087d5ead6326555377949afe1d56712a243fe184a6c3f6d39ccefd8255ef2340",
     "examples/invalid/pod_stream.both-payloads.json": "21abb704b5b83c55e3e45be6c618fdd2969cec316ad2eb2c522d40929a12bde8",
     "examples/invalid/pod_stream.event-empty-job.json": "0624d84b203e6978dee2d0dd089566cce4265a2335512fe50a40b192fd69bf6b",
     "examples/invalid/pod_stream.event-null-optional.json": "ab5f75dea6e9f8d4d68b6747e2f23dfedbc61b504655e2751ad0e07a59893f52",
@@ -2626,34 +2632,34 @@
     "examples/invalid/pod_stream.result-wrong-error-type.json": "d6488d45d945cd3c4d06484e3e94fab4ad836e4e4160b7e56d6beb0a2247df39",
     "examples/invalid/pod_stream_server.ack-missing-stream.json": "f80ced897650af508cd6b99ae9297632036157780ae3717b62a741416fe1f4a8",
     "examples/invalid/pod_stream_server.job-extra-field.json": "cd73b47600f517943a700f57fd1d5ab0a09e2ce4495ae3a01f0a9d3a14547ad9",
-    "examples/invalid/pod_transport_receipt.unknown-field.json": "790ec8c39266ddeb3efcd7fb8db38da02bb8772728663a9bb7fc934ecb76f990",
-    "examples/invalid/publish_job.no-job-id.json": "813af37d202dd4930a66af612acfb0870d1a81f4b7867875062ffbf7a8bd354b",
-    "examples/invalid/publish_job.typo-key.json": "cb4f6366eecf7bd055261ffca95d14b7f5f53d7f513ead30cd1abf05123717f9",
-    "examples/job.chained.json": "3ad30dd284323e7853cc754610e9b1a65e99f368b498b76849fe3f46a6870369",
-    "examples/job.ok.json": "99ba7ea1d185084c8f25412ddabfee43df1cb9f10a2da47cfd82e513d12e8d9f",
-    "examples/job.palette.json": "91c71409abda6dd680f297f691346322f83beeecd81a884d74ca14fbc07e5fad",
-    "examples/job.render-final.json": "e48a4034dd6647988628b1f5c573a9fc10e44651c6fb6f0f9403f857f7e1f8c9",
-    "examples/job.render-preview.json": "c10e1ec6a1958b0d69392905f1cb2a91d63e74fcda0a308b9d41822010a62e16",
-    "examples/manifest.ok.json": "e71304ab13110844d14a57847265311412ad5a01c940dc1f1fb01c91218a68ef",
-    "examples/manifest.scenario.json": "afc8ddfa23a6c0eea7e23a7434981d5448c7106c735cad677ca389952e59c61a",
-    "examples/model-invalid/job.chain-id-not-in-work-prefix.json": "a62966c727e4e35bc76a277e6ab6c24a0b40771abd119728d9d5cfabba24d336",
+    "examples/invalid/pod_transport_receipt.unknown-field.json": "0cc636851f9ea7f676c0ffac06e882d2673bb43e5df7b5ec44fcd6c53f92fc6d",
+    "examples/invalid/publish_job.no-job-id.json": "a60f18fb49dc8a24287029eccc55eb663e865caebd0de75288fc3bb6c8eb1bd5",
+    "examples/invalid/publish_job.typo-key.json": "dd5089c1a531fe20c6bb12b9bc89ac8cd3fa1a7a5b2677c4c3d0e37589fc7094",
+    "examples/job.chained.json": "514594dcaba3c8615dc3e0c9dcbc2f283bb22ae8295c0436752f416dd9624663",
+    "examples/job.ok.json": "7f2e73d7c511dda214bcb08695187a8f5bc87f1e40d3c881cf4222ac04b20269",
+    "examples/job.palette.json": "f340e6ed6fa97000cad34b000fd9d6c4cbd6fd2b0e5fd12fb3b7352f6e880e1b",
+    "examples/job.render-final.json": "8c03a3da242d457ecd89a4426b01046a1790e1bc61641eb801529de535f06268",
+    "examples/job.render-preview.json": "dc550f4aa6aeee5da9095e13ec85e9ffec717346d2a888b048a627e936f6818b",
+    "examples/manifest.ok.json": "5fe0632866fc7894e1b0886b097ff7c135b5329be3f6462981f9785ece14198a",
+    "examples/manifest.scenario.json": "ddae0efef8a4d63042f5cc65446da2954bb8a51c9acf936c9fbcc7f55ec40afe",
+    "examples/model-invalid/job.chain-id-not-in-work-prefix.json": "9babb2b0ac9bcd089ebba9975a59b0b6480289212db0295b817a8693c0cb9a22",
     "examples/model-invalid/pod_stream.result-key-disagrees.json": "c0a89df88e9f517b22b040dc960b9330b4b1d6c33ec61a71e679b2b641aee800",
     "examples/model-invalid/pod_stream_server.delivery-id-disagrees.json": "787bba56477a6963da2f898475744c06396ababcba5b31709231a2841dfb1d26",
-    "examples/pod_enqueue_ack.ok.json": "e4914b608d60b7cd66d7bf4c2b9b9dcc512ac9e6be6cac579402b1ce2a127ffd",
+    "examples/pod_enqueue_ack.ok.json": "e916aebe6bf560c7d1d9ab4b33e6a147759781b42e713d831525680444850509",
     "examples/pod_stream.event.json": "24eeea48319af081949df52fba64e242ef5cbb7144bc2bb99000215ad6d2f0f0",
     "examples/pod_stream.job_ack.json": "758315f18ad5f682ae2d2a035a9ab7a06c2c6f28eaaea8969a610fea628d2c0e",
     "examples/pod_stream.result.json": "5a432c4e4c5ef874969d38b252b338e4c4714b79201f3cf8d7ef1cb4e7e36338",
     "examples/pod_stream_server.ack.json": "fcb85dad3bd3715d446cb438627b4fa9c6a8612b825c84929c3136a1ea1e74d2",
     "examples/pod_stream_server.job.json": "da66625a56ebb2aae28b97e79fb7c8276df3b7d2beaf146fb4a0d51be5854410",
-    "examples/pod_transport_receipt.ok.json": "9b1f26441950b100335241fcdb19845a1e71f960d4a09018ef96a3b979a67c43",
-    "examples/publish_job.ok.json": "fb29591416d6bfb64155bd91799d8083cd3359ac00843cc025ff5ec2ab3096ed",
-    "job.schema.json": "32e52bf40b8b4aec23b48a1137d82f0a21c2a1ced67a66614df0886c83bf869a",
-    "manifest.schema.json": "f631efff66f169ea23d8eb53fc87416a537a1d27067773051f6a475f2ba15dd4",
-    "pod_enqueue_ack.schema.json": "6591f4c1dd02f0cd0654436e9fb3a70ca2ae77bd3dfac3bee970e7b296743880",
-    "pod_stream.schema.json": "987c20e5652259a7deedce612566d447510b6faca31ce980a79ef14bb02afde6",
-    "pod_stream_server.schema.json": "3cd5644ca27d8d9304a392630435aa076a583c9578585fb236a80c4f6c60f110",
-    "pod_token.schema.json": "f10ecdf6482ea326169b1a0aca3ed6a06c63270d1ba6530b4670ec72007fa40d",
-    "pod_transport_receipt.schema.json": "60692ee7069014430b4c2f2cfda99899821d5f06c88e238f543e04dd2d992a11",
-    "publish_job.schema.json": "21e8aa1cf997391be36765291530ed011ee1191b30c90cb1a9f03f77a4fd346e"
+    "examples/pod_transport_receipt.ok.json": "a581d53edaacef856fa3521d173dcaa8ed0933dc9b210c259bcfba46f9fb5958",
+    "examples/publish_job.ok.json": "6f4245715fcf3dbc9cbdf493cc5c55366f15288123629aac4c2217cd0a8e3435",
+    "job.schema.json": "bc13ef0d6d599b000af34ad2b94a0a36a5bd75e3bc7adb41fd3d435f95cc0df0",
+    "manifest.schema.json": "0c85f37a1b413ce8089660b035d9066c94f3438ee2bfae49218f80bdfe360f11",
+    "pod_enqueue_ack.schema.json": "42e927537ad6c6ce17abfaaa1f7abe62f65142c0c9d7201165ad85340a80682d",
+    "pod_stream.schema.json": "44723407b445990dd2967ce7385f0c72b8a9f3e5512d4a9be33f2515fa6cb52e",
+    "pod_stream_server.schema.json": "fcb1a6e8121a3eba3e3a43f5defb4ce343d1797388215dfa3ea7e5f583dc3f6b",
+    "pod_token.schema.json": "6d192fad99f81a3c6a8f02ad9251ad6aa31cccb905b493bdab3b446591ac94d2",
+    "pod_transport_receipt.schema.json": "771a4a9764ecc15103007f570f3683703161b992e923c02e71c0d42960174c2d",
+    "publish_job.schema.json": "cb4f2ab2a8855a23153e036fc33c5c910e16b8b40b7ea81ece0e33d4a98824c2"
   }
 }

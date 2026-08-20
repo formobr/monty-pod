@@ -20,7 +20,7 @@ Transport: the planner and the pod NEVER talk directly. Jobs, lifecycle events, 
 typed EventStream WebSocket; media payloads ride presigned URLs.
 The two EventStream schemas and their shared goldens are not copied into this directory: they come from
 `../vendor/monty-contracts/wire_bundle.json` and generate `../podagent/wire_generated.py`. This directory's
-`VERSION=6` therefore remains solely the render/infer domain pin; shared transport currently has its own v12.
+`VERSION=6` therefore remains solely the render/infer domain pin; shared transport currently has its own v13.
 
 ## The job envelope
 
