@@ -165,6 +165,10 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
     spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
     oom_before = _oom_count()
     r = subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, capture_output=True)
+    # Unconditional: the per-comp "[batch] <comp>: <frames> in <s>" line was DROPPED on the success path.
+    batch_log = (r.stderr or b"").decode("utf-8", "replace")
+    if batch_log.strip():
+        sys.stderr.write(batch_log if batch_log.endswith("\n") else batch_log + "\n")
     # JUDGE THE FRAMES, NOT THE EXIT CODE: headless Chrome aborts on teardown often enough (SIGABRT after every
     # sequence is already on disk) that a rc check throws away finished work and fails the whole master.
     missing = [str(i.get("comp")) for i in items if not any(Path(i["seqdir"]).glob("*.png"))]
@@ -173,8 +177,7 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
             print(f"mograph: render_batch exited {r.returncode} AFTER writing every sequence "
                   f"(Chrome teardown) — keeping the frames", file=sys.stderr)
         return
-    full = ((r.stderr or b"") + (r.stdout or b"")).decode("utf-8", "replace")
-    print(f"mograph: render_batch stderr+stdout follows\n{full[-3000:]}", file=sys.stderr)
+    full = (batch_log + (r.stdout or b"").decode("utf-8", "replace"))
     raise RuntimeError(f"render_batch exited {r.returncode} with no frames for {', '.join(missing)} "
                        f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]: {full[-280:]}")
 
