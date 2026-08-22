@@ -188,6 +188,60 @@ def test_overlay_output_clause_declares_the_grid(monkeypatch, tmp_path: Path) ->
     assert "-ar" not in cmd  # -c:a copy stays untouched — no new -ar on a copied track
 
 
+def test_render_layers_attaches_the_per_item_bound(tmp_path: Path, monkeypatch) -> None:
+    """render_batch.mjs judges EACH item against its own ceiling — every section must carry it, not just
+    the first (D38 follow-up: the pod's batch call had no per-item bound at all)."""
+    captured = {}
+    monkeypatch.setattr(mograph, "remotion_dir", lambda ref, tmp: tmp_path)
+    monkeypatch.setattr(mograph, "_run_batch", lambda rd, items, spec, entry: captured.setdefault("items", items))
+    monkeypatch.setattr(mograph, "_pack", lambda metas, tmp: metas)
+    sec = SimpleNamespace(comp="Stat", start=1.0, props={}, glass=False)
+    mograph._render_layers([sec], None, {}, tmp_path, max_seconds=65.0)
+    assert captured["items"][0]["maxSeconds"] == 65.0
+
+
+def test_render_layers_omits_the_bound_when_none_is_reachable(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(mograph, "remotion_dir", lambda ref, tmp: tmp_path)
+    monkeypatch.setattr(mograph, "_run_batch", lambda rd, items, spec, entry: captured.setdefault("items", items))
+    monkeypatch.setattr(mograph, "_pack", lambda metas, tmp: metas)
+    sec = SimpleNamespace(comp="Stat", start=1.0, props={}, glass=False)
+    mograph._render_layers([sec], None, {}, tmp_path)
+    assert "maxSeconds" not in captured["items"][0]
+
+
+def test_composite_derives_the_per_item_bound_from_the_bases_own_duration(monkeypatch, tmp_path: Path) -> None:
+    """The bound comes from the BASE's OWN measured runtime, not a section prop — a corrupted
+    durationInSeconds must not be able to inflate its own render ceiling."""
+    monkeypatch.setattr(mograph, "_probe_duration", lambda _p: 42.0)
+    captured = {}
+
+    def fake_render_layers(sections, brand, input_paths, tmp, bundle_ref=None, max_seconds=None):
+        captured["max_seconds"] = max_seconds
+        return [{"mov": "x"}]
+    monkeypatch.setattr(mograph, "_render_layers", fake_render_layers)
+    monkeypatch.setattr(mograph, "_overlay", lambda base, layers, out, gpu, enc, grid: out)
+    motion_plan = SimpleNamespace(sections=["s"], brand=None, bundle=None)
+    mograph.composite(motion_plan, tmp_path / "base.mp4", {}, tmp_path / "out.mp4", False, None, tmp_path,
+                      grid="30/1")
+    assert captured["max_seconds"] == 42.0 + mograph._SECTION_MAX_SECONDS_MARGIN
+
+
+def test_composite_derives_no_bound_when_the_base_is_unmeasurable(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(mograph, "_probe_duration", lambda _p: None)
+    captured = {}
+
+    def fake_render_layers(sections, brand, input_paths, tmp, bundle_ref=None, max_seconds=None):
+        captured["max_seconds"] = max_seconds
+        return [{"mov": "x"}]
+    monkeypatch.setattr(mograph, "_render_layers", fake_render_layers)
+    monkeypatch.setattr(mograph, "_overlay", lambda base, layers, out, gpu, enc, grid: out)
+    motion_plan = SimpleNamespace(sections=["s"], brand=None, bundle=None)
+    mograph.composite(motion_plan, tmp_path / "base.mp4", {}, tmp_path / "out.mp4", False, None, tmp_path,
+                      grid="30/1")
+    assert captured["max_seconds"] is None
+
+
 def test_composite_threads_the_caller_supplied_grid(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(mograph, "_render_layers", lambda *_a, **_k: [{"mov": "x"}])
     captured = {}
@@ -215,6 +269,20 @@ def test_composite_falls_back_to_probing_its_own_input_when_no_grid_given(monkey
     motion_plan = SimpleNamespace(sections=["s"], brand=None, bundle=None)
     mograph.composite(motion_plan, tmp_path / "base.mp4", {}, tmp_path / "out.mp4", False, None, tmp_path)
     assert captured["grid"] == "60000/1001"
+
+
+def test_probe_duration_returns_the_seconds(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *_a, **_kw: subprocess.CompletedProcess([], 0, stdout="61.5\n", stderr=""))
+    assert mograph._probe_duration(tmp_path / "base.mp4") == 61.5
+
+
+def test_probe_duration_is_best_effort_not_a_refusal(monkeypatch, tmp_path: Path) -> None:
+    """Unlike `_probe_grid`, an unmeasurable base must not block the composite — it only forfeits the
+    tighter per-item bound and falls back to render_batch.mjs's own default."""
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *_a, **_kw: subprocess.CompletedProcess([], 1, stdout="", stderr="no such file"))
+    assert mograph._probe_duration(tmp_path / "missing.mp4") is None
 
 
 def test_probe_grid_refuses_an_unmeasurable_fps(monkeypatch, tmp_path: Path) -> None:

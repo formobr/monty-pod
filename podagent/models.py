@@ -139,6 +139,9 @@ class SpecCaptions(BaseModel):
     hot: list[float] = Field(default_factory=list)
     words: list[SpecCaptionWord] = Field(default_factory=list)
     font: str | None = None
+    # mirrors scripts/spec_models.py — the pod's libass burn does not consume it (no Remotion Captions path
+    # here), but extra="forbid" means the field must exist or a spec that carries it fails validation.
+    maxSeconds: float | None = Field(default=None, gt=0)
 
 
 class SpecBrandManifest(BaseModel):

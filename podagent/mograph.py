@@ -197,10 +197,15 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
     return layers
 
 
+# Slop past the base's own runtime (a section trailing to the very last frame, float/frame rounding).
+_SECTION_MAX_SECONDS_MARGIN = 5.0
+
+
 def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path,
-                   bundle_ref=None) -> list[dict]:
+                   bundle_ref=None, max_seconds: float | None = None) -> list[dict]:
     """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch; each Bespoke
-    (LLM .tsx delivered + staged by the brain) via its own per-job entry. A missing bespoke entry = skip loud."""
+    (LLM .tsx delivered + staged by the brain) via its own per-job entry. A missing bespoke entry = skip loud.
+    `max_seconds` rides on every item as render_batch.mjs's per-item ceiling (independent of props)."""
     rd = remotion_dir(bundle_ref, tmp)
     _stage_public(input_paths, rd)
     tok = (brand or {}).get("tokens")
@@ -222,6 +227,8 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
                 "head_below": bool((sec.props or {}).get("headBelow")),
                 "backing": (sec.props or {}).get("backing")}
         item = {"comp": sec.comp, "props": _props(sec), "seqdir": str(seqdir)}
+        if max_seconds is not None:
+            item["maxSeconds"] = max_seconds
         if sec.comp.startswith("Bespoke"):
             entry = f"src/index.bespoke.{sec.comp}.tsx"
             if not (rd / entry).is_file():
@@ -356,6 +363,18 @@ def _probe_grid(video: Path) -> str:
     return out
 
 
+def _probe_duration(video: Path) -> float | None:
+    """`video`'s own format duration, best-effort — only RAISES a section's render ceiling above the
+    default, so an unmeasurable base must not block the composite it would otherwise just leave unbounded."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", str(video)],
+                             capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S).stdout.strip()
+        return float(out)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return None
+
+
 def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc, grid: str) -> Path:
     """Composite alpha layers onto base in one ffmpeg pass (mirrors the engine _composite)."""
     cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(base)]
@@ -379,8 +398,10 @@ def composite(motion_plan, base: Path, input_paths: dict, out: Path, gpu: bool, 
     """Render motion_plan.sections and overlay them onto `base`. Returns `base` unchanged if nothing
     rendered. `grid` is the spec's declared -r rational; falling back to probing `base` itself covers
     the (untested-in-prod) case of a caller with no spec reachable here."""
+    base_dur = _probe_duration(base)
+    max_seconds = (base_dur + _SECTION_MAX_SECONDS_MARGIN) if base_dur else None
     layers = _render_layers(motion_plan.sections, motion_plan.brand.model_dump() if motion_plan.brand else None,
-                            input_paths, tmp, getattr(motion_plan, "bundle", None))
+                            input_paths, tmp, getattr(motion_plan, "bundle", None), max_seconds=max_seconds)
     if not layers:
         return base
     return _overlay(base, layers, out, gpu, enc, grid if grid is not None else _probe_grid(base))
