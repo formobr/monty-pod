@@ -406,9 +406,18 @@ def encode_budget_s(duration: float) -> float:
     return _ENCODE_FLOOR_S + _ENCODE_REALTIME_X * max(0.0, duration)
 
 
+def _speed_line(stderr: bytes) -> str | None:
+    """Last ffmpeg progress line — capture_output eats stderr on success, and with it the only record of
+    the single pass's actual throughput (speed=/fps=)."""
+    for line in reversed((stderr or b"").splitlines()):
+        if b"speed=" in line or b"fps=" in line:
+            return line.decode("utf-8", "replace").strip()
+    return None
+
+
 def _run(cmd: list[str], budget_s: float) -> None:
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=budget_s)
+        proc = subprocess.run(cmd, check=True, capture_output=True, timeout=budget_s)
     except subprocess.CalledProcessError as exc:
         tail = (exc.stderr or b"")[-2000:]
         detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
@@ -418,6 +427,8 @@ def _run(cmd: list[str], budget_s: float) -> None:
         raise RuntimeError(
             f"body single-pass ffmpeg exceeded its {budget_s:.0f}s budget — a graph that cannot end "
             f"(check -t against the looped watermark idle)") from exc
+    if (tail := _speed_line(proc.stderr)) is not None:
+        print(f"[onepass] {tail}", file=sys.stderr, flush=True)
 
 
 def run_encode(p: Prepared, phase=_no_phase) -> None:

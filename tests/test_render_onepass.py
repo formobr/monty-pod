@@ -1075,3 +1075,33 @@ def test_render_body_survives_a_post_render_probe_failure(monkeypatch, tmp_path)
     _runs, puts, d = _door(monkeypatch, tmp_path, _spec(_drop_mograph))
     assert d.defect is not None and "probe_failed" in d.defect
     assert puts
+
+
+# --- the encode pass's own throughput record (speed=/fps= off a swallowed stderr) -------------
+
+
+def test_run_logs_the_last_speed_line_on_success(monkeypatch, capsys):
+    stderr = (b"frame=  100 fps= 50 q=20.0 size=1024KiB time=00:00:04.00 speed=2.5x\r"
+              b"frame=  200 fps= 48 q=20.0 size=2048KiB time=00:00:08.00 speed=1.9x\n"
+              b"[out#0] video summary\n")
+    monkeypatch.setattr(op.subprocess, "run",
+                        lambda *_a, **_k: SimpleNamespace(stderr=stderr, returncode=0))
+    op._run(["ffmpeg"], 10.0)
+    err = capsys.readouterr().err
+    assert "[onepass]" in err and "speed=1.9x" in err
+    assert "speed=2.5x" not in err
+
+
+def test_run_without_a_progress_line_logs_nothing(monkeypatch, capsys):
+    monkeypatch.setattr(op.subprocess, "run",
+                        lambda *_a, **_k: SimpleNamespace(stderr=b"no progress here\n", returncode=0))
+    op._run(["ffmpeg"], 10.0)
+    assert "[onepass]" not in capsys.readouterr().err
+
+
+def test_run_failure_still_raises_with_the_stderr_tail(monkeypatch):
+    def boom(*_a, **_k):
+        raise op.subprocess.CalledProcessError(1, "ffmpeg", stderr=b"speed=0.1x then died")
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    with pytest.raises(RuntimeError, match="exited 1"):
+        op._run(["ffmpeg"], 10.0)
