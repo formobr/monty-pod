@@ -487,8 +487,8 @@ class FilmBurnPlan(NamedTuple):
 
 def film_burn_plan(accents) -> FilmBurnPlan:
     """Split a resolved accent list into (ordinary singles, the one burn set) and refuse every
-    malformed shape — PURE, so both transports (multi-pass finalize and the one-pass graph) judge a
-    burn set by the same law rather than each holding its own copy of what "legal" means."""
+    malformed shape — PURE, so the one-pass graph (the only final encode core) judges a burn set by
+    one law rather than reaching for its own copy of what "legal" means."""
     burns = [a for a in accents if a.kind == "film_burn"]
     singles = [a for a in accents if a.kind != "film_burn"]
     burn_ids = {a.burn for a in burns}

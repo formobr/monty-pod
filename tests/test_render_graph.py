@@ -193,24 +193,6 @@ def test_build_command_emits_the_exact_rational_not_a_rounded_float() -> None:
     assert cmd[cmd.index("-r") + 1] == "30000/1001"
 
 
-def test_burn_captions_declares_the_grid_but_never_touches_audio(monkeypatch, tmp_path) -> None:
-    """The captions pass RE-ENCODES video (libass burn) but copies audio through — it must declare
-    -r/-fps_mode and must NOT declare -ar next to a -c:a copy clause."""
-    spec = _spec("spec.final.json")
-    mp = spec.overlays.motion_plan
-    input_paths = {"caption_font": Path("/work/caption_font")}
-    cmds: list[list[str]] = []
-    monkeypatch.setattr(render.subprocess, "run", lambda cmd, **_kw: cmds.append(cmd))
-    render._burn_captions(mp.captions, mp, Path("/work/src.mp4"), input_paths, tmp_path / "out.mp4",
-                          False, spec.timeline.width, spec.timeline.height, spec.encode,
-                          spec.timeline.fps)
-    cmd = cmds[0]
-    assert cmd[cmd.index("-r") + 1] == "30"
-    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
-    assert cmd[cmd.index("-c:a") + 1] == "copy"
-    assert "-ar" not in cmd
-
-
 def test_final_overlays_not_implemented() -> None:
     spec = _spec("spec.final.json")
 

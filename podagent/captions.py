@@ -5,7 +5,7 @@ them with a delivered TTF.
 NO COLOUR LITERAL LIVES IN THIS FILE. `fg` and `accent` are REQUIRED arguments: this module used to spell
 one tenant's warm white and one tenant's lime as defaults, and since the pod is the FINAL renderer every
 delivered video burned them — a second tenant's captions came out in the first one's palette with every
-test green. The caller resolves both from the crossing brand data (render._burn_captions)."""
+test green. The caller resolves both from the crossing brand data (render_onepass._write_ass)."""
 from __future__ import annotations
 
 from pathlib import Path

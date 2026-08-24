@@ -1,30 +1,6 @@
-"""Delivery tail — the LAST thing that happens to a master, on whichever box rendered it.
-
-After the composite (segments + b-roll + mograph + captions + cover weld) the master still has to be
-accented, branded and levelled before it is a deliverable:
-
-  1. frame accents  — the Director's resolved zoom_punch / camera_shake / glitch / grain / … chained
-                      into ONE pass over the body (podagent.accents).
-  2. body logo      — the persistent corner logo, over the BODY only; the cover end-card carries its
-                      own logo, so the overlay is disabled for the last `cover_hold` seconds.
-  3. watermark      — the animated brand sting -> idle loop, plus its chime mixed once into the audio.
-  4. loudnorm       — two-pass loudnorm to the brand's delivery target, as the LAST step, so every
-                      video ships at one level.
-
-Order is load-bearing: accents first (they re-slice the picture, and must not smear the static
-overlays), then the overlays, then the level. This mirrors the order the engine used when this tail
-still ran on the origin, which is what keeps the two transports' masters comparable.
-
-Everything brand-specific arrives as data: the logo/sting/idle are `inputs[]` ids resolved by the
-planner, every geometry and level is a number on `overlays.finalize`. The pod holds no brand profile
-and reads none — `brands/` and `effects/` do not exist here.
-
-Encoder settings are NOT on the contract. They are tuning, and tuning stays in the handler (the same
-rule render_profile.py follows on the planner side). The values below are the delivery chain's own,
-deliberately not `spec.encode`: the finalize passes have always run at their own quality, and the
-watermark pass is the TERMINAL full-frame encode of the master, so it sets the deliverable's
-bitrate/colour signal.
-"""
+"""Delivery-tail BUILDERS: pure filtergraph fragments (body logo, watermark) plus the grid/level
+steps (declared_grid, grid_verdict, apply_loudnorm) that render_onepass.assemble folds into its ONE
+encode. Brand-specific values (logo/sting/idle assets, geometry, levels) all arrive as spec data."""
 from __future__ import annotations
 
 import json
@@ -34,15 +10,11 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
-from . import accents as _accents
 from .sanitize import safe_error
 
 # bt709 SIGNAL (tag, no convert) — an untagged master makes platforms GUESS the colourspace.
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
 _BT709_SET_PARAMS = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
-# Intermediate finalize passes: cq/crf 16, matching the engine's fx/logo chain.
-_MID_GPU = ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-cq", "16", *_BT709]
-_MID_CPU = ["-c:v", "libx264", "-preset", "medium", "-crf", "16", *_BT709]
 # TERMINAL encode (the watermark pass): cq14 + unclamped maxrate/bufsize so busy frames aren't
 # starved, since the platform re-compresses whatever we ship.
 _FINAL_GPU = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-cq", "14",
@@ -60,7 +32,6 @@ _POS = {
 }
 WM_CANVAS_W = 1200
 WM_CANVAS_H = 600
-FILM_BURN_RENDER_TIMEOUT_S = 1800
 
 
 def _run(cmd: list[str], what: str, *, timeout_s: int | None = None) -> None:
@@ -175,65 +146,7 @@ def _terminal_bt709(fc: str, out_v: str) -> str:
     return f"{fc};[{out_v}]{_BT709_SET_PARAMS}[{out_v}]"
 
 
-# --- 1. frame accents ---------------------------------------------------------
-
-def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
-    plan = _accents.film_burn_plan(fin.accents)
-    burn_path = input_paths.get(plan.burn)
-    if burn_path is None:
-        raise RuntimeError(f"film_burn accent burn input {plan.burn!r} is not resolved")
-    w, h, fps, fps_num, fps_den, _ = _probe(src)
-    flares = _accents.detect_flares(burn_path)
-    if plan.singles:
-        fc = _accents.build_chain_filter(plan.singles, fps=fps, w=w, h=h, gpu=gpu)
-        if fc is None:
-            raise RuntimeError("ordinary accent chain unexpectedly empty")
-        prefix, terminal = fc.rsplit("[vout]", 1)
-        parts = [prefix + "[preburn]" + terminal]
-        prev = "[preburn]"
-    else:
-        parts, prev = [], "[0:v]"
-    parts, prev = _accents.add_offset_jump(parts, prev, plan.boundaries, w=w, h=h)
-    parts, prev = _accents.add_filmburn(
-        parts, prev, 1, plan.boundaries, flares, opacity=plan.opacity, w=w, h=h,
-        fps=_accents.FPS if (fps_num, fps_den) == (60000, 1001) else f"{fps:.4f}",
-    )
-    script = out.with_name(out.name + ".filter_complex")
-    script.write_text(_terminal_bt709(";".join(parts), prev[1:-1]) + "\n", encoding="utf-8")
-    grid = _grid_rate(fps_num, fps_den)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           *( ["-init_hw_device", "vulkan"] if gpu else []), "-i", str(src),
-           "-stream_loop", "-1", "-i", str(burn_path), "-filter_complex_script", str(script),
-           "-map", prev, "-map", "0:a?",
-           "-r", grid, "-fps_mode", "cfr",
-           *(_MID_GPU if gpu else _MID_CPU),
-           "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
-    _run(cmd, "film burn accents", timeout_s=FILM_BURN_RENDER_TIMEOUT_S)
-    return out
-
-def apply_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
-    """Chain the resolved frame-accents over the FULL master in one pass. No accents -> `src` unchanged."""
-    if not fin.accents:
-        return src
-    if any(a.kind == "film_burn" for a in fin.accents):
-        return _apply_film_burn_accents(fin, src, out, input_paths, gpu)
-    w, h, fps, fps_num, fps_den, _ = _probe(src)
-    fc = _accents.build_chain_filter(fin.accents, fps=fps, w=w, h=h, gpu=gpu)
-    if fc is None:
-        return src
-    fc = _terminal_bt709(fc, "vout")
-    grid = _grid_rate(fps_num, fps_den)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           *(["-init_hw_device", "vulkan"] if gpu else []), "-i", str(src),
-           "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
-           "-r", grid, "-fps_mode", "cfr",
-           *(_MID_GPU if gpu else _MID_CPU),
-           "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
-    _run(cmd, "frame accents")
-    return out
-
-
-# --- 2. persistent body logo --------------------------------------------------
+# --- 1. persistent body logo --------------------------------------------------
 
 def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_end: float, *,
                      base_v: str = "0:v", logo_v: str = "1:v", out_v: str = "vout") -> str:
@@ -246,34 +159,7 @@ def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_
             f"[{base_v}][lg]overlay={x}:{y}:enable='lt(t,{body_end:.3f})'[{out_v}]")
 
 
-def apply_logo(fin, src: Path, out: Path, input_paths: dict, gpu: bool, *,
-               cover_welded: bool = False) -> Path:
-    """Bake the brand's persistent corner logo onto the master BODY. `logo` absent (partner /
-    --no-logo) -> `src` unchanged."""
-    logo = fin.logo
-    if logo is None:
-        return src
-    asset = input_paths.get(logo.asset)
-    if asset is None:
-        raise RuntimeError(f"finalize.logo.asset {logo.asset!r} is not a resolved inputs[] id")
-    # body_end is derived from the master the pod itself just welded, not guessed upstream: the cover
-    # tail is exactly `cover_hold` s long, and only this box knows the welded master's real duration.
-    # Held back unless a cover WAS welded — `src` is then pure body, and subtracting a tail that does
-    # not exist deletes the logo from the last `cover_hold` seconds of live picture.
-    _w, _h, _fps, fps_num, fps_den, src_dur = _probe(src)
-    body_end = max(0.0, src_dur - (logo.cover_hold if cover_welded else 0.0))
-    fc = _terminal_bt709(body_logo_filter(logo.corner, logo.width, logo.opacity, logo.margin, body_end), "vout")
-    grid = _grid_rate(fps_num, fps_den)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-i", str(asset),
-           "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
-           "-r", grid, "-fps_mode", "cfr",
-           *(_MID_GPU if gpu else _MID_CPU),
-           "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
-    _run(cmd, "body logo")
-    return out
-
-
-# --- 3. animated watermark ----------------------------------------------------
+# --- 2. animated watermark ----------------------------------------------------
 
 def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, overlay_xy: str,
                      base_a: str | None, chime_a: str | None, chime_vol: float, delay: float,
@@ -310,49 +196,7 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
     return f, out_v, ret_a
 
 
-def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
-    """Overlay the animated brand watermark (+ chime). `watermark` absent (paid tier / --no-watermark)
-    -> `src` unchanged.
-
-    The .webm alpha lives in a separate VP9 stream that ONLY the `libvpx-vp9` decoder extracts —
-    ffmpeg's default native `vp9` decoder drops it and the mark renders as a BLACK BOX. Each webm
-    input is therefore forced with `-c:v libvpx-vp9`."""
-    wm = fin.watermark
-    if wm is None:
-        return src
-    for ref in (wm.sting, wm.idle):
-        if ref not in input_paths:
-            raise RuntimeError(f"finalize.watermark asset {ref!r} is not a resolved inputs[] id")
-    sting, idle = input_paths[wm.sting], input_paths[wm.idle]
-    has_audio = _has_audio(src)
-    _w, _h, _fps, fps_num, fps_den, src_dur = _probe(src)
-    grid = _grid_rate(fps_num, fps_den)
-    overlay_xy = (f"{wm.x}:{wm.y}" if wm.x is not None and wm.y is not None
-                  else _POS[wm.position].format(m=wm.margin))
-    fc, out_v, out_a = watermark_filter(
-        base_v="0:v", sting_v="1:v", idle_v="2:v", width=wm.width, overlay_xy=overlay_xy,
-        base_a=("0:a" if has_audio else None), chime_a=("1:a" if wm.chime else None),
-        chime_vol=wm.chime_volume, delay=wm.delay, grid=grid, sample_rate=48000,
-        out_v="v", out_a="a")
-    fc = _terminal_bt709(fc, out_v)
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-           "-c:v", "libvpx-vp9", "-i", str(sting),
-           "-c:v", "libvpx-vp9", "-stream_loop", "-1", "-i", str(idle),
-           "-filter_complex", fc, "-map", f"[{out_v}]"]
-    # No chime means the filter never TOUCHED the base audio, so there is no [out_a] to map and the
-    # master's own track is mapped straight from input 0. `-an` here shipped a silent deliverable.
-    audio_map = f"[{out_a}]" if out_a else ("0:a" if has_audio else None)
-    cmd += ["-map", audio_map] if audio_map else ["-an"]
-    if not has_audio:
-        cmd += ["-t", f"{src_dur:.3f}"]
-    cmd += ["-r", grid, "-fps_mode", "cfr",
-            *(_FINAL_GPU if gpu else _FINAL_CPU),
-            "-ar", "48000", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
-    _run(cmd, "watermark")
-    return out
-
-
-# --- 4. delivery loudness -----------------------------------------------------
+# --- 3. delivery loudness -----------------------------------------------------
 
 # covers loudnorm's linear-mode TP prediction slack (~0.2 dB) PLUS the AAC encode's measured ~0.9 dBTP
 # of codec peaks after it — an aim that ignores the encoder ships past the ceiling (test-pinned, no mirror)
@@ -404,18 +248,3 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
         print(f"[finalize] master loudnorm exit {r.returncode} -> left at source level")
         return src
     return out
-
-
-# --- the tail -----------------------------------------------------------------
-
-def finalize(fin, master: Path, input_paths: dict, tmp: Path, gpu: bool, *,
-             cover_welded: bool = False) -> Path:
-    """Run the delivery tail over `master`, returning the path to the finished deliverable.
-
-    Each step returns its input unchanged when its block is absent, so a spec that carries only some
-    of the tail (a partner deliverable with no logo and no watermark) walks the same code path — the
-    two transports cannot diverge on which steps they honour, because there is only one of them."""
-    out = apply_accents(fin, master, tmp / "fin_accents.mp4", input_paths, gpu)
-    out = apply_logo(fin, out, tmp / "fin_logo.mp4", input_paths, gpu, cover_welded=cover_welded)
-    out = apply_watermark(fin, out, tmp / "fin_wm.mp4", input_paths, gpu)
-    return apply_loudnorm(fin, out, tmp / "fin_ln.mp4")

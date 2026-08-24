@@ -197,10 +197,6 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
     return layers
 
 
-# Slop past the base's own runtime (a section trailing to the very last frame, float/frame rounding).
-_SECTION_MAX_SECONDS_MARGIN = 5.0
-
-
 def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path,
                    bundle_ref=None, max_seconds: float | None = None) -> list[dict]:
     """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch; each Bespoke
@@ -345,63 +341,3 @@ def overlay_filtergraph(layers: list[dict], *, base: str = "0:v",
                        f"[{src}][o{i}]overlay=enable='between(t,{s},{e})':eof_action=pass[v{i}]")
         src = f"v{i}"
     return ";".join(filters), src
-
-
-_PROBE_TIMEOUT_S = 20  # header-only ffprobe; matches the engine's own precedent (scripts/tag_music.py:_duration)
-
-
-def _probe_grid(video: Path) -> str:
-    """Exact -r rational for `video`'s OWN video stream — no literal fallback, an unmeasurable rate refuses."""
-    try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                              "-show_entries", "stream=r_frame_rate", "-of", "default=nw=1:nk=1", str(video)],
-                             capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S).stdout.strip()
-    except subprocess.TimeoutExpired:
-        out = ""  # a hang is as unmeasurable as empty stdout — same refusal below, not a new outcome
-    if not out or out in ("0/0", "N/A"):
-        raise RuntimeError(f"could not measure the delivery grid from {video} — no r_frame_rate")
-    return out
-
-
-def _probe_duration(video: Path) -> float | None:
-    """`video`'s own format duration, best-effort — only RAISES a section's render ceiling above the
-    default, so an unmeasurable base must not block the composite it would otherwise just leave unbounded."""
-    try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                              "-of", "default=nw=1:nk=1", str(video)],
-                             capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S).stdout.strip()
-        return float(out)
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        return None
-
-
-def _overlay(base: Path, layers: list[dict], out: Path, gpu: bool, enc, grid: str) -> Path:
-    """Composite alpha layers onto base in one ffmpeg pass (mirrors the engine _composite)."""
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(base)]
-    for lay in layers:
-        cmd += ["-i", lay["mov"]]
-    fc, last = overlay_filtergraph(layers)
-    from .render import _venc
-    cmd += ["-filter_complex", fc, "-map", f"[{last}]", "-map", "0:a?"]
-    cmd += ["-r", grid, "-fps_mode", "cfr"] + _venc(enc, gpu) + ["-c:a", "copy", str(out)]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as exc:
-        tail = (exc.stderr or b"")[-2000:]
-        raise RuntimeError(f"mograph overlay ffmpeg exited {exc.returncode}: "
-                           f"{tail.decode('utf-8', 'replace')}") from exc
-    return out
-
-
-def composite(motion_plan, base: Path, input_paths: dict, out: Path, gpu: bool, enc, tmp: Path,
-             grid: str | None = None) -> Path:
-    """Render motion_plan.sections and overlay them onto `base`. Returns `base` unchanged if nothing
-    rendered. `grid` is the spec's declared -r rational; falling back to probing `base` itself covers
-    the (untested-in-prod) case of a caller with no spec reachable here."""
-    base_dur = _probe_duration(base)
-    max_seconds = (base_dur + _SECTION_MAX_SECONDS_MARGIN) if base_dur else None
-    layers = _render_layers(motion_plan.sections, motion_plan.brand.model_dump() if motion_plan.brand else None,
-                            input_paths, tmp, getattr(motion_plan, "bundle", None), max_seconds=max_seconds)
-    if not layers:
-        return base
-    return _overlay(base, layers, out, gpu, enc, grid if grid is not None else _probe_grid(base))

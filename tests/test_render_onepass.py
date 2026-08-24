@@ -556,84 +556,6 @@ def test_no_chime_still_maps_the_composite_audio() -> None:
     assert_connected(graph, ["vwatermark", "atail"] + _REF_MAPS)
 
 
-@pytest.mark.parametrize("chime", [True, False])
-def test_the_multipass_watermark_maps_audio_too(chime, monkeypatch, tmp_path) -> None:
-    """NEGATIVE: apply_watermark emitted -an whenever the chime was off — a SILENT deliverable, on
-    the path that ships today. Both paths must map audio; neither may reach -an with a track present."""
-    cmds = []
-    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
-    monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
-
-    def mutate(d):
-        d["overlays"]["finalize"]["watermark"]["chime"] = chime
-    spec = _spec(mutate)
-    finalize.apply_watermark(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
-                             _paths(spec, tmp_path), False)
-    maps = _maps(tuple(cmds[0]))
-    assert "-an" not in cmds[0]
-    assert maps[1] == ("a" if chime else "0:a")
-
-
-def test_the_multipass_watermark_still_says_an_with_no_audio_at_all(monkeypatch, tmp_path) -> None:
-    """The one legitimate -an: a source with no audio stream has nothing to map."""
-    cmds = []
-    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
-    monkeypatch.setattr(finalize, "_has_audio", lambda _p: False)
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
-    spec = _spec(_no_chime)
-    finalize.apply_watermark(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
-                             _paths(spec, tmp_path), False)
-    assert "-an" in cmds[0] and "-t" in cmds[0]
-
-
-def test_the_multipass_watermark_declares_the_probed_grid(monkeypatch, tmp_path) -> None:
-    """The terminal encode of the multipass tail (watermark's own sting/idle are 60fps assets) must
-    declare -r from the PROBE, not inherit whatever the sting/idle branches negotiate."""
-    cmds = []
-    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
-    monkeypatch.setattr(finalize, "_has_audio", lambda _p: True)
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 60000 / 1001, 60000, 1001, 10.0))
-    spec = _spec()
-    finalize.apply_watermark(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
-                             _paths(spec, tmp_path), False)
-    cmd = cmds[0]
-    assert cmd[cmd.index("-r") + 1] == "60000/1001"
-    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
-    assert cmd[cmd.index("-ar") + 1] == "48000"
-    assert "fps=60000/1001" in cmd[cmd.index("-filter_complex") + 1]
-    assert "aresample=48000" in cmd[cmd.index("-filter_complex") + 1]
-
-
-def test_the_multipass_logo_declares_the_probed_grid(monkeypatch, tmp_path) -> None:
-    """The body-logo re-encode must declare -r from the probe, matching the master's own measured grid."""
-    cmds = []
-    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30000 / 1001, 30000, 1001, 10.0))
-    spec = _spec()
-    finalize.apply_logo(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
-                        _paths(spec, tmp_path), False, cover_welded=False)
-    cmd = cmds[0]
-    assert cmd[cmd.index("-r") + 1] == "30000/1001"
-    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
-    assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "copy"
-    assert "-ar" not in cmd
-
-
-def test_the_multipass_accents_declare_the_probed_grid(monkeypatch, tmp_path) -> None:
-    """The ordinary (non film-burn) accent re-encode must declare -r from the probe too."""
-    cmds = []
-    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 25.0, 25, 1, 10.0))
-    spec = _spec()
-    finalize.apply_accents(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4", {}, False)
-    cmd = cmds[0]
-    assert cmd[cmd.index("-r") + 1] == "25"
-    assert cmd[cmd.index("-fps_mode") + 1] == "cfr"
-    assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "copy"
-    assert "-ar" not in cmd
-
-
 def test_encode_shape_per_output_clause() -> None:
     """The ref rung carries the SAME -r as the master (not the old contract's bare absence): the sync
     oracle diffs the two rungs by frame INDEX, so a different grid compares different instants."""
@@ -761,32 +683,6 @@ def test_the_logo_runs_to_the_end_of_the_body() -> None:
     graph, _cmd = op.assemble(_prepared(spec))
     assert "enable='lt(t,10.000)'" in graph
     assert "9.400" not in graph
-
-
-@pytest.mark.parametrize("cover_welded,want", [(False, "10.000"), (True, "9.400")])
-def test_the_multipass_logo_reserves_a_tail_only_when_one_was_welded(
-        cover_welded, want, monkeypatch, tmp_path) -> None:
-    """NEGATIVE: cover_hold reserves the welded end-card's tail. final_dispatch passes cover=None
-    unconditionally, so subtracting it unasked deleted the logo from the last 0.6s of live body."""
-    cmds = []
-    monkeypatch.setattr(finalize, "_run", lambda cmd, _what: cmds.append(cmd))
-    monkeypatch.setattr(finalize, "_probe", lambda _p: (1080, 1920, 30.0, 30, 1, 10.0))
-    spec = _spec()
-    finalize.apply_logo(spec.overlays.finalize, tmp_path / "m.mp4", tmp_path / "o.mp4",
-                        _paths(spec, tmp_path), False, cover_welded=cover_welded)
-    assert f"enable='lt(t,{want})'" in cmds[0][cmds[0].index("-filter_complex") + 1]
-
-
-def test_the_tail_defaults_to_no_cover(monkeypatch, tmp_path) -> None:
-    """finalize() is the only caller that knows whether render_cover ran; unasked, no tail exists."""
-    seen = {}
-    monkeypatch.setattr(finalize, "apply_accents", lambda _f, src, *_a, **_kw: src)
-    monkeypatch.setattr(finalize, "apply_logo",
-                        lambda _f, src, *_a, **kw: (seen.update(kw), src)[1])
-    monkeypatch.setattr(finalize, "apply_watermark", lambda _f, src, *_a, **_kw: src)
-    monkeypatch.setattr(finalize, "apply_loudnorm", lambda _f, src, *_a, **_kw: src)
-    finalize.finalize(_spec().overlays.finalize, tmp_path / "m.mp4", {}, tmp_path, False)
-    assert seen == {"cover_welded": False}
 
 
 def test_the_t_bound_survives_a_missing_watermark() -> None:
@@ -1027,12 +923,6 @@ def test_an_unresolved_burn_input_refuses_before_any_pass(monkeypatch, tmp_path)
 
 # --- the door: one VIDEO encode, the loudnorm, both outputs delivered ---------
 
-def _forbidden(name):
-    def boom(*_a, **_kw):
-        raise AssertionError(f"{name} ran — the one-pass graph already did that work")
-    return boom
-
-
 class _FakeFFmpeg:
     """Records argv and creates whatever each output clause names, so apply_loudnorm's own
     'did the remux produce a file' check sees what it would see for real."""
@@ -1055,10 +945,18 @@ def _door(monkeypatch, tmp_path, spec, **kw):
     monkeypatch.setattr(op.subprocess, "run", runs)
     monkeypatch.setattr(op, "upload", lambda path, url, _mime: puts.append((Path(path).name, url)))
     _stub_prepare_passes(monkeypatch, tmp_path)
-    for mod, name in ((mograph, "_overlay"), (render, "_burn_captions"), (finalize, "apply_accents"),
-                      (finalize, "apply_logo"), (finalize, "apply_watermark")):
-        monkeypatch.setattr(mod, name, _forbidden(f"{mod.__name__}.{name}"))
+    # No forbid-loop: the builders it used to stub are gone (see test_the_multipass_builders_no_longer_exist).
     return runs, puts, op.render_body(spec, _paths(spec, tmp_path), tmp_path, False, **kw)
+
+
+def test_the_multipass_builders_no_longer_exist() -> None:
+    """Pins the deletion: the one-pass graph is the ONLY final encode core, so its predecessors
+    (and the cover module the old tail welded through) cannot exist to be reached by anything."""
+    for mod, name in ((finalize, "apply_accents"), (finalize, "apply_logo"),
+                      (finalize, "apply_watermark"), (finalize, "finalize"),
+                      (render, "_burn_captions"), (mograph, "_overlay"), (mograph, "composite")):
+        assert not hasattr(mod, name), f"{mod.__name__}.{name} should have been deleted"
+    assert not (Path(__file__).resolve().parents[1] / "podagent" / "cover.py").exists()
 
 
 def test_one_video_encode_the_loudnorm_still_runs_and_both_outputs_ship(monkeypatch, tmp_path) -> None:

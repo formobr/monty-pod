@@ -380,10 +380,6 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
     return chains
 
 
-def _music_of(spec: RenderSpec) -> "object | None":
-    return spec.overlays.music if (spec.mode == "final" and spec.overlays is not None) else None
-
-
 def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = None,
                       terminal_bt709: bool = True) -> str:
     """Pure: the -filter_complex string trimming, speed-adjusting, motion-treating and concatenating
@@ -481,31 +477,6 @@ def _caption_colours(caps, motion_plan) -> tuple[str, str]:
         print("[render] captions: no brand fg crossed (motion_plan.brand absent) — burning neutral "
               f"{_NEUTRAL_FG}, NOT a brand off-white", file=sys.stderr)
     return fg, accent
-
-
-def _burn_captions(caps, motion_plan, src: Path, input_paths: dict, out_path: Path, gpu: bool,
-                   w: int, h: int, enc, fps: float) -> None:
-    """Burn the subtitle track onto `src` via libass (one re-encode, audio copied through)."""
-    from .captions import build_ass
-    if not caps.font or caps.font not in input_paths:
-        raise RuntimeError("captions present but no resolved font input on the spec")
-    font = input_paths[caps.font]
-    words = [wd.model_dump() for wd in caps.words]
-    fg, accent = _caption_colours(caps, motion_plan)
-    ass = out_path.parent / "captions.ass"
-    ass.write_text(build_ass(words, font=font, w=w, h=h, fg=fg, accent=accent,
-                             center_y=caps.centerY if caps.centerY is not None else 0.76,
-                             style=caps.style or "oneword"), encoding="utf-8")
-    grid = _finalize.declared_grid(fps)
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(src),
-           "-vf", f"subtitles={ass}:fontsdir={font.parent}"]
-    cmd += ["-r", grid, "-fps_mode", "cfr"] + _venc(enc, gpu) + ["-c:a", "copy", str(out_path)]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as exc:
-        tail = (exc.stderr or b"")[-2000:]
-        detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
-        raise RuntimeError(f"caption burn ffmpeg exited {exc.returncode}: {detail}") from exc
 
 
 # --- I/O orchestration --------------------------------------------------------
@@ -661,6 +632,12 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                 if o.kind == "cache":
                     print(f"cache output {o.id!r} skipped (v1)", file=sys.stderr)
                     continue
+                if o.kind == "cover":
+                    # preflight refuses this on mode=final only; without the guard a preview spec
+                    # declaring one would PUT the mp4 to the cover URL instead of refusing.
+                    raise RuntimeError(
+                        f"output {o.id!r} kind=cover has no producer "
+                        "(the-cover-weld-arm-is-deleted-with-the-multipass-path)")
                 if o.kind == "presync":
                     if fin is not None:
                         upload(presync, o.put_url, "video/mp4")

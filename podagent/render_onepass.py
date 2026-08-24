@@ -129,8 +129,8 @@ def preflight(spec: RenderSpec) -> None:
 
 
 def _check_assets(spec: RenderSpec, input_paths: dict) -> None:
-    """Every asset the tail names must be a resolved inputs[] id, refused here rather than as a
-    KeyError inside the assembler — same errors apply_logo/apply_watermark/_burn_captions raise."""
+    """Every asset the tail names must be a resolved inputs[] id, refused here as a named RuntimeError
+    rather than a KeyError deep inside the assembler once the graph is already being built."""
     ov = spec.overlays if spec.mode == "final" else None
     if ov is None:
         return
@@ -212,7 +212,7 @@ def _audio_mix(spec: RenderSpec, input_paths: dict, tmp: Path, dur: float, phase
 
 
 def _write_ass(caps, motion_plan, input_paths: dict, out_dir: Path, w: int, h: int) -> tuple[Path, Path]:
-    """The same ASS file render._burn_captions writes, minus its ffmpeg pass."""
+    """The ASS text only — assemble() burns it inline via -vf subtitles=, so there is no ffmpeg pass here."""
     from .captions import build_ass
     font = input_paths[caps.font]
     fg, accent = _render._caption_colours(caps, motion_plan)
@@ -227,8 +227,8 @@ def _write_ass(caps, motion_plan, input_paths: dict, out_dir: Path, w: int, h: i
 def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
             master_out: Path | None = None, presync_out: Path | None = None,
             phase=_no_phase) -> Prepared:
-    """Run every preparation the current multi-pass path runs — mograph qtrle layers, voice/bed audio
-    passes, the ASS file — and return them typed. Layers that produced no frames simply do not appear
+    """Run every pre-pass the merged encode needs — mograph qtrle layers, voice/bed audio passes,
+    the ASS file — and return them typed. Layers that produced no frames simply do not appear
     (mograph.py:143/275): a declared section with no bundle entry prints SKIP and the base stays bare."""
     _check_assets(spec, input_paths)
     tmp = Path(tmp)
@@ -251,7 +251,7 @@ def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
     flares: tuple[float, ...] = ()
     fin = ov.finalize if ov is not None else None
     if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
-        # The pure shape refusals fire BEFORE the flare decode — same order the multi-pass path keeps.
+        # The pure shape refusals (film_burn_plan) fire BEFORE the flare decode — cheap checks first.
         plan = _accents.film_burn_plan(fin.accents)
         with phase("flares"):
             flares = tuple(_accents.detect_flares(input_paths[plan.burn]))
@@ -348,7 +348,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         lg = fin.logo
         logo_v = f"{inputs.add(p.input_paths[lg.asset])}:v"
         # body_end is the WHOLE body: cover_hold reserves the welded end-card's tail, and preflight
-        # refuses a cover here, so there is no tail to reserve (apply_logo now holds it back too).
+        # refuses a cover here, so there is no tail to reserve.
         frag = _finalize.body_logo_filter(lg.corner, lg.width, lg.opacity, lg.margin, p.duration,
                                           base_v=vlink, logo_v=logo_v, out_v=V_LOGO)
         chains.append(rewire(frag, "lgo", {vlink: vlink, logo_v: logo_v, V_LOGO: V_LOGO}))

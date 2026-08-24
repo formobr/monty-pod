@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from podagent import finalize, mograph, render, render_onepass as op
+from podagent import finalize, render, render_onepass as op
 from podagent.models import RenderSpec
 
 SHA = "0" * 64
@@ -108,10 +108,9 @@ def _onepass_ops(cp: _CP) -> list[str]:
 
 def test_an_accepted_final_spec_runs_the_onepass_core(monkeypatch):
     _runs, puts = _wire(monkeypatch)
-    for mod, name in ((mograph, "composite"), (render, "build_command"),
-                      (finalize, "finalize"), (finalize, "apply_accents"), (finalize, "apply_logo"),
-                      (finalize, "apply_watermark")):
-        _forbid(monkeypatch, mod, name)
+    # build_command is preview's own composite; the multi-pass builders it also used to forbid are
+    # gone (test_render_onepass.py::test_the_multipass_builders_no_longer_exist pins the deletion).
+    _forbid(monkeypatch, render, "build_command")
     ln_calls = []
     monkeypatch.setattr(finalize, "apply_loudnorm",
                         lambda _fin, src, out: (ln_calls.append(src), Path(out).write_bytes(b"v"),
@@ -137,8 +136,6 @@ def test_a_film_burn_spec_runs_the_onepass_core(monkeypatch):
     _runs, puts = _wire(monkeypatch)
     from podagent import accents
     monkeypatch.setattr(accents, "detect_flares", lambda _p: [0.3])
-    for mod, name in ((finalize, "finalize"), (finalize, "apply_accents")):
-        _forbid(monkeypatch, mod, name)
     monkeypatch.setattr(finalize, "apply_loudnorm",
                         lambda _fin, _src, out: (Path(out).write_bytes(b"v"), out)[1])
     cp = _CP()
@@ -190,6 +187,20 @@ def test_a_preview_spec_keeps_its_single_pass_composite(monkeypatch):
     argv = _runs.calls[0]
     assert argv[argv.index("-crf") + 1] == "23"
     assert not any(argv[i:i + len(finalize._FINAL_CPU)] == finalize._FINAL_CPU for i in range(len(argv)))
+
+
+def test_a_preview_spec_declaring_a_cover_output_refuses_at_the_put(monkeypatch):
+    """preflight only guards mode=final; without the upload-loop guard a preview spec declaring an
+    outputs[kind=cover] would PUT the mp4 to the cover URL instead of refusing."""
+    _runs, _puts = _wire(monkeypatch)
+    cp = _CP()
+    with pytest.raises(RuntimeError, match="kind=cover has no producer"):
+        render.render_spec(_spec(lambda d: (d.__setitem__("mode", "preview"),
+                                            d.__setitem__("overlays", None),
+                                            d.__setitem__("outputs", [
+                                                d["outputs"][0],
+                                                {"id": "cover", "kind": "cover",
+                                                 "put_url": "https://x/cover.png?PUT"}]))), cp)
 
 
 def test_the_presync_put_keeps_the_fin_condition_on_the_onepass_route(monkeypatch):
