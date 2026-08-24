@@ -395,8 +395,11 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     if ln is None:
         return src
     tp_aim = round(ln.tp - TP_HEADROOM_DB, 2)
+    # -map 0:a:0? : unmapped `-f null` decodes the whole master's VIDEO for an audio measure; the `?`
+    # keeps a silent master a parse miss (handled below), not an ffmpeg error.
     meas = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostats", "-i", str(src),
+         "-map", "0:a:0?",
          "-af", f"loudnorm=I={ln.i}:TP={tp_aim}:LRA={ln.lra}:print_format=json", "-f", "null", "-"],
         capture_output=True, text=True)
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", meas.stderr, re.S)
