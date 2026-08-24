@@ -265,6 +265,19 @@ def test_a_groups_tiles_are_pulled_concurrently(monkeypatch, tmp_path):
     assert ok == list(range(n)) and len(images) == n
 
 
+class _InlinePool:
+    """submit() runs on the caller's thread, so `requested` IS what was on the wire at that instant — a real
+    pool records the download on ITS thread, and under xdist load that write races the forward (a flake)."""
+
+    def submit(self, fn, *args, **kwargs):
+        fut = cf.Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except Exception as exc:  # noqa: BLE001 — mirror a real Future: the error surfaces at .result()
+            fut.set_exception(exc)
+        return fut
+
+
 def test_the_next_groups_tiles_are_already_on_the_wire_while_this_one_forwards(monkeypatch, tmp_path):
     """The card must not idle on a download it could already have had. Watched fail with the fetch moved
     back inside each group's turn: group 1's tile is unrequested when group 0 forwards."""
@@ -282,7 +295,7 @@ def test_the_next_groups_tiles_are_already_on_the_wire_while_this_one_forwards(m
     monkeypatch.setattr(m, "download", fake_download)
     monkeypatch.setattr("PIL.Image.open", lambda p: types.SimpleNamespace(convert=lambda mode: "img"))
     monkeypatch.setattr(m, "upload", lambda src, url, ct=None: None)
-    m._FETCH_POOL = None
+    monkeypatch.setattr(m, "_FETCH_POOL", _InlinePool())
 
     svc = _svc()
     svc._prepare = lambda images, ok: (seen_at_forward.append(list(requested)),
