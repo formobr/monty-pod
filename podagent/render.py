@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -563,6 +564,26 @@ def _gpu_available() -> bool:
     return _GPU
 
 
+@contextmanager
+def _job_tmpdir():
+    """The job's tmp dir, deleted on exit — UNLESS the unwinding error is marked `unlanded_arms`: a
+    pool arm that never landed may still own a writing child, and an rmtree under a live writer is a
+    worse defect than a leaked dir (the container's /tmp dies with the pod)."""
+    td = tempfile.mkdtemp(prefix="monty-render-")
+    keep = False
+    try:
+        yield Path(td)
+    except BaseException as exc:
+        if names := getattr(exc, "unlanded_arms", None):
+            keep = True
+            print(f"[render] leaking tmp {td}: arm(s) {', '.join(names)} never landed — deleting "
+                  f"under a possibly-live child is the worse defect", file=sys.stderr, flush=True)
+        raise
+    finally:
+        if not keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 # One input's transfer cap per pool wave; download() already retries and resumes inside it.
 _DL_WORKERS = 4
 _DL_ARM_S = 600.0
@@ -603,11 +624,12 @@ def _download_inputs(inputs, tmp: Path) -> dict[str, Path]:
                 print(f"[render] download: {len(got)}/{len(futs)} in hand, {len(pending)} still out, "
                       f"{max(0.0, stop - time.monotonic()):.0f}s of patience left",
                       file=sys.stderr, flush=True)
-    except BaseException:
+    except BaseException as exc:
         from . import render_onepass as _onepass
         for f in pending:
             f.cancel()
-        _onepass._drain("download", {f for f in pending if not f.cancelled()}, futs, stop)
+        if left := _onepass._drain("download", {f for f in pending if not f.cancelled()}, futs, stop):
+            exc.unlanded_arms = left  # read by _job_tmpdir: leak the dir, never race a live child
         raise
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
@@ -676,10 +698,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             print("camera.apply: GPU unavailable — degrading to a static crop at the first keyframe "
                   "(MONTY_ALLOW_STATIC_CAMERA=1)", file=sys.stderr)
 
-    # ignore_cleanup_errors: on the failure path a drained-but-unlanded arm may still touch tmp; the
-    # unwind must surface the REAL error, not an rmtree OSError that buries it.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        tmp = Path(td)
+    with _job_tmpdir() as tmp:
         with phase("download"):
             input_paths = _download_inputs(spec.inputs, tmp)
         fin = spec.overlays.finalize if (spec.mode == "final" and spec.overlays is not None) else None

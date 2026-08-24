@@ -198,27 +198,26 @@ def _voice_filters(spec: RenderSpec, input_paths: dict) -> tuple[str, str]:
     return clean, _render._measure_loudnorm(voice, clean)
 
 
-# 960 DOMINATES the largest arm-child timeout (mograph's 900s node wall): past `stop` no arm still owns a subprocess.
+# above the largest single child wall (mograph's 900s node) so a healthy run never trips it
 _ARM_WALL_S = 960.0
 _ARM_TICK_S = 15.0
 
 
-def _drain(what: str, running: set, names: dict, stop: float) -> None:
-    """After a fault: hold the raise until every RUNNING arm lands (bounded by `stop`, which dominates
-    each arm's own subprocess timeout), so the tmp dir the arms write into is only torn down behind
-    them — never under a still-writing ffmpeg/node child."""
+def _drain(what: str, running: set, names: dict, stop: float) -> list[str]:
+    """After a fault: hold the raise until every RUNNING arm lands, bounded by `stop`; returns the
+    arms STILL unlanded at the wall — no outer wall can prove their children dead (a child timeout
+    starts at ITS launch), so the caller must LEAK its tmp dir instead of tearing it down."""
     while running:
         left = stop - time.monotonic()
         if left <= 0:
-            print(f"[render] {what}: wall exhausted with {len(running)} arm(s) unlanded — their "
-                  f"children are already past their own timeouts", file=sys.stderr, flush=True)
-            return
+            return sorted(names[f] for f in running)
         print(f"[render] {what}: failing — waiting for {', '.join(sorted(names[f] for f in running))} "
               f"to land first ({left:.0f}s of patience left)", file=sys.stderr, flush=True)
         done, running = cf.wait(running, timeout=min(_ARM_TICK_S, left),
                                 return_when=cf.FIRST_COMPLETED)
         for f in done:
             f.exception(timeout=0)  # observed, deliberately dropped: the FIRST fault is the verdict
+    return []
 
 
 def _run_arms(arms: dict) -> dict:
@@ -248,10 +247,11 @@ def _run_arms(arms: dict) -> dict:
                       f"{', '.join(sorted(futs[f] for f in pending))} still out, "
                       f"{max(0.0, stop - time.monotonic()):.0f}s of patience left",
                       file=sys.stderr, flush=True)
-    except BaseException:
+    except BaseException as exc:
         for f in pending:
             f.cancel()
-        _drain("prepare", {f for f in pending if not f.cancelled()}, futs, stop)
+        if left := _drain("prepare", {f for f in pending if not f.cancelled()}, futs, stop):
+            exc.unlanded_arms = left  # read by render._job_tmpdir: leak the dir, never race a live child
         raise
     finally:
         ex.shutdown(wait=False, cancel_futures=True)

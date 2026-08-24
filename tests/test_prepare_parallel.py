@@ -110,6 +110,27 @@ def test_colliding_flattened_ids_refuse_before_any_transfer(monkeypatch, tmp_pat
         render._download_inputs(spec.inputs, tmp_path)
 
 
+def test_tmpdir_is_leaked_when_an_arm_never_landed(tmp_path, monkeypatch) -> None:
+    """An error marked `unlanded_arms` must LEAK the job tmp dir: an rmtree under a possibly-live
+    writing child is the worse defect. An unmarked error still cleans up."""
+    orig = render.tempfile.mkdtemp
+    monkeypatch.setattr(render.tempfile, "mkdtemp",
+                        lambda prefix: orig(prefix=prefix, dir=tmp_path))
+    with pytest.raises(RuntimeError):
+        with render._job_tmpdir() as d:
+            kept = d
+            e = RuntimeError("first fault")
+            e.unlanded_arms = ["mograph"]
+            raise e
+    assert kept.exists(), "tmp dir was torn down under a possibly-live child"
+
+    with pytest.raises(RuntimeError):
+        with render._job_tmpdir() as d:
+            gone = d
+            raise RuntimeError("plain fault")
+    assert not gone.exists(), "a landed failure must still clean up"
+
+
 # --- the gpu probe cache ------------------------------------------------------
 
 @pytest.fixture()
