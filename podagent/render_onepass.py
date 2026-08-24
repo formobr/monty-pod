@@ -3,9 +3,11 @@ accents, logo and watermark in a single pass, the ONLY final encode core render.
 `refusals` names the non-goals this graph does not build; `preflight` hard-refuses them up front."""
 from __future__ import annotations
 
+import concurrent.futures as cf
 import re
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -186,29 +188,54 @@ class Delivered:
     defect: dict | None = None
 
 
-def _audio_mix(spec: RenderSpec, input_paths: dict, tmp: Path, dur: float, phase):
-    """The voice+bed mix the composite consumes: measure the voice, pre-render the -33 LUFS bed. Both
-    are render.py's own pre-passes, unchanged — the merge removes video encodes, not these."""
-    ov = spec.overlays if spec.mode == "final" else None
-    music = ov.music if ov is not None else None
-    sfx = ov.sfx if ov is not None else None
-    if music is None and not sfx:
-        return None, None
-    with phase("audio_prepare"):
-        ids = _render.input_ids(spec)
-        voice = input_paths[spec.timeline.segments[0].src]
-        # The flag is read FIRST: _voice_is_dirty is a full decode whose answer is then thrown away.
-        dirty = not spec.base_voice_rescued and _render._voice_is_dirty(voice)
-        clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
-        vln = _render._measure_loudnorm(voice, clean)
-        bed, bed_idx = None, None
-        if music is not None:
-            bed = _render._prerender_bed(input_paths[music.track], music.start, dur, tmp)
-            bed_idx = len(ids)
-        mix = _render._AudioMix(
-            voice_idx=ids.index(spec.timeline.segments[0].src), bed_idx=bed_idx, clean=clean,
-            vln=vln, dur=dur, sfx=tuple((ids.index(s.sound), s.at, s.gain) for s in (sfx or [])))
-    return mix, bed
+def _voice_filters(spec: RenderSpec, input_paths: dict) -> tuple[str, str]:
+    """The voice pre-filter and its measured loudnorm. Inherently serial inside: the dirty probe's
+    verdict changes the chain the measure pass must run (the flag is read FIRST — a rescued voice
+    skips the probe decode entirely)."""
+    voice = input_paths[spec.timeline.segments[0].src]
+    dirty = not spec.base_voice_rescued and _render._voice_is_dirty(voice)
+    clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
+    return clean, _render._measure_loudnorm(voice, clean)
+
+
+# The whole pre-pass block's wall; every subprocess under an arm carries its own tighter timeout,
+# so shutdown(cancel_futures) never leaves an orphan running past its cap.
+_ARM_WALL_S = 900.0
+_ARM_TICK_S = 15.0
+
+
+def _run_arms(arms: dict) -> dict:
+    """Run named independent thunks concurrently → results by name. Bounded and narrated; the first
+    arm to fail re-raises its error, unstarted siblings are cancelled, running ones die at their own
+    subprocess timeouts. No arms, no pool."""
+    if not arms:
+        return {}
+    t0 = time.monotonic()
+    stop = t0 + _ARM_WALL_S
+    ex = cf.ThreadPoolExecutor(max_workers=len(arms), thread_name_prefix="prepare")
+    futs = {ex.submit(fn): name for name, fn in arms.items()}
+    got, secs, pending = {}, {}, set(futs)
+    try:
+        while pending:
+            left = stop - time.monotonic()
+            if left <= 0:
+                raise RuntimeError(f"prepare: out of patience after {_ARM_WALL_S:.0f}s with "
+                                   + ", ".join(sorted(futs[f] for f in pending)) + " still out")
+            done, pending = cf.wait(pending, timeout=min(_ARM_TICK_S, left),
+                                    return_when=cf.FIRST_COMPLETED)
+            for f in done:
+                got[futs[f]] = f.result(timeout=0)  # an arm's exception re-raises HERE: first fault wins
+                secs[futs[f]] = time.monotonic() - t0
+            if pending:
+                print(f"[render] prepare: {len(got)}/{len(futs)} arm(s) landed, "
+                      f"{', '.join(sorted(futs[f] for f in pending))} still out, "
+                      f"{max(0.0, stop - time.monotonic()):.0f}s of patience left",
+                      file=sys.stderr, flush=True)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    print("[render] prepare arms: " + " ".join(f"{n}={secs[n]:.1f}s" for n in sorted(secs)),
+          file=sys.stderr, flush=True)
+    return got
 
 
 def _write_ass(caps, motion_plan, input_paths: dict, out_dir: Path, w: int, h: int) -> tuple[Path, Path]:
@@ -227,40 +254,58 @@ def _write_ass(caps, motion_plan, input_paths: dict, out_dir: Path, w: int, h: i
 def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
             master_out: Path | None = None, presync_out: Path | None = None,
             phase=_no_phase) -> Prepared:
-    """Run every pre-pass the merged encode needs — mograph qtrle layers, voice/bed audio passes,
-    the ASS file — and return them typed. Layers that produced no frames simply do not appear
-    (mograph.py:143/275): a declared section with no bundle entry prints SKIP and the base stays bare."""
+    """Run every pre-pass the merged encode needs and return them typed. Independent pre-passes run
+    as parallel ARMS under ONE `prepare` phase — the voice chain, the bed, the mograph layers and the
+    flare scan read none of each other; layers with no frames simply do not appear (mograph.py:143/275)."""
     _check_assets(spec, input_paths)
     tmp = Path(tmp)
     dur = body_duration(spec)
     ov = spec.overlays if spec.mode == "final" else None
     mp = ov.motion_plan if ov is not None else None
-    audio, bed = _audio_mix(spec, input_paths, tmp, dur, phase)
-    layers: tuple[dict, ...] = ()
-    if mp is not None and mp.sections:
-        with phase("mograph"):
-            layers = tuple(_mograph._render_layers(
-                mp.sections, mp.brand.model_dump() if mp.brand else None, input_paths, tmp,
-                getattr(mp, "bundle", None)))
-    ass = font_dir = None
+    music = ov.music if ov is not None else None
+    sfx = ov.sfx if ov is not None else None
     caps = mp.captions if mp is not None else None
-    if caps is not None and caps.words:
-        with phase("captions"):
-            ass, font_dir = _write_ass(caps, mp, input_paths, tmp,
-                                       spec.timeline.width, spec.timeline.height)
-    flares: tuple[float, ...] = ()
     fin = ov.finalize if ov is not None else None
+
+    arms: dict = {}
+    if music is not None or sfx:
+        arms["voice"] = lambda: _voice_filters(spec, input_paths)
+    if music is not None:
+        arms["bed"] = lambda: _render._prerender_bed(input_paths[music.track], music.start, dur, tmp)
+    if mp is not None and mp.sections:
+        arms["mograph"] = lambda: tuple(_mograph._render_layers(
+            mp.sections, mp.brand.model_dump() if mp.brand else None, input_paths, tmp,
+            getattr(mp, "bundle", None)))
     if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
         # The pure shape refusals (film_burn_plan) fire BEFORE the flare decode — cheap checks first.
         plan = _accents.film_burn_plan(fin.accents)
-        with phase("flares"):
-            flares = tuple(_accents.detect_flares(input_paths[plan.burn]))
+        arms["flares"] = lambda: tuple(_accents.detect_flares(input_paths[plan.burn]))
+
+    with phase("prepare"):
+        got = _run_arms(arms)
+        ass = font_dir = None
+        if caps is not None and caps.words:
+            # pure text write, milliseconds — not worth an arm
+            ass, font_dir = _write_ass(caps, mp, input_paths, tmp,
+                                       spec.timeline.width, spec.timeline.height)
+
+    audio = bed = None
+    if "voice" in got:
+        clean, vln = got["voice"]
+        bed = got.get("bed")
+        ids = _render.input_ids(spec)
+        audio = _render._AudioMix(
+            voice_idx=ids.index(spec.timeline.segments[0].src),
+            bed_idx=len(ids) if bed is not None else None,
+            clean=clean, vln=vln, dur=dur,
+            sfx=tuple((ids.index(s.sound), s.at, s.gain) for s in (sfx or [])))
     return Prepared(
         spec=spec, gpu=gpu, input_paths=input_paths, duration=dur,
         master_out=master_out or tmp / "render.mp4",
         presync_out=presync_out or tmp / "render.presync.mp4",
         filter_script=tmp / "body_onepass.filter",
-        bed=bed, audio=audio, layers=layers, ass=ass, font_dir=font_dir, flares=flares)
+        bed=bed, audio=audio, layers=got.get("mograph", ()), ass=ass, font_dir=font_dir,
+        flares=got.get("flares", ()))
 
 
 # --- 3. assemble --------------------------------------------------------------

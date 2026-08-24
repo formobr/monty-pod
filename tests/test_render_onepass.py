@@ -878,8 +878,8 @@ def test_prepare_leaves_the_base_bare_when_no_mograph_layer_survived(monkeypatch
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
-def test_prepare_detects_flares_in_its_own_phase(monkeypatch, tmp_path) -> None:
-    """The flare decode is the ONE film_burn I/O — it lives in prepare so assemble stays pure."""
+def test_prepare_detects_flares_under_the_prepare_phase(monkeypatch, tmp_path) -> None:
+    """The flare decode is the ONE film_burn I/O — it rides prepare's arm pool so assemble stays pure."""
     spec = _spec(_add_film_burn)
     _stub_prepare_passes(monkeypatch, tmp_path)
     calls: list[str] = []
@@ -895,7 +895,7 @@ def test_prepare_detects_flares_in_its_own_phase(monkeypatch, tmp_path) -> None:
     p = op.prepare(spec, _paths(spec, tmp_path), tmp_path, False, phase=rec)
     assert p.flares == (0.3, 1.7)
     assert calls == ["fx__burn.mp4"]
-    assert "flares" in ops
+    assert "prepare" in ops
 
 
 def test_prepare_refuses_a_malformed_burn_set_before_the_flare_decode(monkeypatch, tmp_path) -> None:
@@ -1023,12 +1023,12 @@ def test_the_phase_hook_carries_the_render_stages_own_op_names(monkeypatch, tmp_
         yield
 
     _runs, _puts, _d = _door(monkeypatch, tmp_path, _spec(), phase=rec)
-    assert ops == ["audio_prepare", "mograph", "captions", "ffmpeg", "finalize", "upload"]
+    assert ops == ["prepare", "ffmpeg", "finalize", "upload"]
 
 
 def test_a_film_burn_door_run_never_reaches_the_multipass_burn(monkeypatch, tmp_path) -> None:
     """_door forbids finalize.apply_accents, so a burn spec passing through IS the proof the one-pass
-    graph composited the burn itself; the flare decode gets its own phase between captions and ffmpeg."""
+    graph composited the burn itself; the flare decode rides prepare's arm pool before ffmpeg."""
     monkeypatch.setattr(accents, "detect_flares", lambda _p: [0.3])
     ops: list[str] = []
 
@@ -1038,7 +1038,7 @@ def test_a_film_burn_door_run_never_reaches_the_multipass_burn(monkeypatch, tmp_
         yield
 
     _runs, _puts, d = _door(monkeypatch, tmp_path, _spec(_add_film_burn), phase=rec)
-    assert ops == ["audio_prepare", "mograph", "captions", "flares", "ffmpeg", "finalize", "upload"]
+    assert ops == ["prepare", "ffmpeg", "finalize", "upload"]
     assert d.prepared.flares == (0.3,)
     assert d.outputs == ["master", "presync"]
 

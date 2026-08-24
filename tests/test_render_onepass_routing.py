@@ -146,7 +146,7 @@ def test_a_film_burn_spec_runs_the_onepass_core(monkeypatch):
                                          ("render.presync.mp4", "https://x/presync.mp4?PUT")]
     assert cp.results and cp.results[0]["status"] == "ok"
     ops = [e.get("op") for e in cp.events if e.get("phase", "").endswith("_started")]
-    assert "flares" in ops and "ffmpeg" in ops
+    assert "prepare" in ops and "ffmpeg" in ops
 
 
 @pytest.mark.parametrize("what,mutate", [

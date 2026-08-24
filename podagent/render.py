@@ -3,6 +3,8 @@ PUT back over presigned URLs. No decisions here — every number was fixed by th
 module only translates those numbers into a filtergraph and an argv."""
 from __future__ import annotations
 
+import concurrent.futures as cf
+import hashlib
 import json
 import os
 import re
@@ -283,6 +285,9 @@ def _has_broll(spec: RenderSpec) -> bool:
 _VOICE_LUFS, _TP, _LRA = -20.0, -1.5, 11
 _MUSIC_LUFS = -33.0
 _DUCK = 3
+# One full-length audio decode/encode runs far above realtime; minutes of source fit well under this.
+# A pass that does not is wedged, and a wedge must fail loud, not absorb the stage (deadline law).
+_AUDIO_PASS_WALL_S = 300
 
 
 class _AudioMix(NamedTuple):
@@ -305,7 +310,7 @@ def _voice_is_dirty(voice: Path) -> bool:
     denoise ONLY a source whose post-highpass noise floor is above -50 dB."""
     res = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(voice), "-map", "0:a?",
                           "-af", "highpass=f=80,astats=metadata=1:reset=0", "-f", "null", "-"],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, timeout=_AUDIO_PASS_WALL_S)
     for line in res.stderr.splitlines():
         if "Noise floor dB" in line:
             try:
@@ -324,7 +329,7 @@ def _measure_loudnorm(voice: Path, pre: str) -> str:
     res = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(voice),
                           "-map", "0:a:0?",
                           "-af", f"{pre},{vln}:print_format=json", "-f", "null", "-"],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, timeout=_AUDIO_PASS_WALL_S)
     out = res.stderr
     try:
         d = json.loads(out[out.rindex("{"):out.rindex("}") + 1])
@@ -341,11 +346,11 @@ def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
     norm = tmp / "music_norm.flac"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(music),
                     "-af", f"loudnorm=I={_num(_MUSIC_LUFS)}:TP=-2:LRA=11", "-ar", "48000", "-ac", "2",
-                    str(norm)], check=True)
+                    str(norm)], check=True, timeout=_AUDIO_PASS_WALL_S)
     bed = tmp / "music_bed.flac"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stream_loop", "-1",
                     "-ss", _num(mstart), "-i", str(norm), "-t", _num(dur), "-ar", "48000", "-ac", "2",
-                    str(bed)], check=True)
+                    str(bed)], check=True, timeout=_AUDIO_PASS_WALL_S)
     return bed
 
 
@@ -491,21 +496,102 @@ def _safe_send_event(cp: ControlPlane, event: dict) -> None:
 
 
 _GPU: bool | None = None
+_GPU_CACHE_ENV = "MONTY_GPU_PROBE_CACHE"
+
+
+def _gpu_cache_key() -> str:
+    """Identity of the probed configuration: boot, driver, visible devices, probe argv; an unreadable
+    part contributes its own marker so a box that cannot say still keys stably."""
+    parts = []
+    for p in ("/proc/sys/kernel/random/boot_id", "/proc/driver/nvidia/version"):
+        try:
+            parts.append(Path(p).read_text().splitlines()[0].strip())
+        except (OSError, IndexError):
+            parts.append(f"{p}?")
+    parts.append(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+    parts.append(" ".join(VULKAN_PROBE))
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def _gpu_cache_read(path: Path, key: str) -> bool | None:
+    """True only on a matching POSITIVE record; anything else is a miss that re-probes. A cached
+    negative would silently demote every later render on this box to CPU, so it does not exist."""
+    try:
+        rec = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return True if rec.get("key") == key and rec.get("ok") is True else None
+
+
+def _gpu_cache_write(path: Path, key: str) -> None:
+    try:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"key": key, "ok": True}))
+        os.replace(tmp, path)  # atomic; concurrent writers race to an identical record
+    except OSError:
+        pass  # cache is an optimization — the probe already answered for this process
 
 
 def _gpu_available() -> bool:
-    """One cached REAL smoke render — an encoder merely being listed proves nothing about the
-    Vulkan/libplacebo/NVENC path actually working on this box."""
+    """One cached REAL smoke render (a listed encoder proves nothing about the Vulkan/libplacebo/NVENC
+    path), its POSITIVE verdict also cached on disk across worker processes — each was re-paying the
+    ~2s probe. A stale positive on a died GPU is bounded by the encode itself failing loudly."""
     global _GPU
     if os.environ.get("MONTY_GPU_MOTION") == "0":
         return False
     if _GPU is None:
+        cache = Path(os.environ.get(_GPU_CACHE_ENV) or "/tmp/monty_gpu_probe.json")
+        key = _gpu_cache_key()
+        if _gpu_cache_read(cache, key):
+            _GPU = True
+            return _GPU
         try:
             probe = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=120)
             _GPU = probe.returncode == 0
         except (OSError, subprocess.SubprocessError):
             _GPU = False
+        if _GPU:
+            _gpu_cache_write(cache, key)
     return _GPU
+
+
+# One input's transfer cap per pool wave; download() already retries and resumes inside it.
+_DL_WORKERS = 4
+_DL_ARM_S = 600.0
+_DL_TICK_S = 15.0
+
+
+def _download_inputs(inputs, tmp: Path) -> dict[str, Path]:
+    """Fetch every spec input concurrently, bounded and narrated; the mapping is built in spec order
+    so nothing downstream can observe completion order. A failed transfer raises immediately (a master
+    missing an input is not renderable), cancelling unstarted arms; running ones die at their caps."""
+    if not inputs:
+        return {}
+    workers = min(_DL_WORKERS, len(inputs))
+    waves = -(-len(inputs) // workers)
+    stop = time.monotonic() + _DL_ARM_S * waves
+    ex = cf.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl")
+    futs = {ex.submit(download, inp.url, tmp / inp.id.replace("/", "__")): inp.id for inp in inputs}
+    got: dict[str, Path] = {}
+    pending = set(futs)
+    try:
+        while pending:
+            left = stop - time.monotonic()
+            if left <= 0:
+                raise RuntimeError(
+                    f"download: out of patience after {_DL_ARM_S * waves:.0f}s with "
+                    + ", ".join(sorted(futs[f] for f in pending)) + " still out")
+            done, pending = cf.wait(pending, timeout=min(_DL_TICK_S, left),
+                                    return_when=cf.FIRST_COMPLETED)
+            for f in done:
+                got[futs[f]] = f.result(timeout=0)  # a failed transfer re-raises HERE: first fault wins
+            if pending:
+                print(f"[render] download: {len(got)}/{len(futs)} in hand, {len(pending)} still out, "
+                      f"{max(0.0, stop - time.monotonic()):.0f}s of patience left",
+                      file=sys.stderr, flush=True)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return {inp.id: got[inp.id] for inp in inputs}
 
 
 def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
@@ -573,9 +659,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         with phase("download"):
-            input_paths = {
-                inp.id: download(inp.url, tmp / inp.id.replace("/", "__")) for inp in spec.inputs
-            }
+            input_paths = _download_inputs(spec.inputs, tmp)
         fin = spec.overlays.finalize if (spec.mode == "final" and spec.overlays is not None) else None
 
         if spec.mode == "final":

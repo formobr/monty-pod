@@ -156,6 +156,9 @@ def _box_facts(oom_before: int | None, conc: int, cache: int, tmp: Path) -> str:
     return f"{oom} {mem} {disk} tabs={conc} cache={cache >> 20}MiB"
 
 
+_BATCH_WALL_S = 900  # bundle + every comp; each comp is already ceilinged by maxSeconds inside the batch
+
+
 def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) -> None:
     conc = _render_concurrency()
     cache = _offthread_cache_bytes()
@@ -164,7 +167,12 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
         body["entryPoint"] = entry_point
     spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
     oom_before = _oom_count()
-    r = subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, capture_output=True)
+    try:
+        r = subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, capture_output=True,
+                           timeout=_BATCH_WALL_S)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"render_batch ran out its {_BATCH_WALL_S}s wall "
+                           f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]") from exc
     # Unconditional: the per-comp "[batch] <comp>: <frames> in <s>" line was DROPPED on the success path.
     batch_log = (r.stderr or b"").decode("utf-8", "replace")
     if batch_log.strip():
