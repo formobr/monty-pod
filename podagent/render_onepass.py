@@ -1,6 +1,6 @@
 """ONE filter graph and ONE master encode for the BODY delivery tail — composite, mograph, captions,
-accents, logo and watermark in a single pass. render.render_spec routes accepted final specs through
-this encode core; a named `refusals` verdict sends the rest down its multi-pass chain, counted."""
+accents, logo and watermark in a single pass, the ONLY final encode core render.render_spec runs.
+`refusals` names the non-goals this graph does not build; `preflight` hard-refuses them up front."""
 from __future__ import annotations
 
 import re
@@ -99,27 +99,28 @@ class Inputs:
 # --- 1. preflight -------------------------------------------------------------
 
 def refusals(spec: RenderSpec) -> list[str]:
-    """The NAMED non-goals this graph refuses, empty on accept. A separate pure function so the
-    router (render.render_spec) can emit each decision as a counted event — wave B's go/no-go is
-    the measured share of runs each named reason sends down the legacy path."""
+    """The NAMED non-goals this graph hard-refuses, empty on accept — every named reason is a
+    permanent non-goal, not a share to be measured toward a later go/no-go."""
+    unimplemented = []
+    if any(o.kind == "cover" for o in spec.outputs):
+        # A declared cover OUTPUT with no overlays.cover block: this graph never writes a cover.png,
+        # so the upload loop would silently skip the deliverable — the half-render this list stops.
+        unimplemented.append("outputs[kind=cover]")
     ov = spec.overlays if spec.mode == "final" else None
     if ov is None:
-        return []
-    unimplemented = []
+        return unimplemented
     if ov.trims:
         unimplemented.append("trims")
     if ov.opener is not None:
         unimplemented.append("opener")
     if ov.cover is not None:
-        # Not in render.py's list because the multi-pass path DOES weld a cover; this graph does not,
-        # and silently dropping a declared end-card is exactly the half-render that list exists to stop.
         unimplemented.append("cover")
     return unimplemented
 
 
 def preflight(spec: RenderSpec) -> None:
     """Refuse every non-goal BEFORE any subprocess — same exception type and same timing as
-    render.render_spec (render.py:552-568), so a v6 spec cannot half-render through this door either."""
+    render.render_spec, so a v6 spec cannot half-render through this door either."""
     _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
     unimplemented = refusals(spec)
     if unimplemented:

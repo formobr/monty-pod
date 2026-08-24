@@ -576,20 +576,12 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                     "timings": {"phase_s": round(time.monotonic() - started, 3)},
                 }.items() if v is not None
             })
-    if spec.mode == "final" and spec.overlays is not None:
-        unimplemented = []
-        if spec.overlays.trims:
-            unimplemented.append("trims")
-        if spec.overlays.opener is not None:
-            unimplemented.append("opener")
-        fin = spec.overlays.finalize
-        if unimplemented:
-            # opener (contract v6) declares a junction asset, but this multi-pass translator still
-            # cannot weld it. Refuse before execution rather than half-rendering a v6 spec.
-            raise NotImplementedError(
-                f"final overlay(s) not yet composited on the pod multi-pass path: {unimplemented}")
-
-    _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
+    if spec.mode == "final":
+        # function-local: render_onepass imports this module, so a top-level import would cycle.
+        from . import render_onepass as _onepass
+        _onepass.preflight(spec)  # refuses trims/opener/cover before any subprocess (the only door)
+    else:
+        _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
 
     with phase("gpu_probe"):
         cpu_requested = os.environ.get("MONTY_OPS_CPU_ENCODE") == "1"
@@ -613,68 +605,25 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             input_paths = {
                 inp.id: download(inp.url, tmp / inp.id.replace("/", "__")) for inp in spec.inputs
             }
-        # On accept only the ENCODE CORE is swapped — grid_verify, the guarded upload, presync's
-        # `fin` condition and the terminal result stay HERE, so defects reach the cabinet either way.
-        from . import render_onepass as _onepass  # function-local: render_onepass imports this module
         fin = spec.overlays.finalize if (spec.mode == "final" and spec.overlays is not None) else None
-        use_onepass = False
-        if spec.mode == "final":
-            refused = _onepass.refusals(spec)
-            use_onepass = not refused
-            # Counted decision, pre-spend (a failed send stays fatal here): wave B's go/no-go reads
-            # the measured share of runs each named reason keeps on the legacy path.
-            cp.send_event({k: v for k, v in {
-                **common,
-                "status": "step",
-                "op": "onepass_preflight",
-                "phase": "onepass_accepted" if use_onepass else "onepass_refused",
-                "outcome": "ok",
-                **({"timings": {"refused": refused}} if refused else {}),
-            }.items() if v is not None})
 
-        cover_png: Path | None = None
-        if use_onepass:
+        if spec.mode == "final":
+            # preflight already ran above; the one-pass graph is the ONLY final encode core.
+            from . import render_onepass as _onepass
             prepared = _onepass.prepare(spec, input_paths, tmp, gpu, phase=phase)
             _onepass.run_encode(prepared, phase=phase)
             master = prepared.master_out
-            # The pre-accent reference; its PUT below still gates on `fin` exactly as the legacy path
-            # does — guard_sync reads an absent presync object as "the tail never ran" (contract).
+            # The pre-accent reference; its PUT below still gates on `fin` — guard_sync reads an
+            # absent presync object as "the tail never ran" (contract), regardless of which core built it.
             presync = prepared.presync_out
             if fin is not None:
                 with phase("finalize"):
                     master = _finalize.apply_loudnorm(fin, master, tmp / "fin_ln.mp4")
         else:
-            # music: pre-measure the voice loudnorm + pre-render the -33 LUFS bed (own ffmpeg passes),
-            # then the main pass mixes voice+bed instead of copying segment audio (add_music.sh chain).
-            extra_inputs: tuple[Path, ...] = ()
-            audio: _AudioMix | None = None
-            music = _music_of(spec)
-            sfx = spec.overlays.sfx if (spec.mode == "final" and spec.overlays is not None) else None
-            if music is not None or sfx:
-                with phase("audio_prepare"):
-                    ids = input_ids(spec)
-                    voice = input_paths[spec.timeline.segments[0].src]
-                    dur = body_duration(spec)
-                    # base already DFN3/MF2-rescued upstream → keep only the rumble cut, DROP afftdn.
-                    # The flag is read FIRST: _voice_is_dirty is a full decode whose answer is then thrown away.
-                    dirty = not spec.base_voice_rescued and _voice_is_dirty(voice)
-                    clean = "highpass=f=80" + (",afftdn=nr=8:nf=-30" if dirty else "")
-                    vln = _measure_loudnorm(voice, clean)
-                    bed_idx: int | None = None
-                    if music is not None:
-                        extra_inputs = (_prerender_bed(input_paths[music.track], music.start, dur, tmp),)
-                        bed_idx = len(ids)
-                    sfx_tuples = tuple((ids.index(s.sound), s.at, s.gain) for s in (sfx or []))
-                    audio = _AudioMix(
-                        voice_idx=ids.index(spec.timeline.segments[0].src),
-                        bed_idx=bed_idx,
-                        clean=clean,
-                        vln=vln,
-                        dur=dur,
-                        sfx=sfx_tuples,
-                    )
+            # preview carries no overlays (models.py:423-424) — a single composite pass with no
+            # audio pre-pass, no mograph/captions/cover, camera `motion` only.
             out = tmp / "render.mp4"
-            cmd = build_command(spec, input_paths, out, gpu, extra_inputs, audio)
+            cmd = build_command(spec, input_paths, out, gpu, (), None)
             with phase("ffmpeg"):
                 try:
                     subprocess.run(cmd, check=True, capture_output=True)
@@ -683,56 +632,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                     detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
                     raise RuntimeError(
                         f"ffmpeg exited {exc.returncode}: {safe_error(RuntimeError(detail))}") from exc
-
             master = out
-            _mp = spec.overlays.motion_plan if (spec.mode == "final" and spec.overlays is not None) else None
-            # mograph overlays first (under the captions), then captions, then the cover weld.
-            if _mp is not None and _mp.sections:
-                from .mograph import composite
-                with phase("mograph"):
-                    master = composite(
-                        _mp, master, input_paths, tmp / "render_mograph.mp4", gpu, spec.encode, tmp,
-                        grid=_finalize.declared_grid(spec.timeline.fps))
-
-            # captions burn (libass) BEFORE the cover weld — the subtitle track covers the whole body.
-            caps = _mp.captions if _mp is not None else None
-            if caps is not None and caps.words:
-                captioned = tmp / "render_caps.mp4"
-                with phase("captions"):
-                    _burn_captions(caps, _mp, master, input_paths, captioned, gpu,
-                                   spec.timeline.width, spec.timeline.height, spec.encode,
-                                   spec.timeline.fps)
-                master = captioned
-
-            # cover is the LAST step: extract the base frame, compose the still, weld it onto the master tail.
-            cover = spec.overlays.cover if (spec.mode == "final" and spec.overlays is not None) else None
-            if cover is not None or fin is not None:
-                with phase("finalize"):
-                    if cover is not None:
-                        from .cover import render_cover
-                        welded = tmp / "render_cover.mp4"
-                        cover_png = (
-                            tmp / "cover.png") if any(o.kind == "cover" for o in spec.outputs) else None
-                        render_cover(
-                            cover.model_dump(by_alias=True),
-                            input_paths[spec.timeline.segments[0].src],
-                            master,
-                            input_paths,
-                            welded,
-                            gpu,
-                            spec.timeline.width,
-                            spec.timeline.height,
-                            png_out=cover_png,
-                        )
-                        master = welded
-                    # Pin the completed composite before the delivery tail can change A/V sync.
-                    presync = master
-                    if fin is not None:
-                        from .finalize import finalize
-                        master = finalize(fin, master, input_paths, tmp, gpu,
-                                          cover_welded=cover is not None)
-            else:
-                presync = master
+            presync = master
 
         # The COMPOSITE is complete here; everything below is the delivery tail. `presync` pins this
         # exact frame: it is the video-identical reference the origin's A/V-sync guard measures the
@@ -763,11 +664,6 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                 if o.kind == "presync":
                     if fin is not None:
                         upload(presync, o.put_url, "video/mp4")
-                        done.append(o.id)
-                    continue
-                if o.kind == "cover":
-                    if cover_png is not None and cover_png.is_file():
-                        upload(cover_png, o.put_url, "image/png")
                         done.append(o.id)
                     continue
                 upload(master, o.put_url, "video/mp4")

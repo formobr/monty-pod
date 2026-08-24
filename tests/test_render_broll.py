@@ -99,11 +99,9 @@ def test_dissolve_is_alpha_fade_not_overlay_move():
     pytest.param({"opener": {"cold": "base"}}, "opener", id="opener"),
 ])
 def test_render_spec_fails_loud_on_unimplemented_overlays(monkeypatch, overlays, expected):
-    """trims/opener are the overlays still unimplemented on the pod (broll/music/cover/sfx/
-    captions/mograph and multi-pass film_burn are done). The refusal must fire BEFORE any execution-side call:
-    monkeypatching gpu_probe/download
-    to explode, and a send_event stub that asserts it's never reached, proves the NotImplementedError
-    lands ahead of both — not a KeyError deep in accents.BUILDERS or a half-rendered master."""
+    """trims/opener are the only overlays unimplemented on the pod (the rest composite in the one-pass
+    graph). gpu_probe/download are stubbed to explode and send_event asserts it's never reached, so the
+    NotImplementedError is proved to land ahead of both, not a half-rendered master."""
     spec = RenderSpec.model_validate({
         "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
         "inputs": [_BASE_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,

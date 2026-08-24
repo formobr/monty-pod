@@ -905,19 +905,30 @@ def _no_subprocess(monkeypatch) -> None:
         monkeypatch.setattr(mod.subprocess, "run", boom)
 
 
-@pytest.mark.parametrize("what", ["opener", "trims", "cover"])
-def test_the_non_goals_are_refused_before_any_subprocess(what, monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("what,match", [
+    ("opener", "opener"), ("trims", "trims"), ("cover", "cover"),
+    ("cover-output", "cover"), ("cover-both", "cover"),
+])
+def test_the_non_goals_are_refused_before_any_subprocess(what, match, monkeypatch, tmp_path) -> None:
+    def _cover_output(d):
+        d["outputs"].append({"id": "cover", "kind": "cover", "put_url": "https://x/cover.png?PUT"})
+
     def mutate(d):
         if what == "opener":
             d["inputs"].append({"id": "cold.mp4", "kind": "video", "sha256": SHA, "url": "https://x/o"})
             d["overlays"]["opener"] = {"cold": "cold.mp4", "cold_trim": 0.1, "gain": 0.4}
         elif what == "trims":
             d["overlays"]["trims"] = [{"a": 1.0, "b": 2.0}]
-        else:
+        elif what == "cover":
             d["overlays"]["cover"] = {"frame_at": 4.0, "headline": {"lines": ["A"]}}
+        elif what == "cover-output":
+            _cover_output(d)
+        else:  # cover-both: overlays.cover AND a declared cover output, both refuse
+            d["overlays"]["cover"] = {"frame_at": 4.0, "headline": {"lines": ["A"]}}
+            _cover_output(d)
     spec = _spec(mutate)
     _no_subprocess(monkeypatch)
-    with pytest.raises(NotImplementedError, match=what.split("_")[0]):
+    with pytest.raises(NotImplementedError, match=match):
         op.preflight(spec)
     with pytest.raises(NotImplementedError):
         op.render_body(spec, _paths(spec, tmp_path), tmp_path, False)
