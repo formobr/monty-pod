@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -42,6 +44,27 @@ def test_parallel_prepare_hands_assemble_the_same_prepared(monkeypatch, tmp_path
     assert p.flares == ()
 
 
+def test_a_fault_waits_for_running_siblings_before_raising(monkeypatch, tmp_path) -> None:
+    """The raise must land BEHIND every running arm: the caller's TemporaryDirectory unwinds right
+    after it, and a still-writing sibling under a dying tmp dir is the race this drains away."""
+    spec = t._spec()
+    t._stub_prepare_passes(monkeypatch, tmp_path)
+    landed = threading.Event()
+
+    def slow_layers(*_a, **_kw):
+        time.sleep(0.3)
+        landed.set()
+        return list(t.LAYERS)
+
+    def dead_bed(*_a, **_kw):
+        raise RuntimeError("bed died")
+    monkeypatch.setattr(mograph, "_render_layers", slow_layers)
+    monkeypatch.setattr(render, "_prerender_bed", dead_bed)
+    with pytest.raises(RuntimeError, match="bed died"):
+        op.prepare(spec, t._paths(spec, tmp_path), tmp_path, False)
+    assert landed.is_set(), "prepare raised while a sibling arm was still running"
+
+
 def test_no_overlays_means_no_pool_at_all(monkeypatch, tmp_path) -> None:
     def boom(*_a, **_kw):
         raise AssertionError("an armless prepare must not build a pool")
@@ -76,6 +99,17 @@ def test_one_failed_download_fails_the_render_loud(monkeypatch, tmp_path) -> Non
         render._download_inputs(spec.inputs, tmp_path)
 
 
+def test_colliding_flattened_ids_refuse_before_any_transfer(monkeypatch, tmp_path) -> None:
+    """ids are unique, but "/"→"__" flattening is not injective — two parallel writers on one path
+    would race where the serial loop silently last-wrote. Refused by name, before any bytes move."""
+    spec = t._spec(lambda d: d["inputs"].append(
+        {"id": "music__bed.mp3", "kind": "audio", "sha256": t.SHA, "url": "https://x/bed2.mp3"}))
+    monkeypatch.setattr(render, "download",
+                        lambda *_a: pytest.fail("a transfer started despite the collision"))
+    with pytest.raises(RuntimeError, match="collide after path flattening"):
+        render._download_inputs(spec.inputs, tmp_path)
+
+
 # --- the gpu probe cache ------------------------------------------------------
 
 @pytest.fixture()
@@ -88,10 +122,13 @@ def gpu_cache(monkeypatch, tmp_path):
 
 
 def _probe_runs(monkeypatch, rc: int | None):
-    """rc=None forbids the probe subprocess entirely; otherwise it records calls and exits rc."""
+    """rc=None forbids the PROBE subprocess entirely; otherwise it records probe calls and exits rc.
+    The ffmpeg -version identity read (part of the cache key) is always answered, never counted."""
     calls: list = []
 
     def run(cmd, **_kw):
+        if list(cmd[:2]) == ["ffmpeg", "-version"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="ffmpeg version test\n", stderr="")
         if rc is None:
             raise AssertionError("the probe ran when the cache should have answered")
         calls.append(cmd)

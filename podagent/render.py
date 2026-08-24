@@ -500,8 +500,9 @@ _GPU_CACHE_ENV = "MONTY_GPU_PROBE_CACHE"
 
 
 def _gpu_cache_key() -> str:
-    """Identity of the probed configuration: boot, driver, visible devices, probe argv; an unreadable
-    part contributes its own marker so a box that cannot say still keys stably."""
+    """Identity of the probed configuration: boot, driver, visible devices, the ffmpeg build (a new pod
+    image on an unrebooted host must re-probe), probe argv; an unreadable part contributes its own
+    marker so a box that cannot say still keys stably."""
     parts = []
     for p in ("/proc/sys/kernel/random/boot_id", "/proc/driver/nvidia/version"):
         try:
@@ -509,6 +510,11 @@ def _gpu_cache_key() -> str:
         except (OSError, IndexError):
             parts.append(f"{p}?")
     parts.append(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+    try:
+        v = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
+        parts.append((v.stdout or "").splitlines()[0].strip() if v.stdout else "ffmpeg?")
+    except (OSError, subprocess.SubprocessError, IndexError):
+        parts.append("ffmpeg?")
     parts.append(" ".join(VULKAN_PROBE))
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
@@ -528,8 +534,10 @@ def _gpu_cache_write(path: Path, key: str) -> None:
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({"key": key, "ok": True}))
         os.replace(tmp, path)  # atomic; concurrent writers race to an identical record
-    except OSError:
-        pass  # cache is an optimization — the probe already answered for this process
+    except OSError as exc:
+        # a foreign-uid file at the fixed path makes every write fail: the probe answered this process,
+        # but silence here would hide that every future process re-pays it
+        print(f"[render] gpu probe cache not written ({path}): {exc}", file=sys.stderr, flush=True)
 
 
 def _gpu_available() -> bool:
@@ -562,16 +570,22 @@ _DL_TICK_S = 15.0
 
 
 def _download_inputs(inputs, tmp: Path) -> dict[str, Path]:
-    """Fetch every spec input concurrently, bounded and narrated; the mapping is built in spec order
-    so nothing downstream can observe completion order. A failed transfer raises immediately (a master
-    missing an input is not renderable), cancelling unstarted arms; running ones die at their caps."""
+    """Fetch every spec input concurrently, bounded and narrated; the mapping is built in spec order.
+    A failed transfer raises (a master missing an input is not renderable) — unstarted arms are
+    cancelled, RUNNING ones drained before the raise, never a teardown under a still-writing child."""
     if not inputs:
         return {}
+    dests = {inp.id: tmp / inp.id.replace("/", "__") for inp in inputs}
+    if len(set(dests.values())) != len(dests):
+        # unique ids by contract, but the "/"→"__" flattening is not injective — and two parallel
+        # writers on one path would race where the serial loop silently last-wrote
+        clash = sorted({i for i in dests if list(dests.values()).count(dests[i]) > 1})
+        raise RuntimeError(f"download: input ids collide after path flattening: {clash}")
     workers = min(_DL_WORKERS, len(inputs))
     waves = -(-len(inputs) // workers)
     stop = time.monotonic() + _DL_ARM_S * waves
     ex = cf.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl")
-    futs = {ex.submit(download, inp.url, tmp / inp.id.replace("/", "__")): inp.id for inp in inputs}
+    futs = {ex.submit(download, inp.url, dests[inp.id]): inp.id for inp in inputs}
     got: dict[str, Path] = {}
     pending = set(futs)
     try:
@@ -589,6 +603,12 @@ def _download_inputs(inputs, tmp: Path) -> dict[str, Path]:
                 print(f"[render] download: {len(got)}/{len(futs)} in hand, {len(pending)} still out, "
                       f"{max(0.0, stop - time.monotonic()):.0f}s of patience left",
                       file=sys.stderr, flush=True)
+    except BaseException:
+        from . import render_onepass as _onepass
+        for f in pending:
+            f.cancel()
+        _onepass._drain("download", {f for f in pending if not f.cancelled()}, futs, stop)
+        raise
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
     return {inp.id: got[inp.id] for inp in inputs}
@@ -656,7 +676,9 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             print("camera.apply: GPU unavailable — degrading to a static crop at the first keyframe "
                   "(MONTY_ALLOW_STATIC_CAMERA=1)", file=sys.stderr)
 
-    with tempfile.TemporaryDirectory() as td:
+    # ignore_cleanup_errors: on the failure path a drained-but-unlanded arm may still touch tmp; the
+    # unwind must surface the REAL error, not an rmtree OSError that buries it.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         with phase("download"):
             input_paths = _download_inputs(spec.inputs, tmp)

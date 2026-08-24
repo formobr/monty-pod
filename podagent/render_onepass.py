@@ -198,16 +198,33 @@ def _voice_filters(spec: RenderSpec, input_paths: dict) -> tuple[str, str]:
     return clean, _render._measure_loudnorm(voice, clean)
 
 
-# The whole pre-pass block's wall; every subprocess under an arm carries its own tighter timeout,
-# so shutdown(cancel_futures) never leaves an orphan running past its cap.
-_ARM_WALL_S = 900.0
+# 960 DOMINATES the largest arm-child timeout (mograph's 900s node wall): past `stop` no arm still owns a subprocess.
+_ARM_WALL_S = 960.0
 _ARM_TICK_S = 15.0
+
+
+def _drain(what: str, running: set, names: dict, stop: float) -> None:
+    """After a fault: hold the raise until every RUNNING arm lands (bounded by `stop`, which dominates
+    each arm's own subprocess timeout), so the tmp dir the arms write into is only torn down behind
+    them — never under a still-writing ffmpeg/node child."""
+    while running:
+        left = stop - time.monotonic()
+        if left <= 0:
+            print(f"[render] {what}: wall exhausted with {len(running)} arm(s) unlanded — their "
+                  f"children are already past their own timeouts", file=sys.stderr, flush=True)
+            return
+        print(f"[render] {what}: failing — waiting for {', '.join(sorted(names[f] for f in running))} "
+              f"to land first ({left:.0f}s of patience left)", file=sys.stderr, flush=True)
+        done, running = cf.wait(running, timeout=min(_ARM_TICK_S, left),
+                                return_when=cf.FIRST_COMPLETED)
+        for f in done:
+            f.exception(timeout=0)  # observed, deliberately dropped: the FIRST fault is the verdict
 
 
 def _run_arms(arms: dict) -> dict:
     """Run named independent thunks concurrently → results by name. Bounded and narrated; the first
-    arm to fail re-raises its error, unstarted siblings are cancelled, running ones die at their own
-    subprocess timeouts. No arms, no pool."""
+    arm to fail re-raises its error after unstarted siblings are cancelled and RUNNING ones are
+    drained (_drain), so no child outlives the raise. No arms, no pool."""
     if not arms:
         return {}
     t0 = time.monotonic()
@@ -231,6 +248,11 @@ def _run_arms(arms: dict) -> dict:
                       f"{', '.join(sorted(futs[f] for f in pending))} still out, "
                       f"{max(0.0, stop - time.monotonic()):.0f}s of patience left",
                       file=sys.stderr, flush=True)
+    except BaseException:
+        for f in pending:
+            f.cancel()
+        _drain("prepare", {f for f in pending if not f.cancelled()}, futs, stop)
+        raise
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
     print("[render] prepare arms: " + " ".join(f"{n}={secs[n]:.1f}s" for n in sorted(secs)),
