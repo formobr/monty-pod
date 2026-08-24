@@ -149,6 +149,24 @@ def test_the_unlanded_mark_survives_a_reporting_error(tmp_path, monkeypatch) -> 
     assert kept.exists(), "the mark was laundered by the reporting error"
 
 
+def test_the_mark_survives_an_unmarked_explicit_cause_beside_it(tmp_path, monkeypatch) -> None:
+    """raise X from unmarked_cause while the marked error sits in __context__: the walk must take
+    BOTH branches, not `__cause__ or __context__`."""
+    orig = render.tempfile.mkdtemp
+    monkeypatch.setattr(render.tempfile, "mkdtemp",
+                        lambda prefix: orig(prefix=prefix, dir=tmp_path))
+    with pytest.raises(ConnectionError):
+        with render._job_tmpdir() as d:
+            kept = d
+            try:
+                e = RuntimeError("first fault")
+                e.unlanded_arms = ["mograph"]
+                raise e
+            except RuntimeError:
+                raise ConnectionError("send died") from OSError("transport")
+    assert kept.exists(), "the walk followed __cause__ and dropped the marked __context__"
+
+
 # --- the gpu probe cache ------------------------------------------------------
 
 @pytest.fixture()

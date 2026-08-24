@@ -565,14 +565,18 @@ def _gpu_available() -> bool:
 
 
 def _unlanded_arms(exc: BaseException | None) -> list[str] | None:
-    """The `unlanded_arms` mark, sought through the WHOLE cause/context chain: an error raised while
-    reporting the marked one (phase's event send) must not launder the mark away."""
+    """The `unlanded_arms` mark, sought through the WHOLE cause/context GRAPH (both branches, cycle
+    safe): an error raised while reporting the marked one must not launder the mark away."""
     seen: set[int] = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        if names := getattr(exc, "unlanded_arms", None):
+    stack = [exc]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if names := getattr(e, "unlanded_arms", None):
             return list(names)
-        exc = exc.__cause__ or exc.__context__
+        stack += [e.__cause__, e.__context__]
     return None
 
 
