@@ -802,6 +802,13 @@ def test_the_merge_rewriter_never_rewrites_its_own_substitution() -> None:
         "[vout]anull[vaccents]"
 
 
+def test_the_merge_rewriter_refuses_an_unallocated_external_pad() -> None:
+    """NEGATIVE: a fragment reading an input pad the allocator never handed out would silently read
+    another timeline's stream in the merged argv — it must raise, not namespace or pass through."""
+    with pytest.raises(ValueError, match="never handed out"):
+        op.rewire("[0:v][7:v]overlay[vout]", "lgo", {"0:v": "vbase", "vout": "vlogo"})
+
+
 def test_a_pad_neither_side_declares_is_left_exactly_as_it_stands() -> None:
     """substitute_pads is a REWRITER, not a validator: resolve() returning None must leave the token
     byte-for-byte, which is what keeps a filter argument that merely looks like a pad safe."""
