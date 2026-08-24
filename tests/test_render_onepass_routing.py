@@ -133,23 +133,28 @@ def test_an_accepted_final_spec_runs_the_onepass_core_not_the_multipass_chain(mo
     assert "ffmpeg" in ops and "finalize" in ops and "upload" in ops
 
 
-def test_a_film_burn_spec_falls_back_with_a_counted_named_reason(monkeypatch):
+def test_a_film_burn_spec_now_runs_the_onepass_core(monkeypatch):
+    """Wave B: the 1/1 production refusal reason is gone — a burn spec routes through the one-pass
+    core, flare-decodes in prepare, and never touches the multi-pass chain."""
     _runs, puts = _wire(monkeypatch)
-    _forbid(monkeypatch, op, "prepare")
-    _forbid(monkeypatch, op, "run_encode")
-    fin_calls = []
-    monkeypatch.setattr(finalize, "finalize",
-                        lambda _f, master, *_a, **_kw: (fin_calls.append(master), master)[1])
+    from podagent import accents
+    monkeypatch.setattr(accents, "detect_flares", lambda _p: [0.3])
+    for mod, name in ((finalize, "finalize"), (finalize, "apply_accents")):
+        _forbid(monkeypatch, mod, name)
+    monkeypatch.setattr(finalize, "apply_loudnorm",
+                        lambda _fin, _src, out: (Path(out).write_bytes(b"v"), out)[1])
     cp = _CP()
     render.render_spec(_spec(_add_film_burn), cp)
 
     dec = _decisions(cp)
-    assert [d["phase"] for d in dec] == ["onepass_refused"]
-    assert dec[0]["timings"] == {"refused": ["finalize.accents[kind=film_burn]"]}
+    assert [d["phase"] for d in dec] == ["onepass_accepted"]
+    assert "timings" not in dec[0]
     StreamEvent.model_validate({**dec[0]})
-    assert fin_calls, "the legacy multi-pass tail must have run"
-    assert [n for n, _u in puts] == ["render.mp4", "render.mp4"]
+    assert [(n, u) for n, u in puts] == [("fin_ln.mp4", "https://x/master.mp4?PUT"),
+                                         ("render.presync.mp4", "https://x/presync.mp4?PUT")]
     assert cp.results and cp.results[0]["status"] == "ok"
+    ops = [e.get("op") for e in cp.events if e.get("phase", "").endswith("_started")]
+    assert "flares" in ops and "ffmpeg" in ops
 
 
 @pytest.mark.parametrize("what,mutate", [
@@ -208,9 +213,9 @@ def test_onepass_defects_reach_the_terminal_result_and_the_degraded_event(monkey
 def test_every_decision_event_is_a_valid_stream_event(monkeypatch):
     _wire(monkeypatch)
     monkeypatch.setattr(finalize, "apply_loudnorm", lambda _f, src, _o: src)
+    from podagent import accents
+    monkeypatch.setattr(accents, "detect_flares", lambda _p: [0.3])
     for mutate in (None, _add_film_burn):
-        if mutate is _add_film_burn:
-            monkeypatch.setattr(finalize, "finalize", lambda _f, master, *_a, **_kw: master)
         cp = _CP()
         render.render_spec(_spec(mutate), cp)
         for ev in _decisions(cp):

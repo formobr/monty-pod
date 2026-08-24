@@ -114,11 +114,6 @@ def refusals(spec: RenderSpec) -> list[str]:
         # Not in render.py's list because the multi-pass path DOES weld a cover; this graph does not,
         # and silently dropping a declared end-card is exactly the half-render that list exists to stop.
         unimplemented.append("cover")
-    fin = ov.finalize
-    if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
-        # Production film-burn compositing belongs to finalize's multi-pass graph; this one-pass
-        # graph intentionally keeps refusing the junction until it can composite that graph safely.
-        unimplemented.append("finalize.accents[kind=film_burn]")
     return unimplemented
 
 
@@ -145,6 +140,9 @@ def _check_assets(spec: RenderSpec, input_paths: dict) -> None:
     fin = ov.finalize
     if fin is None:
         return
+    for a in fin.accents:
+        if a.kind == "film_burn" and input_paths.get(a.burn) is None:
+            raise RuntimeError(f"film_burn accent burn input {a.burn!r} is not resolved")
     if fin.logo is not None and input_paths.get(fin.logo.asset) is None:
         raise RuntimeError(f"finalize.logo.asset {fin.logo.asset!r} is not a resolved inputs[] id")
     if fin.watermark is not None:
@@ -171,6 +169,7 @@ class Prepared:
     layers: tuple[dict, ...] = ()
     ass: Path | None = None
     font_dir: Path | None = None
+    flares: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,12 +247,19 @@ def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
         with phase("captions"):
             ass, font_dir = _write_ass(caps, mp, input_paths, tmp,
                                        spec.timeline.width, spec.timeline.height)
+    flares: tuple[float, ...] = ()
+    fin = ov.finalize if ov is not None else None
+    if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
+        # The pure shape refusals fire BEFORE the flare decode — same order the multi-pass path keeps.
+        plan = _accents.film_burn_plan(fin.accents)
+        with phase("flares"):
+            flares = tuple(_accents.detect_flares(input_paths[plan.burn]))
     return Prepared(
         spec=spec, gpu=gpu, input_paths=input_paths, duration=dur,
         master_out=master_out or tmp / "render.mp4",
         presync_out=presync_out or tmp / "render.presync.mp4",
         filter_script=tmp / "body_onepass.filter",
-        bed=bed, audio=audio, layers=layers, ass=ass, font_dir=font_dir)
+        bed=bed, audio=audio, layers=layers, ass=ass, font_dir=font_dir, flares=flares)
 
 
 # --- 3. assemble --------------------------------------------------------------
@@ -307,16 +313,34 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
 
     wm = fin.watermark if fin is not None else None
 
-    accent_frag = (_accents.build_chain_filter(fin.accents, fps=fps, w=w, h=h, gpu=gpu)
-                   if fin is not None and fin.accents else None)
-    if accent_frag is not None:
+    if fin is not None and fin.accents:
         src = vlink
         if gpu:
             # The GPU accent branches issue a BARE hwupload (accents.py:81/145/300); the intermediate
             # encode that used to hand them yuv420p is the one this wave deletes.
             chains.append(f"[{vlink}]format=yuv420p[{V_ACCENT_IN}]")
             src = V_ACCENT_IN
-        chains.append(rewire(accent_frag, "acc", {"0:v": src, "vout": V_ACCENTS}))
+        if any(a.kind == "film_burn" for a in fin.accents):
+            plan = _accents.film_burn_plan(fin.accents)
+            # Looped because add_filmburn trims the burn at flare offsets that may pass the clip's
+            # end; -t already bounds the process (the same pairing finalize's own pass uses).
+            burn = inputs.add(p.input_paths[plan.burn], "-stream_loop", "-1")
+            parts: list[str] = []
+            prev = f"[{src}]"
+            if plan.singles:
+                fc = _accents.build_chain_filter(plan.singles, fps=fps, w=w, h=h, gpu=gpu)
+                prefix, terminal = fc.rsplit("[vout]", 1)
+                parts = [prefix + "[preburn]" + terminal]
+                prev = "[preburn]"
+            parts, prev = _accents.add_offset_jump(parts, prev, plan.boundaries, w=w, h=h)
+            parts, prev = _accents.add_filmburn(parts, prev, burn, plan.boundaries, list(p.flares),
+                                                opacity=plan.opacity, w=w, h=h, fps=grid)
+            chains.append(rewire(";".join(parts), "acc",
+                                 {"0:v": src, src: src, f"{burn}:v": f"{burn}:v",
+                                  prev[1:-1]: V_ACCENTS}))
+        else:
+            frag = _accents.build_chain_filter(fin.accents, fps=fps, w=w, h=h, gpu=gpu)
+            chains.append(rewire(frag, "acc", {"0:v": src, "vout": V_ACCENTS}))
         vlink = V_ACCENTS
 
     if fin is not None and fin.logo is not None:

@@ -25,6 +25,7 @@ from __future__ import annotations
 import random
 import re
 import subprocess
+from typing import NamedTuple
 
 SS = 2  # supersample factor for any zoompan x/y move
 _PI = 3.14159265358979
@@ -477,6 +478,34 @@ def add_offset_jump(parts: list, prev: str, boundaries: list, lead: float = 0.42
     return parts, "[vout]"
 
 
+class FilmBurnPlan(NamedTuple):
+    singles: list
+    burn: str
+    opacity: float
+    boundaries: list[float]
+
+
+def film_burn_plan(accents) -> FilmBurnPlan:
+    """Split a resolved accent list into (ordinary singles, the one burn set) and refuse every
+    malformed shape — PURE, so both transports (multi-pass finalize and the one-pass graph) judge a
+    burn set by the same law rather than each holding its own copy of what "legal" means."""
+    burns = [a for a in accents if a.kind == "film_burn"]
+    singles = [a for a in accents if a.kind != "film_burn"]
+    burn_ids = {a.burn for a in burns}
+    if len(burn_ids) != 1:
+        raise RuntimeError("all film_burn accents must share one burn input id")
+    intensities = {float(a.intensity) for a in burns}
+    if len(intensities) != 1:
+        raise RuntimeError("all film_burn accents must share one intensity")
+    boundaries = sorted(float(a.at) for a in burns)
+    if len(boundaries) > MAX_FILM_BURN_BOUNDARIES:
+        raise RuntimeError(
+            f"film_burn boundary count {len(boundaries)} exceeds cap {MAX_FILM_BURN_BOUNDARIES}; "
+            "registry law: film burns are a RARE accent, 2-3/video"
+        )
+    return FilmBurnPlan(singles, next(iter(burn_ids)), intensities.pop(), boundaries)
+
+
 # --- chaining -----------------------------------------------------------------
 
 BUILDERS = {
@@ -488,9 +517,8 @@ BUILDERS = {
     "rgb_split": rgb_split_filter,
     "pixelate": pixelate_filter,
 }
-# The contract's accent-kind enum is these keys PLUS "film_burn" (contract v6): multi-pass finalize
-# composites film_burn; render_onepass refuses it. A kind reaching build_chain_filter is always one of
-# the keys below (an unhandled kind would otherwise KeyError deep past the seam).
+# The contract's accent-kind enum is these keys PLUS "film_burn" (contract v6), routed through
+# film_burn_plan/add_filmburn on both transports — an unhandled kind here would KeyError past the seam.
 
 
 _PAD = re.compile(r"\[([^\[\]]*)\]")

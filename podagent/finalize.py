@@ -178,29 +178,14 @@ def _terminal_bt709(fc: str, out_v: str) -> str:
 # --- 1. frame accents ---------------------------------------------------------
 
 def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> Path:
-    burns = [a for a in fin.accents if a.kind == "film_burn"]
-    singles = [a for a in fin.accents if a.kind != "film_burn"]
-    burn_ids = {a.burn for a in burns}
-    if len(burn_ids) != 1:
-        raise RuntimeError("all film_burn accents must share one burn input id")
-    intensities = {float(a.intensity) for a in burns}
-    if len(intensities) != 1:
-        raise RuntimeError("all film_burn accents must share one intensity")
-    burn_id = next(iter(burn_ids))
-    burn_path = input_paths.get(burn_id)
+    plan = _accents.film_burn_plan(fin.accents)
+    burn_path = input_paths.get(plan.burn)
     if burn_path is None:
-        raise RuntimeError(f"film_burn accent burn input {burn_id!r} is not resolved")
-
-    boundaries = sorted(float(a.at) for a in burns)
-    if len(boundaries) > _accents.MAX_FILM_BURN_BOUNDARIES:
-        raise RuntimeError(
-            f"film_burn boundary count {len(boundaries)} exceeds cap "
-            f"{_accents.MAX_FILM_BURN_BOUNDARIES}; registry law: film burns are a RARE accent, 2-3/video"
-        )
+        raise RuntimeError(f"film_burn accent burn input {plan.burn!r} is not resolved")
     w, h, fps, fps_num, fps_den, _ = _probe(src)
     flares = _accents.detect_flares(burn_path)
-    if singles:
-        fc = _accents.build_chain_filter(singles, fps=fps, w=w, h=h, gpu=gpu)
+    if plan.singles:
+        fc = _accents.build_chain_filter(plan.singles, fps=fps, w=w, h=h, gpu=gpu)
         if fc is None:
             raise RuntimeError("ordinary accent chain unexpectedly empty")
         prefix, terminal = fc.rsplit("[vout]", 1)
@@ -208,9 +193,9 @@ def _apply_film_burn_accents(fin, src: Path, out: Path, input_paths: dict, gpu: 
         prev = "[preburn]"
     else:
         parts, prev = [], "[0:v]"
-    parts, prev = _accents.add_offset_jump(parts, prev, boundaries, w=w, h=h)
+    parts, prev = _accents.add_offset_jump(parts, prev, plan.boundaries, w=w, h=h)
     parts, prev = _accents.add_filmburn(
-        parts, prev, 1, boundaries, flares, opacity=float(burns[0].intensity), w=w, h=h,
+        parts, prev, 1, plan.boundaries, flares, opacity=plan.opacity, w=w, h=h,
         fps=_accents.FPS if (fps_num, fps_den) == (60000, 1001) else f"{fps:.4f}",
     )
     script = out.with_name(out.name + ".filter_complex")

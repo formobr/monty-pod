@@ -223,12 +223,48 @@ _COMPOSITE_NO_MUSIC = [
     '[0:a]atrim=start=10:end=15,asetpts=PTS-STARTPTS,atempo=1.25[a1__cmp]',
     '[v0__cmp][a0__cmp][v1__cmp][a1__cmp]concat=n=2:v=1:a=1[vcomposite][acomposite]',
 ]
-_ACCENT = [
-    '[vtail]split=2[base_a0__acc][px_a0__acc]',
-    '[px_a0__acc]trim=start=2.8333:end=3.1667,setpts=PTS-STARTPTS,scale=49:87:flags=neighbor,'
-    'scale=1080:1920:flags=neighbor,setpts=PTS-STARTPTS+2.8333/TB[pxx_a0__acc]',
-    "[base_a0__acc][pxx_a0__acc]overlay=enable='between(t,2.8333,3.1667)'[vaccents]",
-]
+def _pixelate(base: str, out: str) -> list[str]:
+    return [
+        '[%s]split=2[base_a0__acc][px_a0__acc]' % base,
+        '[px_a0__acc]trim=start=2.8333:end=3.1667,setpts=PTS-STARTPTS,scale=49:87:flags=neighbor,'
+        'scale=1080:1920:flags=neighbor,setpts=PTS-STARTPTS+2.8333/TB[pxx_a0__acc]',
+        "[base_a0__acc][pxx_a0__acc]overlay=enable='between(t,2.8333,3.1667)'[%s]" % out,
+    ]
+
+
+_ACCENT = _pixelate("vtail", "vaccents")
+
+# add_offset_jump is seeded (seed=42): the slip expression below is a deterministic function of the
+# two boundaries alone, so the literal pins it the same way every other golden line is pinned.
+_JUMP_CROP = (
+    "[jstk__acc]crop=1080:1920:0:y='mod(((between(t,3.080,3.095)*(0+(107)*(t-3.080)/0.01500)"
+    "+between(t,3.095,3.162)*(107+(0)*(t-3.095)/0.06700)+between(t,3.162,3.169)*(107+(-248)*(t-3.162)/0.00700)"
+    "+between(t,3.169,3.271)*(-141+(0)*(t-3.169)/0.10200)+between(t,3.271,3.284)*(-141+(244)*(t-3.271)/0.01300)"
+    "+between(t,3.284,3.336)*(103+(0)*(t-3.284)/0.05200)+between(t,3.336,3.371)*(103+(-103)*(t-3.336)/0.03500)"
+    "+between(t,3.371,3.500)*(0+(0)*(t-3.371)/0.12900))+(between(t,6.580,6.595)*(0+(131)*(t-6.580)/0.01500)"
+    "+between(t,6.595,6.694)*(131+(0)*(t-6.595)/0.09900)+between(t,6.694,6.705)*(131+(-300)*(t-6.694)/0.01100)"
+    "+between(t,6.705,6.775)*(-169+(0)*(t-6.705)/0.07000)+between(t,6.775,6.790)*(-169+(300)*(t-6.775)/0.01500)"
+    "+between(t,6.790,6.851)*(131+(0)*(t-6.790)/0.06100)+between(t,6.851,6.886)*(131+(-131)*(t-6.851)/0.03500)"
+    "+between(t,6.886,7.000)*(0+(0)*(t-6.886)/0.11400)))+192000,1920)'[vout__acc]"
+)
+
+
+def _burn_chains(idx: int, base: str) -> list[str]:
+    return [
+        '[%s]split=2[jc0__acc][jc1__acc]' % base,
+        '[jc0__acc][jc1__acc]vstack=inputs=2[jstk__acc]',
+        _JUMP_CROP,
+        '[%d:v]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,'
+        'crop=1080:1920,fps=30,format=gbrp,split=2[bc__acc][bl__acc]' % idx,
+        "[bl__acc]format=gray,curves=all='0/0.05 0.12/0.5 1/0.8',colorchannelmixer=aa=0.6[bm__acc]",
+        '[bc__acc][bm__acc]alphamerge,format=yuva420p,split=2[bn0__acc][bn1__acc]',
+        '[bn0__acc]trim=start=0.06:duration=0.640,setpts=PTS-STARTPTS,fade=t=in:st=0:d=0.140:alpha=1,'
+        'fade=t=out:st=0.440:d=0.200:alpha=1,setpts=PTS-STARTPTS+3.080/TB[bs0__acc]',
+        "[vout__acc][bs0__acc]overlay=enable='between(t,3.080,3.720)'[g0__acc]",
+        '[bn1__acc]trim=start=0.06:duration=0.640,setpts=PTS-STARTPTS,fade=t=in:st=0:d=0.140:alpha=1,'
+        'fade=t=out:st=0.440:d=0.200:alpha=1,setpts=PTS-STARTPTS+6.580/TB[bs1__acc]',
+        "[g0__acc][bs1__acc]overlay=enable='between(t,6.580,7.220)'[vaccents]",
+    ]
 
 
 def _mograph_chains(idx: int) -> list[str]:
@@ -293,6 +329,23 @@ def _drop_presync(d):
 
 def _no_chime(d):
     d["overlays"]["finalize"]["watermark"]["chime"] = False
+
+
+def _add_film_burn(d):
+    d["inputs"] += [{"id": "fx/burn.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b"},
+                    {"id": "fx/clicks.wav", "kind": "audio", "sha256": SHA, "url": "https://x/c"}]
+    d["overlays"]["finalize"]["accents"] += [
+        {"kind": "film_burn", "at": 3.5, "intensity": 0.6, "burn": "fx/burn.mp4",
+         "clicks": "fx/clicks.wav"},
+        {"kind": "film_burn", "at": 7.0, "intensity": 0.6, "burn": "fx/burn.mp4",
+         "clicks": "fx/clicks.wav"},
+    ]
+
+
+def _only_film_burn(d):
+    _add_film_burn(d)
+    d["overlays"]["finalize"]["accents"] = [
+        a for a in d["overlays"]["finalize"]["accents"] if a["kind"] == "film_burn"]
 
 
 def test_golden_everything_present() -> None:
@@ -362,6 +415,27 @@ def test_golden_no_presync_output() -> None:
     _ins, outs = _argv(cmd)
     assert [_maps(o[0]) for o in outs] == [_MASTER_MAPS]
     assert [o[1] for o in outs] == ["/w/master.mp4"]
+
+
+def test_golden_film_burn_with_singles() -> None:
+    """The singles chain feeds [preburn], the slip precedes the burn overlay, the burn rides its own
+    looped input — the exact multi-pass recipe (finalize._apply_film_burn_accents), merged."""
+    graph, cmd = op.assemble(_prepared(_spec(_add_film_burn), flares=(0.3,)))
+    assert graph.split(";") == (
+        _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
+        + _pixelate("vtail", "preburn__acc") + _burn_chains(3, "preburn__acc")
+        + _logo(4, "vaccents") + _watermark(5, 6, "vlogo"))
+    assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
+    ins, _outs = _argv(cmd)
+    assert ins[3] == (("-stream_loop", "-1"), "/w/fx/burn.mp4")
+
+
+def test_golden_film_burn_only() -> None:
+    graph, _cmd = op.assemble(_prepared(_spec(_only_film_burn), flares=(0.3,)))
+    assert graph.split(";") == (
+        _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
+        + _burn_chains(3, "vtail") + _logo(4, "vaccents") + _watermark(5, 6, "vlogo"))
+    assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
 def test_branch_order_is_by_link_not_by_substring() -> None:
@@ -831,16 +905,10 @@ def _no_subprocess(monkeypatch) -> None:
         monkeypatch.setattr(mod.subprocess, "run", boom)
 
 
-@pytest.mark.parametrize("what", ["film_burn", "opener", "trims", "cover"])
+@pytest.mark.parametrize("what", ["opener", "trims", "cover"])
 def test_the_non_goals_are_refused_before_any_subprocess(what, monkeypatch, tmp_path) -> None:
     def mutate(d):
-        if what == "film_burn":
-            d["inputs"] += [{"id": "burn.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b"},
-                            {"id": "clicks.wav", "kind": "audio", "sha256": SHA, "url": "https://x/c"}]
-            d["overlays"]["finalize"]["accents"].append(
-                {"kind": "film_burn", "at": 4.0, "intensity": 0.6, "burn": "burn.mp4",
-                 "clicks": "clicks.wav"})
-        elif what == "opener":
+        if what == "opener":
             d["inputs"].append({"id": "cold.mp4", "kind": "video", "sha256": SHA, "url": "https://x/o"})
             d["overlays"]["opener"] = {"cold": "cold.mp4", "cold_trim": 0.1, "gain": 0.4}
         elif what == "trims":
@@ -901,6 +969,49 @@ def test_prepare_leaves_the_base_bare_when_no_mograph_layer_survived(monkeypatch
     graph, _cmd = op.assemble(p)
     assert "__mog" not in graph
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
+
+
+def test_prepare_detects_flares_in_its_own_phase(monkeypatch, tmp_path) -> None:
+    """The flare decode is the ONE film_burn I/O — it lives in prepare so assemble stays pure."""
+    spec = _spec(_add_film_burn)
+    _stub_prepare_passes(monkeypatch, tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(accents, "detect_flares",
+                        lambda p: (calls.append(Path(p).name), [0.3, 1.7])[1])
+    ops: list[str] = []
+
+    @contextmanager
+    def rec(name):
+        ops.append(name)
+        yield
+
+    p = op.prepare(spec, _paths(spec, tmp_path), tmp_path, False, phase=rec)
+    assert p.flares == (0.3, 1.7)
+    assert calls == ["fx__burn.mp4"]
+    assert "flares" in ops
+
+
+def test_prepare_refuses_a_malformed_burn_set_before_the_flare_decode(monkeypatch, tmp_path) -> None:
+    def two_ids(d):
+        _add_film_burn(d)
+        d["inputs"].append({"id": "fx/burn2.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b2"})
+        d["overlays"]["finalize"]["accents"][-1]["burn"] = "fx/burn2.mp4"
+    spec = _spec(two_ids)
+    _stub_prepare_passes(monkeypatch, tmp_path)
+    monkeypatch.setattr(accents, "detect_flares",
+                        lambda _p: pytest.fail("the flare decode ran before the shape refusal"))
+    with pytest.raises(RuntimeError, match="share one burn input id"):
+        op.prepare(spec, _paths(spec, tmp_path), tmp_path, False)
+
+
+def test_an_unresolved_burn_input_refuses_before_any_pass(monkeypatch, tmp_path) -> None:
+    spec = _spec(_add_film_burn)
+    paths = _paths(spec, tmp_path)
+    del paths["fx/burn.mp4"]
+    monkeypatch.setattr(accents, "detect_flares",
+                        lambda _p: pytest.fail("the flare decode ran on an unresolved input"))
+    with pytest.raises(RuntimeError, match="is not resolved"):
+        op.prepare(spec, paths, tmp_path, False)
 
 
 # --- the door: one VIDEO encode, the loudnorm, both outputs delivered ---------
@@ -1004,6 +1115,23 @@ def test_the_phase_hook_carries_the_render_stages_own_op_names(monkeypatch, tmp_
 
     _runs, _puts, _d = _door(monkeypatch, tmp_path, _spec(), phase=rec)
     assert ops == ["audio_prepare", "mograph", "captions", "ffmpeg", "finalize", "upload"]
+
+
+def test_a_film_burn_door_run_never_reaches_the_multipass_burn(monkeypatch, tmp_path) -> None:
+    """_door forbids finalize.apply_accents, so a burn spec passing through IS the proof the one-pass
+    graph composited the burn itself; the flare decode gets its own phase between captions and ffmpeg."""
+    monkeypatch.setattr(accents, "detect_flares", lambda _p: [0.3])
+    ops: list[str] = []
+
+    @contextmanager
+    def rec(name):
+        ops.append(name)
+        yield
+
+    _runs, _puts, d = _door(monkeypatch, tmp_path, _spec(_add_film_burn), phase=rec)
+    assert ops == ["audio_prepare", "mograph", "captions", "flares", "ffmpeg", "finalize", "upload"]
+    assert d.prepared.flares == (0.3,)
+    assert d.outputs == ["master", "presync"]
 
 
 def test_the_door_runs_with_nobody_listening(monkeypatch, tmp_path) -> None:
