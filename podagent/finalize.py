@@ -369,10 +369,9 @@ def apply_watermark(fin, src: Path, out: Path, input_paths: dict, gpu: bool) -> 
 
 # --- 4. delivery loudness -----------------------------------------------------
 
-# loudnorm's linear-mode TP is a PREDICTION, not a brickwall (it overshoots ~0.2 dB), so the delivery pass
-# aims this far UNDER the declared ceiling. Named, not inline: it has no engine mirror to drift against, so
-# a test pins it directly (test_finalize_parity) — otherwise editing it re-levels every master, silently.
-TP_HEADROOM_DB = 0.7
+# covers loudnorm's linear-mode TP prediction slack (~0.2 dB) PLUS the AAC encode's measured ~0.9 dBTP
+# of codec peaks after it — an aim that ignores the encoder ships past the ceiling (test-pinned, no mirror)
+TP_HEADROOM_DB = 1.2
 
 
 def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> tuple[str | None, str]:
