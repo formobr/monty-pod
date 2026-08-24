@@ -1,6 +1,6 @@
 """ONE filter graph and ONE master encode for the BODY delivery tail — composite, mograph, captions,
-accents, logo and watermark in a single pass. BUILT, NOT ROUTED: production still walks
-render.render_spec's up-to-six conditional full-frame re-encodes; wiring this in is a later wave."""
+accents, logo and watermark in a single pass. render.render_spec routes accepted final specs through
+this encode core; a named `refusals` verdict sends the rest down its multi-pass chain, counted."""
 from __future__ import annotations
 
 import re
@@ -98,13 +98,13 @@ class Inputs:
 
 # --- 1. preflight -------------------------------------------------------------
 
-def preflight(spec: RenderSpec) -> None:
-    """Refuse every non-goal BEFORE any subprocess — same exception type and same timing as
-    render.render_spec (render.py:552-568), so a v6 spec cannot half-render through this door either."""
-    _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
+def refusals(spec: RenderSpec) -> list[str]:
+    """The NAMED non-goals this graph refuses, empty on accept. A separate pure function so the
+    router (render.render_spec) can emit each decision as a counted event — wave B's go/no-go is
+    the measured share of runs each named reason sends down the legacy path."""
     ov = spec.overlays if spec.mode == "final" else None
     if ov is None:
-        return
+        return []
     unimplemented = []
     if ov.trims:
         unimplemented.append("trims")
@@ -119,6 +119,14 @@ def preflight(spec: RenderSpec) -> None:
         # Production film-burn compositing belongs to finalize's multi-pass graph; this one-pass
         # graph intentionally keeps refusing the junction until it can composite that graph safely.
         unimplemented.append("finalize.accents[kind=film_burn]")
+    return unimplemented
+
+
+def preflight(spec: RenderSpec) -> None:
+    """Refuse every non-goal BEFORE any subprocess — same exception type and same timing as
+    render.render_spec (render.py:552-568), so a v6 spec cannot half-render through this door either."""
+    _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
+    unimplemented = refusals(spec)
     if unimplemented:
         raise NotImplementedError(
             f"body single-pass graph does not composite these yet (opener/junction waves): {unimplemented}")
@@ -387,6 +395,15 @@ def _run(cmd: list[str], budget_s: float) -> None:
             f"(check -t against the looped watermark idle)") from exc
 
 
+def run_encode(p: Prepared, phase=_no_phase) -> None:
+    """Write the assembled filter script and run the ONE bounded encode — the whole encode core
+    behind the router, so render_spec and render_body cannot diverge on it."""
+    graph, cmd = assemble(p)
+    p.filter_script.write_text(graph, encoding="utf-8")
+    with phase("ffmpeg"):
+        _run(cmd, encode_budget_s(p.duration))
+
+
 def render_body(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
                 master_out: Path | None = None, presync_out: Path | None = None,
                 phase=_no_phase) -> Delivered:
@@ -396,10 +413,7 @@ def render_body(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
     preflight(spec)
     p = prepare(spec, input_paths, tmp, gpu, master_out=master_out, presync_out=presync_out,
                 phase=phase)
-    graph, cmd = assemble(p)
-    p.filter_script.write_text(graph, encoding="utf-8")
-    with phase("ffmpeg"):
-        _run(cmd, encode_budget_s(p.duration))
+    run_encode(p, phase=phase)
     fin = spec.overlays.finalize if (spec.mode == "final" and spec.overlays is not None) else None
     master = p.master_out
     if fin is not None:

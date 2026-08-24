@@ -227,9 +227,10 @@ def _run_render_spec(monkeypatch, spec):
     monkeypatch.setattr(render, "upload", lambda *_a, **_kw: None)
     monkeypatch.setattr(render, "_gpu_available", lambda: False)
     monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: _Done())
-    real = render.build_command
-    monkeypatch.setattr(render, "build_command",
-                        lambda *a, **kw: (seen.update(audio=a[5] if len(a) > 5 else kw.get("audio")),
+    # capture at build_filtergraph: the ONE seam both the legacy and the one-pass core feed the mix into
+    real = render.build_filtergraph
+    monkeypatch.setattr(render, "build_filtergraph",
+                        lambda *a, **kw: (seen.update(audio=a[2] if len(a) > 2 else kw.get("audio")),
                                           real(*a, **kw))[1])
     render.render_spec(spec, _CP())
     return seen["audio"]
