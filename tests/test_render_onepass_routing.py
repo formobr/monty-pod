@@ -215,3 +215,28 @@ def test_every_decision_event_is_a_valid_stream_event(monkeypatch):
         render.render_spec(_spec(mutate), cp)
         for ev in _decisions(cp):
             StreamEvent.model_validate({**ev, "stage": ev["stage"]})
+
+
+def test_a_cover_spec_falls_back_with_a_counted_named_reason(monkeypatch):
+    """The refusal most likely to fire in production: the multi-pass tail WELDS a cover, the graph does not."""
+    _runs, puts = _wire(monkeypatch)
+    _forbid(monkeypatch, op, "prepare")
+    _forbid(monkeypatch, op, "run_encode")
+    fin_calls = []
+    monkeypatch.setattr(finalize, "finalize",
+                        lambda _f, master, *_a, **_kw: (fin_calls.append(master), master)[1])
+    from podagent import cover as cover_mod
+    monkeypatch.setattr(cover_mod, "render_cover",
+                        lambda *_a, **_kw: _kw.get("out") or _a[3])
+
+    def _add_cover(d):
+        d["overlays"]["cover"] = {"frame_at": 1.0, "headline": {"lines": ["X"]}}
+
+    cp = _CP()
+    render.render_spec(_spec(_add_cover), cp)
+
+    dec = _decisions(cp)
+    assert [d["phase"] for d in dec] == ["onepass_refused"]
+    assert dec[0]["timings"] == {"refused": ["cover"]}
+    assert fin_calls or cp.results, "the legacy multi-pass tail must have run"
+    assert cp.results and cp.results[0]["status"] == "ok"

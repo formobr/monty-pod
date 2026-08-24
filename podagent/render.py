@@ -320,7 +320,7 @@ def _measure_loudnorm(voice: Path, pre: str) -> str:
     linear=true (exact delivery). On a measure failure return the plain filter (single-pass dynamic)."""
     vln = f"loudnorm=I={_num(_VOICE_LUFS)}:TP={_num(_TP)}:LRA={_LRA}"
     # -map 0:a:0? : a `-f null` pass with no map decodes the VIDEO too, and this measure only needs
-    # the first audio stream (`?` keeps the no-audio case a parse miss, not an ffmpeg error).
+    # the first audio stream (with no audio ffmpeg still exits nonzero — rc is unchecked, the parse miss below handles it).
     res = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(voice),
                           "-map", "0:a:0?",
                           "-af", f"{pre},{vln}:print_format=json", "-f", "null", "-"],
