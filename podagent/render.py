@@ -564,17 +564,29 @@ def _gpu_available() -> bool:
     return _GPU
 
 
+def _unlanded_arms(exc: BaseException | None) -> list[str] | None:
+    """The `unlanded_arms` mark, sought through the WHOLE cause/context chain: an error raised while
+    reporting the marked one (phase's event send) must not launder the mark away."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if names := getattr(exc, "unlanded_arms", None):
+            return list(names)
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
 @contextmanager
 def _job_tmpdir():
-    """The job's tmp dir, deleted on exit — UNLESS the unwinding error is marked `unlanded_arms`: a
-    pool arm that never landed may still own a writing child, and an rmtree under a live writer is a
+    """The job's tmp dir, deleted on exit — UNLESS the unwinding error chain carries `unlanded_arms`:
+    a pool arm that never landed may still own a writing child, and an rmtree under a live writer is a
     worse defect than a leaked dir (the container's /tmp dies with the pod)."""
     td = tempfile.mkdtemp(prefix="monty-render-")
     keep = False
     try:
         yield Path(td)
     except BaseException as exc:
-        if names := getattr(exc, "unlanded_arms", None):
+        if names := _unlanded_arms(exc):
             keep = True
             print(f"[render] leaking tmp {td}: arm(s) {', '.join(names)} never landed — deleting "
                   f"under a possibly-live child is the worse defect", file=sys.stderr, flush=True)

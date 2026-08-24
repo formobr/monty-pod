@@ -131,6 +131,24 @@ def test_tmpdir_is_leaked_when_an_arm_never_landed(tmp_path, monkeypatch) -> Non
     assert not gone.exists(), "a landed failure must still clean up"
 
 
+def test_the_unlanded_mark_survives_a_reporting_error(tmp_path, monkeypatch) -> None:
+    """phase() may replace the marked error with an event-send failure; the mark must be found down
+    the cause/context chain, or the leak guard is laundered away exactly when it matters."""
+    orig = render.tempfile.mkdtemp
+    monkeypatch.setattr(render.tempfile, "mkdtemp",
+                        lambda prefix: orig(prefix=prefix, dir=tmp_path))
+    with pytest.raises(ConnectionError):
+        with render._job_tmpdir() as d:
+            kept = d
+            try:
+                e = RuntimeError("first fault")
+                e.unlanded_arms = ["mograph"]
+                raise e
+            except RuntimeError:
+                raise ConnectionError("event send died")  # implicit __context__ carries the mark
+    assert kept.exists(), "the mark was laundered by the reporting error"
+
+
 # --- the gpu probe cache ------------------------------------------------------
 
 @pytest.fixture()
