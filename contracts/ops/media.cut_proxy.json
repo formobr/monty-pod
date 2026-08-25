@@ -1,0 +1,46 @@
+{
+  "op": "media.cut_proxy",
+  "version": 1,
+  "summary": "Pre-scale the recording to the cut tier's grid with a dense (~1s) keyframe interval, audio stream-copied, timing passthrough — the preview cut's decode source, so per-segment seeks stop walking a 4K long-GOP file (incident img-8009). Identity pixels but for the scale: no grade, no tonemap, no re-timing; the final tier never binds this artifact.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "The argv is a pure function of (params, measured fps): the scaler term is cutgrid.cut_scale_vf — the SAME string cut.apply caps with, so the proxied cut's pixel grid equals the direct cut's by construction. libx264 at the pinned crf over identical input bytes emits identical output bytes (MONTY_OPS_CPU_ENCODE=1, the reproducible proof); NVENC is the fast default and, like every encoder op, is not byte-reproducible run-to-run. Audio is `-c:a copy` — packet-identical to the source, so the cut's sample grid cannot move. The proxy makes the preview a SECOND-generation picture; the declared acceptance is perceptual (PSNR/SSIM against the direct cut), and the decision that admits that names the preview tier only."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "video", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["max_h"],
+    "properties": {
+      "max_h": {
+        "type": "integer",
+        "minimum": 120,
+        "maximum": 4320,
+        "multipleOf": 2,
+        "description": "The cut tier's height cap, aspect kept, never upscaling — the same number cut.apply receives as max_h, read from the SAME RenderProfile by the caller. Geometry: nothing here says which tier chose it."
+      },
+      "gop_s": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 10,
+        "default": 1.0,
+        "description": "Keyframe interval in seconds. The whole point of the op: a segment seek decodes at most this much of the tier-grid file. ~1s is the measured sweet spot; all-I multiplies the bytes for no seek win."
+      },
+      "crf": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 51,
+        "default": 16,
+        "description": "Proxy quality (cq/crf). One rung above the cut's own cq14: the preview cut re-encodes right after, so this bounds the second-generation loss the declared perceptual acceptance tolerates."
+      }
+    }
+  },
+  "handler": "montyops.media_cut_proxy:run"
+}

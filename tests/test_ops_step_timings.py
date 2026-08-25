@@ -118,8 +118,16 @@ class _Chain:
 
 @pytest.fixture
 def op():
-    """A real shipped op with one required output, so the runner's own checks stay live."""
-    o = next(x for x in registry.all_ops().values() if any(not p.many for p in x.outputs))
+    """A real shipped NON-heavy op with one required output, so the runner's own checks stay live. Heavy
+    ops route through gpu_admission (extra live phases, exclusive handler) and have their own suite."""
+    from podagent.ops import gpu_admission
+
+    o = next((x for x in registry.all_ops().values()
+              if x.op not in gpu_admission.HEAVY_GPU_OPS
+              and sum(1 for p in x.outputs if not p.optional) == 1
+              and any(not p.many for p in x.outputs)), None)
+    if o is None:
+        pytest.fail("registry holds no non-heavy op with exactly one required output — widen this fixture")
     return o
 
 

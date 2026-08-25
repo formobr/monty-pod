@@ -34,7 +34,7 @@ from ..artifact import log
 from ..cp import download, put_trace, retry, upload
 from ..identity import worker_identity
 from ..sanitize import safe_error
-from . import inputcache, pack, registry, resultcache
+from . import gpu_admission, inputcache, pack, registry, resultcache
 
 MAX_PARALLEL_ENV = "OPS_MAX_PARALLEL"
 
@@ -202,6 +202,12 @@ def _reset_step_slots() -> None:
     with _slots_lock:
         _slots = None
         _xfer = None
+
+
+@contextmanager
+def _null_permit():
+    """The no-op arm of the heavy/light permit pair, so ONE `with` spells both paths."""
+    yield
 
 
 class ChainError(RuntimeError):
@@ -766,7 +772,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
 
     def live(phase: str, *, started: float | None = None,
              exc: BaseException | None = None, timings: dict[str, float] | None = None,
-             outputs: list[dict[str, Any]] | None = None, outcome: str | None = None) -> None:
+             outputs: list[dict[str, Any]] | None = None, outcome: str | None = None,
+             worker: str | None = None) -> None:
         if emit is None:
             return
         payload: dict[str, Any] = {
@@ -781,6 +788,10 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
             payload["outputs"] = list(outputs)
         if outcome is not None:
             payload["outcome"] = outcome
+        if worker is not None:
+            # the wire event vocabulary is CLOSED (StreamEventFields extra="forbid"), so the worker name
+            # rides inside `timings` — the one open dict the contract already carries end to end
+            payload.setdefault("timings", {})["worker"] = worker
         if started is not None:
             payload.setdefault("timings", {})["phase_s"] = round(time.monotonic() - started, 3)
         if exc is not None:
@@ -811,7 +822,11 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
 
     fn = pack.resolve(op.handler)
     recorder = pack.legs()
+    # A heavy op takes exclusive GPU admission INSTEAD of the CPU/RAM permit (gpu_admission module docstring).
+    heavy = op.op in gpu_admission.HEAVY_GPU_OPS and op.budget != "transport"
     live("slot_wait_started", timings={"bind_s": timing.bind_s})
+    if heavy:
+        live("heavy_slot_wait_started", timings={"bind_s": timing.bind_s}, worker=worker_identity())
     slot_ready = time.monotonic()
     slot_start_ns = time.monotonic_ns()
     # THE handler call. `LocalBackend` makes this exact call in-process on the origin machine; here the
@@ -823,29 +838,41 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     # encode. Both are still bounded globally (TRANSPORT_BUDGET_WHY).
     run_announced = False
     try:
-        with handler_slots(op):
-            timing.slot_wait_s = time.monotonic() - slot_ready
-            timing.intervals["slot_wait"] = {
-                "start_mono_ns": slot_start_ns, "end_mono_ns": time.monotonic_ns()}
-            live("run_started", timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
-            run_announced = True
-            t0 = time.monotonic()
-            run_start_ns = time.monotonic_ns()
-            if recorder is not None:
-                with recorder.recording():
+        # heavy: park holding NOTHING → admission → an ordinary step slot IN ADDITION (fixed lock order,
+        # lights never take admission → no cycle); the step slot prices the running heavy's CPU/RAM
+        with (gpu_admission.admission(op.op) if heavy else _null_permit()):
+            if heavy:
+                # measured BEFORE the step-slot acquire, so GPU contention stays attributable
+                live("heavy_slot_wait_ended",
+                     timings={"heavy_slot_wait_s": time.monotonic() - slot_ready},
+                     worker=worker_identity())
+            with handler_slots(op):
+                timing.slot_wait_s = time.monotonic() - slot_ready
+                timing.intervals["slot_wait"] = {
+                    "start_mono_ns": slot_start_ns, "end_mono_ns": time.monotonic_ns()}
+                live("run_started", timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
+                run_announced = True
+                t0 = time.monotonic()
+                run_start_ns = time.monotonic_ns()
+                if recorder is not None:
+                    with recorder.recording():
+                        timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
+                    timing.legs, timing.handler_intervals, placed = _collect_legs(recorder)
+                    if not placed:
+                        timing.incomplete_reasons.append("handler_leg_intervals_missing")
+                else:
                     timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
-                timing.legs, timing.handler_intervals, placed = _collect_legs(recorder)
-                if not placed:
-                    timing.incomplete_reasons.append("handler_leg_intervals_missing")
-            else:
-                timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
-                timing.incomplete_reasons.append("handler_recorder_missing")
+                    timing.incomplete_reasons.append("handler_recorder_missing")
     except BaseException as exc:
         # If the durable `step_started` append itself failed, do not try another append and mask the transport
         # refusal; work has not started, and main must stop before paid work can go silent.
         if run_announced:
             live("run_error", started=t0, exc=exc,
                  timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
+        elif heavy:
+            # a refused/timed-out admission must CLOSE the wait it announced, or the ledger reads a park
+            # that never ended as a park still going
+            live("heavy_slot_wait_error", started=slot_ready, exc=exc, worker=worker_identity())
         raise
     dt = time.monotonic() - t0
     timing.run_s = dt
