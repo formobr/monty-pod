@@ -47,6 +47,7 @@ A_TAIL, A_PRESYNC = "atail", "apresync"
 V_ACCENT_IN, V_ACCENTS = "vaccentin", "vaccents"
 V_LOGO = "vlogo"
 V_WATERMARK, A_WATERMARK = "vwatermark", "awatermark"
+V_MASTER = "vmaster"
 
 
 @contextmanager
@@ -442,6 +443,10 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         # the composite mix is mapped straight through. The old path emits -an there and ships a
         # silent master; that divergence is deliberate, not inherited.
         vlink, alink = V_WATERMARK, (out_a or alink)
+
+    # Re-stamp AFTER every overlay stage: the merged graph can reset frame colour metadata downstream of the encoder's own context flags (check_master OFF-CONTRACT without this).
+    chains.append(f"[{vlink}]{_finalize._BT709_SET_PARAMS}[{V_MASTER}]")
+    vlink = V_MASTER
 
     t = f"{p.duration:.3f}"
     cmd = ["ffmpeg", "-y", "-hide_banner"]

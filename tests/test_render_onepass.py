@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -297,8 +299,12 @@ def _watermark(sting: int, idle: int, base: str, base_a: str = "atail") -> list[
 
 
 _CAPTIONS = '[%s]subtitles=/w/captions.ass:fontsdir=/w/fonts[vcaptions]'
-_MASTER_MAPS = ["vwatermark", "awatermark"]
+_MASTER_MAPS = ["vmaster", "awatermark"]
 _REF_MAPS = ["vpresync", "apresync"]
+
+
+def _bt709_stamp(base: str) -> list[str]:
+    return [f'[{base}]{finalize._BT709_SET_PARAMS}[vmaster]']
 
 
 def _drop_mograph(d):
@@ -352,7 +358,7 @@ def test_golden_everything_present() -> None:
     graph, cmd = op.assemble(_prepared(_spec()))
     assert graph.split(";") == (
         _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _ACCENT + _logo(3, "vaccents") + _watermark(4, 5, "vlogo"))
+        + _ACCENT + _logo(3, "vaccents") + _watermark(4, 5, "vlogo") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
     _ins, outs = _argv(cmd)
     assert [_maps(o[0]) for o in outs] == [_MASTER_MAPS, _REF_MAPS]
@@ -362,7 +368,7 @@ def test_golden_no_mograph() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_drop_mograph), layers=()))
     assert graph.split(";") == (
         _COMPOSITE + [_CAPTIONS % "vcomposite"] + _fork("vcaptions")
-        + _ACCENT + _logo(2, "vaccents") + _watermark(3, 4, "vlogo"))
+        + _ACCENT + _logo(2, "vaccents") + _watermark(3, 4, "vlogo") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
@@ -370,7 +376,7 @@ def test_golden_no_captions() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_drop_captions), ass=None, font_dir=None))
     assert graph.split(";") == (
         _COMPOSITE + _mograph_chains(2) + _fork("vmograph")
-        + _ACCENT + _logo(3, "vaccents") + _watermark(4, 5, "vlogo"))
+        + _ACCENT + _logo(3, "vaccents") + _watermark(4, 5, "vlogo") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
@@ -378,7 +384,7 @@ def test_golden_no_accents_no_logo() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_drop_accents_and_logo)))
     assert graph.split(";") == (
         _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _watermark(3, 4, "vtail"))
+        + _watermark(3, 4, "vtail") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
@@ -386,10 +392,10 @@ def test_golden_no_watermark() -> None:
     graph, cmd = op.assemble(_prepared(_spec(_drop_watermark)))
     assert graph.split(";") == (
         _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _ACCENT + _logo(3, "vaccents"))
-    assert_connected(graph, ["vlogo", "atail"] + _REF_MAPS)
+        + _ACCENT + _logo(3, "vaccents") + _bt709_stamp("vlogo"))
+    assert_connected(graph, ["vmaster", "atail"] + _REF_MAPS)
     _ins, outs = _argv(cmd)
-    assert [_maps(o[0]) for o in outs] == [["vlogo", "atail"], _REF_MAPS]
+    assert [_maps(o[0]) for o in outs] == [["vmaster", "atail"], _REF_MAPS]
 
 
 def test_golden_no_music() -> None:
@@ -398,7 +404,7 @@ def test_golden_no_music() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_drop_music), audio=None, bed=None))
     assert graph.split(";") == (
         _COMPOSITE_NO_MUSIC + _mograph_chains(1) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _ACCENT + _logo(2, "vaccents") + _watermark(3, 4, "vlogo"))
+        + _ACCENT + _logo(2, "vaccents") + _watermark(3, 4, "vlogo") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
@@ -409,7 +415,7 @@ def test_golden_no_presync_output() -> None:
     assert graph.split(";") == (
         _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"]
         + ['[vcaptions]split=2[base_a0__acc][px_a0__acc]'] + _ACCENT[1:]
-        + _logo(3, "vaccents") + _watermark(4, 5, "vlogo", base_a="acomposite"))
+        + _logo(3, "vaccents") + _watermark(4, 5, "vlogo", base_a="acomposite") + _bt709_stamp("vwatermark"))
     assert "vpresync" not in graph and "asplit=2[atail]" not in graph
     assert_connected(graph, _MASTER_MAPS)
     _ins, outs = _argv(cmd)
@@ -424,7 +430,7 @@ def test_golden_film_burn_with_singles() -> None:
     assert graph.split(";") == (
         _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
         + _pixelate("vtail", "preburn__acc") + _burn_chains(3, "preburn__acc")
-        + _logo(4, "vaccents") + _watermark(5, 6, "vlogo"))
+        + _logo(4, "vaccents") + _watermark(5, 6, "vlogo") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
     ins, _outs = _argv(cmd)
     assert ins[3] == (("-stream_loop", "-1"), "/w/fx/burn.mp4")
@@ -434,7 +440,7 @@ def test_golden_film_burn_only() -> None:
     graph, _cmd = op.assemble(_prepared(_spec(_only_film_burn), flares=(0.3,)))
     assert graph.split(";") == (
         _COMPOSITE + _mograph_chains(2) + [_CAPTIONS % "vmograph"] + _fork("vcaptions")
-        + _burn_chains(3, "vtail") + _logo(4, "vaccents") + _watermark(5, 6, "vlogo"))
+        + _burn_chains(3, "vtail") + _logo(4, "vaccents") + _watermark(5, 6, "vlogo") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
 
 
@@ -549,11 +555,11 @@ def test_no_chime_still_maps_the_composite_audio() -> None:
     graph, cmd = op.assemble(_prepared(_spec(_no_chime)))
     _ins, outs = _argv(cmd)
     (master_opts, _m), (ref_opts, _r) = outs
-    assert _maps(master_opts) == ["vwatermark", "atail"]
+    assert _maps(master_opts) == ["vmaster", "atail"]
     assert _maps(ref_opts) == _REF_MAPS
     assert "-an" not in master_opts and "-an" not in ref_opts
     assert "chm__wmk" not in graph
-    assert_connected(graph, ["vwatermark", "atail"] + _REF_MAPS)
+    assert_connected(graph, ["vmaster", "atail"] + _REF_MAPS)
 
 
 def test_encode_shape_per_output_clause() -> None:
@@ -1105,3 +1111,46 @@ def test_run_failure_still_raises_with_the_stderr_tail(monkeypatch):
     monkeypatch.setattr(op.subprocess, "run", boom)
     with pytest.raises(RuntimeError, match="exited 1"):
         op._run(["ffmpeg"], 10.0)
+
+
+@pytest.mark.integration
+def test_real_onepass_master_survives_loudnorm_bt709_tagged(tmp_path: Path) -> None:
+    """Argv assertions miss a remux that drops container/stream colour tags — run the REAL encode
+    AND the real apply_loudnorm remux, then ffprobe the file actually delivered (check_master's own
+    read), not the pre-remux one."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000",
+        "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", str(source),
+    ], check=True)
+
+    spec = RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "colour-onepass", "slug": "colour-onepass", "mode": "final",
+        "inputs": [{"id": "source", "kind": "video", "sha256": SHA, "url": "unused"}],
+        "timeline": {"fps": 10, "width": 64, "height": 64,
+                     "segments": [{"src": "source", "in": 0.0, "out": 1.0, "speed": 1.0}]},
+        "overlays": {"finalize": {"loudnorm": {"i": -14.0, "tp": -1.0, "lra": 11.0}}},
+        "encode": {"video": "libx264", "preset": "medium", "cq": 14, "pix_fmt": "yuv420p",
+                    "audio": "aac", "audio_bitrate": "128k"},
+        "outputs": [{"id": "master", "kind": "master", "put_url": "unused"}],
+    })
+    p = op.prepare(spec, {"source": source}, tmp_path, gpu=False)
+    op.run_encode(p)
+    delivered = finalize.apply_loudnorm(spec.overlays.finalize, p.master_out, tmp_path / "fin_ln.mp4")
+    assert delivered != p.master_out, "loudnorm must have actually remuxed, or this proves nothing"
+
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=color_space,color_primaries,color_transfer",
+        "-of", "json", str(delivered),
+    ], check=True, capture_output=True, text=True)
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["color_space"] == "bt709"
+    assert stream["color_primaries"] == "bt709"
+    assert stream["color_transfer"] == "bt709"
