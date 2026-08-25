@@ -133,11 +133,12 @@ def _cpu_quota_cores() -> float | None:
 
 def usable_cores() -> int:
     """CPU cores this pod can actually schedule: min(affinity mask, cgroup quota). The broker admits offers
-    by ADVERTISED cores; this is the measured after-claim truth the box gates the lease on (min_cpu_cores)."""
+    by ADVERTISED cores; this is the measured after-claim truth the box gates the lease on (min_cpu_cores).
+    The quota ROUNDS (7.9 cores is an 8-core box): truncation would condemn healthy hosts on the box side."""
     cores = _host_threads()
     quota = _cpu_quota_cores()
     if quota is not None:
-        cores = min(cores, max(1, int(quota)))
+        cores = min(cores, max(1, round(quota)))
     return max(1, int(cores))
 
 

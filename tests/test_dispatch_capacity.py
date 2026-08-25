@@ -149,3 +149,12 @@ def test_usable_cores_without_a_quota_is_the_affinity_mask(monkeypatch):
     monkeypatch.setattr(icr, "_host_threads", lambda: 16)
     monkeypatch.setattr(icr, "_cpu_quota_cores", lambda: None)
     assert icr.usable_cores() == 16
+
+
+def test_a_nearly_whole_quota_rounds_up_not_down(monkeypatch):
+    """7.9 quota on an 8-core box is an 8-core box — truncation would get a healthy host condemned."""
+    from podagent import infer_cliprank as icr
+
+    monkeypatch.setattr(icr, "_host_threads", lambda: 8)
+    monkeypatch.setattr(icr, "_cpu_quota_cores", lambda: 7.9)
+    assert icr.usable_cores() == 8
