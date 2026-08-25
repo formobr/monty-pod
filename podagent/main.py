@@ -98,7 +98,8 @@ life, and nvidia-smi has no such query. So: a real total, and a named absence ra
 def capacity_payload(*, rank_lanes: int, fetch_workers: int,
                      vram_total_mb: float | None = None,
                      vulkan: bool = False,
-                     artifact_fetch_workers: int | None = None) -> dict[str, Any]:
+                     artifact_fetch_workers: int | None = None,
+                     usable_cores: int | None = None) -> dict[str, Any]:
     """Advertise diagnostics and bounded per-class credits (CAPACITY_VRAM_WHY). `fetch_workers` is the
     clip_rank tile pool; `artifact_fetch_workers` is the separate weights/bundle ranged-download pool."""
     payload: dict[str, Any] = {
@@ -116,6 +117,10 @@ def capacity_payload(*, rank_lanes: int, fetch_workers: int,
         payload["vram_total_mb"] = float(vram_total_mb)
     if artifact_fetch_workers is not None:
         payload["artifact_fetch_workers"] = int(artifact_fetch_workers)
+    if usable_cores is not None:
+        # affinity∧cgroup-quota truth the box gates the lease on (broker Constraints.min_cpu_cores) — the
+        # advertised offer cores were never measured off this machine
+        payload["usable_cores"] = int(usable_cores)
     return payload
 
 
@@ -948,11 +953,12 @@ def main() -> None:
     _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
     from .artifact import range_fetch_width
-    from .infer_cliprank import fetch_width, lane_width, vram_total_mb
+    from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
     rank_width = lane_width()
     capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width(),
                                 vram_total_mb=vram_total_mb(),
-                                artifact_fetch_workers=range_fetch_width())
+                                artifact_fetch_workers=range_fetch_width(),
+                                usable_cores=usable_cores())
     _capability_preflight(cp, capacity=capacity)
     # On reconnect the API resets credit. Replay the ACKed readiness verdict
     # together with capacity; this event is installed only after preflight.

@@ -113,6 +113,34 @@ def _host_threads() -> int:
     return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4)
 
 
+def _cpu_quota_cores() -> float | None:
+    """Cgroup CPU quota in cores, or None when unlimited/unreadable — a co-tenant box can hand us the host's
+    full affinity mask while cpu.max caps the actual cycles, so affinity alone overstates what we can use."""
+    try:
+        raw = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="ascii").split()  # v2: "<quota|max> <period>"
+        if len(raw) == 2 and raw[0] != "max":
+            quota, period = float(raw[0]), float(raw[1])
+            return quota / period if quota > 0 and period > 0 else None
+    except (OSError, ValueError):
+        pass
+    try:  # v1 fallback
+        quota = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text(encoding="ascii"))
+        period = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text(encoding="ascii"))
+        return quota / period if quota > 0 and period > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def usable_cores() -> int:
+    """CPU cores this pod can actually schedule: min(affinity mask, cgroup quota). The broker admits offers
+    by ADVERTISED cores; this is the measured after-claim truth the box gates the lease on (min_cpu_cores)."""
+    cores = _host_threads()
+    quota = _cpu_quota_cores()
+    if quota is not None:
+        cores = min(cores, max(1, int(quota)))
+    return max(1, int(cores))
+
+
 def _width_from(free_mb: float | None, threads: int, env_raw: str | None) -> tuple[int, str]:
     """The lane width and the sentence that explains it (LANE_SIZING_WHY). Pure — readings are injected."""
     if env_raw:

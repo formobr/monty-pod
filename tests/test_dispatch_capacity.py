@@ -119,3 +119,33 @@ def test_existing_callers_that_never_pass_vram_are_unaffected():
     capacity = agent_main.capacity_payload(rank_lanes=3, fetch_workers=7)
     assert "vram_total_mb" not in capacity and "vram_peak_used_mb" not in capacity
     assert capacity["vulkan"] is False
+
+
+# ── usable_cores: the measured after-claim truth the box gates the lease on ────────────────────────
+
+def test_capacity_declares_measured_usable_cores():
+    """NEGATIVE (pre-change the payload had no CPU fact at all): the box-side min_cpu_cores gate reads it."""
+    capacity = agent_main.capacity_payload(rank_lanes=1, fetch_workers=1, usable_cores=6)
+    assert capacity["usable_cores"] == 6
+
+
+def test_capacity_without_a_cores_reading_publishes_no_zero():
+    capacity = agent_main.capacity_payload(rank_lanes=1, fetch_workers=1)
+    assert "usable_cores" not in capacity
+
+
+def test_usable_cores_is_the_affinity_mask_capped_by_the_cgroup_quota(monkeypatch):
+    """A co-tenant box hands out the host's full mask while cpu.max caps the cycles — quota must win."""
+    from podagent import infer_cliprank as icr
+
+    monkeypatch.setattr(icr, "_host_threads", lambda: 16)
+    monkeypatch.setattr(icr, "_cpu_quota_cores", lambda: 2.0)
+    assert icr.usable_cores() == 2
+
+
+def test_usable_cores_without_a_quota_is_the_affinity_mask(monkeypatch):
+    from podagent import infer_cliprank as icr
+
+    monkeypatch.setattr(icr, "_host_threads", lambda: 16)
+    monkeypatch.setattr(icr, "_cpu_quota_cores", lambda: None)
+    assert icr.usable_cores() == 16
