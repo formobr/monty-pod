@@ -38,6 +38,39 @@ from . import gpu_admission, inputcache, pack, registry, resultcache
 
 MAX_PARALLEL_ENV = "OPS_MAX_PARALLEL"
 
+# Only a handler call outliving this many seconds ever ticks (RUN_SILENCE_WHY) — tunable so a test can shrink it.
+_RUN_HEARTBEAT_S: Final = float(os.environ.get("POD_RUN_HEARTBEAT_S") or 30.0)
+
+RUN_SILENCE_WHY = """
+A CLAIMED LANE THAT SAYS NOTHING IS NOT DISTINGUISHABLE FROM A DEAD ONE.
+
+Incident 2026-08-25, run c7cf9947, job img8009c-3: `cut.apply` announced `run_started` and then said nothing
+for the rest of the render — not a step_finished, not a run_error, nothing — while the box's own 600s ceiling
+for this op ran out, declared the chain lost, and failed the run with no retry (this op's budget sits above
+`_OPS_RETRY_MAX_BUDGET_S`). The provisioner's own telemetry showed the pod alive and still holding the claim
+the whole time. Every exception path in this file was already sound — `run_error`/`bind_error`/`upload_error`
+all fire before the exception leaves this function — so the silence was not a swallowed raise. It was the
+designed shape of a SUCCEEDING (or still-working) call: `live()` fires once at `run_started` and once more at
+`step_finished`, and nothing between them by construction, so a step legitimately mid-encode and a step whose
+process died look byte-for-byte identical to the box for the whole handler call.
+
+A heartbeat beside the call (never inside it — the handler thread is not touched, exactly as
+`patience._narrate` beats beside a subprocess rather than polling it) turns that identical shape into two
+different ones: a live handler ticks, a dead one does not. It does not change what the box DOES about a slow
+op — `op_backend.py`'s budget and retry policy are unchanged — it only removes the false choice between
+"assume dead" and "wait blind" that a pod which is neither erroring nor finishing forced on every reader of
+this incident.
+"""
+
+
+def _run_heartbeat(live: Any, t0: float, stop: threading.Event, tick: float) -> None:
+    """Beside the handler call, never inside it: a step whose handler blocks for minutes must still say it is
+    alive (RUN_SILENCE_WHY). `stop` is set in the caller's `finally`, so this thread never outlives the call
+    it is reporting on — a leaked heartbeat would itself become a second silent thing to explain."""
+    while not stop.wait(tick):
+        live("run_progress", timings={"elapsed_s": round(time.monotonic() - t0, 3)})
+
+
 # ── how wide the chain runs ──────────────────────────────────────────────────────────────────────
 #
 # A fan-out stage is ~51 independent `media.scale` steps, so the cap IS the wall clock: a flat 8 left
@@ -800,10 +833,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
             payload["error"] = safe_error(exc)
         emit(**payload)
 
-    # LIVE is deliberately one START boundary per waitable phase plus ONE success closure for the whole step.
-    # Each event is a durable outbox rewrite+fsync, so restoring every phase-finished event would make wide
-    # chains pay for noise. The single closure is not optional: without it, completed siblings and siblings
-    # hung in upload are indistinguishable until a terminal that a hung chain can never produce.
+    # One START boundary per waitable phase plus one closure — every event fsyncs, so per-phase-finished would
+    # tax wide chains — except the run phase, which also ticks while it runs (RUN_SILENCE_WHY below).
     live("bind_started")
     t_bind = time.monotonic()
     bind_start_ns = time.monotonic_ns()
@@ -854,15 +885,23 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
                 run_announced = True
                 t0 = time.monotonic()
                 run_start_ns = time.monotonic_ns()
-                if recorder is not None:
-                    with recorder.recording():
+                heartbeat_stop = threading.Event()
+                heartbeat = threading.Thread(
+                    target=_run_heartbeat, args=(live, t0, heartbeat_stop, _RUN_HEARTBEAT_S),
+                    daemon=True, name=f"heartbeat-{step.id}"[:63])
+                heartbeat.start()
+                try:
+                    if recorder is not None:
+                        with recorder.recording():
+                            timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
+                        timing.legs, timing.handler_intervals, placed = _collect_legs(recorder)
+                        if not placed:
+                            timing.incomplete_reasons.append("handler_leg_intervals_missing")
+                    else:
                         timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
-                    timing.legs, timing.handler_intervals, placed = _collect_legs(recorder)
-                    if not placed:
-                        timing.incomplete_reasons.append("handler_leg_intervals_missing")
-                else:
-                    timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
-                    timing.incomplete_reasons.append("handler_recorder_missing")
+                        timing.incomplete_reasons.append("handler_recorder_missing")
+                finally:
+                    heartbeat_stop.set()  # SET before waiting: a single tick left in flight is fine, a leaked thread is not
     except BaseException as exc:
         # If the durable `step_started` append itself failed, do not try another append and mask the transport
         # refusal; work has not started, and main must stop before paid work can go silent.

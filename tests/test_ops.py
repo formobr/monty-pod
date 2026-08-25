@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -349,6 +350,42 @@ def test_a_missing_optional_output_is_allowed_and_a_missing_required_one_is_not(
     monkeypatch.setattr(runner.pack, "resolve", lambda h: (lambda **kw: None))
     with pytest.raises(runner.ChainError, match=required):
         runner._run_step(step, runner.Workspace(tmp_path / "second"), {})
+
+
+def test_a_slow_handler_ticks_before_it_finishes_a_fast_one_stays_silent(tmp_path, monkeypatch):
+    """RUN_SILENCE_WHY. NEGATIVE: drop the heartbeat thread and a slow handler reports no `run_progress`."""
+    from podagent.ops import runner
+
+    op = next(o for o in registry.all_ops().values() if any(not p.optional for p in o.outputs))
+    required = next(p.id for p in op.outputs if not p.optional)
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"x")
+    step = type("S", (), {
+        "id": "s", "op": op.op, "params": {}, "needs": [],
+        "inputs": [type("B", (), {"port": p.id, "url": None, "from_step": None, "path": str(src)})()
+                   for p in op.inputs],
+        "outputs": [type("B", (), {"port": required, "url": None, "urls": None})()]})()
+    monkeypatch.setattr(runner.registry, "validate_params", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_RUN_HEARTBEAT_S", 0.02)
+
+    def _slow(*, params, inputs, outputs):
+        time.sleep(0.12)
+        outputs[required].write_text("{}")
+
+    events: list[dict] = []
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _slow)
+    runner._run_step(step, runner.Workspace(tmp_path / "slow"), {}, emit=lambda **kw: events.append(kw))
+    ticks = [e for e in events if e.get("phase") == "run_progress"]
+    assert ticks, f"a 0.12s handler over a 0.02s tick must beat at least once, got {events}"
+    assert events[-1]["phase"] == "step_finished"  # the heartbeat must not outlive the call it reports on
+
+    def _fast(*, params, inputs, outputs):
+        outputs[required].write_text("{}")
+
+    events.clear()
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _fast)
+    runner._run_step(step, runner.Workspace(tmp_path / "fast"), {}, emit=lambda **kw: events.append(kw))
+    assert not [e for e in events if e.get("phase") == "run_progress"]  # faster than a tick stays quiet
 
 
 # ── one keep-list, two renders, one timeline ─────────────────────────────────────────────────────
