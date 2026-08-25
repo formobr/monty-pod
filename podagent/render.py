@@ -6,6 +6,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -334,11 +335,18 @@ def _measure_loudnorm(voice: Path, pre: str) -> str:
     out = res.stderr
     try:
         d = json.loads(out[out.rindex("{"):out.rindex("}") + 1])
-        return (f"{vln}:measured_I={d['input_i']}:measured_TP={d['input_tp']}"
-                f":measured_LRA={d['input_lra']}:measured_thresh={d['input_thresh']}"
-                f":offset={d['target_offset']}:linear=true")
+        i, tp, lra = float(d["input_i"]), float(d["input_tp"]), float(d["input_lra"])
     except (ValueError, KeyError):
         return vln
+    # ffmpeg's loudnorm itself refuses a non-finite measured_I deep inside the merged body filtergraph — catch it here, named, before that opaque crash.
+    if not (math.isfinite(i) and math.isfinite(tp) and math.isfinite(lra)):
+        raise RuntimeError(
+            f"voice measure: {voice} carries no signal across its measured span "
+            f"(input_i={d['input_i']!r} input_tp={d['input_tp']!r} input_lra={d['input_lra']!r}) — "
+            f"refusing to feed a non-finite measured_I into the body loudnorm filter")
+    return (f"{vln}:measured_I={d['input_i']}:measured_TP={d['input_tp']}"
+            f":measured_LRA={d['input_lra']}:measured_thresh={d['input_thresh']}"
+            f":offset={d['target_offset']}:linear=true")
 
 
 def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
@@ -635,7 +643,13 @@ def _download_inputs(inputs, tmp: Path) -> dict[str, Path]:
             done, pending = cf.wait(pending, timeout=min(_DL_TICK_S, left),
                                     return_when=cf.FIRST_COMPLETED)
             for f in done:
-                got[futs[f]] = f.result(timeout=0)  # a failed transfer re-raises HERE: first fault wins
+                iid = futs[f]
+                path = f.result(timeout=0)  # a failed transfer re-raises HERE: first fault wins
+                # a 200/206 that streamed zero bytes is not a transfer failure `download()` can see — the input is silently empty rather than silently missing.
+                if path.stat().st_size == 0:
+                    raise RuntimeError(f"download: input {iid!r} arrived at 0 bytes ({path}) — refusing an "
+                                       f"empty object rather than letting it become silence downstream")
+                got[iid] = path
             if pending:
                 print(f"[render] download: {len(got)}/{len(futs)} in hand, {len(pending)} still out, "
                       f"{max(0.0, stop - time.monotonic()):.0f}s of patience left",

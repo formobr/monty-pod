@@ -80,7 +80,7 @@ def test_no_overlays_means_no_pool_at_all(monkeypatch, tmp_path) -> None:
 
 def test_downloads_map_by_spec_order_not_completion_order(monkeypatch, tmp_path) -> None:
     spec = t._spec()
-    monkeypatch.setattr(render, "download", lambda _url, dest: dest)
+    monkeypatch.setattr(render, "download", lambda _url, dest: (dest.write_bytes(b"m"), dest)[1])
     got = render._download_inputs(spec.inputs, tmp_path)
     assert list(got) == [i.id for i in spec.inputs]
     assert got["base"] == tmp_path / "base"
@@ -93,9 +93,25 @@ def test_one_failed_download_fails_the_render_loud(monkeypatch, tmp_path) -> Non
     def dl(url, dest):
         if url.endswith("bed.mp3"):
             raise RuntimeError("transfer died")
+        dest.write_bytes(b"m")
         return dest
     monkeypatch.setattr(render, "download", dl)
     with pytest.raises(RuntimeError, match="transfer died"):
+        render._download_inputs(spec.inputs, tmp_path)
+
+
+def test_a_zero_byte_download_refuses_instead_of_becoming_silence(monkeypatch, tmp_path) -> None:
+    """A 200/206 that streamed zero bytes is not a transfer failure `download()` itself can see — an
+    empty music (or any) object must fail loudly here, not ride downstream as a silent asset."""
+    def dl(url, dest):
+        if url.endswith("bed.mp3"):
+            dest.write_bytes(b"")
+            return dest
+        dest.write_bytes(b"m")
+        return dest
+    monkeypatch.setattr(render, "download", dl)
+    spec = t._spec()
+    with pytest.raises(RuntimeError, match="0 bytes"):
         render._download_inputs(spec.inputs, tmp_path)
 
 

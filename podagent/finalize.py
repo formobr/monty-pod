@@ -210,6 +210,13 @@ def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> t
     in_i = float(mv["input_i"])
     if attenuate_only and in_i <= target:
         return None, f"hot source, {in_i} LUFS <= target — shipped clean, no boost (crackle guard)"
+    in_tp, in_lra = float(mv["input_tp"]), float(mv["input_lra"])
+    # a non-finite measured_I is bit-exact silence across the whole master, not a quiet one — ffmpeg's loudnorm refuses it anyway, so name it here instead of the caller's generic "couldn't apply" fallback.
+    if not (math.isfinite(in_i) and math.isfinite(in_tp) and math.isfinite(in_lra)):
+        raise RuntimeError(
+            f"master measure: no signal across the delivered master's measured span "
+            f"(input_i={mv['input_i']!r} input_tp={mv['input_tp']!r} input_lra={mv['input_lra']!r}) — "
+            f"refusing to feed a non-finite measured_I into the delivery loudnorm filter")
     af = (f"loudnorm=I={target}:TP={tp_aim}:LRA=11:linear=true:measured_I={mv['input_i']}"
           f":measured_TP={mv['input_tp']}:measured_LRA={mv['input_lra']}:measured_thresh={mv['input_thresh']}")
     verb = "attenuate" if in_i > target else "normalize"
