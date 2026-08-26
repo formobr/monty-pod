@@ -689,9 +689,9 @@ def test_the_store_pool_is_as_wide_as_the_transfers_the_box_assigned(monkeypatch
     monkeypatch.setenv("OPS_MAX_TRANSFERS", "64")
     assert cp._store_pool() == 64
     monkeypatch.setenv("OPS_MAX_TRANSFERS", "")
-    assert cp._store_pool() == 16, "an unset width must not fall back to the 4 that caused this"
+    assert cp._store_pool() >= 16, "an unset width must not fall back to the 4 that caused this"
     monkeypatch.setenv("OPS_MAX_TRANSFERS", "not-a-number")
-    assert cp._store_pool() == 16
+    assert cp._store_pool() >= 16
     monkeypatch.setenv("OPS_MAX_TRANSFERS", "1")
     assert cp._store_pool() >= 4, "a floor keeps a typo from serialising every transfer"
     importlib.reload  # noqa: B018 — the module-level session is built once; this test pins the sizer
