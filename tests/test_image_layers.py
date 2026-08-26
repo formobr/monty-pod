@@ -101,3 +101,17 @@ def test_ffmpeg_is_pinned_and_not_the_rolling_master():
     assert re.search(r"-gpl-\d+\.\d+\.tar\.xz$", asset.group(1)), (
         f"FFMPEG_ASSET {asset.group(1)!r} is not a release-branch build (…-gpl-<n.n>.tar.xz) — only the "
         "release branches were verified to open h264_nvenc on the fleet's driver")
+
+
+def test_ffmpeg_is_not_the_build_whose_acrossfade_drops_the_first_input():
+    """NEGATIVE: n7.1.5-16-g9a4bb2c579's acrossfade silently discards most of the first operand on a
+    long+short join — exactly cut_audio.py's left-folded shape — and shipped for months because host
+    ffmpeg (a different, correct build) always passed local repro. See docs/POD_RUNBOOK.md."""
+    text = "\n".join(ln for ln in DOCKERFILE.read_text().splitlines() if not ln.strip().startswith("#"))
+    assert "n7.1.5-16-g9a4bb2c579" not in text, (
+        "this exact BtbN build's acrossfade drops the first operand on a long/short join")
+    asset = re.search(r"ARG FFMPEG_ASSET=(\S+)", text)
+    assert asset.group(1) == "ffmpeg-n6.1.3-linux64-gpl-6.1.tar.xz", (
+        f"FFMPEG_ASSET moved to {asset.group(1)!r} — re-run the acrossfade isolation (long+short join, "
+        "3x) against the built image before repinning, and update scripts/broker/pod_ffmpeg_pin.py "
+        "(engine repo) to match")

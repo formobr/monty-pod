@@ -98,9 +98,18 @@ ENV REMOTION_BUNDLE_CACHE=/var/cache/monty/remotion
 
 # --- ffmpeg: BtbN static build (NVENC + libplacebo, not in ubuntu22.04 apt) -
 # n8.x libplacebo expression graphs hang forever (measured, 3-keyframe repro).
-ARG FFMPEG_BUILD=autobuild-2026-08-15-13-02
-# The n7.1 `latest` tag is BtbN's stable branch and is never rotated away.
-ARG FFMPEG_ASSET=ffmpeg-n7.1.5-16-g9a4bb2c579-linux64-gpl-7.1.tar.xz
+# PINNED TO THE n6.1 LINE, NOT NEWEST: n7.1.5-16-g9a4bb2c579 (the prior pin) silently DISCARDS most of the
+# first operand in `acrossfade` when that input is much longer than the second — exactly the shape
+# cut_audio.py's left-folded join produces every time, and exactly why every production montage for months
+# lost its closing ~24s while every local repro (host ffmpeg 6.1.1-3ubuntu5) passed. Isolated, reproduced 3x
+# each: host 6.1.1 and this BtbN n6.1.3 build both hold the full acrossfade join at 17.770000s three times;
+# n7.1.5-16 collapses it to 0.78-1.38s. Matching the HOST's 6.1.x line (not chasing the newest BtbN branch)
+# is the point — `same-tool-same-version-everywhere` (memory) — and `scripts/broker/pod_ffmpeg_pin.py` +
+# `fleet_doctor` gate this exact identity so a future repin that reintroduces the regression is a refusal,
+# not a silent loss. Re-verify NVENC against a real rented host before ever moving this pin again
+# (docs/POD_RUNBOOK.md `v0.9.0` incident) — this fix only proves the acrossfade/CPU filter path.
+ARG FFMPEG_BUILD=autobuild-2025-08-31-13-00
+ARG FFMPEG_ASSET=ffmpeg-n6.1.3-linux64-gpl-6.1.tar.xz
 # `/releases/download/<tag>/`, NOT `/releases/latest/download/`: the second means "the newest release",
 # which on any day BtbN cuts a dated autobuild carries only version-stamped asset names — the URL 404s, curl
 # without --fail writes the error page, and tar dies with "File format not recognized" three lines later.
