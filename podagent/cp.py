@@ -138,7 +138,9 @@ def _store_pool() -> int:
     try:
         return max(4, int(raw))
     except ValueError:
-        return _transport_cap_fallback()
+        # floor at the historic 16: a pool wider than the box's transfer budget is idle sockets, a
+        # narrower one is the churn engine STORE_POOL_WHY documents — measured red on a 2-core CI runner
+        return max(16, _transport_cap_fallback())
 
 
 _store = requests.Session()
