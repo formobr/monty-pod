@@ -3,6 +3,7 @@ via presigned URLs. Auth = the single job token from the environment; no other c
 on this machine."""
 from __future__ import annotations
 
+import concurrent.futures as cf
 import os
 import shutil
 import sys
@@ -35,6 +36,25 @@ _XFER_ATTEMPTS = 3
 # a generous round-up over that floor, leaves room for all 3 attempts inside a render lease, and cuts a
 # dripping origin off well before the ops timeout would.
 _XFER_DEADLINE_S = 300.0
+
+# The cap is per-STREAM: this pod's aggregate throughput across concurrent transfers is far higher than
+# one stream's, so parallel ranged GETs scale where a single GET can't (matches artifact.py's own floor).
+_RANGE_THRESHOLD_BYTES = 64 << 20
+_RANGE_MIN_PART_BYTES = 32 << 20
+_RANGE_CHUNK = 8 << 20
+_RANGE_WORKERS_ENV = "OPS_RANGE_WORKERS"
+_RANGE_WORKERS_DEFAULT = 6
+# The shared `_store` pool is sized for OPS_MAX_TRANSFERS top-level transfers (STORE_POOL_WHY), not
+# transfers x ranged fan-out; capping here keeps one download's fan-out from reproducing that churn.
+_RANGE_WORKERS_POOL_CAP = 4
+# Each part gets its own retry against the SAME pinned ETag before the whole ranged attempt fails.
+_RANGE_PART_ATTEMPTS = 2
+# ONE wall for the whole ranged attempt, not per-part — a wait with no deadline is a swallowed error.
+_RANGE_DEADLINE_FLOOR_S = 120.0
+_RANGE_DEADLINE_BYTES_PER_S = 1 << 20
+_RANGE_TICK_S = 5.0
+# Bounded by the per-read `_TIMEOUT`, the worst a worker can go unresponsive to `abort`, plus unwind slack.
+_RANGE_DRAIN_GRACE_S = _TIMEOUT + 5.0
 
 # The object store is a DIFFERENT host with DIFFERENT auth (each presigned url carries its own signature),
 # so it gets its own keep-alive session — the CP's Bearer token must never travel to a third party. No
@@ -273,6 +293,174 @@ def _resume_range(headers: Any, have: int, pinned_total: int | None) -> tuple[in
     return start, end, total
 
 
+def _range_workers() -> int:
+    raw = (os.environ.get(_RANGE_WORKERS_ENV) or "").strip()
+    try:
+        return max(1, int(raw)) if raw else _RANGE_WORKERS_DEFAULT
+    except ValueError:
+        return _RANGE_WORKERS_DEFAULT
+
+
+def _range_probe(url: str) -> tuple[int, str] | None:
+    """A 206 to `Range: bytes=0-1` carrying a Content-Range total AND a non-empty ETag proves the origin
+    honors ranges and hands us an identity to pin; anything else is None (download() falls back unchanged)."""
+    try:
+        resp = _store.get(url, headers={"Range": "bytes=0-1"}, stream=True, timeout=_TIMEOUT)
+    except requests.RequestException:
+        return None
+    with resp:
+        if resp.status_code != 206:
+            return None
+        etag = resp.headers.get("ETag")
+        cr = resp.headers.get("Content-Range")
+        if not etag or not cr:
+            return None
+        try:
+            total = int(cr.rsplit("/", 1)[-1])
+        except ValueError:
+            return None
+        if total <= 0:
+            return None
+        for _ in resp.iter_content(_RANGE_CHUNK):
+            pass  # drain the tiny probe body so the connection returns to the pool clean
+        return total, etag
+
+
+def _range_bounds(total: int, width: int) -> list[tuple[int, int]]:
+    part = -(-total // width)
+    return [(i * part, min((i + 1) * part, total) - 1) for i in range(width) if i * part < total]
+
+
+def _ranged_deadline(total: int) -> float:
+    """Never past the single-stream per-attempt lease ceiling (`_XFER_DEADLINE_S`) — a ranged attempt is
+    still ONE attempt of the same rented-time budget."""
+    return min(_XFER_DEADLINE_S, max(_RANGE_DEADLINE_FLOOR_S, total / _RANGE_DEADLINE_BYTES_PER_S))
+
+
+def _ranged_worker(url: str, temp: Path, start: int, end: int, total: int, etag: str,
+                   abort: threading.Event) -> int:
+    """One range into `temp` at its own offset, retried against the SAME pinned ETag. A 200, a drifted
+    ETag, a mismatched Content-Range or a short body all abort this part; returns bytes actually WRITTEN —
+    never the probed total (that's the artifact.py bug this must not repeat)."""
+    expected = end - start + 1
+    for part_attempt in range(_RANGE_PART_ATTEMPTS):
+        if abort.is_set():
+            return 0
+        try:
+            with _store.get(url, headers={"Range": f"bytes={start}-{end}", "If-Range": etag},
+                            stream=True, timeout=_TIMEOUT) as resp:
+                if resp.status_code != 206:
+                    raise _RestartRequired(
+                        f"ranged part {start}-{end}: expected 206, got {resp.status_code} — the If-Range "
+                        f"pin fell back to a full body (object replaced mid-fetch)")
+                if resp.headers.get("Content-Encoding"):
+                    # a Range offset addresses the DECODED stream; a transcoded part can't honour that
+                    # (mirrors the single-stream resume guard).
+                    raise _RestartRequired(f"ranged part {start}-{end}: Content-Encoding present — cannot "
+                                           f"trust a transcoded ranged part")
+                got_etag = resp.headers.get("ETag")
+                if got_etag != etag:
+                    raise _RestartRequired(
+                        f"ranged part {start}-{end}: ETag drift ({etag!r} -> {got_etag!r})")
+                cr = resp.headers.get("Content-Range")
+                expect_cr = f"bytes {start}-{end}/{total}"
+                if cr != expect_cr:
+                    raise _RestartRequired(
+                        f"ranged part {start}-{end}: Content-Range {cr!r} != expected {expect_cr!r}")
+                got = 0
+                with temp.open("r+b") as fh:
+                    fh.seek(start)
+                    for chunk in resp.iter_content(_RANGE_CHUNK):
+                        if abort.is_set():
+                            return 0
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        got += len(chunk)
+                if abort.is_set():
+                    return 0
+                if got != expected:
+                    raise ShortBody(f"ranged part {start}-{end}: delivered {got} of {expected} bytes")
+                return got
+        except requests.RequestException:
+            if part_attempt + 1 == _RANGE_PART_ATTEMPTS:
+                raise
+    raise RuntimeError("unreachable: ranged worker loop exited without returning or raising")
+
+
+def _drain_ranged(pending: set, stop: float) -> None:
+    """Wait for RUNNING ranged workers to actually stop before the caller deletes the temp file they may
+    still hold open — never a teardown under a still-writing thread."""
+    while pending:
+        left = stop - time.monotonic()
+        if left <= 0:
+            _log(f"download: ranged drain timed out with {len(pending)} worker(s) still unlanded after abort")
+            return
+        done, pending = cf.wait(pending, timeout=min(_RANGE_TICK_S, left), return_when=cf.FIRST_COMPLETED)
+        for f in done:
+            f.exception(timeout=0)  # observed, deliberately dropped: the first fault already won
+
+
+def _download_ranged(url: str, dest: Path, total: int, etag: str) -> int:
+    """N parallel ranged GETs pinned to `etag`, assembled in a temp UNIQUE to this call (pid+thread) — never
+    `dest`, and never shared with a concurrent download() racing the SAME `dest` (ops/runner.py sanctions
+    that). Renamed onto `dest` only once every worker's own byte count sums to `total`; returns the width."""
+    width = min(_range_workers(), _RANGE_WORKERS_POOL_CAP, max(1, total // _RANGE_MIN_PART_BYTES))
+    bounds = _range_bounds(total, width)
+    temp = dest.with_name(f"{dest.name}.{os.getpid()}.{threading.get_ident()}.ranged-part")
+    temp.unlink(missing_ok=True)
+    try:
+        with temp.open("wb") as fh:
+            fh.truncate(total)
+        abort = threading.Event()
+        deadline_s = _ranged_deadline(total)
+        stop = time.monotonic() + deadline_s
+        moved_total = 0
+        ex = cf.ThreadPoolExecutor(max_workers=len(bounds), thread_name_prefix="cp-range")
+        try:
+            futs = {ex.submit(_ranged_worker, url, temp, start, end, total, etag, abort): (start, end)
+                    for start, end in bounds}
+            pending = set(futs)
+            while pending:
+                left = stop - time.monotonic()
+                if left <= 0:
+                    abort.set()
+                    for f in pending:
+                        f.cancel()
+                    _drain_ranged({f for f in pending if not f.cancelled()},
+                                 time.monotonic() + _RANGE_DRAIN_GRACE_S)
+                    raise TransferTimeout(
+                        f"ranged download stalled: aborted after {deadline_s:.0f}s aggregate wall with "
+                        f"{moved_total} of {total} bytes accounted for")
+                done, pending = cf.wait(pending, timeout=min(_RANGE_TICK_S, left),
+                                        return_when=cf.FIRST_EXCEPTION)
+                failure = None
+                for f in done:
+                    exc = f.exception(timeout=0)
+                    if exc is not None:
+                        failure = exc
+                        break
+                    moved_total += f.result(timeout=0)
+                if failure is not None:
+                    abort.set()
+                    for other in pending:
+                        other.cancel()
+                    _drain_ranged({f for f in pending if not f.cancelled()},
+                                 time.monotonic() + _RANGE_DRAIN_GRACE_S)
+                    raise failure
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        # NOT `temp.stat().st_size != total`: pre-truncate makes that tautological. This sums what each
+        # worker's OWN `got == expected` check already verified it wrote — the meaningful guard.
+        if moved_total != total:
+            raise ShortBody(f"ranged download: workers moved {moved_total} of {total} bytes")
+        temp.replace(dest)
+        return len(bounds)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+
 def download(url: str, dest: Path) -> Path:
     """Presigned GET → file, streamed, 3 attempts, RESUMING via Range (file:// copies locally). A raise
     unwinds the whole step chain, so a dropped connection costs the remaining bytes, never the job. A byte
@@ -283,12 +471,33 @@ def download(url: str, dest: Path) -> Path:
     if local is not None:
         shutil.copyfile(local, dest)
         return dest
+    t0 = time.monotonic()
     pinned_total: int | None = None
     pinned_etag: str | None = None
     etag_warned = False
     for attempt in range(_XFER_ATTEMPTS):
         # attempt 0 always truncates: only bytes THIS call wrote are known to belong to this object.
         have = dest.stat().st_size if attempt and dest.exists() else 0
+        if attempt == 0:
+            probe = _range_probe(url)
+            if probe is not None and probe[0] >= _RANGE_THRESHOLD_BYTES:
+                total, etag = probe
+                try:
+                    width = _download_ranged(url, dest, total, etag)
+                except Exception as exc:  # noqa: BLE001 - ANY ranged failure degrades to the proven path
+                    _log(f"download: ranged attempt failed ({safe_error(exc)}) — falling back to "
+                         f"single-stream from a fresh attempt")
+                    if _XFER_ATTEMPTS <= 1:
+                        raise
+                    pinned_total, pinned_etag = total, etag
+                    dest.unlink(missing_ok=True)  # "attempt 0 always truncates" must hold for this path too
+                    time.sleep(2**attempt)
+                    continue
+                else:
+                    dt = max(time.monotonic() - t0, 1e-6)
+                    _log(f"download: mode=ranged ({width}x parts) {total / 1e6:.1f} MB in "
+                         f"{dt:.1f}s ({total / 1e6 / dt:.1f} MB/s)")
+                    return dest
         headers: dict[str, str] = {"Range": f"bytes={have}-"} if have else {}
         if have and pinned_etag:
             headers["If-Range"] = pinned_etag
@@ -361,6 +570,9 @@ def download(url: str, dest: Path) -> Path:
                             f"transport error) — deleting so the next attempt starts clean")
             have_now = dest.stat().st_size if dest.exists() else 0
             if pinned_total is None or have_now >= pinned_total:
+                dt = max(time.monotonic() - t0, 1e-6)
+                _log(f"download: mode=single-stream {have_now / 1e6:.1f} MB in {dt:.1f}s "
+                     f"({have_now / 1e6 / dt:.1f} MB/s)")
                 return dest
             # pinned_total known but not yet reached: a range-capping origin answered a shorter span than
             # asked for, or this attempt only made partial progress — resume from the new `have` next time.
@@ -378,6 +590,8 @@ def download(url: str, dest: Path) -> Path:
     if pinned_total is not None and final < pinned_total:
         dest.unlink(missing_ok=True)
         raise ShortBody(f"download: attempts exhausted with {final}/{pinned_total} bytes on disk")
+    dt = max(time.monotonic() - t0, 1e-6)
+    _log(f"download: mode=single-stream {final / 1e6:.1f} MB in {dt:.1f}s ({final / 1e6 / dt:.1f} MB/s)")
     return dest
 
 
