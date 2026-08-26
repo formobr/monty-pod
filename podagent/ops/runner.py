@@ -175,6 +175,7 @@ def parallel_cap() -> tuple[int, str]:
 _slots: threading.Semaphore | None = None
 _slots_lock = threading.Lock()
 _xfer: threading.Semaphore | None = None
+_uploader: cf.ThreadPoolExecutor | None = None
 
 
 def step_slots() -> threading.Semaphore:
@@ -213,6 +214,22 @@ def transport_slots() -> threading.Semaphore:
         return _xfer
 
 
+# Generous: `transport_slots()`, not this count, is the real budget a submitted put blocks on (PUT_DRAIN_WHY).
+_UPLOAD_POOL_MULTIPLIER = 4
+_UPLOAD_POOL_FLOOR = 8
+
+
+def _uploader_pool() -> cf.ThreadPoolExecutor:
+    """The box-wide put queue every chain's drain enqueues onto (PUT_DRAIN_WHY) — one pool per process."""
+    global _uploader
+    with _slots_lock:
+        if _uploader is None:
+            cap = transport_cap()[0]
+            workers = max(_UPLOAD_POOL_FLOOR, cap * _UPLOAD_POOL_MULTIPLIER)
+            _uploader = cf.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ops-put-drain")
+        return _uploader
+
+
 def handler_slots(op: Any) -> threading.Semaphore:
     """The permit for the handler's actual work.
 
@@ -230,11 +247,14 @@ def executor_workers(step_cap: int, transfer_cap: int) -> int:
 
 
 def _reset_step_slots() -> None:
-    """Tests only: re-derive both budgets after monkeypatching the cap."""
-    global _slots, _xfer
+    """Tests only: re-derive every budget after monkeypatching the cap."""
+    global _slots, _xfer, _uploader
     with _slots_lock:
         _slots = None
         _xfer = None
+        if _uploader is not None:
+            _uploader.shutdown(wait=False)
+            _uploader = None
 
 
 @contextmanager
@@ -784,16 +804,208 @@ def _upload_outputs(step: Any, outputs: dict[str, Any]) -> tuple[float, float, l
     return max(waits), sum(retries), traces
 
 
+PUT_DRAIN_WHY = """
+A STEP'S OWN PUT WAS ON THE DAG'S CRITICAL PATH FOR A HAND-OFF THAT NEVER READS IT.
+
+Measured on a 145 s prod render: put legs summed to 73% of step time — `media.fetch`'s 61 single-port PUTs
+serialised end to end (PUT_FANOUT_WHY's fanout is INSIDE one step; a fetch step has one output, so the
+fanout inside it buys nothing) while every dependent step binds its input `from_step`, a workspace path
+lookup that never reads the object the PUT is addressing (models.OpBinding: "from_step ... Costs a path
+lookup"). The dependent was waiting on bytes it was structurally incapable of reading.
+
+SO A STEP RETURNS THE MOMENT COMPUTE IS DONE, and its PUTs go on a box-wide queue bounded by the SAME
+`transport_slots()` every bind/put already shares — no new budget, only a place to defer this one phase's
+wait out of the DAG's critical path. What still gates on it is the CHAIN's own terminal: a step's PUT can
+only ever be read by something OUTSIDE this chain (a deliverable, or a later job), so nothing INSIDE the
+chain may observe a step "done" before its PUT lands — only the chain's own close may, and it does
+(`_PutDrain.wait`, awaited before the terminal is built).
+
+THE ONE SHAPE THIS WOULD BREAK: a sibling step reading THIS step's output by `url` instead of `from_step`,
+inside the SAME chain — that read would then race the deferred PUT instead of finding it already landed.
+`_sibling_url_readers` checks every chain for exactly that address collision and pins the producing step's
+PUT back to the synchronous, pre-drain shape when it is found (none exist in this pod's own job-building
+today — every same-chain hand-off in the wild uses `from_step` — but the runner does not get to assume it).
+
+A DEFERRED PUT MAY NOT SPEND THE CHAIN'S OWN COMPUTE TIME OUT OF ITS BUDGET. `wait()`/`settle()` each open
+their deadline window at THEIR OWN entry, never at chain construction — a long chain's DAG work must not
+eat the seconds a genuinely-hung upload is judged against, and the `finally`-path join gets its OWN window
+rather than whatever `wait()` already spent, because a compute failure that never reached `wait()` must
+still bound how long teardown waits on someone else's PUT.
+
+A DEFERRED PUT MAY NOT TURN AN OPTIONAL STEP'S FAILURE INTO THE WHOLE CHAIN'S. The sync scheduling loop
+already tolerates a `media.fetch` fan-out arm whose candidate host 403s ("a 403 from one candidate's host
+must not discard the twelve siblings that were fetching fine"); a failed PUT is the same kind of arm,
+discovered later, so `wait()` RETURNS an optional step's failure instead of raising it — only a REQUIRED
+step's failed or hung PUT still kills the chain.
+"""
+
+_PUT_DRAIN_DEADLINE_ENV = "OPS_PUT_DRAIN_DEADLINE_S"
+# Above the worst wall ONE stalled object costs alone (cp.py's per-attempt deadline x its attempts).
+_PUT_DRAIN_DEADLINE_DEFAULT_S: Final = 1200.0
+# Real wall time a hermetic test ever pays, however far an injected clock jumps between polls.
+_PUT_DRAIN_POLL_S: Final = 0.05
+
+
+def _put_drain_deadline_s() -> float:
+    raw = (os.environ.get(_PUT_DRAIN_DEADLINE_ENV) or "").strip()
+    if raw:
+        try:
+            if (n := float(raw)) > 0:
+                return n
+        except ValueError:
+            pass
+    return _PUT_DRAIN_DEADLINE_DEFAULT_S
+
+
+class _PutDrain:
+    """Every PUT one chain enqueued onto the box-wide uploader (PUT_DRAIN_WHY), tracked so the CHAIN's own
+    terminal — never a sibling step — waits for them. `deadline_s` is a WINDOW: `wait()`/`settle()` each
+    open their OWN, at their OWN entry, never shared (PUT_DRAIN_WHY); `clock` lets a test prove that."""
+
+    def __init__(self, pool: cf.ThreadPoolExecutor, deadline_s: float, *, clock: Any = time.monotonic) -> None:
+        self._pool = pool
+        self._clock = clock
+        self._deadline_s = deadline_s
+        self._lock = threading.Lock()
+        self._entries: list[tuple[str, bool, cf.Future]] = []
+        self._stuck: set[cf.Future] = set()   # futures a PRIOR window already gave up on (F1)
+
+    def enqueue(self, step_id: str, fn: Any, *, optional: bool = False) -> None:
+        fut = self._pool.submit(fn)
+        with self._lock:
+            self._entries.append((step_id, optional, fut))
+
+    def _snapshot(self) -> list[tuple[str, bool, cf.Future]]:
+        with self._lock:
+            return list(self._entries)
+
+    def _poll(self, *, skip_known_stuck: bool = False) -> dict[cf.Future, tuple[str, bool]]:
+        """Every future still outstanding after a fresh window opened HERE, in short slices so an injected
+        clock ends it without real sleep. `skip_known_stuck` never re-spends a window a PRIOR one already
+        gave up on — that would only re-prove the same thing, at the rented box's expense."""
+        entries = self._snapshot()
+        if skip_known_stuck:
+            with self._lock:
+                known = set(self._stuck)
+            entries = [(sid, optional, f) for sid, optional, f in entries if f not in known]
+        pending = {f: (sid, optional) for sid, optional, f in entries}
+        if not pending:
+            return pending
+        deadline = self._clock() + self._deadline_s
+        while pending:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            done, _ = cf.wait(list(pending), timeout=min(_PUT_DRAIN_POLL_S, remaining))
+            for f in done:
+                pending.pop(f, None)
+        if pending:
+            with self._lock:
+                self._stuck.update(pending)
+        return pending
+
+    def settle(self) -> None:
+        """Best-effort join on its OWN window, never raises — the `finally` calls this on EVERY exit so a
+        workspace a future may still be reading is never removed under it. Skips what `wait()` already
+        gave up on (F1): that window is for work `wait()` never saw, not a second try at the same future."""
+        self._poll(skip_known_stuck=True)
+
+    def wait(self) -> list[tuple[str, BaseException]]:
+        """Block for every enqueued PUT, on THIS call's own window. A REQUIRED step's failed or hung PUT
+        raises (the original exception, or a ChainError naming it on timeout); an OPTIONAL step's failure
+        or timeout is returned as `(step_id, exception)` instead of raised (PUT_DRAIN_WHY)."""
+        entries = self._snapshot()
+        pending = self._poll()
+        stuck_required = sorted(sid for sid, optional in pending.values() if not optional)
+        if stuck_required:
+            raise ChainError(
+                f"put drain: step(s) {stuck_required} had not returned within {self._deadline_s:.0f}s of "
+                f"the chain's put-drain deadline; a hung PUT may not outlive the chain")
+        optional_failures: list[tuple[str, BaseException]] = []
+        for sid, optional, fut in entries:
+            if fut in pending:
+                optional_failures.append((sid, TimeoutError(
+                    f"put drain: step {sid!r} had not returned within {self._deadline_s:.0f}s")))
+                continue
+            try:
+                fut.result()
+            except BaseException as exc:
+                if optional:
+                    optional_failures.append((sid, exc))
+                else:
+                    raise
+        return optional_failures
+
+
+def _sibling_url_readers(chain: Any) -> set[str]:
+    """Step ids whose PUT this chain's drain may NOT defer (PUT_DRAIN_WHY): a sibling in the SAME chain
+    reads one of their output addresses by `url` rather than `from_step`, so that step keeps the old
+    synchronous shape and `produced[sid]` is not set until its PUT actually lands."""
+    produced_urls: dict[str, str] = {}
+    for step in chain.steps:
+        for b in step.outputs:
+            if b.url is not None:
+                produced_urls[b.url] = step.id
+            for u in (b.urls or []):
+                produced_urls[u] = step.id
+    hazard: set[str] = set()
+    for step in chain.steps:
+        for b in step.inputs:
+            if b.from_step is None and b.url is not None and b.url in produced_urls:
+                hazard.add(produced_urls[b.url])
+    return hazard
+
+
+def _finish_step_uploads(step: Any, outputs: dict[str, Any], timing: StepTiming,
+                          live: Any, sink: list[StepTiming] | None) -> None:
+    """Retain + PUT a step's outputs and settle its timing row — what `_run_step_inner` always did inline,
+    now also reachable from the box-wide put queue so a chain-scheduled run can return the moment compute
+    is done. Every direct `_run_step` caller (no `drain`) still gets this synchronously, same call."""
+    live("upload_started", timings={"run_s": timing.run_s})
+    t_put = time.monotonic()
+    put_start_ns = time.monotonic_ns()
+    failure: BaseException | None = None
+    try:
+        if kept := _retain_outputs(step, outputs):
+            timing.retained_ports = kept
+            log(f"op {step.op} [{step.id}] kept {kept} on this worker — no PUT (RETAIN_WHY)")
+        timing.put_wait_s, timing.put_retry_s, timing.puts = _upload_outputs(step, outputs)
+    except BaseException as exc:
+        live("upload_error", started=t_put, exc=exc)
+        failure = exc
+    timing.put_s = time.monotonic() - t_put
+    timing.intervals["put"] = {
+        "start_mono_ns": put_start_ns, "end_mono_ns": time.monotonic_ns()}
+    if any(not row.get("attempts") for row in timing.puts):
+        timing.incomplete_reasons.append("put_attempt_intervals_missing")
+    # A REQUIRED step's failed put books NOTHING (old contract: a duration for work that did not land is
+    # worse than none); an OPTIONAL one no longer kills the chain (PUT_DRAIN_WHY), so its row must still land.
+    if failure is not None and step.optional:
+        timing.incomplete_reasons.append(f"put_failed: {safe_error(failure)}"[:200])
+    if sink is not None and (failure is None or step.optional):
+        sink.append(timing)
+    if failure is not None:
+        raise failure
+    live("step_finished", timings={
+        "slot_wait_s": timing.slot_wait_s,
+        "bind_s": timing.bind_s,
+        "run_s": timing.run_s,
+        "put_s": timing.put_s,
+        "seconds": timing.seconds,
+        "cache_hit": float(timing.cache_hit),
+    }, outputs=timing.outputs, outcome="ok")
+
+
 def _run_step(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
-              sink: list[StepTiming] | None = None, emit: Any = None) -> dict[str, Any]:
-    # The CPU slot is taken around the HANDLER ONLY (TRANSPORT_BUDGET_WHY) — see `_run_step_inner`. The disk
-    # and socket bound the original comment was really protecting is now its own counter, which is what lets
-    # a one-step fetch through while fifteen-step chains are encoding.
-    return _run_step_inner(step, ws, produced, sink, emit)
+              sink: list[StepTiming] | None = None, emit: Any = None,
+              drain: _PutDrain | None = None) -> dict[str, Any]:
+    # The CPU slot is taken around the HANDLER ONLY (TRANSPORT_BUDGET_WHY) — see `_run_step_inner`.
+    return _run_step_inner(step, ws, produced, sink, emit, drain)
 
 
 def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]],
-                    sink: list[StepTiming] | None = None, emit: Any = None) -> dict[str, Any]:
+                    sink: list[StepTiming] | None = None, emit: Any = None,
+                    drain: _PutDrain | None = None) -> dict[str, Any]:
     op = registry.get(step.op)
     # Refuse a judgement op HERE, on the executing box, before anything is fetched or run. Redundant with
     # the control plane's placement check by design: a check that lives only where the routing decision is
@@ -925,35 +1137,15 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     log(f"op {step.op} [{step.id}] ok in {dt:.1f}s")
     timing.nbytes, timing.outputs = _moved_outputs(outputs)
 
-    # Only NOW does anything leave the box, and only for bindings that named a url.
-    live("upload_started", timings={"run_s": timing.run_s})
-    t_put = time.monotonic()
-    put_start_ns = time.monotonic_ns()
-    try:
-        if kept := _retain_outputs(step, outputs):
-            timing.retained_ports = kept
-            log(f"op {step.op} [{step.id}] kept {kept} on this worker — no PUT (RETAIN_WHY)")
-        timing.put_wait_s, timing.put_retry_s, timing.puts = _upload_outputs(step, outputs)
-    except BaseException as exc:
-        live("upload_error", started=t_put, exc=exc)
-        raise
-    timing.put_s = time.monotonic() - t_put
-    timing.intervals["put"] = {
-        "start_mono_ns": put_start_ns, "end_mono_ns": time.monotonic_ns()}
-    if any(not row.get("attempts") for row in timing.puts):
-        timing.incomplete_reasons.append("put_attempt_intervals_missing")
-    # LAST, and only on the success road: a step that raised delivered nothing, and a duration booked for
-    # work that did not land is the kind of number that makes a ledger worse than none.
-    if sink is not None:
-        sink.append(timing)
-    live("step_finished", timings={
-        "slot_wait_s": timing.slot_wait_s,
-        "bind_s": timing.bind_s,
-        "run_s": timing.run_s,
-        "put_s": timing.put_s,
-        "seconds": timing.seconds,
-        "cache_hit": float(timing.cache_hit),
-    }, outputs=timing.outputs, outcome="ok")
+    # Only NOW does anything leave the box, and only for bindings that named a url. A step with nothing
+    # durable to move (every output is `from_step`-only within this chain) has nothing a drain buys it.
+    durable = any(getattr(b, "url", None) is not None or getattr(b, "urls", None) is not None
+                  or getattr(b, "retain", None) is not None for b in step.outputs)
+    if drain is not None and durable:
+        drain.enqueue(str(step.id), lambda: _finish_step_uploads(step, outputs, timing, live, sink),
+                      optional=bool(step.optional))
+        return outputs
+    _finish_step_uploads(step, outputs, timing, live, sink)
     return outputs
 
 
@@ -1225,6 +1417,8 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
 
     tmp = Path(tempfile.mkdtemp(prefix="opchain_"))
     ws = Workspace(tmp)
+    drain = _PutDrain(_uploader_pool(), _put_drain_deadline_s())
+    hazard_producers = _sibling_url_readers(chain)
     produced: dict[str, dict[str, Any]] = {}
     by_id = {s.id: s for s in chain.steps}
     deps = {s.id: set(s.needs) | {b.from_step for b in s.inputs if b.from_step} for s in chain.steps}
@@ -1267,8 +1461,9 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     # ContextVars carry the claimed corr into an op's LLM call without a process-wide env
                     # race.  Each future gets its own snapshot because sibling steps may run concurrently.
                     ctx = contextvars.copy_context()
+                    step_drain = None if sid in hazard_producers else drain
                     running[ex.submit(
-                        ctx.run, _run_step, by_id[sid], ws, produced, timings, _event)] = sid
+                        ctx.run, _run_step, by_id[sid], ws, produced, timings, _event, step_drain)] = sid
                 if not running:
                     # pending non-empty with nothing runnable cannot happen (OpChain rejects cycles at
                     # validation) — but a deadlock on a rented box is expensive enough to name explicitly.
@@ -1293,6 +1488,20 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                     raise
                 with lock:
                     produced[sid] = outs
+        try:
+            optional_put_failures = drain.wait()
+        except BaseException as exc:
+            _event(job_id=chain.job_id, stage="ops", status="error", error=safe_error(exc)[:500])
+            raise
+        for sid, put_exc in optional_put_failures:
+            # Same bookkeeping the sync loop gives an optional compute failure — arrives later because the
+            # PUT that failed was deferred, not because it matters less (PUT_DRAIN_WHY).
+            failed.add(sid)
+            # Popped AFTER scheduling is done (every from_step reader already read the local file, F2) so
+            # the terminal's `steps`/`skipped` do not both name a row the CP would read as contradictory.
+            produced.pop(sid, None)
+            _event(job_id=chain.job_id, stage="ops", status="step", step=sid, optional=True,
+                   error=f"{by_id[sid].op}: {safe_error(put_exc)}"[:500])
         # PER-STEP SECONDS RIDE THE TERMINAL, in one additive key. Not folded into `steps` (a list of ids
         # that both sides already know the shape of) — a new key is dropped by an older control plane with a
         # 202 and ignored by an older box, while a changed element type would be a break on a field that
@@ -1349,4 +1558,5 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
         return {sid: {p: ([str(x) for x in v] if isinstance(v, list) else str(v))
                       for p, v in outs.items()} for sid, outs in produced.items()}
     finally:
+        drain.settle()
         shutil.rmtree(tmp, ignore_errors=True)

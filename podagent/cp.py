@@ -84,13 +84,61 @@ churn we ourselves create; whether the rented network drops for other reasons as
 """
 
 
+TRANSPORT_FALLBACK_WHY = """
+MIRRORS podagent.ops.runner's MEM_PER_STEP_BYTES/CORES_PER_STEP/_CPU_FALLBACK/TRANSFERS_PER_STEP exactly
+(STORE_POOL_WHY). This module is a dependency OF runner.py (which imports download/upload/retry/put_trace
+from here), and `_store_pool()` below runs at THIS module's own import time — importing runner.py back from
+inside it would hit a partially-initialized `podagent.cp` and fail, so the derivation is copied, not
+imported. A change to runner.py's constants that is not mirrored here reproduces STORE_POOL_WHY's churn
+with a DIFFERENT wrong number instead of the old bare 16.
+"""
+
+_TRANSPORT_MEM_PER_STEP_BYTES = 1536 * 1024 * 1024
+_TRANSPORT_CORES_PER_STEP = 2
+_TRANSPORT_CPU_FALLBACK = 4
+_TRANSPORT_PER_STEP = 4
+_TRANSPORT_PARALLEL_ENV = "OPS_MAX_PARALLEL"
+
+
+def _mem_available_bytes() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _transport_cap_fallback() -> int:
+    """What runner.transport_cap() derives with no OPS_MAX_TRANSFERS set (TRANSPORT_FALLBACK_WHY)."""
+    n = os.cpu_count() or _TRANSPORT_CPU_FALLBACK
+    core_bound = max(1, n // _TRANSPORT_CORES_PER_STEP)
+    mem_avail = _mem_available_bytes()
+    mem_bound = (max(1, mem_avail // _TRANSPORT_MEM_PER_STEP_BYTES)
+                 if mem_avail and mem_avail > 0 else None)
+    parallel_raw = (os.environ.get(_TRANSPORT_PARALLEL_ENV) or "").strip()
+    env_cap = 0
+    if parallel_raw:
+        try:
+            env_cap = int(parallel_raw)
+        except ValueError:
+            env_cap = 0
+    derived = core_bound if mem_bound is None else min(core_bound, mem_bound)
+    cap = max(1, env_cap if env_cap > 0 else derived)
+    return max(1, cap * _TRANSPORT_PER_STEP)
+
+
 def _store_pool() -> int:
     """As wide as the transfers this pod was told it may run (STORE_POOL_WHY)."""
     raw = (os.environ.get("OPS_MAX_TRANSFERS") or "").strip()
     try:
         return max(4, int(raw))
     except ValueError:
-        return 16      # the step cap this image ships with; never the old 4
+        return _transport_cap_fallback()
 
 
 _store = requests.Session()
