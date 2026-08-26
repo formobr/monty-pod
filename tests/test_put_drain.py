@@ -334,13 +334,13 @@ def test_wait_returns_an_optional_steps_timeout_instead_of_raising():
 def test_store_pool_fallback_matches_transport_cap_derivation(monkeypatch):
     monkeypatch.delenv("OPS_MAX_TRANSFERS", raising=False)
     monkeypatch.delenv("OPS_MAX_PARALLEL", raising=False)
-    assert cp._store_pool() == runner.transport_cap()[0]
+    assert cp._store_pool() == max(16, runner.transport_cap()[0])
 
 
-def test_store_pool_fallback_tracks_a_narrower_box_too(monkeypatch):
+def test_store_pool_fallback_floors_at_16_on_a_narrow_box(monkeypatch):
     monkeypatch.delenv("OPS_MAX_TRANSFERS", raising=False)
     monkeypatch.setattr("os.cpu_count", lambda: 2)
-    assert cp._store_pool() == runner.transport_cap()[0]
+    assert cp._store_pool() == 16, "a narrow box must not resurrect the churn engine"
 
 
 def test_store_pool_respects_the_env_when_set(monkeypatch):
