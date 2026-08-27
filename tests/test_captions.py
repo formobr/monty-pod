@@ -104,3 +104,51 @@ def test_portrait_center_y_clamped_to_safe_zone() -> None:
     # a center_y past the bottom UI reserve is pulled up; landscape is left untouched
     assert captions._clamp_cy(0.99, 60, 1080, 1920) < 0.99
     assert captions._clamp_cy(0.99, 60, 1920, 1080) == 0.99
+
+
+# ── bold (4th style): block layout like phrase, heavier weight ───────────────────────────────────────
+
+def _real_font():
+    """A real TTF: bold's block wrap measures glyph width via PIL, same as phrase/phrase_jump."""
+    import glob
+    for pat in ("/usr/share/fonts/**/*.ttf", "/usr/share/fonts/**/DejaVuSans*.ttf"):
+        found = glob.glob(pat, recursive=True)
+        if found:
+            return Path(found[0])
+    pytest.skip("no system TTF available to measure the bold block wrap")
+
+
+def test_bold_style_head_carries_bold_flag_and_block_layout() -> None:
+    font = _real_font()
+    ass = captions.build_ass(_WORDS, font=font, w=1080, h=1920, fg=_FG, accent=_ACCENT, style="bold")
+    style_line = next(ln for ln in ass.splitlines() if ln.startswith("Style: Cap,"))
+    fields = style_line.split(",")
+    assert fields[2] == str(captions.BOLD_SIZE)                 # a dedicated, bigger Fontsize than phrase
+    assert fields[7] == "1"                                     # Bold:1 (Format col index 7 after "Style:")
+    assert "\\an8" in ass or "\\an5" in ass                     # block-anchored, not the oneword \move look
+
+
+def test_bold_style_accents_the_spoken_word_like_phrase() -> None:
+    font = _real_font()
+    ass = captions.build_ass(_WORDS, font=font, w=1080, h=1920, fg=_FG, accent=_ACCENT, style="bold")
+    accent = captions._inline_c(_ACCENT)
+    assert f"\\1c{accent}" in ass
+    assert "\\fscx" not in ass                                  # colour accent, not phrase_jump's scale bounce
+
+
+def test_bold_size_sits_between_phrase_and_title() -> None:
+    assert captions.PHRASE_SIZE < captions.BOLD_SIZE < captions.TITLE
+
+
+def test_the_three_legacy_styles_keep_their_own_size_and_stay_not_bold() -> None:
+    """NEGATIVE — proves the `bold` addition did not leak BOLD_SIZE/Bold:1 into phrase/phrase_jump (byte-exact
+    pin for oneword lives in tests/test_captions_ass_golden.py; this covers the two _build_ass_phrase callers
+    the golden test does not hash)."""
+    font = _real_font()
+    kw = dict(font=font, w=1080, h=1920, fg=_FG, accent=_ACCENT, center_y=0.76)
+    for style in ("phrase", "phrase_jump"):
+        ass = captions.build_ass(_WORDS, style=style, **kw)
+        style_line = next(ln for ln in ass.splitlines() if ln.startswith("Style: Cap,"))
+        fields = style_line.split(",")
+        assert fields[2] == str(captions.PHRASE_SIZE), f"{style}: Fontsize drifted from PHRASE_SIZE"
+        assert fields[7] == "0", f"{style}: Bold flag leaked on from the bold addition"

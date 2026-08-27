@@ -517,7 +517,8 @@
               "enum": [
                 "oneword",
                 "phrase",
-                "phrase_jump"
+                "phrase_jump",
+                "bold"
               ]
             },
             "hot": {

@@ -1,5 +1,5 @@
-"""Subtitle track via libass (no browser): brand-neutral ASS builder for three looks
-(oneword/phrase/phrase_jump). The brain bakes words+accent+centerY into the spec; the pod draws
+"""Subtitle track via libass (no browser): brand-neutral ASS builder for four looks
+(oneword/phrase/phrase_jump/bold). The brain bakes words+accent+centerY into the spec; the pod draws
 them with a delivered TTF.
 
 NO COLOUR LITERAL LIVES IN THIS FILE. `fg` and `accent` are REQUIRED arguments: this module used to spell
@@ -28,6 +28,8 @@ PHRASE_MARGIN = 110
 JUMP_OVERSHOOT = 120
 JUMP_SCALE = 110
 JUMP_GROW_MS = 90
+
+BOLD_SIZE = 80      # "bold" look: same ≤2-line block/wrap as phrase, heavier weight + bigger than PHRASE_SIZE
 
 # safe-zone bottom reserve (9:16 only), from the 1080×1920 reference; scales with height
 _REF_H = 1920
@@ -70,7 +72,7 @@ def _clamp_cy(center_y: float, below_px: int, w: int, h: int) -> float:
     return min(center_y, _caption_max_y(below_px, h) / h)
 
 
-def _ass_head(white: str, w: int, h: int, size: int = TITLE) -> str:
+def _ass_head(white: str, w: int, h: int, size: int = TITLE, *, bold: bool = False) -> str:
     return f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {w}
@@ -80,7 +82,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,Inter ExtraBold,{size},{white},&H000000FF,&H00000000,&H50000000,0,0,0,0,100,100,0,0,1,{OUTLINE},{SHADOW},5,0,0,0,1
+Style: Cap,Inter ExtraBold,{size},{white},&H000000FF,&H00000000,&H50000000,{1 if bold else 0},0,0,0,100,100,0,0,1,{OUTLINE},{SHADOW},5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -95,6 +97,9 @@ def build_ass(words: list[dict], *, font: Path, w: int, h: int, fg: str, accent:
     `fg` (body colour) and `accent` (hot-word colour) are required — see the module docstring."""
     if style in ("phrase", "phrase_jump"):
         return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind=style)
+    if style == "bold":
+        return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind="bold",
+                                  size=BOLD_SIZE, bold=True)
     white = _ac(fg)
     lime = _ac(accent)
     center_y = _clamp_cy(center_y, TITLE // 2 + RISE_PX, w, h)
@@ -117,9 +122,9 @@ def build_ass(words: list[dict], *, font: Path, w: int, h: int, fg: str, accent:
     return head + "\n".join(lines) + "\n"
 
 
-def _phrase_font(font: Path):
+def _phrase_font(font: Path, px: int = PHRASE_PX):
     from PIL import ImageFont
-    return ImageFont.truetype(str(font), PHRASE_PX)   # measure at on-screen px, not the libass Fontsize
+    return ImageFont.truetype(str(font), px)   # measure at on-screen px, not the libass Fontsize
 
 
 def _wrap_lines(block, fnt, spc, w):
@@ -152,14 +157,17 @@ def _group_blocks(words, fnt, spc, window_ms, w):
     return blocks
 
 
-def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kind):
-    """Stable, centred ≤2-line block pinned at a fixed y (never jumps); kind = phrase | phrase_jump."""
+def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kind,
+                       size=PHRASE_SIZE, bold=False):
+    """Stable, centred ≤2-line block pinned at a fixed y (never jumps); kind = phrase | phrase_jump | bold
+    (bold reuses the phrase colour-block layout at a bigger, Bold:1 style)."""
     white = _ac(fg)
     white_c = _inline_c(fg)
     accent_c = _inline_c(accent)
-    fnt = _phrase_font(font)
+    px = round(size * 64 / TITLE)   # libass Fontsize → on-screen px, same metric conversion as PHRASE_PX
+    fnt = _phrase_font(font, px)
     spc = fnt.getlength(" ")
-    line_h = round(PHRASE_PX * 1.5)
+    line_h = round(px * 1.5)
     center_y = _clamp_cy(center_y, line_h, w, h)
     y_top = round(h * center_y) - line_h
     xc = w // 2
@@ -174,7 +182,7 @@ def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kin
             out += _phrase_jump_block(lines, b_start, b_end, y_top, line_h, spc, xc, white_c, accent_c)
         else:
             out += _phrase_colour_block(lines, b_start, b_end, y_top, line_h, xc, white_c, accent_c)
-    return _ass_head(white, w, h, PHRASE_SIZE) + "\n".join(out) + "\n"
+    return _ass_head(white, w, h, size, bold=bold) + "\n".join(out) + "\n"
 
 
 def _phrase_colour_block(lines, b_start, b_end, y_top, line_h, xc, white_c, accent_c):
