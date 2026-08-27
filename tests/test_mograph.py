@@ -91,6 +91,24 @@ def test_batch_with_a_missing_sequence_still_fails_loud(tmp_path: Path, monkeypa
         mograph._run_batch(rd, items, tmp_path / "spec.json", None)
 
 
+def test_batch_failure_message_keeps_head_and_tail_of_a_long_dump(tmp_path: Path, monkeypatch) -> None:
+    """Node error dumps carry message+stack at the TOP; a tail-only slice (prod ac5b4614) showed none of it."""
+    rd = tmp_path / "rd"; rd.mkdir()
+    items = _batch_items(tmp_path, ["SplitScreen"], write_frames=False)
+    head_line = "Error: A delayRender() ... was called but not cleared after ~28000ms"
+    tail_marker = "END-OF-DUMP-MARKER"
+    long_stderr = (head_line + "\n" + ("x" * 2000) + "\n" + tail_marker).encode()
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, b"", long_stderr))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        mograph._run_batch(rd, items, tmp_path / "spec.json", None)
+
+    msg = str(exc_info.value)
+    assert head_line in msg    # the message line survives, not buried under 2000 chars of stack
+    assert tail_marker in msg  # the tail survives too
+
+
 def test_render_concurrency_follows_the_container_not_the_host(monkeypatch) -> None:
     """A rented pod is a cgroup slice of someone's machine: sizing Chrome tabs off the HOST's cores/RAM is
     how 2 of 3 paid runs died OOM. These are negative tests — the host numbers must LOSE."""

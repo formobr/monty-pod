@@ -691,7 +691,9 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                     "phase": f"{op}_error",
                     "outcome": "error",
                     "error_type": type(exc).__name__,
-                    "error": safe_error(exc),
+                    # 1600, not the 500 default: a prepare-arm failure (e.g. mograph's head+tail render_batch
+                    # dump, mograph.py) needs more than one line to carry both the Node error's message and its tail.
+                    "error": safe_error(exc, limit=1600),
                     "timings": {"phase_s": round(time.monotonic() - started, 3)},
                 }.items() if v is not None
             })

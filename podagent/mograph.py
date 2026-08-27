@@ -186,8 +186,10 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
                   f"(Chrome teardown) — keeping the frames", file=sys.stderr)
         return
     full = (batch_log + (r.stdout or b"").decode("utf-8", "replace"))
+    # Node error dumps carry message+stack at the TOP; a tail-only slice showed none of it. Head AND tail.
+    snippet = full[:800] + ("…⋯…" + full[-400:] if len(full) > 800 else "")
     raise RuntimeError(f"render_batch exited {r.returncode} with no frames for {', '.join(missing)} "
-                       f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]: {full[-280:]}")
+                       f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]: {snippet}")
 
 
 def _pack(metas: list[dict], tmp: Path) -> list[dict]:
