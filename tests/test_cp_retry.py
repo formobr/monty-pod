@@ -160,7 +160,12 @@ def test_result_is_a_typed_frame_and_requires_correlation(tmp_path: Path) -> Non
     assert acked["op"] == "ops" and set(acked["timings"]) == {"delivery_s"}
 
 
-def test_single_sender_preserves_append_order(tmp_path: Path) -> None:
+def test_single_sender_preserves_append_order(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Wider than _fast_transport's wall: this asserts order, not retry, so a loaded runner must not be able to
+    # race an on-time ACK into a spurious reconnect+retransmit (duplicate, not reordered, under at-least-once).
+    monkeypatch.setattr(event_stream, "FRAME_WALL_S", 5.0)
+    monkeypatch.setattr(event_stream, "OPEN_WALL_S", 5.0)
     seen: list[dict[str, Any]] = []
 
     def handler(ws: Any) -> None:
