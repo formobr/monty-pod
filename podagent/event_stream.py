@@ -50,6 +50,9 @@ MAX_REOPENS = int(os.environ.get("POD_STREAM_MAX_REOPENS", "2"))
 REOPEN_BACKOFF_S = float(os.environ.get("POD_STREAM_REOPEN_BACKOFF_S", "0.25"))
 BACKGROUND_RETRY_S = float(os.environ.get("POD_STREAM_BACKGROUND_RETRY_S", "5"))
 ACK_WINDOW = min(256, max(1, int(os.environ.get("POD_STREAM_ACK_WINDOW", "32"))))
+# ~10 min at the default BACKGROUND_RETRY_S: generous, but bounded — an unbounded DeliveryPending retry
+# bricks admission on a billed pod forever if the control plane can never accept this exact frame.
+DELIVERY_PENDING_MAX_ATTEMPTS = int(os.environ.get("POD_STREAM_DELIVERY_PENDING_MAX_ATTEMPTS", "120"))
 DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 3
@@ -127,6 +130,9 @@ class EventStream:
         self._bootstrap_event: dict[str, Any] | None = None
         # A not-yet-settled bootstrap frame's identity: a replayed job_ack must never beat it to the wire.
         self._pending_bootstrap_key: tuple[str, int] | None = None
+        # Sender-loop exhaustion cycles per frame identity, since only a bounded count of ambiguous
+        # cycles should be able to keep any one frame — and the admission it closes — alive forever.
+        self._pending_settlement_attempts: dict[tuple[str, int], int] = {}
 
         # A process incarnation owns one new stream id. Frames restored from disk keep THEIR original id/seq;
         # mixing an old identity into the new stream makes server-side dedupe unable to identify a replay.
@@ -332,9 +338,9 @@ class EventStream:
                 raise self._storage_error
             corr_id = str(normalized.get("corr_id") or "")
             if kind == "result" and corr_id in self._result_corrs_locked():
-                error = TransportUnhealthy(f"result corr_id {corr_id!r} already pending or rejected")
-                self._latch_locked(error)
-                raise error
+                # This corr_id alone is refused, not the process: latching here would brick every OTHER
+                # corr's admission on the strength of one already-settled duplicate.
+                raise TransportUnhealthy(f"result corr_id {corr_id!r} already pending or rejected")
             seq = self._next_seq
             frame = {"type": kind, "stream_id": self._stream_id, "seq": seq, kind: normalized}
             if kind == "result":
@@ -514,9 +520,21 @@ class EventStream:
                 with self._state:
                     head = dict(self._outbox[0]) if self._outbox else None
                 if head is not None and self._frame_key(head) in attempted:
-                    # Exhaustion is ambiguous, not a verdict. It wakes a synchronous caller and closes job
-                    # admission, while the frame and any ACKed successors remain ordered and durable.
-                    self._settle(head, "pending", None, 0.0)
+                    head_key = self._frame_key(head)
+                    with self._work:
+                        attempts = self._pending_settlement_attempts.get(head_key, 0) + 1
+                        self._pending_settlement_attempts[head_key] = attempts
+                    if attempts > DELIVERY_PENDING_MAX_ATTEMPTS:
+                        _log(f"frame {head_key[0]}:{head_key[1]} dead-lettered after {attempts} "
+                             "delivery-pending attempts — that corr is lost, other admission continues")
+                        self._settle(head, "abandoned", {
+                            "status": 0,
+                            "error": f"delivery-pending cap ({DELIVERY_PENDING_MAX_ATTEMPTS}) exceeded",
+                        }, 0.0)
+                    else:
+                        # Exhaustion is ambiguous, not a verdict. It wakes a synchronous caller and closes
+                        # job admission, while the frame and any ACKed successors stay ordered and durable.
+                        self._settle(head, "pending", None, 0.0)
                     with self._work:
                         self._work.wait(timeout=BACKGROUND_RETRY_S)
             except BaseException as e:  # noqa: BLE001 - sender death would strand a synchronous terminal
@@ -588,10 +606,11 @@ class EventStream:
                 outcome = True
                 self._wire_attempts.pop(key, None)
                 self._wire_sends.pop(key, None)
+                self._pending_settlement_attempts.pop(key, None)
                 if (isinstance(self._admission_error, DeliveryPending)
                         and not self._outbox and self._storage_error is None):
                     self._admission_error = None
-            elif disposition == "rejected":
+            elif disposition in ("rejected", "abandoned"):
                 if self._outbox and (str(self._outbox[0]["stream_id"]),
                                      int(self._outbox[0]["seq"])) == key:
                     popped = self._outbox.pop(0)
@@ -611,7 +630,14 @@ class EventStream:
                 outcome = FrameRejected(frame, ack or {})
                 self._wire_attempts.pop(key, None)
                 self._wire_sends.pop(key, None)
-                self._latch_locked(outcome)
+                self._pending_settlement_attempts.pop(key, None)
+                if disposition == "rejected":
+                    self._latch_locked(outcome)
+                elif (isinstance(self._admission_error, DeliveryPending)
+                        and not self._outbox and self._storage_error is None):
+                    # This corr alone is lost (already logged loudly by the caller); every other corr's
+                    # admission must not stay closed behind a frame this process has given up retrying.
+                    self._admission_error = None
             else:
                 # Retry exhaustion is not a verdict. Keep the frame durably at the head and continue bounded
                 # background attempts, but close admission until the ordered voice catches up.

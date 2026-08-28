@@ -1236,7 +1236,39 @@ def test_dead_letter_row_quarantines_one_corr_not_the_whole_agent(tmp_path: Path
     assert reopened._admission_error is None, "one dead-lettered corr must not brick the whole agent"
     with pytest.raises(TransportUnhealthy, match="already pending or rejected"):
         reopened.send_result(_result(corr_id="dead"))
+    assert reopened._admission_error is None, (
+        "codex#25 review: the per-corr refusal itself must not latch admission on its own retry")
     reopened.close()
+
+
+def test_delivery_pending_cap_dead_letters_the_stuck_frame_not_the_process(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """codex#25 review: a frame the CP never once acknowledges must not brick admission (spend risk)."""
+    monkeypatch.setattr(event_stream, "DELIVERY_PENDING_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(event_stream, "BACKGROUND_RETRY_S", 0.01)
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        while True:
+            try:
+                ws.recv()
+            except Exception:
+                return
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        # wait=False: the cap is a BACKGROUND sender property. A synchronous waiter wakes on the FIRST
+        # ambiguous exhaustion regardless (existing behavior) and would never observe the later cap.
+        assert stream.send_result(_result(corr_id="stuck"), wait=False) is True
+        _wait_for(lambda: stream.pending_count() == 0, wall=5.0)
+        assert stream._admission_error is None, "the process must keep admitting OTHER work"
+        with pytest.raises(TransportUnhealthy, match="already pending or rejected"):
+            stream.send_result(_result(corr_id="stuck"))
+        assert stream._admission_error is None, "re-sending the lost corr must not re-brick admission"
+        stream.close()
+
+    assert "dead-lettered after 3 delivery-pending attempts" in capsys.readouterr().err
+    assert json.loads(path.read_text())["rejected"], "the stuck frame must be durably dead-lettered"
 
 
 def test_poisoned_legacy_outbox_boots_with_quarantine_line(
