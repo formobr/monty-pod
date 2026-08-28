@@ -38,6 +38,11 @@ INFER_KINDS = ("align", "face_probe", "clip_rank")
 # On a healthy connection nothing ever waits here: the claim itself blocks on the wire.
 _MIN_POLL_INTERVAL_S = 1.0
 
+_TRANSPORT_UNHEALTHY_BACKOFF_S = 5.0
+_TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_ENV = "POD_TRANSPORT_UNHEALTHY_MAX_ATTEMPTS"
+# Bounded, not infinite: a genuinely broken transport must exit honestly (POST_MORTEM_WHY) rather than spin.
+_TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT = 12
+
 # The claim loop DISPATCHES; it does not execute. It used to run each envelope inline, which made this box the
 # one place the whole pipeline serialises: the brain fans b-roll ranking out ≤6 rank chains wide and awaits
 # them by corr_id (op_backend deliberately dropped its per-jid lane lock for exactly this), and every one of
@@ -76,6 +81,14 @@ def ops_chain_pool_size() -> int:
         return max(1, int(os.environ.get(_OPS_MAX_CHAINS_ENV, "") or _OPS_MAX_CHAINS_DEFAULT))
     except ValueError:
         return _OPS_MAX_CHAINS_DEFAULT
+
+
+def _transport_unhealthy_max_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get(
+            _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_ENV, "") or _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT))
+    except ValueError:
+        return _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT
 
 
 CAPACITY_VRAM_WHY = """
@@ -1019,12 +1032,14 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                    once: bool = False, coordinator: "RestartCoordinator | None" = None) -> None:
     """Claim envelopes and hand them to a pool. `once` is the test seam — the production loop never returns
     on its own; a set restart latch is the one other way out, checked before every new claim wait."""
+    unhealthy_attempts = 0
     while True:
         if coordinator is not None and coordinator.restart_requested():
             return
         try:
             t_poll = time.monotonic()
             job = cp.poll_job()          # a wait on the live socket, not a request (cp.poll_job WHY)
+            unhealthy_attempts = 0
             if job is None:
                 idle = time.monotonic() - t_poll
                 if idle < _MIN_POLL_INTERVAL_S:
@@ -1070,8 +1085,22 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
         except requests.RequestException as e:
             _log(f"control-plane request failed: {safe_error(e)}")
             time.sleep(5)
-        except TransportUnhealthy:
-            raise
+        except DeliveryPending as e:
+            # A transient subclass of TransportUnhealthy: the durable sender is still retrying in the
+            # background, so this must never count toward — or trigger — the bounded exit below.
+            _log(f"control-plane delivery pending, retrying: {safe_error(e)}")
+            time.sleep(_TRANSPORT_UNHEALTHY_BACKOFF_S)
+        except TransportUnhealthy as e:
+            unhealthy_attempts += 1
+            max_attempts = _transport_unhealthy_max_attempts()
+            if unhealthy_attempts > max_attempts:
+                _log(f"control-plane transport unhealthy after {unhealthy_attempts} attempts "
+                     f"(cap {max_attempts}); exiting honestly: {safe_error(e)}")
+                _mark_stopped()
+                sys.exit(4)
+            _log(f"control-plane transport unhealthy (attempt {unhealthy_attempts}/{max_attempts}): "
+                 f"{safe_error(e)}")
+            time.sleep(_TRANSPORT_UNHEALTHY_BACKOFF_S)
         # Anything else used to unwind main() and end the process with the claimed job unreported: the pod
         # stayed rented, the brain waited out its timeout, and nothing on the wire said why.
         except Exception as e:

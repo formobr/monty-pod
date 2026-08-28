@@ -54,6 +54,9 @@ DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 3
 _ADMISSION_WAKE = object()
+# 422 is the ONLY ack status that is a permanent content verdict; every other 4xx (409 readiness/identity
+# races included) is a transport race and gets retried like a 5xx, never dead-lettered.
+_CONTENT_REJECT_STATUS = 422
 
 
 def _delivery_wall_s() -> float:
@@ -122,15 +125,17 @@ class EventStream:
         # result; it is appended to the same durable ordered outbox so it
         # cannot race frame sequencing or vanish on reconnect.
         self._bootstrap_event: dict[str, Any] | None = None
+        # A not-yet-settled bootstrap frame's identity: a replayed job_ack must never beat it to the wire.
+        self._pending_bootstrap_key: tuple[str, int] | None = None
 
         # A process incarnation owns one new stream id. Frames restored from disk keep THEIR original id/seq;
         # mixing an old identity into the new stream makes server-side dedupe unable to identify a replay.
         self._stream_id, self._next_seq = uuid.uuid4().hex, 1
         self._outbox, self._rejected, self._inbox, self._delivery_meta = self._load()
-        if self._rejected:
-            self._admission_error = TransportUnhealthy(
-                "a deterministic rejected verdict remains in durable dead-letter")
-        elif self._outbox:
+        for row in self._rejected:
+            _log(f"durable dead-letter quarantined at boot: {self._frame_identity_line(row.get('frame', {}))} "
+                 "— that one identity stays refused, the rest of the agent is not bricked by it")
+        if self._outbox:
             self._admission_error = DeliveryPending("startup replay must clear before admitting work")
         # Establish durability at construction, before claiming work. Discovering an unwritable volume only
         # after a paid job finishes would recreate the silent-terminal failure in a different layer.
@@ -155,6 +160,14 @@ class EventStream:
                 self._work.notify_all()
 
     # ── durable state ──────────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _frame_identity_line(frame: dict[str, Any]) -> str:
+        """One human line naming a frame for a boot-time log — never raises on a malformed row."""
+        kind = frame.get("type")
+        body = frame.get(kind) if isinstance(kind, str) else None
+        corr = str((body or {}).get("corr_id") or "") if isinstance(body, dict) else ""
+        return f"{kind} {frame.get('stream_id')}:{frame.get('seq')} corr={corr!r}"
 
     @staticmethod
     def _validate_client_frame(frame: Any) -> dict[str, Any]:
@@ -353,6 +366,26 @@ class EventStream:
             self._work.notify_all()
             return seq, waiter
 
+    def _append_bootstrap_head(self, payload: dict[str, Any]) -> int:
+        """Insert durably at the outbox HEAD: this frame must win the wire race against anything pending."""
+        normalized = event_payload(payload)
+        with self._work:
+            seq = self._next_seq
+            frame = {"type": "event", "stream_id": self._stream_id, "seq": seq, "event": normalized}
+            self._validate_client_frame(frame)
+            self._outbox.insert(0, frame)
+            self._next_seq += 1
+            try:
+                self._persist_locked()
+            except BaseException as e:
+                self._outbox.pop(0)
+                self._next_seq -= 1
+                error = TransportUnhealthy(f"durable bootstrap append failed: {safe_error(e)}")
+                self._latch_locked(error, storage=True)
+                raise error from e
+            self._work.notify_all()
+            return seq
+
     def pending_count(self) -> int:
         with self._state:
             return len(self._outbox)
@@ -529,6 +562,8 @@ class EventStream:
                 ack: dict[str, Any] | None, delivery_s: float) -> None:
         key = (str(frame["stream_id"]), int(frame["seq"]))
         with self._work:
+            if self._pending_bootstrap_key == key:
+                self._pending_bootstrap_key = None
             outcome: bool | BaseException
             if disposition == "accepted":
                 if self._outbox and (str(self._outbox[0]["stream_id"]),
@@ -608,6 +643,15 @@ class EventStream:
                 if attempt < MAX_REOPENS:
                     time.sleep(REOPEN_BACKOFF_S)
                 continue
+            with self._state:
+                bootstrap_key = self._pending_bootstrap_key
+            if bootstrap_key is not None and (not pending or self._frame_key(pending[0]) != bootstrap_key):
+                with self._state:
+                    head_frame = next(
+                        (dict(f) for f in self._outbox if self._frame_key(f) == bootstrap_key), None)
+                if head_frame is not None:
+                    pending = [head_frame] + [f for f in pending if self._frame_key(f) != bootstrap_key]
+                    started.setdefault(bootstrap_key, time.monotonic())
             acks = self._exchange_window(pending)
             retry: list[dict[str, Any]] = []
             for frame in pending:
@@ -617,13 +661,17 @@ class EventStream:
                 delivery_s = time.monotonic() - started[key]
                 if 200 <= status < 300:
                     outcomes[key] = ("accepted", ack, delivery_s)
-                elif 400 <= status < 500:
+                elif status == _CONTENT_REJECT_STATUS:
                     _log(f"frame seq={frame['seq']} REJECTED status={status} "
                          f"reason={safe_text(ack.get('error') or '', 200)} "
                          "— moved to durable dead-letter")
                     outcomes[key] = ("rejected", ack, delivery_s)
                 else:
-                    # A 5xx or absent ACK made no content verdict. Keep the exact identity for replay.
+                    # Every other 4xx (409 readiness/identity races included), a 5xx, or an absent ACK
+                    # made no permanent content verdict — retry transport, do not dead-letter.
+                    if 400 <= status < 500:
+                        _log(f"frame seq={frame['seq']} transport-retryable status={status} "
+                             f"reason={safe_text(ack.get('error') or '', 200)}")
                     retry.append(frame)
             pending = retry
             if pending and attempt < MAX_REOPENS:
@@ -913,7 +961,7 @@ class EventStream:
                     self._acks[key] = ack
                     waiter = self._ack_waiters.get(key)
                     status = int(ack["status"])
-                    if 400 <= status < 500:
+                    if status == _CONTENT_REJECT_STATUS:
                         # Ordered persistence may wait for an earlier ACK. Admission cannot: the peer already
                         # made a deterministic verdict, so no new paid job may enter during that gap.
                         frame = next(
@@ -962,12 +1010,14 @@ class EventStream:
                 ))
             if bootstrap is not None and not already_pending:
                 try:
-                    self._append("event", bootstrap, wait=False)
+                    seq = self._append_bootstrap_head(bootstrap)
                 except Exception as e:  # noqa: BLE001 — no admission without durable bootstrap
                     why = f"bootstrap append: {safe_error(e)}"
                     self._fail_connection(conn, why)
                     _log(f"bootstrap append failed ({safe_error(e)}); admission remains closed")
                     return False
+                with self._state:
+                    self._pending_bootstrap_key = (self._stream_id, seq)
             self._reader = threading.Thread(
                 target=self._read_loop, args=(conn,), name="pod-stream-reader", daemon=True)
             self._reader.start()

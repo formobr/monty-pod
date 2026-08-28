@@ -17,6 +17,7 @@ from websockets.sync.server import serve
 
 from podagent import cp, event_stream
 from podagent.event_stream import DeliveryPending, EventStream, FrameRejected, TransportUnhealthy
+from podagent.stream_models import result_payload
 from wire_fixtures import DELETE, invalid_wire, valid_wire
 
 _ATTEMPT_ID = "a" * 32
@@ -382,7 +383,8 @@ def test_bootstrap_persist_failure_closes_admission_loudly(
     stream.set_bootstrap_event(_event(phase="capacity", capacity={"max_inflight": 1, "max_parallel": 1}))
     monkeypatch.setattr(event_stream, "_ws_client", type(
         "_Client", (), {"connect": staticmethod(lambda *_a, **_k: _Connection())}))
-    monkeypatch.setattr(stream, "_append", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(
+        stream, "_append_bootstrap_head", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")))
     failed: list[str] = []
 
     def fail_connection(_conn: Any, why: str) -> None:
@@ -652,7 +654,7 @@ def test_async_4xx_dead_letters_without_accumulating_an_outcome(tmp_path: Path) 
 
     def handler(ws: Any) -> None:
         frame = json.loads(ws.recv())
-        ws.send(_ack(frame, status=409, error="duplicate content key"))
+        ws.send(_ack(frame, status=422, error="malformed content"))
 
     with _server(handler) as base:
         stream = EventStream(base, "token", outbox_path=path)
@@ -662,6 +664,29 @@ def test_async_4xx_dead_letters_without_accumulating_an_outcome(tmp_path: Path) 
         assert stream._delivery_outcomes == {}
         with pytest.raises(FrameRejected):
             stream.claim(0.1)
+        stream.close()
+
+
+def test_409_is_transport_retried_not_dead_lettered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """codex#25: a readiness/identity race answers 409, not a content verdict — retry it like a 5xx."""
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
+    path = tmp_path / "outbox.json"
+    hits = 0
+
+    def handler(ws: Any) -> None:
+        nonlocal hits
+        frame = json.loads(ws.recv())
+        hits += 1
+        ws.send(_ack(frame, status=409, error="job_ack arrived before readiness"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(DeliveryPending):
+            stream.send_result(_result())
+        assert hits == 1
+        assert stream.pending_count() == 1, "a 409 must remain durable, not move to dead-letter"
+        state = json.loads(path.read_text())
+        assert state["rejected"] == []
         stream.close()
 
 
@@ -1145,3 +1170,90 @@ def test_control_plane_delegates_one_result_without_a_second_lane() -> None:
 
     assert calls == [({
         "job_id": "j", "stage": "ops", "status": "ok", "session_id": "s", "corr_id": "c"}, True)]
+
+
+def test_reconnect_bootstrap_ready_precedes_a_replayed_job_ack(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """codex#25: a job_ack durably pending before a reconnect must never reach the wire ahead of that
+    reconnect's bootstrap-ready — the exact race that used to earn a deterministic Go 409."""
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
+    connections: list[list[dict[str, Any]]] = []
+    lock = threading.Lock()
+    close_now = threading.Event()
+
+    def handler(ws: Any) -> None:
+        with lock:
+            no = len(connections)
+            connections.append([])
+        if no == 0:
+            frame = json.loads(ws.recv())
+            connections[0].append(frame)
+            ws.send(_ack(frame))
+            assert close_now.wait(2)
+            return
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            connections[no].append(frame)
+            ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        assert stream.send_event(_event(phase="warm"), wait=True)
+        stream.set_bootstrap_event(_event(phase="capacity", capacity={"max_inflight": 1}))
+        close_now.set()
+        _wait_for(lambda: stream._conn is None)
+        stream._append("job_ack", {
+            "delivery_id": "c", "corr_id": "c", "attempt_id": _ATTEMPT_ID, "client_recv_mono_ns": 1,
+        }, wait=False)
+        _wait_for(lambda: len(connections) >= 2 and stream.pending_count() == 0)
+        stream.close()
+
+    assert connections[0] and connections[0][0]["event"]["phase"] == "warm"
+    assert connections[1], "the pod must reconnect"
+    first = connections[1][0]
+    assert first["type"] == "event" and first["event"].get("phase") == "capacity", (
+        "a replayed job_ack must never precede the reconnect's bootstrap-ready")
+    assert any(f["type"] == "job_ack" for f in connections[1])
+
+
+def test_dead_letter_row_quarantines_one_corr_not_the_whole_agent(tmp_path: Path) -> None:
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        ws.send(_ack(frame, status=422, error="bad result"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(FrameRejected):
+            stream.send_result(_result(corr_id="dead"))
+        stream.close()
+
+    reopened = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
+    assert reopened._admission_error is None, "one dead-lettered corr must not brick the whole agent"
+    with pytest.raises(TransportUnhealthy, match="already pending or rejected"):
+        reopened.send_result(_result(corr_id="dead"))
+    reopened.close()
+
+
+def test_poisoned_legacy_outbox_boots_with_quarantine_line(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """codex#25 migration: a dead-letter row written by the OLD (409-dead-letters) code must not brick boot
+    under the new code — it is quarantined and logged, never latched as a process-wide TransportUnhealthy."""
+    path = tmp_path / "outbox.json"
+    legacy_frame = {
+        "type": "result", "stream_id": "old-incarnation", "seq": 1, "attempt_id": _ATTEMPT_ID,
+        "result": result_payload(_result(corr_id="legacy-dead")),
+    }
+    path.write_text(json.dumps({
+        "version": 3, "frames": [], "inbox": {}, "deliveries": {},
+        "rejected": [{"frame": legacy_frame, "rejected_at": "2024-01-01T00:00:00Z",
+                      "ack": {"status": 409, "error": "duplicate content key"}}],
+    }))
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
+    assert stream._admission_error is None
+    assert "quarantined at boot" in capsys.readouterr().err
+    stream.close()
