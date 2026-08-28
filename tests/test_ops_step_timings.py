@@ -186,6 +186,22 @@ def test_the_terminal_carries_one_timing_per_step(monkeypatch, wired, tmp_path, 
     assert got[0]["outputs"], "the terminal names every output measured on the pod"
 
 
+def test_chain_admitted_fires_exactly_once_at_admission(monkeypatch, wired, op):
+    """The box's READINESS phase (op_backend.READINESS_WHY) reads this frame as the chain-pool-to-worker
+    admission edge. NEGATIVE: a duplicate or a frame that moved past preflight would mis-time that edge."""
+    src, required = wired
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
+    cp = _CP()
+    runner.run_chain(_Chain([_Step(f"s{i}", op.op, src, required) for i in range(3)]), cp,
+                     corr_id="corr-1", session_id="sess-1")
+
+    admitted = [e for e in cp.events if e.get("phase") == "chain_admitted"]
+    assert len(admitted) == 1, cp.events
+    assert cp.events[0] is admitted[0], "chain_admitted must be the FIRST frame this chain ever posts"
+    assert admitted[0]["corr_id"] == "corr-1" and admitted[0]["session_id"] == "sess-1"
+    assert admitted[0]["stage"] == "ops" and admitted[0]["status"] == "step" and admitted[0]["op"] == "ops"
+
+
 def test_live_events_keep_starts_plus_one_step_closure_while_terminal_keeps_detail(monkeypatch, wired, op):
     """Success keeps one boundary per phase that may hang plus one closure for the whole step; the terminal
     remains the full-chain receipt."""
@@ -194,7 +210,8 @@ def test_live_events_keep_starts_plus_one_step_closure_while_terminal_keeps_deta
     cp = _CP()
     runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp, corr_id="c", session_id="s")
     chain_phases = [e["phase"] for e in cp.events if e.get("op") == "ops" and e.get("phase")]
-    assert chain_phases[:4] == [
+    assert chain_phases[:5] == [
+        "chain_admitted",
         "preflight_started", "preflight_finished",
         "pack_activate_started", "pack_activate_finished",
     ]
@@ -214,7 +231,7 @@ def test_live_events_keep_starts_plus_one_step_closure_while_terminal_keeps_deta
 
 
 def test_success_event_count_has_a_small_constant_per_step(monkeypatch, wired, op):
-    """NEGATIVE/perf: restoring three phase-finished boundaries changes 5N+7 back to 8N+7 and makes the
+    """NEGATIVE/perf: restoring three phase-finished boundaries changes 5N+8 back to 8N+8 and makes the
     durable stream itself the critical path for wide b-roll chains."""
     src, required = wired
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
@@ -222,7 +239,7 @@ def test_success_event_count_has_a_small_constant_per_step(monkeypatch, wired, o
     count = 8
     runner.run_chain(_Chain([_Step(f"s{i}", op.op, src, required) for i in range(count)]), cp)
 
-    assert len(cp.events) == 5 * count + 7, [e.get("phase") for e in cp.events]
+    assert len(cp.events) == 5 * count + 8, [e.get("phase") for e in cp.events]
     assert [e.get("phase") for e in cp.events].count("timeline_sync") == 1
     terminal = cp.terminal["timings"]["steps"]
     assert len(terminal) == count

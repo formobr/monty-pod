@@ -1398,10 +1398,11 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                 timings={"phase_s": round(time.monotonic() - started, 3)},
             )
 
-    # The clock the box cannot read. Started BEFORE preflight and the pack fetch on purpose: everything from
-    # here to the terminal is the pod's own, and what the box's wall holds beyond it is transport and queue
-    # (STEP_TIMING_WHY). `timings` on every list.append below is safe unlocked — `append` is atomic under the
-    # GIL, and a lock here would be a wait with no deadline anyone could state.
+    # FIRST LINE: the chain-pool-to-worker admission edge op_backend.READINESS_WHY reads.
+    _event(status="step", op="ops", phase="chain_admitted")
+
+    # The clock the box cannot read, started BEFORE preflight/pack fetch on purpose (STEP_TIMING_WHY).
+    # `timings.append` below is safe unlocked: atomic under the GIL, and a lock here has no statable deadline.
     t_chain = time.monotonic()
     chain_start_ns = time.monotonic_ns()
     timings: list[StepTiming] = []
