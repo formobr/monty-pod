@@ -44,7 +44,7 @@ def test_delivery_pending_retries_forever_and_never_exits(
 def test_transport_unhealthy_backs_off_then_exits_honestly_within_the_cap(
         monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
-    monkeypatch.setenv(agent_main._TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_ENV, "3")
+    monkeypatch.setattr(agent_main, "_TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT", 3)
     cp = _AlwaysRaises(TransportUnhealthy("durable append failed: disk full"))
 
     with pytest.raises(SystemExit) as excinfo:
@@ -58,7 +58,7 @@ def test_transport_unhealthy_backs_off_then_exits_honestly_within_the_cap(
 def test_transport_unhealthy_attempt_count_resets_after_a_healthy_poll(
         monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
-    monkeypatch.setenv(agent_main._TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_ENV, "2")
+    monkeypatch.setattr(agent_main, "_TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT", 2)
 
     class _RecoversOnce:
         def __init__(self) -> None:

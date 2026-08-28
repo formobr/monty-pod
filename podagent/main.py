@@ -39,7 +39,6 @@ INFER_KINDS = ("align", "face_probe", "clip_rank")
 _MIN_POLL_INTERVAL_S = 1.0
 
 _TRANSPORT_UNHEALTHY_BACKOFF_S = 5.0
-_TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_ENV = "POD_TRANSPORT_UNHEALTHY_MAX_ATTEMPTS"
 # Bounded, not infinite: a genuinely broken transport must exit honestly (POST_MORTEM_WHY) rather than spin.
 _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT = 12
 
@@ -84,11 +83,7 @@ def ops_chain_pool_size() -> int:
 
 
 def _transport_unhealthy_max_attempts() -> int:
-    try:
-        return max(1, int(os.environ.get(
-            _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_ENV, "") or _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT))
-    except ValueError:
-        return _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT
+    return max(1, _TRANSPORT_UNHEALTHY_MAX_ATTEMPTS_DEFAULT)
 
 
 CAPACITY_VRAM_WHY = """

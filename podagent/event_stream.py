@@ -52,7 +52,7 @@ BACKGROUND_RETRY_S = float(os.environ.get("POD_STREAM_BACKGROUND_RETRY_S", "5"))
 ACK_WINDOW = min(256, max(1, int(os.environ.get("POD_STREAM_ACK_WINDOW", "32"))))
 # ~10 min at the default BACKGROUND_RETRY_S: generous, but bounded — an unbounded DeliveryPending retry
 # bricks admission on a billed pod forever if the control plane can never accept this exact frame.
-DELIVERY_PENDING_MAX_ATTEMPTS = int(os.environ.get("POD_STREAM_DELIVERY_PENDING_MAX_ATTEMPTS", "120"))
+DELIVERY_PENDING_MAX_ATTEMPTS = 120  # ~10 min at BACKGROUND_RETRY_S; a frame the CP cannot settle by then is dead-lettered, not a brick
 DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 3
