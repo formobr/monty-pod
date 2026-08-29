@@ -1,6 +1,6 @@
 {
   "bundle_format": 1,
-  "bundle_sha256": "20a06cb4c796d75eadc06186bf3f9004e67084550c5e0e618320b814912301a0",
+  "bundle_sha256": "888d48677e7075d405fd0bf955bbc42bf584ec0287b3bdb54649564715938e26",
   "contract_version": 13,
   "fixtures": {
     "event.pod": {
@@ -1173,6 +1173,19 @@
     "surfaces": [
       {
         "fixture_fingerprint": [
+          "contract_version",
+          "producer"
+        ],
+        "name": "browser_acceptance_bundle",
+        "python_models": [],
+        "requires_valid_fixture": false,
+        "schema": "browser_acceptance_bundle.v2.schema.json",
+        "version_pointers": [
+          "/x-contract-version"
+        ]
+      },
+      {
+        "fixture_fingerprint": [
           "schema_version",
           "job_id",
           "stage",
@@ -1310,6 +1323,331 @@
     "version_file": "VERSION"
   },
   "schemas": {
+    "browser_acceptance_bundle": {
+      "$defs": {
+        "browserProtocol": {
+          "additionalProperties": false,
+          "properties": {
+            "app_git_sha": {
+              "$ref": "#/$defs/sha1"
+            },
+            "correlation": {
+              "$ref": "#/$defs/correlation"
+            },
+            "initial_job_id": {
+              "$ref": "#/$defs/opaque"
+            },
+            "job_id": {
+              "$ref": "#/$defs/opaque"
+            },
+            "object_etag": {
+              "$ref": "#/$defs/opaque"
+            },
+            "phase_offsets": {
+              "$ref": "#/$defs/phases"
+            },
+            "plan_digest": {
+              "$ref": "#/$defs/sha256"
+            },
+            "producer": {
+              "const": "browser-acceptance.mjs/v2"
+            },
+            "protocol": {
+              "const": "browser_upload_protocol"
+            },
+            "release_id": {
+              "$ref": "#/$defs/opaque"
+            },
+            "run_id": {
+              "$ref": "#/$defs/opaque"
+            },
+            "server": {
+              "$ref": "#/$defs/server"
+            },
+            "source": {
+              "$ref": "#/$defs/source"
+            },
+            "upload_id": {
+              "$ref": "#/$defs/opaque"
+            }
+          },
+          "required": [
+            "producer",
+            "protocol",
+            "upload_id",
+            "initial_job_id",
+            "job_id",
+            "run_id",
+            "plan_digest",
+            "source",
+            "object_etag",
+            "server",
+            "correlation",
+            "phase_offsets",
+            "app_git_sha",
+            "release_id"
+          ],
+          "type": "object"
+        },
+        "correlation": {
+          "additionalProperties": false,
+          "properties": {
+            "cdp_file_input_set": {
+              "const": true
+            },
+            "job_body_upload_id_only": {
+              "const": true
+            },
+            "job_response_id_matches_online_get": {
+              "const": true
+            },
+            "online_get_authenticated": {
+              "const": true
+            },
+            "put_completion_get_etag_equal": {
+              "const": true
+            },
+            "put_headers_match_mint": {
+              "const": true
+            },
+            "put_url_matches_mint": {
+              "const": true
+            },
+            "same_upload_id_on_completion": {
+              "const": true
+            },
+            "same_upload_id_on_job": {
+              "const": true
+            }
+          },
+          "required": [
+            "cdp_file_input_set",
+            "put_url_matches_mint",
+            "put_headers_match_mint",
+            "same_upload_id_on_completion",
+            "job_body_upload_id_only",
+            "same_upload_id_on_job",
+            "online_get_authenticated",
+            "job_response_id_matches_online_get",
+            "put_completion_get_etag_equal"
+          ],
+          "type": "object"
+        },
+        "opaque": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+          "type": "string"
+        },
+        "palette": {
+          "additionalProperties": false,
+          "properties": {
+            "all_src_loaded": {
+              "const": true
+            },
+            "all_thumbs_loaded": {
+              "const": true
+            },
+            "app_git_sha": {
+              "$ref": "#/$defs/sha1"
+            },
+            "broken_image_named_and_disabled": {
+              "const": true
+            },
+            "job_id": {
+              "$ref": "#/$defs/opaque"
+            },
+            "lazy_scroll_loaded": {
+              "const": true
+            },
+            "release_id": {
+              "$ref": "#/$defs/opaque"
+            },
+            "reopen_loaded": {
+              "const": true
+            },
+            "run_id": {
+              "$ref": "#/$defs/opaque"
+            },
+            "selected_on_canvas_counts": {
+              "items": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "selection_survived_refresh": {
+              "const": true
+            },
+            "selection_updated_preview": {
+              "const": true
+            },
+            "swap_alternative_counts": {
+              "items": {
+                "maximum": 4,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "total_choice_counts": {
+              "items": {
+                "maximum": 4,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "job_id",
+            "run_id",
+            "app_git_sha",
+            "release_id",
+            "swap_alternative_counts",
+            "selected_on_canvas_counts",
+            "total_choice_counts",
+            "all_src_loaded",
+            "all_thumbs_loaded",
+            "lazy_scroll_loaded",
+            "reopen_loaded",
+            "broken_image_named_and_disabled",
+            "selection_updated_preview",
+            "selection_survived_refresh"
+          ],
+          "type": "object"
+        },
+        "phases": {
+          "additionalProperties": false,
+          "properties": {
+            "accepted": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "completion": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "file_selected": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "get": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "job": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "mint": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "palette_observed": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "put": {
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "file_selected",
+            "mint",
+            "put",
+            "completion",
+            "job",
+            "get",
+            "palette_observed",
+            "accepted"
+          ],
+          "type": "object"
+        },
+        "server": {
+          "additionalProperties": false,
+          "properties": {
+            "completed_at": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "enqueue_state": {
+              "const": "enqueued"
+            },
+            "job_created_at": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "minted_at": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "enqueue_state",
+            "minted_at",
+            "completed_at",
+            "job_created_at"
+          ],
+          "type": "object"
+        },
+        "sha1": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "source": {
+          "additionalProperties": false,
+          "properties": {
+            "md5": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "size": {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "size",
+            "sha256",
+            "md5"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "browser_acceptance_bundle.v2",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "browser_protocol": {
+          "$ref": "#/$defs/browserProtocol"
+        },
+        "contract_version": {
+          "const": 2
+        },
+        "palette": {
+          "$ref": "#/$defs/palette"
+        }
+      },
+      "required": [
+        "contract_version",
+        "browser_protocol",
+        "palette"
+      ],
+      "title": "BrowserAcceptanceBundleV2",
+      "type": "object",
+      "x-contract-version": 13
+    },
     "event": {
       "$defs": {
         "podWireStatus": {
@@ -2600,7 +2938,8 @@
   },
   "source_sha256": {
     "VERSION": "3fdba35f04dc8c462986c992bcf875546257113072a909c162f7e470e581e278",
-    "contract_surfaces.json": "d5f22942db5577a8076a6d0986d997470b9c39c34bc2de8bf05bf12f0e5ff045",
+    "browser_acceptance_bundle.v2.schema.json": "87c746ce48671becaaee09408502863665618fbf9c45d9c19e8d8b9225bd5534",
+    "contract_surfaces.json": "bd7407069d628fa1283db30480a0a0f955da6d48fe9be84d8cfbe71caf9df6c8",
     "event.schema.json": "76178e7cb1331dec2f11def0066ccc86ca0c47f52019036fffcbd4ecded19638",
     "examples/event.pod.json": "551c2abc46f04c9692b77ee6a57934fa9e3c2f0ea1f70f5fc309dfb47730a8ce",
     "examples/event.running.json": "8c419b841e595c14502696a89ab8fe9d1c4c54f8ad179bd2bcdefc20f46de436",
