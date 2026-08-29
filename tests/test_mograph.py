@@ -50,6 +50,52 @@ def test_stage_public_copies_by_prefix(tmp_path: Path) -> None:
     assert not (rd / "public" / "x").exists()                             # non-prefixed input NOT staged
 
 
+# ── H6/F8: a staged input id must not escape the job's own render workspace ────────────────────────
+
+def test_stage_public_regression_floor_matches_final_dispatch_shape(tmp_path: Path) -> None:
+    """The exact id shape scripts/final_dispatch.py._ship_public mints (`f"mograph/public/{dest}"` where
+    `dest = f"_photo/{p.name}"`, :433,470,484) must still stage exactly where it did before the guard."""
+    rd = tmp_path / "remotion"
+    (rd / "public").mkdir(parents=True)
+    media = tmp_path / "x.jpg"; media.write_bytes(b"jpg")
+    mograph._stage_public({"mograph/public/_photo/x.jpg": media}, rd)
+    assert (rd / "public" / "_photo" / "x.jpg").read_bytes() == b"jpg"
+
+
+def test_stage_public_refuses_a_dotdot_traversal(tmp_path: Path) -> None:
+    rd = tmp_path / "job" / "remotion"
+    (rd / "public").mkdir(parents=True)
+    src_dir = tmp_path / "src"; src_dir.mkdir()
+    payload = src_dir / "evil.mjs"; payload.write_bytes(b"evil")
+    with pytest.raises(mograph.StagedInputNotAllowed):
+        mograph._stage_public({"mograph/../../evil.mjs": payload}, rd)
+    assert not (rd.parent.parent / "evil.mjs").exists()  # rd.parent.parent == tmp_path — where it would land
+
+
+def test_stage_public_refuses_an_absolute_looking_id(tmp_path: Path) -> None:
+    rd = tmp_path / "remotion"
+    (rd / "public").mkdir(parents=True)
+    victim = tmp_path / "outside"
+    payload = tmp_path / "evil"; payload.write_bytes(b"evil")
+    with pytest.raises(mograph.StagedInputNotAllowed):
+        mograph._stage_public({f"mograph//{victim}/evil": payload}, rd)
+    assert not victim.exists()
+
+
+def test_stage_public_refuses_a_write_through_the_node_modules_symlink(tmp_path: Path) -> None:
+    """bundle.workspace() symlinks `node_modules` into the SHARED, immutable cache (bundle.py:11-19,34,66-69)
+    — an id that walks through it must be refused, not silently persisted across every future job."""
+    shared_cache = tmp_path / "cache" / "node_modules"
+    shared_cache.mkdir(parents=True)
+    rd = tmp_path / "remotion"
+    rd.mkdir()
+    (rd / "node_modules").symlink_to(shared_cache, target_is_directory=True)
+    payload = tmp_path / "evil.txt"; payload.write_bytes(b"evil")
+    with pytest.raises(mograph.StagedInputNotAllowed):
+        mograph._stage_public({"mograph/node_modules/evil.txt": payload}, rd)
+    assert not (shared_cache / "evil.txt").exists()
+
+
 def test_qtrle_layer_encode_sets_bt709(monkeypatch, tmp_path: Path) -> None:
     seqdir = tmp_path / "seq"; seqdir.mkdir()
     (seqdir / "frame.png").write_bytes(b"png")

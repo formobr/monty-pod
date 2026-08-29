@@ -61,11 +61,34 @@ def remotion_dir(ref, tmp: Path) -> Path:
     return bundle.workspace(bundle.ensure(ref), tmp / "remotion")
 
 
+class StagedInputNotAllowed(ValueError):
+    """A staged mograph input id that would write outside this job's own render workspace."""
+
+
+def _stage_dest(rd: Path, iid: str) -> Path:
+    """<rd>/<rel> for input id `mograph/<rel>`, refusing anything that could escape `rd` — including through
+    the `node_modules` symlink into bundle.py's SHARED cache (bundle.py:11-19,34,66-69), which a plain
+    `resolve()` on the joined path still catches because it resolves that already-existing symlink too."""
+    rel = iid[len(_STAGE_PREFIX):]
+    if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+        raise StagedInputNotAllowed(
+            f"REFUSED staged input id {iid!r}: a staged input id must name a RELATIVE path under the "
+            f"staging root — no absolute component, no `..` segment. A legitimate id looks like "
+            f"mograph/public/_photo/x.jpg (scripts/final_dispatch.py's _ship_public mints these).")
+    dest = rd / rel
+    rd_real, dest_real = rd.resolve(), dest.resolve()
+    if dest_real != rd_real and not dest_real.is_relative_to(rd_real):
+        raise StagedInputNotAllowed(
+            f"REFUSED staged input id {iid!r}: {dest} resolves to {dest_real}, outside this job's staging "
+            f"root {rd_real} — likely a symlink (node_modules) walked it into the shared bundle cache.")
+    return dest
+
+
 def _stage_public(input_paths: dict, rd: Path) -> None:
     """Copy every `mograph/<rel>` input into <bundle>/<rel> (public/ fonts+media, src/ bespoke .tsx+entry)."""
     for iid, path in input_paths.items():
         if iid.startswith(_STAGE_PREFIX):
-            dest = rd / iid[len(_STAGE_PREFIX):]
+            dest = _stage_dest(rd, iid)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, dest)
 
