@@ -67,7 +67,7 @@ def _origin(payload: bytes, etag: str, *, honor_range: bool = True,
     lock = threading.Lock()
 
     def get(url: str, *, headers: dict[str, str] | None = None, stream: bool = True,
-           timeout: Any = None) -> _FakeResp:
+           timeout: Any = None, allow_redirects: bool = True) -> _FakeResp:
         headers = headers or {}
         with lock:
             calls.append((headers.get("Range"), headers.get("If-Range")))
@@ -103,7 +103,7 @@ def test_single_stream_full_download_matches_content(tmp_path: Path, monkeypatch
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    got = cp.download("https://store.example/obj?signature=1", dest)
+    got = cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert got == dest
     assert dest.read_bytes() == payload
@@ -125,7 +125,7 @@ def test_single_stream_resumes_via_range_after_a_dropped_connection(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    got = cp.download("https://store.example/obj?signature=1", dest)
+    got = cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert got == dest
     assert dest.read_bytes() == payload, "the resumed tail must splice onto exactly the dropped prefix"
@@ -148,7 +148,7 @@ def test_single_stream_short_body_raises_and_deletes_dest(
     dest = tmp_path / "obj.bin"
 
     with pytest.raises(cp.ShortBody, match="expected 999999"):
-        cp.download("https://store.example/obj?signature=1", dest)
+        cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert not dest.exists()
     assert len(calls) == 1 + cp._XFER_ATTEMPTS, "one probe, then every single-stream attempt exhausted"
@@ -171,7 +171,7 @@ def test_ranged_happy_path_assembles_exact_content(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload, "assembled bytes must equal the known payload exactly"
     assert not _ranged_temp(dest).exists()
@@ -194,7 +194,7 @@ def test_ranged_etag_change_mid_fetch_falls_back_and_leaves_dest_correct(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload, "the fallback single-stream fetch must still land correct bytes"
     assert not _ranged_temp(dest).exists(), "ranged temp must be cleaned up"
@@ -213,7 +213,7 @@ def test_ranged_malformed_content_range_falls_back(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload
     assert not _ranged_temp(dest).exists()
@@ -235,7 +235,7 @@ def test_ranged_part_short_body_falls_back(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload
     assert not _ranged_temp(dest).exists()
@@ -257,7 +257,7 @@ def test_ranged_content_encoding_on_a_part_falls_back(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload
     assert any(c[0] is None for c in calls), "Content-Encoding on a ranged part must fall back"
@@ -277,7 +277,7 @@ def test_ranged_fallback_wipes_stale_dest_and_starts_the_retry_from_zero(
     dest = tmp_path / "obj.bin"
     dest.write_bytes(b"STALE-LEFTOVER-FROM-A-PRIOR-CRASHED-ATTEMPT" * 10)
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload, "stale bytes must never be spliced onto the real object"
     fallback_calls = [c for c in calls if c[0] is None]
@@ -302,7 +302,7 @@ def test_ranged_oserror_during_presize_falls_back_to_single_stream(
     monkeypatch.setattr(Path, "open", failing_open)
     dest = tmp_path / "obj.bin"
 
-    got = cp.download("https://store.example/obj?signature=1", dest)
+    got = cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert got == dest
     assert dest.read_bytes() == payload
@@ -321,7 +321,7 @@ def test_two_concurrent_downloads_to_the_same_dest_use_distinct_temps_and_both_l
 
     def run() -> None:
         try:
-            cp.download("https://store.example/obj?signature=1", dest)
+            cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
         except BaseException as exc:  # noqa: BLE001 - captured for the assertion, never swallowed
             errors.append(exc)
 
@@ -345,7 +345,7 @@ def test_ranged_200_only_origin_uses_single_stream(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload
     assert len(calls) == 2, "probe (200, not 206) then exactly one single-stream fallback GET"
@@ -360,7 +360,7 @@ def test_ranged_threshold_boundary_just_below_uses_single_stream(
     monkeypatch.setattr(cp, "_store", type("S", (), {"get": staticmethod(get)}))
     dest = tmp_path / "obj.bin"
 
-    cp.download("https://store.example/obj?signature=1", dest)
+    cp.download("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest)
 
     assert dest.read_bytes() == payload
     assert len(calls) == 2, "an eligible-but-too-small origin must still take the single-stream path"
@@ -387,7 +387,7 @@ def test_ranged_byte_count_mismatch_skips_rename_and_cleans_temp(
     dest = tmp_path / "obj.bin"
 
     with pytest.raises(cp.ShortBody, match="workers moved"):
-        cp._download_ranged("https://store.example/obj?signature=1", dest, total, etag)
+        cp._download_ranged("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest, total, etag)
 
     assert not dest.exists()
     assert not _ranged_temp(dest).exists()
@@ -414,7 +414,7 @@ def test_aggregate_deadline_trip_drains_running_workers_then_falls_back(
     dest = tmp_path / "obj.bin"
 
     with pytest.raises(cp.TransferTimeout, match="aggregate wall"):
-        cp._download_ranged("https://store.example/obj?signature=1", dest, 64, '"etag"')
+        cp._download_ranged("https://store.example/obj?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", dest, 64, '"etag"')
 
     assert landed.is_set(), "the worker must have been drained (observed to stop) before the raise unwound"
     assert not dest.exists()

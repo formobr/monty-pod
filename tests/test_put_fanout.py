@@ -183,7 +183,8 @@ def test_each_put_retry_keeps_wire_and_retry_intervals_without_changing_total(tm
     monkeypatch.setattr(cp.time, "sleep", lambda _seconds: None)
     cp.retry.reset()
     cp.put_trace.reset()
-    cp.upload(src, "https://store.example/out?signature=must-not-cross")
+    cp.upload(src, "https://store.example/out?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request"
+                   "&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6")
 
     rows = cp.put_trace.collect()
     assert [row["attempt"] for row in rows] == [1, 2]

@@ -51,7 +51,7 @@ def test_snapshot_upload_preserves_browser_image_mime(tmp_path: Path, monkeypatc
     store = _Store()
     monkeypatch.setattr(cp, "_store", store)
 
-    cp.upload(snapshot, "https://r2.example/object?signature=redacted")
+    cp.upload(snapshot, "https://r2.example/object?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6")
 
     assert store.headers["Content-Type"] == "image/jpeg"
 
@@ -62,7 +62,7 @@ def test_unknown_snapshot_remains_binary(tmp_path: Path, monkeypatch) -> None:
     store = _Store()
     monkeypatch.setattr(cp, "_store", store)
 
-    cp.upload(snapshot, "https://r2.example/object?signature=redacted")
+    cp.upload(snapshot, "https://r2.example/object?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6")
 
     assert store.headers["Content-Type"] == "application/octet-stream"
 
@@ -85,6 +85,6 @@ def test_explicit_upload_content_type_wins_over_magic(tmp_path: Path, monkeypatc
     store = _Store()
     monkeypatch.setattr(cp, "_store", store)
 
-    cp.upload(snapshot, "https://r2.example/object?signature=redacted", "application/custom")
+    cp.upload(snapshot, "https://r2.example/object?X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=bb459aa8161dac7d2e80030516e882519b6b9beccbfc141f9f4123d56f0dc6a6", "application/custom")
 
     assert store.headers["Content-Type"] == "application/custom"

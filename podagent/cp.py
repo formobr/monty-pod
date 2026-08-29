@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import os
+import re
 import shutil
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 from urllib.request import url2pathname
 
 import requests
@@ -219,22 +220,43 @@ class UrlNotAllowed(ValueError):
     """A url the transport may not dereference — it is neither local nor a capability we minted."""
 
 
-# A presigned GET carries its signature in the query, whichever object store minted it (SigV4 prefixes,
-# plus SigV2's bare pair). This is what tells "our own R2" from "somewhere on the internet".
-_SIGNED_PREFIXES = ("x-amz-", "x-goog-", "x-ms-", "x-obs-")
-_SIGNED_NAMES = frozenset({"signature", "awsaccesskeyid", "expires", "token"})
+# Every presigner here is SigV4 (Go: r2.go:70,76,133,211,228; Python: store_s3.py:127,149,256) — Signature
+# always arrives paired with Credential; a lone name or the legacy SigV2 triple matches no real producer.
+_SIG_PAIRS = (
+    ("x-amz-signature", "x-amz-credential"),  # R2 (Go) and MinIO (Python) — the only real producers in-repo
+    ("x-goog-signature", "x-goog-credential"),  # kept for parity — no producer in this repo
+    ("x-ms-signature", "x-ms-credential"),  # kept for parity — no producer in this repo
+    ("x-obs-signature", "x-obs-credential"),  # kept for parity — no producer in this repo
+)
+_SIG_VALUE_RE = re.compile(r"^[0-9a-f]{64}$")  # both real producers emit exactly this: HMAC-SHA256 hex
 
 
 def _is_presigned(url: str) -> bool:
-    names = {n.lower() for n, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)}
-    return any(n.startswith(_SIGNED_PREFIXES) or n in _SIGNED_NAMES for n in names)
+    names = {n.lower(): v for n, v in parse_qsl(urlparse(url).query, keep_blank_values=True)}
+    return any(sig in names and cred in names and _SIG_VALUE_RE.match(names[sig])
+               for sig, cred in _SIG_PAIRS)
+
+
+def _is_real_pod() -> bool:
+    """Bare `JOB_TOKEN` (main.py:951) is the rented pod's own boot credential; `--local` dev only ever
+    exports `MONTY_JOB_TOKEN`, in the same interpreter that runs `file://` bindings."""
+    return bool((os.environ.get("JOB_TOKEN") or "").strip())
 
 
 def assert_fetchable(url: str) -> str:
     """THE transport allowlist. A presigned url is a CAPABILITY — one object, expiring, minted by the
     control plane; a bare url is an address the pod was merely told to visit, and this pod is RENTED on
     somebody else's network where `http://169.254.169.254/...` is one string away."""
-    if _file_path(url) is not None or _is_presigned(url):
+    local = _file_path(url)
+    if local is not None:
+        if _is_real_pod():
+            raise UrlNotAllowed(
+                f"REFUSED file:// path {local!r}: this process holds a control-plane JOB_TOKEN, so it is a "
+                f"rented pod, not the keyless local backend — file:// belongs only to `--local` dev and the "
+                f"origin/laptop render, neither of which ever holds this credential. A pod dereferences "
+                f"CAPABILITIES the control plane minted (a presigned url), never a local path.")
+        return url
+    if _is_presigned(url):
         return url
     parts = urlparse(url)
     raise UrlNotAllowed(
@@ -243,6 +265,31 @@ def assert_fetchable(url: str) -> str:
         f"addresses it was handed. An ORIGIN url (a stock CDN) belongs in an op's params, where the ops "
         f"pack runs its own fetch guard on it (montyops.stock_hosts) — not in a binding, where this "
         f"transport would fetch whatever a third party's search response happened to contain.")
+
+
+# Mirrors scripts/montyops/media_fetch.py:303-321: allow_redirects=False, bounded hops, urljoin.
+_MAX_REDIRECT_HOPS = 10
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+def _fetch(url: str, *, headers: dict[str, str] | None = None, timeout: float = _TIMEOUT) -> Any:
+    """GET through `_store`, re-checking `assert_fetchable` on every hop before dereferencing it — shared
+    by download()'s three GET call sites so fixing one could never again leave the other two open."""
+    nxt = url
+    for hop in range(_MAX_REDIRECT_HOPS):
+        nxt = assert_fetchable(nxt)
+        resp = _store.get(nxt, headers=headers, stream=True, timeout=timeout, allow_redirects=False)
+        if resp.status_code not in _REDIRECT_STATUSES:
+            return resp
+        location = resp.headers.get("Location")
+        resp.close()
+        if not location:
+            raise UrlNotAllowed(
+                f"REFUSED redirect hop {hop + 1} from {urlparse(nxt).hostname or ''}: HTTP "
+                f"{resp.status_code} carried no Location header to follow")
+        nxt = urljoin(nxt, location)
+    raise UrlNotAllowed(
+        f"REFUSED: more than {_MAX_REDIRECT_HOPS} redirect hops fetching {urlparse(url).hostname or ''}")
 
 
 class TransferTimeout(requests.RequestException):
@@ -355,7 +402,7 @@ def _range_probe(url: str) -> tuple[int, str] | None:
     """A 206 to `Range: bytes=0-1` carrying a Content-Range total AND a non-empty ETag proves the origin
     honors ranges and hands us an identity to pin; anything else is None (download() falls back unchanged)."""
     try:
-        resp = _store.get(url, headers={"Range": "bytes=0-1"}, stream=True, timeout=_TIMEOUT)
+        resp = _fetch(url, headers={"Range": "bytes=0-1"}, timeout=_TIMEOUT)
     except requests.RequestException:
         return None
     with resp:
@@ -397,8 +444,8 @@ def _ranged_worker(url: str, temp: Path, start: int, end: int, total: int, etag:
         if abort.is_set():
             return 0
         try:
-            with _store.get(url, headers={"Range": f"bytes={start}-{end}", "If-Range": etag},
-                            stream=True, timeout=_TIMEOUT) as resp:
+            with _fetch(url, headers={"Range": f"bytes={start}-{end}", "If-Range": etag},
+                       timeout=_TIMEOUT) as resp:
                 if resp.status_code != 206:
                     raise _RestartRequired(
                         f"ranged part {start}-{end}: expected 206, got {resp.status_code} — the If-Range "
@@ -552,7 +599,7 @@ def download(url: str, dest: Path) -> Path:
         if have and pinned_etag:
             headers["If-Range"] = pinned_etag
         try:
-            with _store.get(url, stream=True, timeout=_TIMEOUT, headers=headers) as r:
+            with _fetch(url, timeout=_TIMEOUT, headers=headers) as r:
                 if r.status_code == 416:
                     raise _RestartRequired(f"416 Range Not Satisfiable at offset {have} — restarting from 0")
                 r.raise_for_status()
@@ -725,6 +772,7 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
     A retry re-sends the object FROM BYTE 0 — a presigned PUT is one signed request and has no resume. The
     real fix is presigned MULTIPART (the brain mints an uploadId plus per-part urls), which makes a reset
     cost one part instead of the object; until that mint exists the waste is at least MEASURED, not unknown."""
+    assert_fetchable(put_url)
     local = _file_path(put_url)
     if local is not None:
         t0_ns = time.monotonic_ns()
