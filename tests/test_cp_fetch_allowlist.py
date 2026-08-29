@@ -107,10 +107,10 @@ def test_download_refuses_a_redirect_hop_instead_of_following_it(tmp_path, monke
     assert len(calls) == 1, f"the redirect hop must never be dereferenced, got calls={calls}"
 
 
-def test_upload_refuses_a_file_url_on_a_token_holding_pod_before_it_writes(tmp_path, monkeypatch):
-    """`upload()` called no guard at all and honoured `file://` outright — on a REAL pod (one that holds a
-    control-plane JOB_TOKEN) that is an arbitrary local file write."""
-    monkeypatch.setenv("JOB_TOKEN", "shaped-like-a-bearer.not-a-real-signature")
+def test_upload_refuses_a_file_url_when_this_process_is_marked_a_rented_pod(tmp_path, monkeypatch):
+    """`upload()` called no guard at all and honoured `file://` outright — on a REAL pod (marked so by its
+    own entrypoint, `cp.mark_rented_pod()`, never by ambient env) that is an arbitrary local file write."""
+    monkeypatch.setattr(cp, "_RENTED_POD", True)
     monkeypatch.setattr(cp.shutil, "copyfile",
                         lambda *a, **k: pytest.fail("a file was written for a refused url"))
     src = tmp_path / "src.bin"
@@ -127,3 +127,23 @@ def test_upload_refuses_a_bare_address_before_it_puts(tmp_path, monkeypatch):
     src.write_bytes(b"payload")
     with pytest.raises(cp.UrlNotAllowed):
         cp.upload(src, "http://169.254.169.254/x")
+
+
+# ── P1: identity is an EXPLICIT call, not an ambient env sniff ──────────────────────────────────────
+
+def test_mark_rented_pod_sets_the_flag_and_nothing_else_does(monkeypatch):
+    monkeypatch.setattr(cp, "_RENTED_POD", False)
+    assert cp._is_real_pod() is False
+    cp.mark_rented_pod()
+    assert cp._is_real_pod() is True
+
+
+def test_a_stray_job_token_in_the_shell_does_not_mark_a_local_render_a_pod(tmp_path, monkeypatch):
+    """THE point of the change: an operator's leftover JOB_TOKEN, inherited by a `--local` launch, must
+    NOT turn a legitimate file:// binding into a refusal — only `podagent.main`'s own boot read may."""
+    monkeypatch.setenv("JOB_TOKEN", "stale-shell-export-not-a-pod")
+    monkeypatch.setattr(cp, "_RENTED_POD", False)
+    src = tmp_path / "out.bin"; src.write_bytes(b"rendered")
+    target = tmp_path / "master" / "final.bin"
+    cp.upload(src, target.as_uri())  # must NOT raise
+    assert target.read_bytes() == b"rendered"

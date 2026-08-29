@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import requests
 from pydantic import ValidationError
 
-from .cp import ControlPlane
+from .cp import ControlPlane, mark_rented_pod
 from .event_stream import DeliveryPending, TransportUnhealthy
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 from .sanitize import safe_error, safe_text, safe_traceback
@@ -949,6 +949,7 @@ def _drain_and_restart(cp: ControlPlane, coordinator: RestartCoordinator, *,
 def main() -> None:
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
+    mark_rented_pod()  # THIS read of JOB_TOKEN is the boot credential, not ambient state — tell cp.py so
     # Shared-fleet workers hold one physical bearer.  It is deliberately not copied into a product-session
     # field; the control plane resolves the product tenant from corr attribution for every LLM call.
     os.environ["MONTY_JOB_TOKEN"] = job_token

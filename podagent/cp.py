@@ -220,13 +220,38 @@ class UrlNotAllowed(ValueError):
     """A url the transport may not dereference — it is neither local nor a capability we minted."""
 
 
-# Every presigner here is SigV4 (Go: r2.go:70,76,133,211,228; Python: store_s3.py:127,149,256) — Signature
-# always arrives paired with Credential; a lone name or the legacy SigV2 triple matches no real producer.
+PRESIGNED_SHAPE_LIMIT_WHY = """
+_IS_PRESIGNED PROVES SHAPE, NOT PROVENANCE.
+
+What this check establishes: the query string carries the SYNTACTIC shape only SigV4 signing ever produces
+— Signature paired with Credential, the signature itself a 64-char lowercase-hex blob (the exact form both
+in-repo presigners, R2 and MinIO, emit). What it does NOT establish: that the control plane actually minted
+THIS url. There is no shared secret here to check the signature against — this transport never held the
+signing key, only the finished url — so anyone who controls the string handed to assert_fetchable can spell
+`http://169.254.169.254/latest/meta-data/?X-Amz-Credential=x&X-Amz-Signature=<64 chosen hex chars>` and pass.
+A syntactically valid forgery is indistinguishable from a real capability BY THIS FUNCTION ALONE.
+
+WHY IT IS STILL A REAL FIX, not theatre. The bug this replaced matched a bare parameter NAME (`?token=1`,
+`?expires=1`) — any string containing the right WORD walked through, no matter how it was spelled. This one
+requires the SHAPE a presigner actually emits, which nobody spells by accident, and it closes the audit's
+exact bypass. It raised the floor; it did not build a ceiling.
+
+THE REAL FIX, if this residual ever needs closing: the control plane names the ALLOWED ORIGIN in the job
+envelope — the host THIS job's presigned urls are minted against — and the pod checks a url's host against
+THAT declared value, not against the url's own claimed shape. That is a control-plane contract change
+(a new envelope field, a new check here keyed on it), not a change this file can make on its own; it is the
+owner's call whether the residual below is worth that cost.
+
+WHAT STANDS BETWEEN AN ATTACKER AND THIS FUNCTION TODAY, so the residual is bounded, not open: this code
+only ever sees a url that already crossed the ENGINE-side guards keeping a foreign string out of a binding
+in the first place — the stock/b-roll lane's assert_bindable_origin + stock_hosts (the model other channels
+should copy per the audit), prodMode()'s fail-closed refusal of a client-supplied source_url in production,
+and the Go/Python schema mirrors on the job envelope. This function is the LAST layer checked on the pod,
+not the only layer standing between a client-supplied string and a dereference.
+"""
+
 _SIG_PAIRS = (
     ("x-amz-signature", "x-amz-credential"),  # R2 (Go) and MinIO (Python) — the only real producers in-repo
-    ("x-goog-signature", "x-goog-credential"),  # kept for parity — no producer in this repo
-    ("x-ms-signature", "x-ms-credential"),  # kept for parity — no producer in this repo
-    ("x-obs-signature", "x-obs-credential"),  # kept for parity — no producer in this repo
 )
 _SIG_VALUE_RE = re.compile(r"^[0-9a-f]{64}$")  # both real producers emit exactly this: HMAC-SHA256 hex
 
@@ -237,10 +262,19 @@ def _is_presigned(url: str) -> bool:
                for sig, cred in _SIG_PAIRS)
 
 
+# EXPLICIT, not an ambient env read — a stray shell JOB_TOKEN must never reach `--local` dev by inheritance.
+_RENTED_POD = False
+
+
+def mark_rented_pod() -> None:
+    """Call once, from `podagent.main` right after it reads its OWN boot JOB_TOKEN (main.py:951) — the one
+    place that KNOWS this process booted as a rented pod, rather than inferring it from ambient state."""
+    global _RENTED_POD
+    _RENTED_POD = True
+
+
 def _is_real_pod() -> bool:
-    """Bare `JOB_TOKEN` (main.py:951) is the rented pod's own boot credential; `--local` dev only ever
-    exports `MONTY_JOB_TOKEN`, in the same interpreter that runs `file://` bindings."""
-    return bool((os.environ.get("JOB_TOKEN") or "").strip())
+    return _RENTED_POD
 
 
 def assert_fetchable(url: str) -> str:
@@ -251,9 +285,9 @@ def assert_fetchable(url: str) -> str:
     if local is not None:
         if _is_real_pod():
             raise UrlNotAllowed(
-                f"REFUSED file:// path {local!r}: this process holds a control-plane JOB_TOKEN, so it is a "
-                f"rented pod, not the keyless local backend — file:// belongs only to `--local` dev and the "
-                f"origin/laptop render, neither of which ever holds this credential. A pod dereferences "
+                f"REFUSED file:// path {local!r}: this process was marked a rented pod by its own "
+                f"entrypoint (podagent.main, on its boot JOB_TOKEN) — file:// belongs only to `--local` dev "
+                f"and the origin/laptop render, neither of which is ever marked. A pod dereferences "
                 f"CAPABILITIES the control plane minted (a presigned url), never a local path.")
         return url
     if _is_presigned(url):
