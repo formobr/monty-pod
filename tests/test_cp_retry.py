@@ -690,6 +690,77 @@ def test_409_is_transport_retried_not_dead_lettered(tmp_path: Path, monkeypatch:
         stream.close()
 
 
+def test_403_is_durably_dead_lettered_and_fails_the_caller(tmp_path: Path) -> None:
+    """codex#20: Go's 403 'unknown or expired fleet corr_id' is a permanent identity verdict — the
+    attribution row is gone, so retrying the identical frame can never make it valid; dead-letter it
+    like 422, not retry it forever like the readiness-race 409."""
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        ws.send(_ack(frame, status=403, error="unknown or expired fleet corr_id"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(FrameRejected, match="403"):
+            stream.send_result(_result())
+        assert stream.pending_count() == 0
+        stream.close()
+
+    state = json.loads(path.read_text())
+    assert state["frames"] == []
+    assert len(state["rejected"]) == 1
+    assert state["rejected"][0]["ack"]["error"] == "unknown or expired fleet corr_id"
+
+
+def test_403_dead_letters_on_first_verdict_without_retrying(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
+    path = tmp_path / "outbox.json"
+    hits = 0
+
+    def handler(ws: Any) -> None:
+        nonlocal hits
+        frame = json.loads(ws.recv())
+        hits += 1
+        ws.send(_ack(frame, status=403, error="unknown or expired fleet corr_id"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(FrameRejected, match="403"):
+            stream.send_result(_result())
+        assert hits == 1, "a 403 verdict must dead-letter on the first ACK, never replayed for retry"
+        stream.close()
+
+
+def test_mixed_outbox_403_and_valid_frame_lets_the_valid_frame_through(tmp_path: Path) -> None:
+    """One dead-lettered corr must not brick the ordered stream: the frame behind it still ships."""
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            if frame["seq"] == 1:
+                ws.send(_ack(frame, status=403, error="unknown or expired fleet corr_id"))
+            else:
+                ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(FrameRejected, match="403"):
+            stream.send_event(_event(phase="bad"), wait=True)
+        assert stream.send_event(_event(phase="good"), wait=True)
+        _wait_for(lambda: stream.pending_count() == 0)
+        stream.close()
+
+    state = json.loads(path.read_text())
+    assert len(state["rejected"]) == 1 and state["rejected"][0]["ack"]["status"] == 403
+    assert state["frames"] == []
+
+
 def test_persist_failure_while_retiring_keeps_frame_and_unblocks_caller(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "outbox.json"

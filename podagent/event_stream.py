@@ -57,9 +57,9 @@ DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 3
 _ADMISSION_WAKE = object()
-# 422 is the ONLY ack status that is a permanent content verdict; every other 4xx (409 readiness/identity
-# races included) is a transport race and gets retried like a 5xx, never dead-lettered.
-_CONTENT_REJECT_STATUS = 422
+# 422 and 403 are the only permanent content verdicts (Go says THIS frame's identity/content will never
+# validate); every other 4xx, 409 readiness/identity races included, is a transport race — retry, don't dead-letter.
+_CONTENT_REJECT_STATUSES = frozenset({422, 403})
 
 
 def _delivery_wall_s() -> float:
@@ -687,14 +687,13 @@ class EventStream:
                 delivery_s = time.monotonic() - started[key]
                 if 200 <= status < 300:
                     outcomes[key] = ("accepted", ack, delivery_s)
-                elif status == _CONTENT_REJECT_STATUS:
+                elif status in _CONTENT_REJECT_STATUSES:
                     _log(f"frame seq={frame['seq']} REJECTED status={status} "
                          f"reason={safe_text(ack.get('error') or '', 200)} "
                          "— moved to durable dead-letter")
                     outcomes[key] = ("rejected", ack, delivery_s)
                 else:
-                    # Every other 4xx (409 readiness/identity races included), a 5xx, or an absent ACK
-                    # made no permanent content verdict — retry transport, do not dead-letter.
+                    # No permanent content verdict — retry transport, do not dead-letter.
                     if 400 <= status < 500:
                         _log(f"frame seq={frame['seq']} transport-retryable status={status} "
                              f"reason={safe_text(ack.get('error') or '', 200)}")
@@ -987,7 +986,7 @@ class EventStream:
                     self._acks[key] = ack
                     waiter = self._ack_waiters.get(key)
                     status = int(ack["status"])
-                    if status == _CONTENT_REJECT_STATUS:
+                    if status in _CONTENT_REJECT_STATUSES:
                         # Ordered persistence may wait for an earlier ACK. Admission cannot: the peer already
                         # made a deterministic verdict, so no new paid job may enter during that gap.
                         frame = next(
