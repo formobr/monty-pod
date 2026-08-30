@@ -245,27 +245,6 @@ def _llm_correlation(corr_id: str | None):
         yield
 
 
-def _setup_vulkan_icd() -> None:
-    # driver's default ICD points at libGLX_nvidia (X11 front); headless pod has no X11 → loader finds no driver
-    # → libplacebo SILENTLY CPU-falls-back. libEGL_nvidia is the headless ICD; ffmpeg children inherit the env.
-    import subprocess
-    if os.environ.get("VK_ICD_FILENAMES"):
-        return
-    try:
-        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
-        out = ""
-    lib = next((ln.split()[-1] for ln in out.splitlines() if "libEGL_nvidia.so.0" in ln), None)
-    if not lib:
-        _log("WARNING no libEGL_nvidia.so.0 — Vulkan/libplacebo will CPU-fall-back (slow, 0% GPU)")
-        return
-    icd = "/tmp/nvidia_egl_icd.json"
-    Path(icd).write_text(
-        '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"1.4.0"}}\n' % lib)
-    os.environ["VK_ICD_FILENAMES"] = icd
-    _log(f"Vulkan ICD → {lib}")
-
-
 def _log_gpu_status() -> None:
     # LOUD at boot: we rent a GPU to compute on it, not to crawl on CPU. Surface the torch arch so a host our
     # torch can't run shows immediately, not as a mystery-slow job.
@@ -337,23 +316,114 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     sys.exit(3)
 
 
-def _vulkan_preflight(cp: "ControlPlane") -> bool:
-    """Return Vulkan verdict; an absent GPU is a routable fact, not a boot refusal."""
+# 1.4.0 was "live-verified on driver 595" (ONE driver) and clobbered every other driver's real ICD; 1.2.0 is
+# libplacebo's own floor — never lower (the-gpu-verdict-carries-its-evidence-or-it-is-not-a-verdict).
+_VULKAN_EGL_API_VERSIONS = ("1.3.0", "1.2.0")
+_VULKAN_EGL_ICD_PATH = "/tmp/nvidia_egl_icd.json"
+
+
+def _egl_icd_lib() -> str | None:
+    """libEGL_nvidia.so.0 via ldconfig -p — the headless ICD (libGLX_nvidia is the X11 front a headless pod
+    lacks). Called only once the default-discovery rank has already failed."""
     import subprocess
+    try:
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=10).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return next((ln.split()[-1] for ln in out.splitlines() if "libEGL_nvidia.so.0" in ln), None)
+
+
+def _write_egl_icd_manifest(lib: str, api_version: str) -> str:
+    Path(_VULKAN_EGL_ICD_PATH).write_text(
+        '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"%s"}}\n'
+        % (lib, api_version))
+    return _VULKAN_EGL_ICD_PATH
+
+
+def _nvidia_driver_version() -> str:
+    """Bare driver_version for evidence — independent of _log_nvidia_runtime's human-formatted log line."""
+    import subprocess
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if r.returncode != 0:
+        return "unknown"
+    return safe_text((r.stdout or b"").decode("utf-8", "replace").strip()) or "unknown"
+
+
+def _run_vulkan_probe() -> tuple[bool, str, bytes]:
+    """One VULKAN_PROBE run under whatever VK_ICD_FILENAMES is currently set. raw_stderr stays UNTRUNCATED —
+    bounding only ever happens on the wire, never on what reaches the pod's own stderr log."""
     # Twin of podagent.render.VULKAN_PROBE and scripts/montyops/camera_apply.py.VULKAN_PROBE.
+    import subprocess
     try:
         r = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as e:
-        detail = f"{type(e).__name__}: {e}"
+        return False, f"{type(e).__name__}: {e}", b""
+    if r.returncode == 0:
+        return True, "", b""
+    return False, f"exit {r.returncode}", (r.stderr or b"")
+
+
+def _log_vulkan_rank(rank: str, ok: bool, brief: str, raw_stderr: bytes) -> None:
+    if ok:
+        return
+    if raw_stderr:
+        _log(f"vulkan rank {rank} FAILED — full stderr:\n"
+             f"{safe_text(raw_stderr.decode('utf-8', 'replace'))}")
     else:
-        if r.returncode == 0:
-            _log("vulkan/libplacebo probe OK — motion path opens on this host")
-            return True
-        detail = f"exit {r.returncode}: {_bounded_stderr(r.stderr or b'')}"
+        _log(f"vulkan rank {rank} FAILED: {brief}")
+
+
+def _vulkan_preflight(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None) -> bool:
+    """3-rank ladder: default loader discovery -> our EGL manifest at 1.3.0 -> 1.2.0 on INCOMPATIBLE_DRIVER
+    only. First green rank wins. A FALSE verdict writes its evidence into capacity["vulkan_detail"], so an
+    eviction built on it names a cause — an absent GPU stays a routable fact, never a boot refusal."""
+    preset_icd = os.environ.get("VK_ICD_FILENAMES")   # every LOSING rank must leave this exactly as found
+    ranks_tried = ["default"]
+    ok, brief, raw_stderr = _run_vulkan_probe()
+    _log_vulkan_rank("default", ok, brief, raw_stderr)
+    if ok:
+        _log("vulkan/libplacebo probe OK — motion path opens on this host (default discovery)")
+        return True
+    detail = brief
+
+    lib = _egl_icd_lib()
+    if lib is None:
+        _log("WARNING no libEGL_nvidia.so.0 — no synthesized ICD fallback is possible")
+    else:
+        for api_version in _VULKAN_EGL_API_VERSIONS:
+            if api_version != _VULKAN_EGL_API_VERSIONS[0] and \
+                    "INCOMPATIBLE_DRIVER" not in raw_stderr.decode("utf-8", "replace"):
+                break  # rank 2 failed for a reason a lower api_version claim cannot fix
+            os.environ["VK_ICD_FILENAMES"] = _write_egl_icd_manifest(lib, api_version)
+            rank = f"egl-{api_version}"
+            ranks_tried.append(rank)
+            ok, brief, raw_stderr = _run_vulkan_probe()
+            _log_vulkan_rank(rank, ok, brief, raw_stderr)
+            if ok:
+                _log(f"vulkan/libplacebo probe OK — motion path opens via synthesized ICD "
+                     f"{api_version} ({lib})")
+                return True
+            detail = brief
+        if preset_icd is None:
+            os.environ.pop("VK_ICD_FILENAMES", None)
+        else:
+            os.environ["VK_ICD_FILENAMES"] = preset_icd
+
+    if raw_stderr:
+        detail = f"{detail}: {_bounded_stderr(raw_stderr, edge=750)}"  # ~1500 chars — the evidence budget
+    driver = _nvidia_driver_version()
+    detail = f"{detail} · ranks_tried={','.join(ranks_tried)} · driver_version={driver}"
     if summary := _vulkaninfo_summary():
         detail = f"{detail} · {summary}"
-    warning = f"WARNING VULKAN UNAVAILABLE: {safe_text(detail)}"
+    detail = safe_text(detail)
+    warning = f"WARNING VULKAN UNAVAILABLE: {detail}"
     _log(warning)
+    if capacity is not None:
+        capacity["vulkan_detail"] = detail
     try:
         cp.send_event({"stage": "boot", "status": "step", "phase": "work_finished", "step": warning},
                       wait=True)
@@ -769,7 +839,7 @@ def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, Any] | None =
     _report_boot(cp)
     _nvenc_or_refuse(cp)
     if capacity is not None:
-        capacity["vulkan"] = _vulkan_preflight(cp)
+        capacity["vulkan"] = _vulkan_preflight(cp, capacity=capacity)
     else:
         _vulkan_preflight(cp)
     _report_ready(cp, capacity=capacity)
@@ -959,7 +1029,6 @@ def main() -> None:
     # which is exactly the signal.
     for _sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(_sig, _stop_and_exit)
-    _setup_vulkan_icd()   # before any ffmpeg child so libplacebo/the motion filters run on GPU, not a CPU crawl
     _log_gpu_status()
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb

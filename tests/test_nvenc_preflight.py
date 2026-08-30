@@ -44,6 +44,9 @@ def test_a_vulkan_probe_warns_and_returns_false_when_the_camera_path_is_unavaila
 
 
 def test_vulkan_probe_warning_keeps_head_and_tail_and_vulkaninfo_summary(monkeypatch):
+    """Every rank (default -> ldconfig lookup -> nvidia-smi) fails the same fake way, so the ladder falls all
+    the way through without finding a libEGL_nvidia.so.0 to synthesize a manifest from — the SAME forensics
+    exhausted-ladder path the deny-list eviction reason downstream depends on."""
     cp = _CP()
     root = b"VK_ERROR_INCOMPATIBLE_DRIVER\n"
     stderr = root + (b"middle-noise\n" * 200) + b"generic ffmpeg tail\n"
@@ -62,8 +65,12 @@ def test_vulkan_probe_warning_keeps_head_and_tail_and_vulkaninfo_summary(monkeyp
     assert "VK_ERROR_INCOMPATIBLE_DRIVER" in step
     assert "generic ffmpeg tail" in step
     assert "vulkaninfo: GPU0: NVIDIA summary" in step
-    assert len(step) < 1400
-    assert seen[0][1] == 120 and seen[1][0] == ["/usr/bin/vulkaninfo", "--summary"]
+    assert "ranks_tried=default" in step
+    assert "driver_version=unknown" in step
+    assert len(step) < 1800
+    assert seen[0] == (list(agent_main.VULKAN_PROBE), 120), "rank 1 is the plain VULKAN_PROBE, timeout 120"
+    assert seen[1][0] == ["ldconfig", "-p"], "a failed default rank must look for libEGL_nvidia before giving up"
+    assert seen[-1][0] == ["/usr/bin/vulkaninfo", "--summary"], "the diagnostic summary is still appended last"
     assert cp.waits == [True]
 
 
@@ -222,11 +229,10 @@ def test_main_never_reaches_dispatch_when_ready_ack_is_ambiguous(monkeypatch):
     monkeypatch.setenv("JOB_TOKEN", "opaque-test-token")
     monkeypatch.setattr(agent_main, "ControlPlane", lambda *_a, **_k: cp)
     monkeypatch.setattr(agent_main.signal, "signal", lambda *_a, **_k: None)
-    monkeypatch.setattr(agent_main, "_setup_vulkan_icd", lambda: None)
     monkeypatch.setattr(agent_main, "_log_gpu_status", lambda: None)
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
-    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
     monkeypatch.setattr(agent_main, "_dispatch_loop", _dispatch)
 
     with pytest.raises(agent_main.DeliveryPending, match="readiness ACK remains ambiguous"):
