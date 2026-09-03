@@ -20,10 +20,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from .cp import download, upload
 from .models import ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload
-from .sanitize import safe_text
+from .sanitize import safe_endpoint, safe_text
 
 _MISS = -1.0   # unreadable image, or an embed-only group where a score has nothing to mean
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
@@ -192,15 +193,39 @@ def _fetch_pool() -> "cf.ThreadPoolExecutor":
         return _FETCH_POOL
 
 
+def _redacted_tile_url(url: str) -> str:
+    """Diagnostic tile address with its capability query removed, while retaining the URL scheme."""
+    try:
+        parts = urlsplit(url)
+        if not parts.scheme:
+            return safe_endpoint(url)
+        return f"{parts.scheme}://{safe_endpoint(url)}"
+    except ValueError:
+        return "[redacted-url]"
+
+
+def _http_status(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None) if response is not None else None
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _fetch_tile(url: str, dest: Path):
-    """One tile: presigned GET → decode, or None. A url that will not fetch or decode is data, not a fault —
-    one dead tile must not fail a whole batch of beats."""
+    """One tile: presigned GET → decode, returning image or a secret-safe failure record."""
     from PIL import Image
 
+    redacted_url = _redacted_tile_url(url)
     try:
-        return Image.open(download(url, dest)).convert("RGB")
-    except Exception:  # noqa: BLE001 — a broken tile is data, not a fault
-        return None
+        return Image.open(download(url, dest)).convert("RGB"), None, redacted_url
+    except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault
+        status = _http_status(exc)
+        reason = type(exc).__name__ + (f" (HTTP {status})" if status is not None else "")
+        return None, reason, redacted_url
 
 
 def _submit_tiles(urls: list[str], workdir: Path) -> list:
@@ -213,15 +238,26 @@ def _submit_tiles(urls: list[str], workdir: Path) -> list:
 
 
 def _gather(futs: list, cells=None) -> tuple[list, list[int]]:
-    """The decoded images and their REQUEST indices — a tile that came back None is dropped here."""
+    """The decoded images and REQUEST indices; failed tiles stay data, with sheet failures named loudly."""
     images: list = []
     ok: list[int] = []
     for i, f in enumerate(futs):
-        img = f.result()
+        fetched = f.result()
+        if isinstance(fetched, tuple) and len(fetched) == 3:
+            img, reason, redacted_url = fetched
+        elif isinstance(fetched, tuple) and len(fetched) == 2:
+            img, reason = fetched
+            redacted_url = "[redacted-url]"
+        else:  # Compatibility for direct/unit-test futures made before failure records existed.
+            img, reason, redacted_url = fetched, None, "[redacted-url]"
+        if reason is not None:
+            print(f"[clip_rank] tile fetch failed — {reason} — {redacted_url}",
+                  file=sys.stderr, flush=True)
         cell = cells[i] if cells is not None else None
         if cell is not None:
             if img is None:
-                raise ValueError(f"clip_rank sheet for cell {i} could not be fetched or decoded")
+                raise ValueError(f"clip_rank sheet for cell {i} could not be fetched or decoded — "
+                                 f"{reason or 'unknown fetch/decode failure'} — {redacted_url}")
             x, y, w, h, sheet_w, sheet_h = (int(v) for v in cell)
             if min(x, y) < 0 or min(w, h, sheet_w, sheet_h) <= 0:
                 raise ValueError(f"clip_rank cell {i} has non-positive geometry")

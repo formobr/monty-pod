@@ -171,6 +171,58 @@ def test_sheet_cell_missing_or_wrong_shape_fails_loudly() -> None:
         _gather([wrong], [(0, 0, 2, 2, 2, 2)])
 
 
+def test_sheet_download_http_failure_names_status_and_redacts_capability(monkeypatch, tmp_path) -> None:
+    import podagent.infer_cliprank as m
+
+    class HttpError(Exception):
+        response = types.SimpleNamespace(status_code=404)
+
+    monkeypatch.setattr(m, "download",
+                        lambda url, dest: (_ for _ in ()).throw(HttpError("signed GET failed")))
+    future = cf.Future()
+    future.set_result(m._fetch_tile("https://r2.test/sheets/a.png?X-Amz-Signature=secret", tmp_path / "a"))
+
+    with pytest.raises(ValueError) as caught:
+        m._gather([future], [(0, 0, 2, 2, 2, 2)])
+
+    message = str(caught.value)
+    assert "404" in message
+    assert "https://r2.test/sheets/a.png" in message
+    assert "X-Amz-Signature" not in message and "secret" not in message
+
+
+def test_sheet_decode_failure_names_exception_class(monkeypatch, tmp_path) -> None:
+    import podagent.infer_cliprank as m
+
+    monkeypatch.setattr(m, "download", lambda url, dest: dest)
+
+    class DecodeFailure(Exception):
+        pass
+
+    monkeypatch.setattr("PIL.Image.open",
+                        lambda path: (_ for _ in ()).throw(DecodeFailure("bad pixels")))
+    future = cf.Future()
+    future.set_result(m._fetch_tile("https://r2.test/sheets/a.png?sig=secret", tmp_path / "a"))
+
+    with pytest.raises(ValueError, match="DecodeFailure"):
+        m._gather([future], [(0, 0, 2, 2, 2, 2)])
+
+
+def test_no_cells_drops_failed_tile_and_keeps_other_images(tmp_path) -> None:
+    import podagent.infer_cliprank as m
+    from PIL import Image
+
+    failed = cf.Future()
+    failed.set_result((None, "OSError", "https://r2.test/a.png"))
+    live = cf.Future()
+    image = Image.new("RGB", (2, 2))
+    live.set_result((image, None, "https://r2.test/b.png"))
+
+    images, order = m._gather([failed, live])
+
+    assert images == [image] and order == [1]
+
+
 def test_sheet_cell_contract_rejects_missing_parallel_entry_and_bad_geometry() -> None:
     with pytest.raises(ValueError, match="parallel"):
         ClipRankGroup(intent="x", image_urls=["sheet", "sheet"], image_cells=[(0, 0, 2, 2, 4, 2)])
