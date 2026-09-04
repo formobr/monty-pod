@@ -154,6 +154,28 @@ def test_a_delivered_master_under_the_bands_floor_refuses_too(monkeypatch, tmp_p
         finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
 
 
+def test_a_delivered_master_over_the_bands_ceiling_refuses_as_well(monkeypatch, tmp_path) -> None:
+    """The make-up can overshoot (its gain is measured on PCM, the aac encode moves the level again), and
+    a band checked in one direction only ships a master the box then throws back."""
+    calls: list[list[str]] = []
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
+          {"input_i": "-10.4", "input_tp": "-1.2", "input_lra": "2.9", "input_thresh": "-20.4"})
+    with pytest.raises(RuntimeError, match=r"OFF-CONTRACT.*lufs=-10\.4 target=-14\.0 tol=3\.0"):
+        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+
+
+def test_a_refused_master_is_not_left_at_the_delivery_address(monkeypatch, tmp_path) -> None:
+    """The caller PUTs whatever sits at that path; a refusal that leaves the file behind is the silent
+    ship this whole verdict exists to prevent."""
+    calls: list[list[str]] = []
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
+          {"input_i": "-16.69", "input_tp": "0.41", "input_lra": "2.9", "input_thresh": "-27.1"})
+    with pytest.raises(RuntimeError):
+        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert not (tmp_path / "o.mp4").exists()
+    assert not (tmp_path / "o.lvl.wav").exists() and not (tmp_path / "o.mk.wav").exists()
+
+
 def test_a_master_exactly_at_the_ceiling_ships(monkeypatch, tmp_path) -> None:
     """The ceiling is the contract, the aim is only the margin — refusing at the aim fails masters the
     box accepts."""
@@ -236,6 +258,49 @@ def test_a_hot_source_shipped_clean_never_reaches_the_verdict(monkeypatch, tmp_p
     src = tmp_path / "m.mp4"
     assert finalize.apply_loudnorm(fin, src, tmp_path / "o.mp4") == src
     assert len(calls) == 1
+
+
+def test_a_hot_source_far_under_target_is_levelled_not_shipped_as_is(monkeypatch, tmp_path) -> None:
+    """The crackle guard is a shortcut past the level chain, and past the band with it: at -20 LUFS the
+    box refuses the very file the guard called done, so the two ends disagree about one master."""
+    calls: list[list[str]] = []
+    quiet_hot = {"input_i": "-20.0", "input_tp": "-0.2", "input_lra": "6.0", "input_thresh": "-30.4"}
+    _stub(monkeypatch, tmp_path, calls, quiet_hot, ON_BAND, ON_BAND)
+    fin = SimpleNamespace(loudnorm=SimpleNamespace(i=-14.0, tp=-1.0, lra=11.0, attenuate_only=True))
+    assert finalize.apply_loudnorm(fin, tmp_path / "m.mp4", tmp_path / "o.mp4") == tmp_path / "o.mp4"
+    assert _afs(calls)[0].startswith("volume=6.00dB,alimiter=")
+
+
+def test_the_band_edges_still_take_the_crackle_guards_shortcut() -> None:
+    """Inside the band a hot mic must NOT be touched — boosting it is what amplifies the crackle."""
+    for i in ("-14.0", "-17.0", "-15.5"):
+        af, note = finalize.master_af(dict(HOT, input_i=i), -14.0, -2.2, True)
+        assert af is None and "shipped clean" in note, i
+    af, _note = finalize.master_af(dict(HOT, input_i="-17.01"), -14.0, -2.2, True)
+    assert af is not None, "past the floor the level chain owns it"
+
+
+def test_every_ffmpeg_wait_names_its_step_when_it_wedges(monkeypatch, tmp_path) -> None:
+    """A bare TimeoutExpired out of a finalize pass says nothing about WHICH pass wedged; the pod's error
+    is all the box gets."""
+    def boom(cmd, **kw):
+        assert kw.get("timeout") == finalize._AUDIO_PASS_WALL_S, cmd
+        raise finalize.subprocess.TimeoutExpired(cmd, kw["timeout"])
+    monkeypatch.setattr(finalize.subprocess, "run", boom)
+    with pytest.raises(RuntimeError, match="master measure ffmpeg timed out after 300s"):
+        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+
+    calls: list[list[str]] = []
+
+    def wedge_level(cmd, **kw):
+        calls.append(list(cmd))
+        if "null" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr=_json(QUIET))
+        raise finalize.subprocess.TimeoutExpired(cmd, kw["timeout"])
+    monkeypatch.setattr(finalize.subprocess, "run", wedge_level)
+    with pytest.raises(RuntimeError, match="master level ffmpeg timed out after 300s"):
+        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert not (tmp_path / "o.lvl.wav").exists(), "a wedged pass still leaves no PCM behind"
 
 
 def test_an_unmeasurable_source_is_still_left_at_source_level(monkeypatch, tmp_path, capsys) -> None:

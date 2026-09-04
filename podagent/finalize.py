@@ -34,12 +34,12 @@ WM_CANVAS_W = 1200
 WM_CANVAS_H = 600
 
 
-def _run(cmd: list[str], what: str, *, timeout_s: int | None = None) -> None:
+def _run(cmd: list[str], what: str, *, timeout_s: int | None = None,
+         check: bool = True, text: bool = False) -> subprocess.CompletedProcess:
+    """Every ffmpeg wait in this module goes through here: a wedge or a crash names its STEP instead of
+    surfacing as a bare TimeoutExpired. `check=False` keeps the passes whose own rc/parse is the verdict."""
     try:
-        if timeout_s is None:
-            subprocess.run(cmd, check=True, capture_output=True)
-        else:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout_s)
+        return subprocess.run(cmd, check=check, capture_output=True, text=text, timeout=timeout_s)
     except subprocess.CalledProcessError as exc:
         tail = (exc.stderr or b"")[-2000:]
         detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
@@ -225,8 +225,10 @@ def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> t
     flagged as clipping-hot and already at/under target -> ship as-is (boosting a hot mic only
     amplifies the crackle). Returns (af|None, note)."""
     in_i = float(mv["input_i"])
-    if attenuate_only and in_i <= target:
-        return None, f"hot source, {in_i} LUFS <= target — shipped clean, no boost (crackle guard)"
+    # only INSIDE the band: a hot-flagged source that is also far under target would be refused by the very
+    # box gate this shortcut skips, and the brickwall handles its crackle better than that refusal does
+    if attenuate_only and target - _LUFS_TOL_DB <= in_i <= target:
+        return None, f"hot source, {in_i} LUFS inside the band — shipped clean, no boost (crackle guard)"
     in_tp, in_lra = float(mv["input_tp"]), float(mv["input_lra"])
     # a non-finite measured_I is bit-exact silence across the whole master, not a quiet one — ffmpeg's loudnorm refuses it anyway, so name it here instead of the caller's generic "couldn't apply" fallback.
     if not (math.isfinite(in_i) and math.isfinite(in_tp) and math.isfinite(in_lra)):
@@ -274,10 +276,10 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
             print("[finalize] master loudnorm: level pass failed -> left at source level")
             return src
         audio = _make_up(lvl, mk, ln, tp_aim)
-        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-i", str(audio),
-                            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                            "-ar", "48000", str(out), "-y"],
-                           capture_output=True, timeout=_AUDIO_PASS_WALL_S)
+        r = _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-i", str(audio),
+                  "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                  "-ar", "48000", str(out), "-y"],
+                 "master mux", timeout_s=_AUDIO_PASS_WALL_S, check=False)
         if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
             print(f"[finalize] master loudnorm exit {r.returncode} -> left at source level")
             return src
@@ -290,9 +292,9 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
 def _pcm_pass(src: Path, dst: Path, af: str) -> bool:
     """One audio-only filter pass to 48k PCM. The level work happens BEFORE the single aac encode, so the
     make-up below can re-measure what the brickwall actually left instead of guessing through the codec."""
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-vn",
-                        "-af", af, "-ar", "48000", "-c:a", "pcm_s16le", str(dst), "-y"],
-                       capture_output=True, timeout=_AUDIO_PASS_WALL_S)
+    r = _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-vn",
+              "-af", af, "-ar", "48000", "-c:a", "pcm_s16le", str(dst), "-y"],
+             "master level", timeout_s=_AUDIO_PASS_WALL_S, check=False)
     return r.returncode == 0 and dst.is_file() and dst.stat().st_size > 0
 
 
@@ -326,11 +328,11 @@ def _make_up(lvl: Path, mk: Path, ln, tp_aim: float) -> Path:
 def _measure(path: Path, ln, tp_aim: float) -> dict | None:
     """One loudnorm print_format=json pass. `-map 0:a:0?`: unmapped, `-f null` decodes the whole VIDEO for
     an audio measure; on a silent master ffmpeg still exits nonzero, so rc is unchecked and None says it."""
-    meas = subprocess.run(
+    meas = _run(
         ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
          "-map", "0:a:0?",
          "-af", f"loudnorm=I={ln.i}:TP={tp_aim}:LRA={ln.lra}:print_format=json", "-f", "null", "-"],
-        capture_output=True, text=True, timeout=_AUDIO_PASS_WALL_S)
+        "master measure", timeout_s=_AUDIO_PASS_WALL_S, check=False, text=True)
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", meas.stderr, re.S)
     return json.loads(m.group(0)) if m else None
 
@@ -345,12 +347,19 @@ def _verdict(out: Path, ln, tp_aim: float) -> Path:
         print("[finalize] master: delivered level UNVERIFIED — post-encode measure unreadable")
         return out
     if tp > ln.tp:
-        raise RuntimeError(
-            f"[finalize] master: OFF-CONTRACT after limiter tp={tp} ceil={ln.tp} "
-            f"(aim {tp_aim}, delivered lufs={i} lra={lra}) — refusing to ship a clipping master")
-    if i < ln.i - _LUFS_TOL_DB:
-        raise RuntimeError(
-            f"[finalize] master: OFF-CONTRACT after limiter lufs={i} target={ln.i} tol={_LUFS_TOL_DB} "
-            f"(tp={tp} lra={lra}) — the box refuses this level, refusing to ship it silently")
+        _refuse(out, f"tp={tp} ceil={ln.tp} (aim {tp_aim}, delivered lufs={i} lra={lra}) — "
+                     f"refusing to ship a clipping master")
+    if abs(i - ln.i) > _LUFS_TOL_DB:
+        # both directions: a make-up overshoot is as off-contract as a short master, and the box's own
+        # band is symmetric — one end shipping what the other refuses is how a master gets re-rendered
+        _refuse(out, f"lufs={i} target={ln.i} tol={_LUFS_TOL_DB} (tp={tp} lra={lra}) — "
+                     f"the box refuses this level, refusing to ship it silently")
     print(f"[finalize] master: delivered lufs={i} tp={tp} lra={lra}")
     return out
+
+
+def _refuse(out: Path, why: str) -> None:
+    """The delivery address must not hold an off-contract master: whoever picks the file up next has no
+    way to know the verdict raised, so the refusal takes the file with it."""
+    out.unlink(missing_ok=True)
+    raise RuntimeError(f"[finalize] master: OFF-CONTRACT after limiter {why}")
