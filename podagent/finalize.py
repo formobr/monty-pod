@@ -198,8 +198,8 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
 
 # --- 3. delivery loudness -----------------------------------------------------
 
-# loudnorm's TP is a PREDICTION (it drops to dynamic mode silently when the linear gain would breach it),
-# so the alimiter below holds the ceiling; this headroom buys only the AAC encode's ~0.9 dBTP of codec peaks.
+# loudnorm's TP is a PREDICTION it abandons (dynamic mode) rather than breach, so the alimiter below holds
+# the ceiling; this headroom buys only the AAC encode's ~0.9 dBTP of codec peaks over limited PCM.
 TP_HEADROOM_DB = 1.2
 _LIMITER_ATTACK_MS = 5   # same transparent brickwall the engine's weld uses (scripts/montyops/edit_weld.py)
 _LIMITER_RELEASE_MS = 50
@@ -226,11 +226,21 @@ def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> t
             f"master measure: no signal across the delivered master's measured span "
             f"(input_i={mv['input_i']!r} input_tp={mv['input_tp']!r} input_lra={mv['input_lra']!r}) — "
             f"refusing to feed a non-finite measured_I into the delivery loudnorm filter")
-    af = (f"loudnorm=I={target}:TP={tp_aim}:LRA=11:linear=true:measured_I={mv['input_i']}"
-          f":measured_TP={mv['input_tp']}:measured_LRA={mv['input_lra']}:measured_thresh={mv['input_thresh']}"
-          f",{limiter_af(tp_aim)}")
+    gain = target - in_i
+    pred_tp = in_tp + gain
+    if pred_tp <= tp_aim:
+        af = (f"loudnorm=I={target}:TP={tp_aim}:LRA=11:linear=true:measured_I={mv['input_i']}"
+              f":measured_TP={mv['input_tp']}:measured_LRA={mv['input_lra']}"
+              f":measured_thresh={mv['input_thresh']},{limiter_af(tp_aim)}")
+        how = "linear loudnorm"
+    else:
+        # ffmpeg would DOWNGRADE this chain to dynamic mode (short of target, transients unhonoured), so
+        # the gain is ours and the brickwall — not loudnorm's prediction — absorbs the overshoot.
+        af = f"volume={gain:.2f}dB,{limiter_af(tp_aim)}"
+        how = f"volume+limiter (linear infeasible: pred_tp {pred_tp:.2f} > aim {tp_aim})"
     verb = "attenuate" if in_i > target else "normalize"
-    return af, f"{in_i} -> {target} LUFS ({verb}{', hot-guarded' if attenuate_only else ''})"
+    return af, (f"{in_i} -> {target} LUFS ({verb}{', hot-guarded' if attenuate_only else ''}) "
+                f"via {how}")
 
 
 def apply_loudnorm(fin, src: Path, out: Path) -> Path:

@@ -11,7 +11,11 @@ import pytest
 
 from podagent import finalize
 
+# the 17-2024 shape: +16.2 dB of gain would land the peak at +11.6 dBTP, so linear mode is impossible
 QUIET = {"input_i": "-30.8", "input_tp": "-4.6", "input_lra": "2.9", "input_thresh": "-41.0"}
+INFEASIBLE = {"input_i": "-20.0", "input_tp": "-2.0", "input_lra": "5.0", "input_thresh": "-30.0"}
+# in_tp + (target - in_i) <= aim: loudnorm keeps its linear mode, so the chain stays as it was
+FEASIBLE = {"input_i": "-16.0", "input_tp": "-6.0", "input_lra": "6.5", "input_thresh": "-26.4"}
 LOUD = {"input_i": "-9.2", "input_tp": "-0.4", "input_lra": "7.2", "input_thresh": "-19.8"}
 # clipping-hot mic already AT target: master_af's crackle guard ships it unencoded
 HOT = {"input_i": "-15.0", "input_tp": "-0.1", "input_lra": "6.0", "input_thresh": "-25.4"}
@@ -25,11 +29,30 @@ def _json(mv: dict) -> str:
     return "{" + ", ".join(f'"{k}" : "{v}"' for k, v in mv.items()) + " }"
 
 
-def test_the_delivery_chain_ends_in_the_brickwall_at_the_aim() -> None:
-    af, _note = finalize.master_af(QUIET, -14.0, -2.2, False)
-    assert af.endswith(",alimiter=limit=0.7762:attack=5:release=50:level=false"), af
-    assert af.index("loudnorm=") < af.index("alimiter="), "the limiter must be AFTER loudnorm"
-    assert "linear=true" in af
+def test_a_feasible_linear_gain_keeps_the_loudnorm_chain_and_ends_in_the_brickwall() -> None:
+    af, note = finalize.master_af(FEASIBLE, -14.0, -2.2, False)
+    assert af == ("loudnorm=I=-14.0:TP=-2.2:LRA=11:linear=true:measured_I=-16.0:measured_TP=-6.0"
+                  ":measured_LRA=6.5:measured_thresh=-26.4"
+                  ",alimiter=limit=0.7762:attack=5:release=50:level=false")
+    assert note.endswith("via linear loudnorm")
+
+
+def test_an_infeasible_linear_gain_stops_asking_ffmpeg_and_gains_it_itself() -> None:
+    """`linear=true` is a REQUEST: ffmpeg downgrades to dynamic whenever in_tp + gain > TP, which lands
+    the integrated loudness short (-16.69 on 17-2024). Our own gain + the brickwall cannot downgrade."""
+    af, note = finalize.master_af(INFEASIBLE, -14.0, -2.2, False)
+    assert af == "volume=6.00dB,alimiter=limit=0.7762:attack=5:release=50:level=false"
+    assert "loudnorm" not in af
+    assert note == "-20.0 -> -14.0 LUFS (normalize) via volume+limiter (linear infeasible: pred_tp 4.00 > aim -2.2)"
+
+
+def test_the_branch_is_decided_at_the_aim_not_at_the_ceiling() -> None:
+    """ffmpeg downgrades against its own TP argument, which is the AIM — a line drawn at the brand's
+    ceiling would keep handing it the -1.8 dBTP prediction it silently turns into dynamic mode."""
+    under_aim = {"input_i": "-20.0", "input_tp": "-8.5", "input_lra": "5.0", "input_thresh": "-30.0"}
+    assert "loudnorm=" in finalize.master_af(under_aim, -14.0, -2.2, False)[0]
+    between = dict(under_aim, input_tp="-7.8")   # pred -1.8: past the aim, still under the -1.0 ceiling
+    assert finalize.master_af(between, -14.0, -2.2, False)[0].startswith("volume=")
 
 
 def test_the_limit_is_the_aim_in_linear_amplitude_not_dB() -> None:
@@ -43,7 +66,7 @@ def test_the_limit_is_the_aim_in_linear_amplitude_not_dB() -> None:
 def test_a_tighter_ceiling_moves_the_limit_with_it(monkeypatch, tmp_path) -> None:
     """The aim is derived (TP - headroom), so the brickwall must follow the brand's TP, not a literal."""
     calls: list[list[str]] = []
-    _stub(monkeypatch, tmp_path, calls, QUIET, QUIET)
+    _stub(monkeypatch, tmp_path, calls, FEASIBLE, FEASIBLE)
     finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln(tp=-1.5)), tmp_path / "m.mp4", tmp_path / "o.mp4")
     apply = calls[1]
     af = apply[apply.index("-af") + 1]
@@ -153,9 +176,10 @@ def test_an_unmeasurable_source_is_still_left_at_source_level(monkeypatch, tmp_p
 
 
 @pytest.mark.integration
-def test_a_real_quiet_source_runs_the_whole_chain_and_lands_under_the_ceiling(tmp_path: Path) -> None:
-    """Argv assertions cannot tell a valid filtergraph from a typo, and a bad alimiter arg kills EVERY
-    final render; the verdict below also has to parse a real ffmpeg measure, not the fixture's JSON."""
+def test_the_real_17_2024_shape_is_delivered_on_target_and_under_the_ceiling(tmp_path: Path) -> None:
+    """The regression itself, end to end: a source measured -30.6 LUFS / -6.7 dBTP (the prod one was
+    -30.8 dB mean, -4.6 dB max) is exactly what ffmpeg answers with dynamic mode, and argv assertions
+    can neither see that nor tell a valid filtergraph from a typo."""
     import shutil
     import subprocess
     if shutil.which("ffmpeg") is None:
@@ -164,9 +188,22 @@ def test_a_real_quiet_source_runs_the_whole_chain_and_lands_under_the_ceiling(tm
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10",
-         "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000",
-         "-t", "4", "-af", "volume=-27dB", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-shortest", str(src)], check=True)
-    # apply_loudnorm RAISES over the ceiling, so returning the encoded path IS the under-ceiling verdict
-    out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), src, tmp_path / "o.mp4")
+         "-f", "lavfi", "-i", "anoisesrc=c=pink:r=48000:d=6:a=0.15",
+         # eval=frame gates on ~21 ms audio frames, so a literal 5 ms window would land between two
+         "-af", "volume='if(between(t,1.5,1.53)+between(t,3.5,3.53),4.8,1.0)':eval=frame",
+         "-map", "0:v", "-map", "1:a", "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-shortest", str(src)], check=True)
+    ln = _ln()
+    # apply_loudnorm RAISES over the ceiling, so returning the encoded path is already half the verdict
+    out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=ln), src, tmp_path / "o.mp4")
     assert out == tmp_path / "o.mp4" and out.stat().st_size > 0
+
+    meas = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(out), "-map", "0:a:0?",
+         "-af", "loudnorm=I=-14:TP=-2.2:LRA=11:print_format=json", "-f", "null", "-"],
+        capture_output=True, text=True)
+    got = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", meas.stderr, re.S)
+    assert got, meas.stderr[-2000:]
+    delivered = {k: float(v) for k, v in re.findall(r'"(input_i|input_tp)"\s*:\s*"(-?[\d.]+)"', got.group(0))}
+    assert delivered["input_i"] == pytest.approx(ln.i, abs=3.0), delivered
+    assert delivered["input_tp"] <= ln.tp, delivered
