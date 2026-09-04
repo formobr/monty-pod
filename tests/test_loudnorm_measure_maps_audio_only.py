@@ -52,8 +52,11 @@ def test_the_master_measure_pass_maps_the_first_audio_stream_only(monkeypatch, t
     fin = SimpleNamespace(loudnorm=SimpleNamespace(i=-14.0, tp=-1.0, lra=11.0, attenuate_only=False))
     out = finalize.apply_loudnorm(fin, tmp_path / "master.mp4", tmp_path / "out.mp4")
     assert out == tmp_path / "out.mp4"
-    measure, apply = calls
+    measure, apply, verify = calls
     _audio_only_measure(measure)
+    # the post-encode verdict is the same measure shape, on the OUTPUT — same video-decode cost to avoid
+    _audio_only_measure(verify)
+    assert str(tmp_path / "out.mp4") in verify and str(tmp_path / "master.mp4") in measure
     # the APPLY pass still carries the video (`-c:v copy`) — the audio-only map is measure-only
     assert "-map" not in apply and _has_seq(apply, ["-c:v", "copy"])
 

@@ -198,9 +198,18 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
 
 # --- 3. delivery loudness -----------------------------------------------------
 
-# covers loudnorm's linear-mode TP prediction slack (~0.2 dB) PLUS the AAC encode's measured ~0.9 dBTP
-# of codec peaks after it — an aim that ignores the encoder ships past the ceiling (test-pinned, no mirror)
+# loudnorm's TP is a PREDICTION (it drops to dynamic mode silently when the linear gain would breach it),
+# so the alimiter below holds the ceiling; this headroom buys only the AAC encode's ~0.9 dBTP of codec peaks.
 TP_HEADROOM_DB = 1.2
+_LIMITER_ATTACK_MS = 5   # same transparent brickwall the engine's weld uses (scripts/montyops/edit_weld.py)
+_LIMITER_RELEASE_MS = 50
+
+
+def limiter_af(tp_aim: float) -> str:
+    """Brickwall at the TP aim. `limit` is linear amplitude, not dB; level=false keeps it a pure ceiling,
+    so a master already under the aim comes out gain-identical."""
+    return (f"alimiter=limit={round(10 ** (tp_aim / 20.0), 4)}"
+            f":attack={_LIMITER_ATTACK_MS}:release={_LIMITER_RELEASE_MS}:level=false")
 
 
 def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> tuple[str | None, str]:
@@ -218,32 +227,25 @@ def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> t
             f"(input_i={mv['input_i']!r} input_tp={mv['input_tp']!r} input_lra={mv['input_lra']!r}) — "
             f"refusing to feed a non-finite measured_I into the delivery loudnorm filter")
     af = (f"loudnorm=I={target}:TP={tp_aim}:LRA=11:linear=true:measured_I={mv['input_i']}"
-          f":measured_TP={mv['input_tp']}:measured_LRA={mv['input_lra']}:measured_thresh={mv['input_thresh']}")
+          f":measured_TP={mv['input_tp']}:measured_LRA={mv['input_lra']}:measured_thresh={mv['input_thresh']}"
+          f",{limiter_af(tp_aim)}")
     verb = "attenuate" if in_i > target else "normalize"
     return af, f"{in_i} -> {target} LUFS ({verb}{', hot-guarded' if attenuate_only else ''})"
 
 
 def apply_loudnorm(fin, src: Path, out: Path) -> Path:
-    """Two-pass loudnorm to the brand's delivery target, audio-gain only (A/V untouched, video copied).
-    Non-critical by contract: a measurement that cannot be parsed leaves the master at source level
-    rather than failing a finished render."""
+    """Two-pass loudnorm + brickwall to the brand's delivery target, audio-gain only (video copied).
+    A measurement that cannot be parsed leaves the master at source level rather than failing a finished
+    render; a master measured OVER the ceiling raises — shipping it silently is what the box refuses."""
     ln = fin.loudnorm
     if ln is None:
         return src
     tp_aim = round(ln.tp - TP_HEADROOM_DB, 2)
-    # -map 0:a:0? : unmapped `-f null` decodes the whole master's VIDEO for an audio measure; the `?`
-    # on a silent master ffmpeg still exits nonzero (no stream mapped); rc is unchecked and the parse
-    # miss below handles it either way.
-    meas = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(src),
-         "-map", "0:a:0?",
-         "-af", f"loudnorm=I={ln.i}:TP={tp_aim}:LRA={ln.lra}:print_format=json", "-f", "null", "-"],
-        capture_output=True, text=True)
-    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", meas.stderr, re.S)
-    if not m:
+    mv = _measure(src, ln, tp_aim)
+    if mv is None:
         print("[finalize] master loudnorm: couldn't measure -> left at source level")
         return src
-    af, note = master_af(json.loads(m.group(0)), ln.i, tp_aim, ln.attenuate_only)
+    af, note = master_af(mv, ln.i, tp_aim, ln.attenuate_only)
     print(f"[finalize] master: {note}")
     if af is None:
         return src
@@ -254,4 +256,33 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
         print(f"[finalize] master loudnorm exit {r.returncode} -> left at source level")
         return src
+    return _verdict(out, ln, tp_aim)
+
+
+def _measure(path: Path, ln, tp_aim: float) -> dict | None:
+    """One loudnorm print_format=json pass. `-map 0:a:0?`: unmapped, `-f null` decodes the whole VIDEO for
+    an audio measure; on a silent master ffmpeg still exits nonzero, so rc is unchecked and None says it."""
+    meas = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+         "-map", "0:a:0?",
+         "-af", f"loudnorm=I={ln.i}:TP={tp_aim}:LRA={ln.lra}:print_format=json", "-f", "null", "-"],
+        capture_output=True, text=True)
+    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", meas.stderr, re.S)
+    return json.loads(m.group(0)) if m else None
+
+
+def _verdict(out: Path, ln, tp_aim: float) -> Path:
+    """Measures what was actually ENCODED. The box's check_master sidecar is swept before anyone reads it,
+    so this line is the durable proof; over the ceiling means the delivery chain failed and must not ship."""
+    mv = _measure(out, ln, tp_aim)
+    try:
+        i, tp, lra = float(mv["input_i"]), float(mv["input_tp"]), float(mv["input_lra"])
+    except (TypeError, KeyError, ValueError):
+        print("[finalize] master: delivered level UNVERIFIED — post-encode measure unreadable")
+        return out
+    if tp > ln.tp:
+        raise RuntimeError(
+            f"[finalize] master: OFF-CONTRACT after limiter tp={tp} ceil={ln.tp} "
+            f"(aim {tp_aim}, delivered lufs={i} lra={lra}) — refusing to ship a clipping master")
+    print(f"[finalize] master: delivered lufs={i} tp={tp} lra={lra}")
     return out
