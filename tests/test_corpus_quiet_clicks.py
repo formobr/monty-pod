@@ -1,10 +1,8 @@
 """The 2913bf1a source shape, generated here: speech-shaped bursts at ~-31 LUFS plus two 5 ms clicks, whose
-CREST is what made loudnorm drop to dynamic mode and ship +0.41 dBTP. The engine's corpus cannot be imported
-from this repo, so the recipe is spelled inline and the delivered true peak is measured, not predicted."""
+CREST is what made loudnorm drop to dynamic mode and ship +0.41 dBTP. Here the clicks carry the integrated
+measure outright, so the designed answer is a loud refusal — the engine's corpus cannot be imported."""
 from __future__ import annotations
 
-import json
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -32,26 +30,17 @@ RECIPE = [
 ]
 
 
-def _measured(path: Path) -> dict:
-    """One loudnorm print_format=json pass over the DELIVERED file — the same measure the pod's own verdict
-    takes, so the number asserted here is the number the box would receive."""
-    r = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0?",
-         "-af", f"loudnorm=I={TARGET}:TP={CEIL}:LRA=11:print_format=json", "-f", "null", "-"],
-        capture_output=True, text=True, timeout=120)
-    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.S)
-    assert m, r.stderr[-2000:]
-    return json.loads(m.group(0))
-
-
 @pytest.mark.integration
-def test_a_quiet_source_with_clicks_is_delivered_under_the_true_peak_ceiling(tmp_path: Path) -> None:
+def test_a_click_carried_quiet_source_is_refused_loud_with_its_numbers(tmp_path: Path) -> None:
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg unavailable")
     src = tmp_path / "quiet_clicks.mp4"
     subprocess.run(["ffmpeg", "-y", *RECIPE, str(src)], check=True, capture_output=True, timeout=300)
     fin = SimpleNamespace(loudnorm=SimpleNamespace(i=TARGET, tp=CEIL, lra=11.0, attenuate_only=False))
-    out = finalize.apply_loudnorm(fin, src, tmp_path / "master.mp4")
-    assert out == tmp_path / "master.mp4" and out.stat().st_size > 0
-    tp = float(_measured(out)["input_tp"])
-    assert tp <= CEIL, f"clipping master delivered at {tp} dBTP (ceiling {CEIL})"
+    # The bed sits ~10 dB under the clicks, so the integrated measure is theirs and the brickwall removes
+    # it: chasing that residual would only feed the limiter the same transients and ship 17-2024 again.
+    with pytest.raises(RuntimeError) as exc:
+        finalize.apply_loudnorm(fin, src, tmp_path / "master.mp4")
+    msg = str(exc.value)
+    assert "lufs=-26." in msg and f"target={TARGET}" in msg and "(residual +12.3" in msg, msg
+    assert not (tmp_path / "master.mp4").exists(), "nothing may be delivered for a refused master"

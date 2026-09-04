@@ -66,8 +66,10 @@ DUR = 10.0                       # (6-0)/1.0 + (15-10)/1.25
 MIX = render._AudioMix(voice_idx=0, bed_idx=1, clean="highpass=f=80",
                        vln="loudnorm=I=-20:TP=-1.5:LRA=11", dur=DUR, sfx=())
 LAYERS = ({"mov": "/w/seq0.mov", "start": 2.0, "dur": 3.0, "glass": False},)
-LN_JSON = ('{ "input_i" : "-19.4", "input_tp" : "-2.1", "input_lra" : "7.2", '
-           '"input_thresh" : "-29.8", "target_offset" : "0.0" }')
+# ON-BAND on purpose: apply_loudnorm answers every one of its measures from this fixture, and a delivered
+# master off the brand's band is a refusal now — the door tests are about routing, not about levels.
+LN_JSON = ('{ "input_i" : "-14.2", "input_tp" : "-1.6", "input_lra" : "7.2", '
+           '"input_thresh" : "-24.6", "target_offset" : "0.0" }')
 
 
 def _spec(mutate=None) -> RenderSpec:
@@ -158,7 +160,7 @@ def _ancestors(script: str, pad: str) -> set[str]:
 
 # --- argv reader (options belong to the destination they precede) -------------
 
-_ZERO_ARG = {"-y", "-hide_banner", "-an", "-nostats"}
+_ZERO_ARG = {"-y", "-hide_banner", "-an", "-nostats", "-vn"}
 
 
 def _argv(cmd: list[str]):

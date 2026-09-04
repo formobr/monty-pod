@@ -11,6 +11,10 @@ from podagent import finalize, render
 
 LN_JSON = ('{ "input_i" : "-19.4", "input_tp" : "-2.1", "input_lra" : "7.2", '
            '"input_thresh" : "-29.8", "target_offset" : "0.0" }')
+# the master path answers EVERY one of its measures from this one, so it has to be on the brand's band:
+# a delivered master under target - tol is a refusal now, and this test is about the -map, not the level
+ON_BAND_JSON = ('{ "input_i" : "-14.2", "input_tp" : "-1.6", "input_lra" : "7.2", '
+                '"input_thresh" : "-24.6", "target_offset" : "0.0" }')
 SILENT_LN_JSON = ('{ "input_i" : "-inf", "input_tp" : "-inf", "input_lra" : "0.00", '
                   '"input_thresh" : "-70.00", "target_offset" : "inf" }')
 
@@ -45,20 +49,21 @@ def test_the_master_measure_pass_maps_the_first_audio_stream_only(monkeypatch, t
     def fake(cmd, **_kw):
         calls.append(list(cmd))
         if "null" in cmd:
-            return SimpleNamespace(returncode=0, stdout="", stderr=LN_JSON)
-        (tmp_path / "out.mp4").write_bytes(b"v")
+            return SimpleNamespace(returncode=0, stdout="", stderr=ON_BAND_JSON)
+        Path(cmd[-2]).write_bytes(b"v")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
     monkeypatch.setattr(finalize.subprocess, "run", fake)
     fin = SimpleNamespace(loudnorm=SimpleNamespace(i=-14.0, tp=-1.0, lra=11.0, attenuate_only=False))
     out = finalize.apply_loudnorm(fin, tmp_path / "master.mp4", tmp_path / "out.mp4")
     assert out == tmp_path / "out.mp4"
-    measure, apply, verify = calls
-    _audio_only_measure(measure)
-    # the post-encode verdict is the same measure shape, on the OUTPUT — same video-decode cost to avoid
-    _audio_only_measure(verify)
-    assert str(tmp_path / "out.mp4") in verify and str(tmp_path / "master.mp4") in measure
-    # the APPLY pass still carries the video (`-c:v copy`) — the audio-only map is measure-only
-    assert "-map" not in apply and _has_seq(apply, ["-c:v", "copy"])
+    measure, level, level_measure, mux, verify = calls
+    for m, path in ((measure, "master.mp4"), (level_measure, "out.lvl.wav"), (verify, "out.mp4")):
+        _audio_only_measure(m)
+        assert str(tmp_path / path) in m
+    # the LEVEL pass is audio-only by -vn (no video to map), the MUX carries the copied video
+    assert "-vn" in level and _has_seq(level, ["-c:a", "pcm_s16le"])
+    assert _has_seq(mux, ["-map", "0:v:0"]) and _has_seq(mux, ["-map", "1:a:0"])
+    assert _has_seq(mux, ["-c:v", "copy"])
 
 
 def test_a_digitally_silent_voice_refuses_before_the_body_encode(monkeypatch) -> None:

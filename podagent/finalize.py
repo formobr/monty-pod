@@ -203,6 +203,14 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
 TP_HEADROOM_DB = 1.2
 _LIMITER_ATTACK_MS = 5   # same transparent brickwall the engine's weld uses (scripts/montyops/edit_weld.py)
 _LIMITER_RELEASE_MS = 50
+_LUFS_TOL_DB = 3.0       # the band the box's own check_master judges the delivered master by
+# One full-length audio decode/encode runs far above realtime (render.py's _AUDIO_PASS_WALL_S, same class);
+# a level pass that does not is wedged, and a wedge must fail loud rather than absorb the stage.
+_AUDIO_PASS_WALL_S = 300
+_MAKEUP_TRIGGER_LU = 1.0
+# a residual this large means the integrated loudness was carried by transients the ceiling just removed;
+# giving it back would only feed the limiter again, so it is a refusal, not a louder retry.
+_MAKEUP_MAX_DB = 12.0
 
 
 def limiter_af(tp_aim: float) -> str:
@@ -244,9 +252,9 @@ def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> t
 
 
 def apply_loudnorm(fin, src: Path, out: Path) -> Path:
-    """Two-pass loudnorm + brickwall to the brand's delivery target, audio-gain only (video copied).
+    """Level the master's audio in PCM, then mux it back over the copied video as ONE aac encode.
     A measurement that cannot be parsed leaves the master at source level rather than failing a finished
-    render; a master measured OVER the ceiling raises — shipping it silently is what the box refuses."""
+    render; a delivered master off the brand's band (too loud OR too quiet) raises instead of shipping."""
     ln = fin.loudnorm
     if ln is None:
         return src
@@ -259,14 +267,60 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     print(f"[finalize] master: {note}")
     if af is None:
         return src
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src),
-                        "-af", af, "-ar", "48000", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                        str(out), "-y"],
-                       capture_output=True)
-    if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
-        print(f"[finalize] master loudnorm exit {r.returncode} -> left at source level")
-        return src
+    lvl = out.with_name(out.stem + ".lvl.wav")
+    mk = out.with_name(out.stem + ".mk.wav")
+    try:
+        if not _pcm_pass(src, lvl, af):
+            print("[finalize] master loudnorm: level pass failed -> left at source level")
+            return src
+        audio = _make_up(lvl, mk, ln, tp_aim)
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-i", str(audio),
+                            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                            "-ar", "48000", str(out), "-y"],
+                           capture_output=True, timeout=_AUDIO_PASS_WALL_S)
+        if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+            print(f"[finalize] master loudnorm exit {r.returncode} -> left at source level")
+            return src
+    finally:
+        lvl.unlink(missing_ok=True)
+        mk.unlink(missing_ok=True)
     return _verdict(out, ln, tp_aim)
+
+
+def _pcm_pass(src: Path, dst: Path, af: str) -> bool:
+    """One audio-only filter pass to 48k PCM. The level work happens BEFORE the single aac encode, so the
+    make-up below can re-measure what the brickwall actually left instead of guessing through the codec."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-vn",
+                        "-af", af, "-ar", "48000", "-c:a", "pcm_s16le", str(dst), "-y"],
+                       capture_output=True, timeout=_AUDIO_PASS_WALL_S)
+    return r.returncode == 0 and dst.is_file() and dst.stat().st_size > 0
+
+
+def _make_up(lvl: Path, mk: Path, ln, tp_aim: float) -> Path:
+    """The brickwall removes exactly the transients a click-carried integrated loudness was made of, so
+    the levelled PCM is re-measured and given back the residual — under the same ceiling, once."""
+    d = _measure(lvl, ln, tp_aim)
+    try:
+        i, tp = float(d["input_i"]), float(d["input_tp"])
+    except (TypeError, KeyError, ValueError):
+        print("[finalize] master: levelled PCM UNVERIFIED — no make-up, the encode decides")
+        return lvl
+    residual = ln.i - i
+    print(f"[finalize] master: levelled lufs={i} tp={tp} (residual {residual:+.2f} LU)")
+    if residual <= _MAKEUP_TRIGGER_LU:
+        return lvl
+    if residual > _MAKEUP_MAX_DB:
+        raise RuntimeError(
+            f"[finalize] master: OFF-CONTRACT after limiter lufs={i} target={ln.i} "
+            f"(residual {residual:+.2f} LU over the {_MAKEUP_MAX_DB} dB make-up cap) — a master whose "
+            f"loudness lives only in the transients the ceiling removes is not a montage, refusing")
+    if not _pcm_pass(lvl, mk, f"volume={residual:.2f}dB,{limiter_af(tp_aim)}"):
+        print("[finalize] master: make-up pass failed -> shipping the levelled PCM")
+        return lvl
+    d2 = _measure(mk, ln, tp_aim)
+    got = f"lufs={d2['input_i']} tp={d2['input_tp']}" if d2 else "UNVERIFIED"
+    print(f"[finalize] master: make-up {residual:+.2f} dB -> {got}")
+    return mk
 
 
 def _measure(path: Path, ln, tp_aim: float) -> dict | None:
@@ -276,7 +330,7 @@ def _measure(path: Path, ln, tp_aim: float) -> dict | None:
         ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
          "-map", "0:a:0?",
          "-af", f"loudnorm=I={ln.i}:TP={tp_aim}:LRA={ln.lra}:print_format=json", "-f", "null", "-"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, timeout=_AUDIO_PASS_WALL_S)
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", meas.stderr, re.S)
     return json.loads(m.group(0)) if m else None
 
@@ -294,5 +348,9 @@ def _verdict(out: Path, ln, tp_aim: float) -> Path:
         raise RuntimeError(
             f"[finalize] master: OFF-CONTRACT after limiter tp={tp} ceil={ln.tp} "
             f"(aim {tp_aim}, delivered lufs={i} lra={lra}) — refusing to ship a clipping master")
+    if i < ln.i - _LUFS_TOL_DB:
+        raise RuntimeError(
+            f"[finalize] master: OFF-CONTRACT after limiter lufs={i} target={ln.i} tol={_LUFS_TOL_DB} "
+            f"(tp={tp} lra={lra}) — the box refuses this level, refusing to ship it silently")
     print(f"[finalize] master: delivered lufs={i} tp={tp} lra={lra}")
     return out

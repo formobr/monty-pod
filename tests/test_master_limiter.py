@@ -17,6 +17,8 @@ INFEASIBLE = {"input_i": "-20.0", "input_tp": "-2.0", "input_lra": "5.0", "input
 # in_tp + (target - in_i) <= aim: loudnorm keeps its linear mode, so the chain stays as it was
 FEASIBLE = {"input_i": "-16.0", "input_tp": "-6.0", "input_lra": "6.5", "input_thresh": "-26.4"}
 LOUD = {"input_i": "-9.2", "input_tp": "-0.4", "input_lra": "7.2", "input_thresh": "-19.8"}
+# on the brand's band: the answer every measure gets when the pass under test is not the one being judged
+ON_BAND = {"input_i": "-14.1", "input_tp": "-1.6", "input_lra": "3.0", "input_thresh": "-24.1"}
 # clipping-hot mic already AT target: master_af's crackle guard ships it unencoded
 HOT = {"input_i": "-15.0", "input_tp": "-0.1", "input_lra": "6.0", "input_thresh": "-25.4"}
 
@@ -66,10 +68,9 @@ def test_the_limit_is_the_aim_in_linear_amplitude_not_dB() -> None:
 def test_a_tighter_ceiling_moves_the_limit_with_it(monkeypatch, tmp_path) -> None:
     """The aim is derived (TP - headroom), so the brickwall must follow the brand's TP, not a literal."""
     calls: list[list[str]] = []
-    _stub(monkeypatch, tmp_path, calls, FEASIBLE, FEASIBLE)
+    _stub(monkeypatch, tmp_path, calls, FEASIBLE, ON_BAND, ON_BAND)
     finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln(tp=-1.5)), tmp_path / "m.mp4", tmp_path / "o.mp4")
-    apply = calls[1]
-    af = apply[apply.index("-af") + 1]
+    af = _afs(calls)[0]
     assert "TP=-2.7:" in af and "alimiter=limit=0.7328:" in af
 
 
@@ -88,40 +89,68 @@ def test_the_headroom_still_covers_only_the_codec() -> None:
 
 # --- the post-encode verdict --------------------------------------------------
 
-def _stub(monkeypatch, tmp_path, calls, first: dict, second: dict) -> None:
-    """ffmpeg stand-in: two measure passes (`-f null`) answer `first` then `second`, the apply pass
-    writes the output file apply_loudnorm's own size check reads."""
-    answers = [first, second]
+def _stub(monkeypatch, tmp_path, calls, *answers: dict) -> None:
+    """ffmpeg stand-in: the measure passes (`-f null`) answer `answers` in order — source, levelled PCM,
+    [made-up PCM], delivered master — and every other pass writes the file it names."""
+    left = list(answers)
 
     def fake(cmd, **_kw):
         calls.append(list(cmd))
         if "null" in cmd:
-            return SimpleNamespace(returncode=0, stdout="", stderr=_json(answers.pop(0)))
-        (tmp_path / "o.mp4").write_bytes(b"v")
+            return SimpleNamespace(returncode=0, stdout="", stderr=_json(left.pop(0)))
+        Path(cmd[-2]).write_bytes(b"v")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
     monkeypatch.setattr(finalize.subprocess, "run", fake)
 
 
+def _afs(calls) -> list[str]:
+    return [c[c.index("-af") + 1] for c in calls if "-af" in c and "null" not in c]
+
+
 def test_the_delivered_master_is_measured_and_its_numbers_are_printed(monkeypatch, tmp_path, capsys) -> None:
     calls: list[list[str]] = []
-    _stub(monkeypatch, tmp_path, calls, QUIET,
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
           {"input_i": "-14.1", "input_tp": "-1.6", "input_lra": "2.8", "input_thresh": "-24.3"})
     out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
     assert out == tmp_path / "o.mp4"
-    assert len(calls) == 3, "measure -> apply -> verify"
-    verify = calls[2]
+    assert len(calls) == 5, "measure -> level PCM -> measure PCM -> mux -> verify"
+    verify = calls[4]
     assert str(tmp_path / "o.mp4") in verify, "the verdict must measure the ENCODED file, not the source"
     assert verify[verify.index("-map") + 1] == "0:a:0?"
     assert "[finalize] master: delivered lufs=-14.1 tp=-1.6 lra=2.8" in capsys.readouterr().out
+
+
+def test_the_level_work_happens_in_pcm_before_the_single_aac_encode(monkeypatch, tmp_path) -> None:
+    """Measuring through the codec is why the make-up could never see what the brickwall removed; one
+    encode also stays one encode — a second aac generation on a finished master is not free."""
+    calls: list[list[str]] = []
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND, ON_BAND)
+    finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    level, mux = calls[1], calls[3]
+    assert "-vn" in level and level[level.index("-c:a") + 1] == "pcm_s16le"
+    assert str(tmp_path / "o.lvl.wav") == level[-2]
+    assert mux[mux.index("-c:a") + 1] == "aac" and "copy" == mux[mux.index("-c:v") + 1]
+    assert len([c for c in calls if "-c:a" in c and c[c.index("-c:a") + 1] == "aac"]) == 1
+    assert not (tmp_path / "o.lvl.wav").exists(), "the intermediate PCM must not survive the job"
 
 
 def test_a_master_over_the_ceiling_refuses_instead_of_shipping(monkeypatch, tmp_path) -> None:
     """The 2913bf1a shape: the chain ran, the file exists, and it is +0.41 dBTP. Returning it (or the
     un-normalized source) is the silent failure — the pod op must fail loud with the numbers."""
     calls: list[list[str]] = []
-    _stub(monkeypatch, tmp_path, calls, QUIET,
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
           {"input_i": "-16.69", "input_tp": "0.41", "input_lra": "2.9", "input_thresh": "-27.1"})
     with pytest.raises(RuntimeError, match=r"OFF-CONTRACT.*tp=0\.41 ceil=-1\.0"):
+        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+
+
+def test_a_delivered_master_under_the_bands_floor_refuses_too(monkeypatch, tmp_path) -> None:
+    """The other half of 2913bf1a: -16.69 LUFS is off-contract even at a clean true peak, and the AAC
+    encode is the last place the level can still move after the make-up."""
+    calls: list[list[str]] = []
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
+          {"input_i": "-17.4", "input_tp": "-1.9", "input_lra": "2.9", "input_thresh": "-27.1"})
+    with pytest.raises(RuntimeError, match=r"OFF-CONTRACT.*lufs=-17\.4 target=-14\.0 tol=3\.0"):
         finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
 
 
@@ -129,10 +158,53 @@ def test_a_master_exactly_at_the_ceiling_ships(monkeypatch, tmp_path) -> None:
     """The ceiling is the contract, the aim is only the margin — refusing at the aim fails masters the
     box accepts."""
     calls: list[list[str]] = []
-    _stub(monkeypatch, tmp_path, calls, QUIET,
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
           {"input_i": "-14.0", "input_tp": "-1.0", "input_lra": "3.0", "input_thresh": "-24.0"})
     assert finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()),
                                    tmp_path / "m.mp4", tmp_path / "o.mp4") == tmp_path / "o.mp4"
+
+
+# --- the make-up: what the brickwall removed, measured and given back ---------
+
+def test_a_short_levelled_master_gets_the_residual_back_under_the_same_ceiling(
+        monkeypatch, tmp_path, capsys) -> None:
+    """The gain is computed from the SOURCE measure, so a brickwall that removes transient-carried
+    loudness leaves the master short — 17-2024 landed -16.69 exactly this way."""
+    calls: list[list[str]] = []
+    _stub(monkeypatch, tmp_path, calls, QUIET,
+          {"input_i": "-17.0", "input_tp": "-2.2", "input_lra": "2.9", "input_thresh": "-27.0"},
+          {"input_i": "-14.2", "input_tp": "-2.2", "input_lra": "3.1", "input_thresh": "-24.2"},
+          {"input_i": "-14.2", "input_tp": "-1.5", "input_lra": "3.1", "input_thresh": "-24.2"})
+    out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert out == tmp_path / "o.mp4"
+    assert _afs(calls)[1] == "volume=3.00dB,alimiter=limit=0.7762:attack=5:release=50:level=false"
+    log = capsys.readouterr().out
+    assert "levelled lufs=-17.0 tp=-2.2 (residual +3.00 LU)" in log
+    assert "make-up +3.00 dB -> lufs=-14.2 tp=-2.2" in log
+
+
+def test_a_master_already_on_target_gets_no_second_pass(monkeypatch, tmp_path, capsys) -> None:
+    """A make-up pass is another decode/encode of the whole master and another trip through the
+    limiter; inside the band there is nothing to buy with it."""
+    calls: list[list[str]] = []
+    _stub(monkeypatch, tmp_path, calls, QUIET,
+          {"input_i": "-14.4", "input_tp": "-2.3", "input_lra": "3.0", "input_thresh": "-24.4"}, ON_BAND)
+    finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert len(_afs(calls)) == 1, "the level pass only"
+    assert "make-up" not in capsys.readouterr().out
+
+
+def test_loudness_that_lives_only_in_transients_refuses_instead_of_chasing_it(
+        monkeypatch, tmp_path) -> None:
+    """Corpus `quiet_speech_clicks`: the integrated measure was carried by clicks the ceiling removes, so
+    the residual is unbounded — giving it back would only feed the limiter the same transients again."""
+    calls: list[list[str]] = []
+    _stub(monkeypatch, tmp_path, calls, QUIET,
+          {"input_i": "-26.33", "input_tp": "-2.2", "input_lra": "0.4", "input_thresh": "-36.3"})
+    with pytest.raises(RuntimeError, match=r"lufs=-26\.33 target=-14\.0 \(residual \+12\.33 LU over the 12\.0 dB"):
+        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert not any("aac" in c for c in calls), "the refusal must come before the master is encoded"
+    assert not (tmp_path / "o.lvl.wav").exists()
 
 
 def test_an_unreadable_verdict_ships_the_master_and_says_so(monkeypatch, tmp_path, capsys) -> None:
@@ -142,8 +214,8 @@ def test_an_unreadable_verdict_ships_the_master_and_says_so(monkeypatch, tmp_pat
         if "null" in cmd and str(tmp_path / "o.mp4") in cmd:
             return SimpleNamespace(returncode=1, stdout="", stderr="Output file #0 does not contain")
         if "null" in cmd:
-            return SimpleNamespace(returncode=0, stdout="", stderr=_json(QUIET))
-        (tmp_path / "o.mp4").write_bytes(b"v")
+            return SimpleNamespace(returncode=0, stdout="", stderr=_json(ON_BAND))
+        Path(cmd[-2]).write_bytes(b"v")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
     monkeypatch.setattr(finalize.subprocess, "run", fake)
     out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
@@ -198,12 +270,50 @@ def test_the_real_17_2024_shape_is_delivered_on_target_and_under_the_ceiling(tmp
     out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=ln), src, tmp_path / "o.mp4")
     assert out == tmp_path / "o.mp4" and out.stat().st_size > 0
 
+    delivered = _delivered(out)
+    # tighter than the box's own +-3 band: this shape has to land ON target, not merely inside it
+    assert delivered["input_i"] == pytest.approx(ln.i, abs=1.0), delivered
+    assert delivered["input_tp"] <= ln.tp, delivered
+
+
+@pytest.mark.integration
+def test_a_click_carried_source_is_either_on_band_or_refused_with_its_numbers(tmp_path: Path) -> None:
+    """Corpus `quiet_speech_clicks` shape at a speech-level bed: 5 ms clicks at -4 dBFS every 1.5 s over a
+    -30 dBFS bed. The clicks carry part of the integrated measure and the ceiling then removes them, which
+    is what the make-up pass exists to answer — and if it cannot, the numbers must be in the refusal."""
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg unavailable")
+    clicks = "+".join(rf"between(t\,{t}\,{t + 0.005})" for t in (1.5, 3.0, 4.5, 6.0, 7.5))
+    src = tmp_path / "clicks.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=8",
+         "-f", "lavfi", "-i", "anoisesrc=r=48000:c=pink:a=0.15:d=8:seed=17",
+         "-f", "lavfi", "-i", rf"aevalsrc=0.63*sin(2*PI*1000*t)*({clicks}):d=8:s=48000",
+         "-filter_complex", "[1:a][2:a]amix=inputs=2:duration=first:normalize=0,"
+                            "aformat=channel_layouts=stereo:sample_rates=48000[a]",
+         "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-shortest", str(src)], check=True)
+    ln = _ln()
+    try:
+        out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=ln), src, tmp_path / "o.mp4")
+    except RuntimeError as exc:
+        assert re.search(r"lufs=-\d+\.\d+ target=-14\.0 \(residual \+\d+\.\d+ LU", str(exc)), exc
+        return
+    delivered = _delivered(out)
+    assert delivered["input_i"] >= -17.0, delivered
+    assert delivered["input_tp"] <= ln.tp, delivered
+
+
+def _delivered(path: Path) -> dict[str, float]:
+    """The same measure the box's check_master takes, so the number asserted is the number it would see."""
+    import subprocess
     meas = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(out), "-map", "0:a:0?",
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0?",
          "-af", "loudnorm=I=-14:TP=-2.2:LRA=11:print_format=json", "-f", "null", "-"],
         capture_output=True, text=True)
     got = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", meas.stderr, re.S)
     assert got, meas.stderr[-2000:]
-    delivered = {k: float(v) for k, v in re.findall(r'"(input_i|input_tp)"\s*:\s*"(-?[\d.]+)"', got.group(0))}
-    assert delivered["input_i"] == pytest.approx(ln.i, abs=3.0), delivered
-    assert delivered["input_tp"] <= ln.tp, delivered
+    return {k: float(v) for k, v in re.findall(r'"(input_i|input_tp)"\s*:\s*"(-?[\d.]+)"', got.group(0))}
