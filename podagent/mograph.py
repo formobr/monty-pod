@@ -6,6 +6,7 @@ bundle.py."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -23,21 +24,34 @@ _STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/
 # renders ffmpeg, not TS. The engine's tests/test_head_settle_ssot.py text-reads this file and reddens on drift.
 HB_DROP_FRAC = 0.33          # frame-fraction the face travels down → seats at 0.75
 HEAD_SETTLE_SEC = 0.4        # settle window at beat start; reversed at beat end
-_HB_ZW0 = 15 / (2 * 0.9)     # GLIDE {damping:15, mass:0.9, stiffness:140} underdamped closed form (== engine)
-_HB_WD = (140 / 0.9) ** 0.5 * (1 - (15 / (2 * (140 * 0.9) ** 0.5)) ** 2) ** 0.5
-_HB_B = _HB_ZW0 / _HB_WD
+# CRITICALLY damped {mass:0.9, stiffness:140, damping:2√(km)}: S(τ)=1-e^(-ω0τ)(1+ω0τ). The underdamped GLIDE
+# passed rest by ~20% at BOTH edges and a run of mographs read as the head JUMPING (fbr ff22e5e4).
+_HB_W0 = (140 / 0.9) ** 0.5
+
+
+def _hb_spring(tau: float) -> float:
+    """Settle 0→1 at local time tau≥0 seconds — monotone, never past 1 (no overshoot to read as a jump)."""
+    if tau <= 0:
+        return 0.0
+    return 1 - math.exp(-_HB_W0 * tau) * (1 + _HB_W0 * tau)
+
+
+def _hb_settle_progress(t: float, s: float, e: float) -> float:
+    """Head-slide progress at absolute time t over beat [s,e]: springs down at s, reverses at e-HEAD_SETTLE_SEC.
+    0 = full frame (face high), 1 = seated in the bottom band. Mirrors MontagePreview.headSettle."""
+    return max(0.0, min(1.0, _hb_spring(t - s) - _hb_spring(t - (e - HEAD_SETTLE_SEC))))
 
 
 def _hb_settle_y_expr(s: float, e: float) -> str:
-    """ffmpeg overlay-y = 0.33·H · head-slide progress: springs down at s, reverses at e-HEAD_SETTLE_SEC. H is the
+    """ffmpeg overlay-y = 0.33·H · head-slide progress — the closed form of _hb_settle_progress in t. H is the
     base height at overlay time, so the drop is resolution-independent (== MontagePreview's 33% of frame)."""
     def spring(t0: float) -> str:
         tau = f"max(t-{t0:.5f}\\,0)"
-        return f"(1-exp(-{_HB_ZW0:.5f}*{tau})*(cos({_HB_WD:.5f}*{tau})+{_HB_B:.5f}*sin({_HB_WD:.5f}*{tau})))"
+        return f"(1-exp(-{_HB_W0:.5f}*{tau})*(1+{_HB_W0:.5f}*{tau}))"
     emf = e - HEAD_SETTLE_SEC
     up = f"if(gte(t\\,{s:.5f})\\,{spring(s)}\\,0)"
     down = f"if(gte(t\\,{emf:.5f})\\,{spring(emf)}\\,0)"
-    return f"{HB_DROP_FRAC}*H*clip(({up})-({down})\\,0\\,1.2)"
+    return f"{HB_DROP_FRAC}*H*clip(({up})-({down})\\,0\\,1)"
 
 
 def remotion_dir(ref, tmp: Path) -> Path:
