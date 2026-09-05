@@ -66,7 +66,7 @@ presigned URLs, query strings and workspace paths never enter the receipt. If a
 recorder or terminal clock sample is unavailable, the work still succeeds but the
 timeline is explicitly incomplete and cannot be used as a performance baseline.
 
-The WebSocket structure and its v13 version come from the deterministic
+The WebSocket structure and its v14 version come from the deterministic
 `vendor/monty-contracts/wire_bundle.json`; `podagent/wire_generated.py` is regenerated from that bundle.
 Only cross-field identity/clock rules remain handwritten in `podagent/stream_models.py`. This shared-wire
 version is independent of `contracts/VERSION=6`, which still owns only render, inference and op payloads.

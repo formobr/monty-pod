@@ -8,8 +8,8 @@ from pydantic import ConfigDict, Field, model_validator
 
 _MISSING = object()
 WIRE_BUNDLE_FORMAT: Final = 1
-WIRE_BUNDLE_SHA256: Final = '888d48677e7075d405fd0bf955bbc42bf584ec0287b3bdb54649564715938e26'
-WIRE_CONTRACT_VERSION: Final = 13
+WIRE_BUNDLE_SHA256: Final = '1ef4b5ac334541841d658ae28376648d163bb85e1a082445b201ae78c71ac883'
+WIRE_CONTRACT_VERSION: Final = 14
 
 
 class StreamEventFields:
