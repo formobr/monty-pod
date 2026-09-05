@@ -316,6 +316,63 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     sys.exit(3)
 
 
+def _ffmpeg_version_head(edge_lines: int = 2) -> str:
+    """The banner's own git-describe + build-config lines, so a probe verdict names its exact binary."""
+    import subprocess
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-version"], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"ffmpeg -version unavailable: {type(e).__name__}: {e}"
+    text = safe_text((r.stdout or b"").decode("utf-8", "replace"))
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:edge_lines]
+    return " · ".join(lines) if lines else "no ffmpeg -version output"
+
+
+def _nvdec_or_refuse(cp: "ControlPlane") -> None:
+    """A passing NVENC probe does not prove NVDEC — separate silicon behind the same driver, and the
+    0.73x-realtime incident host silently software-decoded the whole run despite it (nvdec-normalize-config.md)."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="podagent-nvdec-") as tmp:
+        probe_mp4 = str(Path(tmp) / "probe.mp4")
+        encode = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                  "-i", "color=c=black:s=256x256:d=0.1", "-c:v", "hevc_nvenc", "-preset", "p5",
+                  "-frames:v", "1", probe_mp4]
+        # `hwdownload` requires a HARDWARE frame; unlike bare `-hwaccel cuda` it cannot fall back to software.
+        decode = ["ffmpeg", "-v", "error", "-init_hw_device", "cuda=gpu", "-hwaccel", "cuda",
+                  "-hwaccel_output_format", "cuda", "-i", probe_mp4,
+                  "-vf", "hwdownload,format=nv12", "-f", "null", "-"]
+        detail: str
+        try:
+            enc = subprocess.run(encode, capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            detail = f"{type(e).__name__}: {e}"
+        else:
+            if enc.returncode != 0:
+                detail = f"probe encode exit {enc.returncode}: {_bounded_stderr(enc.stderr or b'')}"
+            else:
+                try:
+                    dec = subprocess.run(decode, capture_output=True, timeout=10)
+                except (OSError, subprocess.SubprocessError) as e:
+                    detail = f"{type(e).__name__}: {e}"
+                else:
+                    if dec.returncode == 0:
+                        _log(f"nvdec probe OK — cuda hwaccel decodes on this host · {_ffmpeg_version_head()}")
+                        return
+                    detail = f"exit {dec.returncode}: {_bounded_stderr(dec.stderr or b'')}"
+    msg = f"REFUSING work: NVDEC (cuda hwaccel) will not initialise on this pod — {detail}"
+    _log(msg)
+    try:
+        cp.send_event(
+            {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
+            wait=True,
+        )
+    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
+        _log(f"NVDEC refusal delivery failed: {safe_error(e)}")
+    _mark_stopped()
+    sys.exit(3)
+
+
 # 1.4.0 was "live-verified on driver 595" (ONE driver) and clobbered every other driver's real ICD; 1.2.0 is
 # libplacebo's own floor — never lower (the-gpu-verdict-carries-its-evidence-or-it-is-not-a-verdict).
 _VULKAN_EGL_API_VERSIONS = ("1.3.0", "1.2.0")
@@ -838,6 +895,7 @@ def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, Any] | None =
     """Report the boot, prove the encoder, then make readiness an ACKed admission barrier."""
     _report_boot(cp)
     _nvenc_or_refuse(cp)
+    _nvdec_or_refuse(cp)
     if capacity is not None:
         capacity["vulkan"] = _vulkan_preflight(cp, capacity=capacity)
     else:

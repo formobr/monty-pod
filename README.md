@@ -72,7 +72,8 @@ Only cross-field identity/clock rules remain handwritten in `podagent/stream_mod
 version is independent of `contracts/VERSION=6`, which still owns only render, inference and op payloads.
 
 At boot, the agent reports its diagnostic beacon, proves that `h264_nvenc`
-actually opens on the rented host, then synchronously sends and waits for ACK of a typed
+actually opens on the rented host, proves that `-hwaccel cuda` actually decodes (a working encoder does not
+imply a working decoder — separate silicon), then synchronously sends and waits for ACK of a typed
 `boot/ready` event. Capacity advertising and job admission happen only after
 that barrier. A failed capability probe reports a bounded, secret-safe stderr
 head and tail synchronously and exits as a deliberate refusal, not an unclean

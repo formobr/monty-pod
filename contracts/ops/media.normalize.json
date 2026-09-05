@@ -17,7 +17,7 @@
   "params": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["width", "height", "fps"],
+    "required": ["width", "height", "fps", "native_width", "native_height"],
     "properties": {
       "width": {
         "type": "integer",
@@ -50,6 +50,23 @@
         "maximum": 32,
         "default": 2,
         "description": "Source audio channel count. >2 (quad/5.1 mono-in-a-container) → SUM all channels into BOTH stereo channels (voice CENTERED); 1/2 → plain stereo. The DECISION is the channel count from the probe; the pan is the handler's."
+      },
+      "rotation": {
+        "type": "integer",
+        "default": 0,
+        "description": "ffprobe displaymatrix rotation (0/90/180/270/-90). The GPU arm decodes with autorotate off and applies this explicitly on the CPU side after the frame leaves the card."
+      },
+      "native_width": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 8192,
+        "description": "ALWAYS present: the pre-`max_h` display width (equals width above when native resolution is kept). The GPU arm's on-card prescale/pad fire only when this differs from width above — never on presence alone."
+      },
+      "native_height": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 8192,
+        "description": "ALWAYS present (paired with native_width): the pre-`max_h` display height, equal to height above when native resolution is kept."
       },
       "grade": {
         "type": "object",

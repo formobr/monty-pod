@@ -628,7 +628,7 @@ def test_the_spec_encode_rung_never_reaches_the_deliverable() -> None:
     assert spec.encode.cq == 23
     _ins, outs = _argv(op.assemble(_prepared(spec))[1])
     assert "23" not in outs[0][0]
-    assert _has_seq(outs[0][0], ["-crf", "14"])
+    assert _has_seq(outs[0][0], ["-crf", "19"])
     assert _has_seq(outs[0][0], finalize._BT709)
     assert _has_seq(outs[1][0], finalize._BT709)
     gpu_outs = _argv(op.assemble(_prepared(spec, gpu=True))[1])[1]

@@ -189,10 +189,11 @@ def test_ready_is_sent_synchronously_only_after_a_successful_probe(monkeypatch):
 
     cp = _OrderedCP()
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: timeline.append("boot"))
-    monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: timeline.append("probe"))
+    monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: timeline.append("nvenc_probe"))
+    monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: timeline.append("nvdec_probe"))
     monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: timeline.append("vulkan"))
     agent_main._capability_preflight(cp)
-    assert timeline == ["boot", "probe", "vulkan", "ready"]
+    assert timeline == ["boot", "nvenc_probe", "nvdec_probe", "vulkan", "ready"]
     assert cp.events == [{
         "stage": "boot", "status": "step", "phase": "ready",
         "step": "capability preflight passed",
@@ -232,6 +233,7 @@ def test_main_never_reaches_dispatch_when_ready_ack_is_ambiguous(monkeypatch):
     monkeypatch.setattr(agent_main, "_log_gpu_status", lambda: None)
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
     monkeypatch.setattr(agent_main, "_dispatch_loop", _dispatch)
 
