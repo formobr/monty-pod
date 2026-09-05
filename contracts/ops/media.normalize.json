@@ -2,22 +2,41 @@
   "op": "media.normalize",
   "version": 1,
   "summary": "Canonical INGEST encode: bake rotation, VFR→CFR, square the pixels, HDR→SDR tonemap, multichannel→centered stereo, 8-bit 4:2:0 h264 + bounded autograde. The MECHANIC of ingest_normalize — WHAT to correct is measured on the brain and arrives as numeric params.",
-  "needs": ["video_encode"],
+  "needs": [
+    "video_encode"
+  ],
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
     "note": "The vf/audio/encoder argv is a PURE function of the params (target dims, tonemap transfer, fps, source channel count, the autograde brightness/contrast/saturation numbers), so libx264 at the pinned preset/crf over identical input bytes emits identical output bytes. tests/test_op_media_normalize.py pins video_filter()/argv() as strings, renders twice on the libx264 path (MONTY_OPS_CPU_ENCODE=1) and sha256-compares, and pins the eq= against autograde.grade_filter so an autograde drift reddens. This normalizes the raw source pixels EVERY downstream decision reads (ASR, Director, all measures) — a pixel shift here silently moves every decision below it, which is why the bar is byte-exact and not perceptual. WHICH corrections apply (needs_normalize gating, the autograde MEASUREMENT) is decided on the brain and crosses as data; NVENC is the fast default and non-reproducible run-to-run like every encoder op, which is a version-pin property of the image, not this op."
   },
   "inputs": [
-    {"id": "src", "kind": "video"}
+    {
+      "id": "src",
+      "kind": "video"
+    }
   ],
   "outputs": [
-    {"id": "dst", "kind": "video", "durable": true}
+    {
+      "id": "dst",
+      "kind": "video",
+      "durable": true
+    }
   ],
   "params": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["width", "height", "fps", "native_width", "native_height"],
+    "required": [
+      "width",
+      "height",
+      "fps",
+      "native_width",
+      "native_height",
+      "max_bitrate",
+      "nvenc_cq",
+      "x264_crf",
+      "nvenc_vbv_mode"
+    ],
     "properties": {
       "width": {
         "type": "integer",
@@ -40,7 +59,11 @@
         "description": "Canonical constant frame rate. VFR sources desync the cut; force CFR at this fps."
       },
       "tonemap": {
-        "enum": ["none", "hlg", "pq"],
+        "enum": [
+          "none",
+          "hlg",
+          "pq"
+        ],
         "default": "none",
         "description": "Source HDR transfer to tonemap SDR→bt709 (hlg = iPhone default, pq). 'none' = an SDR source, no tonemap. The zscale+tonemap=hable chain is the handler's; this names WHICH transfer, not the filtergraph."
       },
@@ -73,10 +96,53 @@
         "additionalProperties": false,
         "description": "Bounded autograde correction (±8%), MEASURED on the brain (autograde.measure/plan). Absent or identity → no eq. NOT an editorial grade — a mechanical exposure/saturation nudge toward neutral.",
         "properties": {
-          "brightness": {"type": "number", "minimum": -0.08, "maximum": 0.08},
-          "contrast": {"type": "number", "minimum": 0.92, "maximum": 1.08},
-          "saturation": {"type": "number", "minimum": 0.92, "maximum": 1.08}
+          "brightness": {
+            "type": "number",
+            "minimum": -0.08,
+            "maximum": 0.08
+          },
+          "contrast": {
+            "type": "number",
+            "minimum": 0.92,
+            "maximum": 1.08
+          },
+          "saturation": {
+            "type": "number",
+            "minimum": 0.92,
+            "maximum": 1.08
+          }
         }
+      },
+      "max_bitrate": {
+        "type": "integer",
+        "minimum": 100000,
+        "description": "VBR cap in bit/s = max(floor, min(source h264-equivalent, ceiling)) from registry/encode.yaml — the brain computes it, the op only obeys."
+      },
+      "source_bit_rate": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "The probed VIDEO STREAM bitrate (bit/s); absent when ffprobe reported none — informational, the cap already folded it in."
+      },
+      "nvenc_cq": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 51,
+        "description": "NVENC -cq for the working-source rung (registry/encode.yaml working_source.nvenc_cq)."
+      },
+      "x264_crf": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 51,
+        "description": "libx264 -crf for the reproducible CPU proof path (registry/encode.yaml working_source.x264_crf)."
+      },
+      "nvenc_vbv_mode": {
+        "type": "string",
+        "enum": [
+          "b0",
+          "bv_cap",
+          "multipass_qres"
+        ],
+        "description": "How the VBV cap is expressed to NVENC; b0 (-b:v 0 -maxrate) was verified live to bind."
       }
     }
   },
