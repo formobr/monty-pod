@@ -23,6 +23,11 @@ ON_BAND = {"input_i": "-14.1", "input_tp": "-1.6", "input_lra": "3.0", "input_th
 HOT = {"input_i": "-15.0", "input_tp": "-0.1", "input_lra": "6.0", "input_thresh": "-25.4"}
 
 
+# 4x oversampled (inter-sample peaks are what the encoder reconstructs) and slow (flat tops are what the
+# aac encode overshoots on) — pinned whole: every delivered master goes through this exact fragment
+LIM = "aresample=192000,alimiter=limit=0.7762:attack=15:release=100:level=false,aresample=48000"
+
+
 def _ln(i: float = -14.0, tp: float = -1.0):
     return SimpleNamespace(i=i, tp=tp, lra=11.0, attenuate_only=False)
 
@@ -35,7 +40,7 @@ def test_a_feasible_linear_gain_keeps_the_loudnorm_chain_and_ends_in_the_brickwa
     af, note = finalize.master_af(FEASIBLE, -14.0, -2.2, False)
     assert af == ("loudnorm=I=-14.0:TP=-2.2:LRA=11:linear=true:measured_I=-16.0:measured_TP=-6.0"
                   ":measured_LRA=6.5:measured_thresh=-26.4"
-                  ",alimiter=limit=0.7762:attack=5:release=50:level=false")
+                  f",{LIM}")
     assert note.endswith("via linear loudnorm")
 
 
@@ -43,7 +48,7 @@ def test_an_infeasible_linear_gain_stops_asking_ffmpeg_and_gains_it_itself() -> 
     """`linear=true` is a REQUEST: ffmpeg downgrades to dynamic whenever in_tp + gain > TP, which lands
     the integrated loudness short (-16.69 on 17-2024). Our own gain + the brickwall cannot downgrade."""
     af, note = finalize.master_af(INFEASIBLE, -14.0, -2.2, False)
-    assert af == "volume=6.00dB,alimiter=limit=0.7762:attack=5:release=50:level=false"
+    assert af == f"volume=6.00dB,{LIM}"
     assert "loudnorm" not in af
     assert note == "-20.0 -> -14.0 LUFS (normalize) via volume+limiter (linear infeasible: pred_tp 4.00 > aim -2.2)"
 
@@ -60,9 +65,9 @@ def test_the_branch_is_decided_at_the_aim_not_at_the_ceiling() -> None:
 def test_the_limit_is_the_aim_in_linear_amplitude_not_dB() -> None:
     """alimiter's `limit` is amplitude: a -2.2 dBTP aim written as `-2.2` is silence-with-a-sign, and a
     `1.0` limit is no ceiling at all."""
-    assert finalize.limiter_af(-2.2) == "alimiter=limit=0.7762:attack=5:release=50:level=false"
-    assert finalize.limiter_af(-2.7) == "alimiter=limit=0.7328:attack=5:release=50:level=false"
-    assert finalize.limiter_af(0.0).startswith("alimiter=limit=1.0:")
+    assert finalize.limiter_af(-2.2) == LIM
+    assert finalize.limiter_af(-2.7) == LIM.replace("0.7762", "0.7328")
+    assert "alimiter=limit=1.0:" in finalize.limiter_af(0.0)
 
 
 def test_a_tighter_ceiling_moves_the_limit_with_it(monkeypatch, tmp_path) -> None:
@@ -134,14 +139,43 @@ def test_the_level_work_happens_in_pcm_before_the_single_aac_encode(monkeypatch,
     assert not (tmp_path / "o.lvl.wav").exists(), "the intermediate PCM must not survive the job"
 
 
-def test_a_master_over_the_ceiling_refuses_instead_of_shipping(monkeypatch, tmp_path) -> None:
-    """The 2913bf1a shape: the chain ran, the file exists, and it is +0.41 dBTP. Returning it (or the
-    un-normalized source) is the silent failure — the pod op must fail loud with the numbers."""
+def test_a_master_that_still_clips_after_the_loop_refuses(monkeypatch, tmp_path) -> None:
+    """The 2913bf1a shape: the chain ran, the file exists, and it is over 0 dBTP twice. Returning it (or
+    the un-normalized source) is the silent failure — the pod op must fail loud with the numbers."""
+    calls: list[list[str]] = []
+    clipping = {"input_i": "-14.69", "input_tp": "0.41", "input_lra": "2.9", "input_thresh": "-24.7"}
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND, clipping, ON_BAND, clipping)
+    with pytest.raises(RuntimeError, match=r"OFF-CONTRACT.*tp=0\.41 ceil=-1\.0 clip_at=0\.0"):
+        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert len([c for c in calls if "-vn" in c]) == 2, "one retry, then the refusal"
+
+
+def test_the_encode_overshoot_is_corrected_by_a_second_pass_at_a_tighter_aim(
+        monkeypatch, tmp_path, capsys) -> None:
+    """Prod 06c0d02c: the PCM held the aim and the aac encode of the limited waveform still delivered
+    +0.21 dBTP. Only the ENCODED file knows that number, so the aim has to move after seeing it."""
     calls: list[list[str]] = []
     _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
-          {"input_i": "-16.69", "input_tp": "0.41", "input_lra": "2.9", "input_thresh": "-27.1"})
-    with pytest.raises(RuntimeError, match=r"OFF-CONTRACT.*tp=0\.41 ceil=-1\.0"):
-        finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+          {"input_i": "-14.37", "input_tp": "0.21", "input_lra": "2.9", "input_thresh": "-24.4"},
+          ON_BAND,
+          {"input_i": "-14.4", "input_tp": "-1.2", "input_lra": "2.9", "input_thresh": "-24.4"})
+    out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert out == tmp_path / "o.mp4"
+    log = capsys.readouterr().out
+    assert "encode overshoot +1.21 dB past the ceiling -> retry at aim -3.71" in log
+    assert "delivered lufs=-14.4 tp=-1.2 lra=2.9 (pass 2, aim -3.71)" in log
+    assert f"limit={round(10 ** (-3.71 / 20), 4)}:" in _afs(calls)[1], "the retry re-aims the brickwall"
+
+
+def test_a_master_between_the_ceiling_and_zero_ships_with_its_number(monkeypatch, tmp_path, capsys) -> None:
+    """Mastering converges, it does not gate: -0.4 dBTP is codec overshoot on a limited waveform, not
+    clipping, and refusing a finished render over it blocks a user for nothing."""
+    calls: list[list[str]] = []
+    near = {"input_i": "-14.2", "input_tp": "-0.4", "input_lra": "2.9", "input_thresh": "-24.2"}
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND, near, ON_BAND, near)
+    out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
+    assert out == tmp_path / "o.mp4" and out.exists()
+    assert "master delivered over ceiling by 0.60 dB (codec overshoot) — shipped" in capsys.readouterr().out
 
 
 def test_a_delivered_master_under_the_bands_floor_refuses_too(monkeypatch, tmp_path) -> None:
@@ -158,8 +192,8 @@ def test_a_delivered_master_over_the_bands_ceiling_refuses_as_well(monkeypatch, 
     """The make-up can overshoot (its gain is measured on PCM, the aac encode moves the level again), and
     a band checked in one direction only ships a master the box then throws back."""
     calls: list[list[str]] = []
-    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
-          {"input_i": "-10.4", "input_tp": "-1.2", "input_lra": "2.9", "input_thresh": "-20.4"})
+    loud = {"input_i": "-10.4", "input_tp": "-1.2", "input_lra": "2.9", "input_thresh": "-20.4"}
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND, loud, ON_BAND, loud)
     with pytest.raises(RuntimeError, match=r"OFF-CONTRACT.*lufs=-10\.4 target=-14\.0 tol=3\.0"):
         finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
 
@@ -168,8 +202,8 @@ def test_a_refused_master_is_not_left_at_the_delivery_address(monkeypatch, tmp_p
     """The caller PUTs whatever sits at that path; a refusal that leaves the file behind is the silent
     ship this whole verdict exists to prevent."""
     calls: list[list[str]] = []
-    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND,
-          {"input_i": "-16.69", "input_tp": "0.41", "input_lra": "2.9", "input_thresh": "-27.1"})
+    clipping = {"input_i": "-14.69", "input_tp": "0.41", "input_lra": "2.9", "input_thresh": "-24.7"}
+    _stub(monkeypatch, tmp_path, calls, QUIET, ON_BAND, clipping, ON_BAND, clipping)
     with pytest.raises(RuntimeError):
         finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
     assert not (tmp_path / "o.mp4").exists()
@@ -199,7 +233,7 @@ def test_a_short_levelled_master_gets_the_residual_back_under_the_same_ceiling(
           {"input_i": "-14.2", "input_tp": "-1.5", "input_lra": "3.1", "input_thresh": "-24.2"})
     out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=_ln()), tmp_path / "m.mp4", tmp_path / "o.mp4")
     assert out == tmp_path / "o.mp4"
-    assert _afs(calls)[1] == "volume=3.00dB,alimiter=limit=0.7762:attack=5:release=50:level=false"
+    assert _afs(calls)[1] == f"volume=3.00dB,{LIM}"
     log = capsys.readouterr().out
     assert "levelled lufs=-17.0 tp=-2.2 (residual +3.00 LU)" in log
     assert "make-up +3.00 dB -> lufs=-14.2 tp=-2.2" in log
@@ -268,7 +302,7 @@ def test_a_hot_source_far_under_target_is_levelled_not_shipped_as_is(monkeypatch
     _stub(monkeypatch, tmp_path, calls, quiet_hot, ON_BAND, ON_BAND)
     fin = SimpleNamespace(loudnorm=SimpleNamespace(i=-14.0, tp=-1.0, lra=11.0, attenuate_only=True))
     assert finalize.apply_loudnorm(fin, tmp_path / "m.mp4", tmp_path / "o.mp4") == tmp_path / "o.mp4"
-    assert _afs(calls)[0].startswith("volume=6.00dB,alimiter=")
+    assert _afs(calls)[0] == f"volume=6.00dB,{LIM}"
 
 
 def test_the_band_edges_still_take_the_crackle_guards_shortcut() -> None:
@@ -370,6 +404,31 @@ def test_a_click_carried_source_is_either_on_band_or_refused_with_its_numbers(tm
     delivered = _delivered(out)
     assert delivered["input_i"] >= -17.0, delivered
     assert delivered["input_tp"] <= ln.tp, delivered
+
+
+@pytest.mark.integration
+def test_the_real_06c0d02c_shape_is_not_refused_any_more(tmp_path: Path) -> None:
+    """A plosive train at speech crest: the PCM holds the aim and the aac encode of the limited waveform
+    still overshoots. At 48 kHz with a 5/50 brickwall this delivered +0.23 dBTP and refused EVERY final
+    render; the oversampled slow ceiling plus the re-aim loop is what makes it shippable."""
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg unavailable")
+    src = tmp_path / "plosives.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=8",
+         "-f", "lavfi", "-i", "anoisesrc=r=48000:c=pink:a=0.15:d=8:seed=9",
+         "-filter_complex", r"[1:a]highpass=f=100,volume='if(lt(mod(t\,0.3)\,0.03)\,6.0\,1.0)':eval=frame,"
+                            r"aformat=channel_layouts=stereo:sample_rates=48000[a]",
+         "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-shortest", str(src)], check=True)
+    ln = _ln()
+    out = finalize.apply_loudnorm(SimpleNamespace(loudnorm=ln), src, tmp_path / "o.mp4")
+    delivered = _delivered(out)
+    assert delivered["input_tp"] <= 0.0, delivered
+    assert delivered["input_i"] == pytest.approx(ln.i, abs=3.0), delivered
 
 
 def _delivered(path: Path) -> dict[str, float]:

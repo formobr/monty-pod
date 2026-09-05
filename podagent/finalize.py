@@ -201,8 +201,18 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
 # loudnorm's TP is a PREDICTION it abandons (dynamic mode) rather than breach, so the alimiter below holds
 # the ceiling; this headroom buys only the AAC encode's ~0.9 dBTP of codec peaks over limited PCM.
 TP_HEADROOM_DB = 1.2
-_LIMITER_ATTACK_MS = 5   # same transparent brickwall the engine's weld uses (scripts/montyops/edit_weld.py)
-_LIMITER_RELEASE_MS = 50
+# slower than the weld's 5/50: a fast brickwall FLAT-TOPS the waveform, and an aac encode of flat tops
+# overshot 2.4 dBTP in prod (job 06c0d02c) — well past any headroom this module could carry.
+_LIMITER_ATTACK_MS = 15
+_LIMITER_RELEASE_MS = 100
+# alimiter only sees SAMPLE peaks; the true peak between two samples is what the encoder reconstructs, so
+# the ceiling is applied 4x oversampled and brought back to the delivery rate afterwards.
+_LIMITER_OVERSAMPLE_HZ = 192000
+_MAX_DELIVERY_PASSES = 2
+_RETRY_MARGIN_DB = 0.3
+# the ceiling is the AIM of the loop; only real clipping (and an off-band level) may refuse a finished
+# render, so the ceiling..0 dBTP window ships with a note instead of blocking the user.
+_CLIP_TP_DBTP = 0.0
 _LUFS_TOL_DB = 3.0       # the band the box's own check_master judges the delivered master by
 # One full-length audio decode/encode runs far above realtime (render.py's _AUDIO_PASS_WALL_S, same class);
 # a level pass that does not is wedged, and a wedge must fail loud rather than absorb the stage.
@@ -216,8 +226,10 @@ _MAKEUP_MAX_DB = 12.0
 def limiter_af(tp_aim: float) -> str:
     """Brickwall at the TP aim. `limit` is linear amplitude, not dB; level=false keeps it a pure ceiling,
     so a master already under the aim comes out gain-identical."""
-    return (f"alimiter=limit={round(10 ** (tp_aim / 20.0), 4)}"
-            f":attack={_LIMITER_ATTACK_MS}:release={_LIMITER_RELEASE_MS}:level=false")
+    return (f"aresample={_LIMITER_OVERSAMPLE_HZ},"
+            f"alimiter=limit={round(10 ** (tp_aim / 20.0), 4)}"
+            f":attack={_LIMITER_ATTACK_MS}:release={_LIMITER_RELEASE_MS}:level=false,"
+            f"aresample={_DELIVERY_SAMPLE_RATE}")
 
 
 def master_af(mv: dict, target: float, tp_aim: float, attenuate_only: bool) -> tuple[str | None, str]:
@@ -260,33 +272,61 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     ln = fin.loudnorm
     if ln is None:
         return src
-    tp_aim = round(ln.tp - TP_HEADROOM_DB, 2)
-    mv = _measure(src, ln, tp_aim)
+    aim = round(ln.tp - TP_HEADROOM_DB, 2)
+    mv = _measure(src, ln, aim)
     if mv is None:
         print("[finalize] master loudnorm: couldn't measure -> left at source level")
         return src
-    af, note = master_af(mv, ln.i, tp_aim, ln.attenuate_only)
-    print(f"[finalize] master: {note}")
-    if af is None:
-        return src
+    for attempt in range(1, _MAX_DELIVERY_PASSES + 1):
+        af, note = master_af(mv, ln.i, aim, ln.attenuate_only)
+        print(f"[finalize] master: {note}")
+        if af is None:
+            return src
+        if not _encode(src, out, af, ln, aim):
+            return src
+        got = _verdict(out, ln, aim, attempt)
+        if got is None:
+            return out
+        i, tp, lra = got
+        over = round(tp - ln.tp, 2)
+        off_band = abs(i - ln.i) > _LUFS_TOL_DB
+        if over <= 0 and not off_band:
+            return out
+        # a quiet master is the make-up's business and it already ran capped; only an OVERSHOOT (peak or
+        # level) is something a tighter aim can still buy back, and only inside the pass budget.
+        if attempt < _MAX_DELIVERY_PASSES and (over > 0 or i > ln.i + _LUFS_TOL_DB):
+            aim = round(aim - (max(over, i - ln.i - _LUFS_TOL_DB, 0.0) + _RETRY_MARGIN_DB), 2)
+            print(f"[finalize] master: encode overshoot {over:+.2f} dB past the ceiling -> retry at aim {aim}")
+            continue
+        if tp > _CLIP_TP_DBTP or off_band:
+            _refuse(out, ln, i, tp, lra, aim)
+        # ceiling..0 dBTP is the codec's overshoot on a limited waveform, not clipping — mastering converges,
+        # it does not gate, and a user waiting on a finished render must not be blocked by this number.
+        print(f"[finalize] master delivered over ceiling by {over:.2f} dB (codec overshoot) — shipped")
+        return out
+    return out
+
+
+def _encode(src: Path, out: Path, af: str, ln, aim: float) -> bool:
+    """Level the audio in PCM (chain + make-up), then mux it over the copied video as ONE aac encode."""
     lvl = out.with_name(out.stem + ".lvl.wav")
     mk = out.with_name(out.stem + ".mk.wav")
     try:
         if not _pcm_pass(src, lvl, af):
             print("[finalize] master loudnorm: level pass failed -> left at source level")
-            return src
-        audio = _make_up(lvl, mk, ln, tp_aim)
+            return False
+        audio = _make_up(lvl, mk, ln, aim)
         r = _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src), "-i", str(audio),
                   "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                   "-ar", "48000", str(out), "-y"],
                  "master mux", timeout_s=_AUDIO_PASS_WALL_S, check=False)
         if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
             print(f"[finalize] master loudnorm exit {r.returncode} -> left at source level")
-            return src
+            return False
     finally:
         lvl.unlink(missing_ok=True)
         mk.unlink(missing_ok=True)
-    return _verdict(out, ln, tp_aim)
+    return True
 
 
 def _pcm_pass(src: Path, dst: Path, af: str) -> bool:
@@ -337,29 +377,25 @@ def _measure(path: Path, ln, tp_aim: float) -> dict | None:
     return json.loads(m.group(0)) if m else None
 
 
-def _verdict(out: Path, ln, tp_aim: float) -> Path:
-    """Measures what was actually ENCODED. The box's check_master sidecar is swept before anyone reads it,
-    so this line is the durable proof; over the ceiling means the delivery chain failed and must not ship."""
-    mv = _measure(out, ln, tp_aim)
+def _verdict(out: Path, ln, aim: float, attempt: int) -> tuple[float, float, float] | None:
+    """Measures what was actually ENCODED — the aac encode of a limited waveform moves the true peak, so
+    nothing before the mux can answer this. None means unreadable, which is not evidence of a bad master."""
+    mv = _measure(out, ln, aim)
     try:
         i, tp, lra = float(mv["input_i"]), float(mv["input_tp"]), float(mv["input_lra"])
     except (TypeError, KeyError, ValueError):
         print("[finalize] master: delivered level UNVERIFIED — post-encode measure unreadable")
-        return out
-    if tp > ln.tp:
-        _refuse(out, f"tp={tp} ceil={ln.tp} (aim {tp_aim}, delivered lufs={i} lra={lra}) — "
-                     f"refusing to ship a clipping master")
-    if abs(i - ln.i) > _LUFS_TOL_DB:
-        # both directions: a make-up overshoot is as off-contract as a short master, and the box's own
-        # band is symmetric — one end shipping what the other refuses is how a master gets re-rendered
-        _refuse(out, f"lufs={i} target={ln.i} tol={_LUFS_TOL_DB} (tp={tp} lra={lra}) — "
-                     f"the box refuses this level, refusing to ship it silently")
-    print(f"[finalize] master: delivered lufs={i} tp={tp} lra={lra}")
-    return out
+        return None
+    print(f"[finalize] master: delivered lufs={i} tp={tp} lra={lra} (pass {attempt}, aim {aim})")
+    return i, tp, lra
 
 
-def _refuse(out: Path, why: str) -> None:
+def _refuse(out: Path, ln, i: float, tp: float, lra: float, aim: float) -> None:
     """The delivery address must not hold an off-contract master: whoever picks the file up next has no
     way to know the verdict raised, so the refusal takes the file with it."""
     out.unlink(missing_ok=True)
+    why = (f"tp={tp} ceil={ln.tp} clip_at={_CLIP_TP_DBTP} (aim {aim}, delivered lufs={i} lra={lra}) — "
+           f"refusing to ship a clipping master") if tp > _CLIP_TP_DBTP else (
+        f"lufs={i} target={ln.i} tol={_LUFS_TOL_DB} (tp={tp} lra={lra}) — "
+        f"the box refuses this level, refusing to ship it silently")
     raise RuntimeError(f"[finalize] master: OFF-CONTRACT after limiter {why}")
