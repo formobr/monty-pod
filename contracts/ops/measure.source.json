@@ -1,7 +1,7 @@
 {
   "op": "measure.source",
-  "version": 3,
-  "summary": "Measure a RAW recording's ingest NUMBERS — dimensions, rotation, SAR, avg/r frame rate, a packet-DTS pts_check (state/period/tolerance/duration_gap_frames) and time_base, codec, pix_fmt, colour tags, audio channel count and the container LENGTH (ffprobe), plus sampled signalstats scalars (YAVG/YMIN/YMAX/SATAVG/UAVG/VAVG + frame count) taken through the source's own HDR tonemap. Numbers only; whether the source needs normalizing, what the target dims are, and the bounded autograde CORRECTION are all the brain's.",
+  "version": 4,
+  "summary": "Measure a RAW recording's ingest NUMBERS — dimensions, rotation, SAR, avg/r frame rate (r_source: header|pts), codec, pix_fmt, colour tags, audio channel count and the container LENGTH (ffprobe), plus sampled signalstats scalars (YAVG/YMIN/YMAX/SATAVG/UAVG/VAVG + frame count) taken through the source's own HDR tonemap. `check_pts` opts into an extra all-packets DTS/cadence scan (time_base, pts_check: state/period_s/nominal_ticks/jitter_ticks/tolerance_ticks/note) — off by default (most callers want header fields only), on for ingest's own normalize verdict. Numbers only; whether the source needs normalizing, what the target dims are, and the bounded autograde CORRECTION are all the brain's.",
   "needs": ["video_encode"],
   "judgement": false,
   "parity": {
@@ -25,6 +25,11 @@
         "maximum": 64,
         "default": 16,
         "description": "How many evenly spaced frames signalstats seek-decodes. The sampling DENSITY — geometry, like media.scale's height — never a cutoff. Absent = 16, the density ingest has always used."
+      },
+      "check_pts": {
+        "type": "boolean",
+        "default": false,
+        "description": "Also scan every packet's DTS for the real CFR/VFR cadence (0.5-3.7s extra, no decode). Off by default — a probe taken for header fields alone (media.cut_proxy, media_clock) must not pay for it; ingest's own normalize verdict is the one caller that turns it on."
       }
     }
   },
