@@ -1,7 +1,7 @@
 {
   "op": "measure.source",
-  "version": 2,
-  "summary": "Measure a RAW recording's ingest NUMBERS — dimensions, rotation, SAR, avg/r frame rate, codec, pix_fmt, colour tags, audio channel count and the container LENGTH (ffprobe), plus sampled signalstats scalars (YAVG/YMIN/YMAX/SATAVG/UAVG/VAVG + frame count) taken through the source's own HDR tonemap. Numbers only; whether the source needs normalizing, what the target dims are, and the bounded autograde CORRECTION are all the brain's.",
+  "version": 3,
+  "summary": "Measure a RAW recording's ingest NUMBERS — dimensions, rotation, SAR, avg/r frame rate, a packet-DTS pts_check (state/period/tolerance/duration_gap_frames) and time_base, codec, pix_fmt, colour tags, audio channel count and the container LENGTH (ffprobe), plus sampled signalstats scalars (YAVG/YMIN/YMAX/SATAVG/UAVG/VAVG + frame count) taken through the source's own HDR tonemap. Numbers only; whether the source needs normalizing, what the target dims are, and the bounded autograde CORRECTION are all the brain's.",
   "needs": ["video_encode"],
   "judgement": false,
   "parity": {
