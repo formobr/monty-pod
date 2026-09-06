@@ -186,6 +186,32 @@ def test_the_terminal_carries_one_timing_per_step(monkeypatch, wired, tmp_path, 
     assert got[0]["outputs"], "the terminal names every output measured on the pod"
 
 
+def _handler_reporting(required: str, instrument: dict, payload: bytes = b"y" * 4096):
+    def _fn(*, params, inputs, outputs):
+        outputs[required].write_bytes(payload)
+        return instrument
+    return _fn
+
+
+def test_a_handler_that_returns_a_dict_rides_the_terminal_as_instrument(monkeypatch, wired, op):
+    """NEGATIVE: skip the capturing wrapper and the box never learns anything the handler tried to report."""
+    src, required = wired
+    instrument = {"encoder_tail": "-c:v h264_nvenc -b:v 41600000", "realized_fps": 24.9}
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_reporting(required, instrument))
+    cp = _CP()
+    runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp)
+    assert cp.terminal["timings"]["steps"][0]["instrument"] == instrument
+
+
+def test_a_handler_that_returns_none_carries_no_instrument_key(monkeypatch, wired, op):
+    """The common case (almost every op returns None): no key at all, never a null placeholder."""
+    src, required = wired
+    monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))
+    cp = _CP()
+    runner.run_chain(_Chain([_Step("s1", op.op, src, required)]), cp)
+    assert "instrument" not in cp.terminal["timings"]["steps"][0]
+
+
 def test_chain_admitted_fires_exactly_once_at_admission(monkeypatch, wired, op):
     """The box's READINESS phase (op_backend.READINESS_WHY) reads this frame as the chain-pool-to-worker
     admission edge. NEGATIVE: a duplicate or a frame that moved past preflight would mis-time that edge."""

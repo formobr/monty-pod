@@ -548,6 +548,8 @@ class StepTiming:
     outputs: list[dict[str, Any]] = field(default_factory=list)
     legs: dict[str, float] = field(default_factory=dict)
     cache_hit: bool = False
+    # additive, free-form: what the op's own handler chose to report (media.normalize's argv/ffmpeg facts today)
+    instrument: dict[str, Any] | None = None
     intervals: dict[str, dict[str, int]] = field(default_factory=dict)
     handler_intervals: list[dict[str, Any]] = field(default_factory=list)
     puts: list[dict[str, Any]] = field(default_factory=list)
@@ -582,6 +584,8 @@ class StepTiming:
             "bytes": self.nbytes,
             "cache_hit": self.cache_hit,
         }
+        if self.instrument:                # dropped when absent — an older control plane sees no new shape
+            out["instrument"] = self.instrument
         return out
 
     def timeline_wire(self, *, job_id: str, corr_id: str) -> dict[str, Any]:
@@ -1064,6 +1068,13 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     outputs = _bind_outputs(step, op, out_dir)
 
     fn = pack.resolve(op.handler)
+    # resultcache.execute() discards fn's return; a handler that hands back a dict (media.normalize's argv
+    # facts) is caught here instead of widening resultcache's own signature, which ~14 tests pin as bool.
+    handler_result: dict[str, Any] = {}
+
+    def _fn_capturing(**kw: Any) -> None:
+        handler_result["value"] = fn(**kw)
+
     recorder = pack.legs()
     # A heavy op takes exclusive GPU admission INSTEAD of the CPU/RAM permit (gpu_admission module docstring).
     heavy = op.op in gpu_admission.HEAVY_GPU_OPS and op.budget != "transport"
@@ -1105,13 +1116,17 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
                 try:
                     if recorder is not None:
                         with recorder.recording():
-                            timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
+                            timing.cache_hit = resultcache.execute(
+                                op, step.params, inputs, outputs, _fn_capturing, log)
                         timing.legs, timing.handler_intervals, placed = _collect_legs(recorder)
                         if not placed:
                             timing.incomplete_reasons.append("handler_leg_intervals_missing")
                     else:
-                        timing.cache_hit = resultcache.execute(op, step.params, inputs, outputs, fn, log)
+                        timing.cache_hit = resultcache.execute(
+                            op, step.params, inputs, outputs, _fn_capturing, log)
                         timing.incomplete_reasons.append("handler_recorder_missing")
+                    if isinstance(handler_result.get("value"), dict):
+                        timing.instrument = handler_result["value"]
                 finally:
                     heartbeat_stop.set()  # SET before waiting: a single tick left in flight is fine, a leaked thread is not
     except BaseException as exc:
