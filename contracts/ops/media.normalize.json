@@ -140,9 +140,10 @@
         "enum": [
           "b0",
           "bv_cap",
-          "multipass_qres"
+          "multipass_qres",
+          "bitrate"
         ],
-        "description": "How the VBV cap is expressed to NVENC; b0 (-b:v 0 -maxrate) was verified live to bind."
+        "description": "How the cap is expressed to NVENC: b0/bv_cap keep -cq beside -maxrate (ignored by some drivers), bitrate drops -cq and targets -b:v = cap — the idiom every driver honours."
       }
     }
   },
