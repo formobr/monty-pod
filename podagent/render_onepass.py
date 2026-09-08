@@ -20,7 +20,7 @@ from . import render as _render
 from .cp import upload
 from .models import RenderSpec
 from .render import body_duration
-from .sanitize import safe_error
+from .sanitize import safe_text
 
 # The sync guard matches frames by argmin|ref-master| over GRAYSCALE at exactly this size
 # (scripts/check_sync.py all_frames), so the reference is scaled and greyed INSIDE the graph: a
@@ -487,14 +487,31 @@ def _speed_line(stderr: bytes) -> str | None:
     return None
 
 
+def _ffmpeg_failure_message(returncode: int, stderr: bytes | str | None) -> str:
+    """Bound the failure after scrubbing so both the head and terminal cause survive."""
+    raw = stderr or b""
+    rendered = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    # Scrub before taking the bounded stderr tail: a credential-bearing URL may begin before the
+    # raw tail boundary, and selecting first could leave its sensitive suffix behind.
+    cleaned = safe_text(rendered)[-2000:]
+    prefix = f"body single-pass ffmpeg exited {returncode}: RuntimeError: "
+    # main.py wraps this once more with safe_error(...), whose own 500-char cap must not trim the
+    # terminal diagnostic we preserve here.
+    room = max(0, 500 - len("RuntimeError: ") - len(prefix))
+    if len(cleaned) > room:
+        marker = " … "
+        split_room = max(0, room - len(marker))
+        head_room = split_room // 2
+        tail_room = split_room - head_room
+        cleaned = cleaned[:head_room] + marker + cleaned[-tail_room:]
+    return prefix + cleaned
+
+
 def _run(cmd: list[str], budget_s: float) -> None:
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, timeout=budget_s)
     except subprocess.CalledProcessError as exc:
-        tail = (exc.stderr or b"")[-2000:]
-        detail = tail.decode("utf-8", "replace") if isinstance(tail, bytes) else str(tail)
-        raise RuntimeError(
-            f"body single-pass ffmpeg exited {exc.returncode}: {safe_error(RuntimeError(detail))}") from exc
+        raise RuntimeError(_ffmpeg_failure_message(exc.returncode, exc.stderr)) from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
             f"body single-pass ffmpeg exceeded its {budget_s:.0f}s budget — a graph that cannot end "

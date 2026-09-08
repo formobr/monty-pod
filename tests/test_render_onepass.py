@@ -1115,6 +1115,32 @@ def test_run_failure_still_raises_with_the_stderr_tail(monkeypatch):
         op._run(["ffmpeg"], 10.0)
 
 
+def test_run_failure_keeps_terminal_diagnostic_after_long_filtergraph_and_redacts_urls(monkeypatch):
+    secret = "terminal-signature-secret"
+    signed_url = (
+        f"https://user:pass@store.example/graph.mp4?X-Amz-Signature={secret}"
+        f"&X-Amz-Credential=worker"
+    )
+    stderr = (
+        b"filtergraph: " + (b"node=overlay, " * 220) + signed_url.encode() + b"\n"
+        b"terminal diagnostic: UNIQUE_FILTERGRAPH_FAILURE"
+    )
+
+    def boom(*_a, **_k):
+        raise op.subprocess.CalledProcessError(218, "ffmpeg", stderr=stderr)
+
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    with pytest.raises(RuntimeError) as raised:
+        op._run(["ffmpeg"], 10.0)
+
+    message = str(raised.value)
+    assert len(message) <= 500
+    assert "body single-pass ffmpeg exited 218:" in message
+    assert "terminal diagnostic: UNIQUE_FILTERGRAPH_FAILURE" in message
+    assert "[redacted-url]" in message
+    assert secret not in message and "user:pass" not in message
+
+
 @pytest.mark.integration
 def test_real_onepass_master_survives_loudnorm_bt709_tagged(tmp_path: Path) -> None:
     """Argv assertions miss a remux that drops container/stream colour tags — run the REAL encode
