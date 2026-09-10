@@ -1,0 +1,32 @@
+{
+  "op": "media.image_scale",
+  "version": 1,
+  "summary": "Downscale a STILL to at most a target height, preserving aspect and the container (a PNG keeps its alpha, a JPEG stays a JPEG), so a browser-sized proxy exists for a still that lives only at the durable address. Never upscales.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "Deterministic for a fixed ffmpeg build: one decode, one bicubic scale, one still-image encode at a pinned quality over identical input bytes emits identical output bytes. tests/test_op_media_image_scale.py asserts the argv is a pure function of (params, paths) so a drift shows as an argv diff rather than as mystery-different pixels. WHY A SECOND OP and not a `kind: image` on media.scale: an op input has ONE kind, and media.scale's argv is video by construction (encoder profile, yuv420p, faststart, audio) — a still needs none of it and must keep its own container. The pre-existing box-side resize (preview_proxy.proxy_img) is the same ffmpeg spelling; this is that resize where the bytes actually are (STILL_SEAM_GAP)."
+  },
+  "inputs": [
+    {"id": "src", "kind": "image"}
+  ],
+  "outputs": [
+    {"id": "dst", "kind": "image", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["height"],
+    "properties": {
+      "height": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 4320,
+        "multipleOf": 2,
+        "description": "Ceiling height in pixels: the still is scaled to min(height, its own height) with the width following its aspect (-2 = nearest even). GEOMETRY, the same class of fact as media.scale's `height`; the clamp lives here because only the pod holds the file open."
+      }
+    }
+  },
+  "handler": "montyops.media_image_scale:run"
+}
