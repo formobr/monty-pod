@@ -99,6 +99,9 @@ def _wire(monkeypatch, grid_defect=None):
     monkeypatch.setattr(render, "_gpu_available", lambda: False)
     monkeypatch.setattr(render.subprocess, "run", runs)
     monkeypatch.setattr(render._finalize, "grid_verdict", lambda *_a, **_kw: grid_defect)
+    # H1: _check_inputs now probes the base timeline segment too — `runs` above answers every argv with
+    # a fake encode result, not a real ffprobe stdout, so _has_video would misread it as "no video".
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
     return runs, puts
 
 

@@ -72,6 +72,7 @@ def test_no_overlays_means_no_pool_at_all(monkeypatch, tmp_path) -> None:
     spec = t._spec(lambda d: (d["overlays"].__setitem__("music", None),
                               d["overlays"].__setitem__("sfx", []),
                               d["overlays"]["motion_plan"].__setitem__("sections", [])))
+    t._stub_prepare_passes(monkeypatch, tmp_path)
     p = op.prepare(spec, t._paths(spec, tmp_path), tmp_path, False)
     assert p.audio is None and p.layers == () and p.flares == ()
 

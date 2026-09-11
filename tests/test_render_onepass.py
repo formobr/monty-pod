@@ -95,6 +95,30 @@ def _paths(spec: RenderSpec, root: Path) -> dict[str, Path]:
     return {i.id: root / i.id.replace("/", "__") for i in spec.inputs}
 
 
+_GOOD_VIDEO_BYTES: bytes | None = None
+
+
+def _good_video_bytes() -> bytes:
+    """A real playable clip, encoded ONCE and cached: H1 now probes the base timeline input for real
+    too, and only actual ffprobe-readable bytes answer that "has video" truthfully."""
+    global _GOOD_VIDEO_BYTES
+    if _GOOD_VIDEO_BYTES is None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "good.mp4"
+            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                            "-i", "color=c=black:s=64x64:d=0.2", "-c:v", "libx264", "-t", "0.2", str(p)],
+                           check=True)
+            _GOOD_VIDEO_BYTES = p.read_bytes()
+    return _GOOD_VIDEO_BYTES
+
+
+def _write_base(tmp_path: Path) -> Path:
+    p = tmp_path / "base"
+    p.write_bytes(_good_video_bytes())
+    return p
+
+
 # --- graph reader (the connectivity assertion) --------------------------------
 
 _EXT = re.compile(r"\d+:[av]")
@@ -857,6 +881,9 @@ def test_preflight_refuses_an_unusable_grid_before_any_subprocess(fps, monkeypat
 def _stub_prepare_passes(monkeypatch, tmp_path):
     monkeypatch.setattr(render, "_voice_is_dirty", lambda _p: False)
     monkeypatch.setattr(render, "_measure_loudnorm", lambda _p, _pre: "loudnorm=I=-20:TP=-1.5:LRA=11")
+    # H1: _check_inputs now probes the base timeline segment too — stub it same as any other pre-pass.
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
+    (tmp_path / "base").write_bytes(b"x")
     bed = tmp_path / "music_bed.flac"
     monkeypatch.setattr(render, "_prerender_bed", lambda *_a, **_kw: bed)
     monkeypatch.setattr(mograph, "_render_layers", lambda *_a, **_kw: list(LAYERS))
@@ -941,6 +968,7 @@ def _add_broll_final(d):
 
 def test_check_inputs_refuses_an_absent_cutaway(tmp_path) -> None:
     spec = _spec(_add_broll_final)
+    _write_base(tmp_path)
     paths = {**_paths(spec, tmp_path), "broll/bad.mp4": tmp_path / "never-written.mp4"}
     with pytest.raises(RuntimeError, match="does not resolve to a file"):
         op._check_inputs(spec, paths)
@@ -948,6 +976,7 @@ def test_check_inputs_refuses_an_absent_cutaway(tmp_path) -> None:
 
 def test_check_inputs_refuses_a_zero_byte_cutaway(tmp_path) -> None:
     spec = _spec(_add_broll_final)
+    _write_base(tmp_path)
     bad = tmp_path / "bad.mp4"
     bad.write_bytes(b"")
     with pytest.raises(RuntimeError, match="zero bytes"):
@@ -958,6 +987,7 @@ def test_check_inputs_refuses_an_audio_only_cutaway_by_name(tmp_path) -> None:
     """F2/F3: a beat's clip landed bytes but decodes no video track — refused HERE, by the rel path and
     the reason, instead of dying deep inside ffmpeg's own filtergraph init."""
     spec = _spec(_add_broll_final)
+    _write_base(tmp_path)
     bad = tmp_path / "bad.mp4"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                     "-i", "anullsrc=r=48000:cl=mono", "-t", "0.2", "-c:a", "aac", str(bad)], check=True)
@@ -967,6 +997,7 @@ def test_check_inputs_refuses_an_audio_only_cutaway_by_name(tmp_path) -> None:
 
 def test_check_inputs_passes_a_playable_cutaway(tmp_path) -> None:
     spec = _spec(_add_broll_final)
+    _write_base(tmp_path)
     good = tmp_path / "good.mp4"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                     "-i", "color=c=black:s=64x64:d=0.2", "-c:v", "libx264", "-t", "0.2", str(good)],
@@ -988,11 +1019,14 @@ def test_check_inputs_names_a_stalled_probe_distinct_from_no_video(monkeypatch, 
     """H3/Claude-L: a timed-out probe must not collapse into the same refusal as a clean 'no video'
     verdict — the ledger line needs to say WHICH fact happened."""
     spec = _spec(_add_broll_final)
+    _write_base(tmp_path)
     bad = tmp_path / "bad.mp4"
     bad.write_bytes(b"x")
 
-    def stall(_path):
-        raise subprocess.TimeoutExpired(["ffprobe"], 20)
+    def stall(path):
+        if Path(path) == bad:
+            raise subprocess.TimeoutExpired(["ffprobe"], 20)
+        return True
 
     monkeypatch.setattr(finalize, "_has_video", stall)
     with pytest.raises(RuntimeError, match=r"ffprobe timed out on 'broll/bad\.mp4'"):
@@ -1000,20 +1034,23 @@ def test_check_inputs_names_a_stalled_probe_distinct_from_no_video(monkeypatch, 
 
 
 def test_check_inputs_aggregate_deadline_refuses_a_later_probe_by_name(monkeypatch, tmp_path) -> None:
-    """H3: the aggregate cap (probe count × the per-file bound, clipped to 60s) must still name the
-    refusal as a timeout once the budget it was given for the whole batch is spent."""
+    """H2: the aggregate budget is n_unique_inputs × the per-file bound, bounded by construction (no
+    separate clip) — once it is spent, the refusal names the CAUSE (probes exhausted, last one that
+    finished), not the next file in line as if IT had stalled."""
     def two_clips(d):
         _add_broll_final(d)
         d["inputs"].append({"id": "broll/bad2.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b2"})
         d["overlays"]["broll_final"]["broll"].append(
             {"clip": "broll/bad2.mp4", "start": 4.0, "preset": "in", "dur": 2.0})
     spec = _spec(two_clips)
+    _write_base(tmp_path)
     for rel in ("broll/bad.mp4", "broll/bad2.mp4"):
         (tmp_path / rel.replace("/", "__")).write_bytes(b"x")
     monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
-    clock = iter([0.0, 0.0, 999.0, 999.0])  # deadline-calc, ok-check(bad), over-budget-check(bad2)
+    clock = iter([0.0, 0.0, 0.0, 999.0, 999.0])  # deadline-calc, ok-checks(base, bad), over-budget(bad2)
     monkeypatch.setattr(op.time, "monotonic", lambda: next(clock))
-    with pytest.raises(RuntimeError, match=r"ffprobe timed out on 'broll/bad2\.mp4'"):
+    with pytest.raises(RuntimeError, match=r"probe budget exhausted after 2 of 3 inputs; "
+                                          r"last probed 'broll/bad\.mp4'"):
         op._check_inputs(spec, _paths(spec, tmp_path))
 
 
@@ -1281,6 +1318,25 @@ def test_run_failure_keeps_the_specifier_across_stderr_sizes(monkeypatch, total_
     message = str(raised.value)
     assert len(message) <= 500
     assert "Stream specifier '7:v'" in message and "matches no streams" in message
+
+
+def test_run_failure_prioritizes_the_specifier_over_an_earlier_invalid_argument(monkeypatch):
+    """H3: `min(found)` picked whichever marker sat at the LOWEST byte offset, so a generic early
+    'Invalid argument' could beat a later, far more specific 'Stream specifier ... matches no streams'."""
+    specifier_line = "Stream specifier '7:v' in filtergraph description matches no streams."
+    stderr = ("Invalid argument\n" + "x" * 300 + "\n" + specifier_line + "\n" + "y" * 300).encode()
+
+    def boom(*_a, **_k):
+        raise op.subprocess.CalledProcessError(219, "ffmpeg", stderr=stderr)
+
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    with pytest.raises(RuntimeError) as raised:
+        op._run(["ffmpeg"], 10.0)
+
+    message = str(raised.value)
+    assert len(message) <= 500
+    assert "Stream specifier '7:v'" in message and "matches no streams" in message
+    assert "Invalid argument" not in message
 
 
 @pytest.mark.integration

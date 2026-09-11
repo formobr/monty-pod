@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from podagent import render
+from podagent import finalize, render
 from podagent.models import RenderSpec
 
 _BASE_INPUT = {"id": "base", "kind": "video", "sha256": "0" * 64, "url": "u"}
@@ -225,6 +225,9 @@ def _run_render_spec(monkeypatch, spec):
     monkeypatch.setattr(render, "upload", lambda *_a, **_kw: None)
     monkeypatch.setattr(render, "_gpu_available", lambda: False)
     monkeypatch.setattr(render.subprocess, "run", lambda *_a, **_kw: _Done())
+    # H1: _check_inputs now probes the base timeline segment too — the shared fake subprocess above
+    # answers every ffprobe with an empty stdout, which _has_video would read as "no video stream".
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
     # capture at build_filtergraph: the ONE seam both the legacy and the one-pass core feed the mix into
     real = render.build_filtergraph
     monkeypatch.setattr(render, "build_filtergraph",

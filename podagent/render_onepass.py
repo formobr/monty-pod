@@ -155,16 +155,10 @@ def _check_assets(spec: RenderSpec, input_paths: dict) -> None:
                 raise RuntimeError(f"finalize.watermark asset {ref!r} is not a resolved inputs[] id")
 
 
-_CHECK_INPUTS_AGGREGATE_S = 60.0  # a probe-count × finalize._PROBE_TIMEOUT_S total, clipped here
-
-
 def _check_inputs(spec: RenderSpec, input_paths: dict) -> None:
-    """Refuse a resolved cutaway/burn with no video stream before ffmpeg's graph init buries the same
-    fact in a truncated "Stream specifier … matches no streams" (ticket b34ab41f); a missing mapping
-    IS a refusal here, not a silent skip left for assembly's KeyError."""
-    ov = spec.overlays if spec.mode == "final" else None
-    if ov is None:
-        return
+    """Refuse a resolved timeline/cutaway/burn input with no video stream before ffmpeg's graph init
+    buries the same fact in a truncated "Stream specifier … matches no streams" (ticket b34ab41f); a
+    missing mapping IS a refusal here, not a silent skip left for assembly's KeyError."""
     to_check: list[tuple[str, Path]] = []
     seen: set[str] = set()
 
@@ -174,32 +168,45 @@ def _check_inputs(spec: RenderSpec, input_paths: dict) -> None:
         seen.add(rel)
         to_check.append((rel, path))
 
-    if ov.broll_final is not None:
-        for c in ov.broll_final.broll:
-            p = input_paths.get(c.clip)
-            if p is None:
-                raise RuntimeError(f"input {c.clip!r} has no input path resolved")
-            collect(c.clip, p)
-    fin = ov.finalize
-    if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
-        plan = _accents.film_burn_plan(fin.accents)  # the shape refusal fires before any path/probe I/O
-        collect(plan.burn, input_paths.get(plan.burn))
+    for seg in spec.timeline.segments:
+        p = input_paths.get(seg.src)
+        if p is None:
+            raise RuntimeError(f"input {seg.src!r} has no input path resolved")
+        collect(seg.src, p)
+    ov = spec.overlays if spec.mode == "final" else None
+    if ov is not None:
+        if ov.broll_final is not None:
+            for c in ov.broll_final.broll:
+                p = input_paths.get(c.clip)
+                if p is None:
+                    raise RuntimeError(f"input {c.clip!r} has no input path resolved")
+                collect(c.clip, p)
+        fin = ov.finalize
+        if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
+            plan = _accents.film_burn_plan(fin.accents)  # the shape refusal fires before any path/probe I/O
+            collect(plan.burn, input_paths.get(plan.burn))
     if not to_check:
         return
-    deadline = time.monotonic() + min(_CHECK_INPUTS_AGGREGATE_S, len(to_check) * _finalize._PROBE_TIMEOUT_S)
-    for rel, path in to_check:
+    # Bounded by construction: n_unique_inputs × the per-file ffprobe bound — no separate aggregate cap
+    # (a healthy 12×6s timeline is 72s of real inputs; capping the SUM below that refuses it for no fault).
+    n = len(to_check)
+    deadline = time.monotonic() + n * _finalize._PROBE_TIMEOUT_S
+    last_probed: str | None = None
+    for k, (rel, path) in enumerate(to_check, start=1):
         if not path.exists():
             raise RuntimeError(f"input {rel!r} does not resolve to a file on disk")
         if path.stat().st_size == 0:
             raise RuntimeError(f"input {rel!r} is zero bytes")
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"ffprobe timed out on {rel!r}")
+            raise RuntimeError(
+                f"probe budget exhausted after {k - 1} of {n} inputs; last probed {last_probed!r}")
         try:
             has_video = _finalize._has_video(path)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"ffprobe timed out on {rel!r}") from None
         if not has_video:
             raise RuntimeError(f"input {rel!r} carries no video stream")
+        last_probed = rel
 
 
 # --- 2. prepare ---------------------------------------------------------------
@@ -535,7 +542,7 @@ def _speed_line(stderr: bytes) -> str | None:
     return None
 
 
-_FAILURE_HEAD_MARKERS = ("Error initializing complex filters", "Stream specifier", "Invalid argument")
+_FAILURE_HEAD_MARKERS = ("Stream specifier", "Error initializing complex filters", "Invalid argument")
 
 
 def _ffmpeg_failure_message(returncode: int, stderr: bytes | str | None) -> str:
@@ -554,12 +561,14 @@ def _ffmpeg_failure_message(returncode: int, stderr: bytes | str | None) -> str:
     if len(scrubbed) <= room:
         return prefix + scrubbed
     marker = " … "
-    found = [i for m in _FAILURE_HEAD_MARKERS if (i := scrubbed.find(m)) != -1]
-    idx = min(found) if found else -1
+    idx = -1
+    for m in _FAILURE_HEAD_MARKERS:   # priority order, NOT earliest byte offset (Stream specifier wins)
+        i = scrubbed.find(m)
+        if i != -1:
+            idx = i
+            break
     if idx == -1:
         tail = scrubbed[-2000:]
-        if len(tail) <= room:
-            return prefix + tail
         split_room = max(0, room - len(marker))
         head_room = split_room // 2
         return prefix + tail[:head_room] + marker + tail[-(split_room - head_room):]
