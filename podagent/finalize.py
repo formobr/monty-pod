@@ -103,6 +103,18 @@ def _has_audio(path: Path) -> bool:
     return bool(r.stdout.strip())
 
 
+def _has_video(path: Path) -> bool:
+    """Bounded twin of `_has_audio`; TimeoutExpired PROPAGATES so a stall stays distinct from a clean
+    'no video' verdict (render_onepass._check_inputs names the stall, ticket b34ab41f)."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v",
+                            "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+                           capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
+    except OSError:
+        return False
+    return bool(r.stdout.strip())
+
+
 def _probe_audio(path: Path) -> tuple[int, float]:
     """(sample_rate, duration) of the first audio stream — header-only, same cost class as _probe."""
     out = subprocess.run(

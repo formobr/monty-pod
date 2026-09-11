@@ -155,6 +155,53 @@ def _check_assets(spec: RenderSpec, input_paths: dict) -> None:
                 raise RuntimeError(f"finalize.watermark asset {ref!r} is not a resolved inputs[] id")
 
 
+_CHECK_INPUTS_AGGREGATE_S = 60.0  # a probe-count × finalize._PROBE_TIMEOUT_S total, clipped here
+
+
+def _check_inputs(spec: RenderSpec, input_paths: dict) -> None:
+    """Refuse a resolved cutaway/burn with no video stream before ffmpeg's graph init buries the same
+    fact in a truncated "Stream specifier … matches no streams" (ticket b34ab41f); a missing mapping
+    IS a refusal here, not a silent skip left for assembly's KeyError."""
+    ov = spec.overlays if spec.mode == "final" else None
+    if ov is None:
+        return
+    to_check: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+
+    def collect(rel: str, path: Path | None) -> None:
+        if path is None or rel in seen:
+            return
+        seen.add(rel)
+        to_check.append((rel, path))
+
+    if ov.broll_final is not None:
+        for c in ov.broll_final.broll:
+            p = input_paths.get(c.clip)
+            if p is None:
+                raise RuntimeError(f"input {c.clip!r} has no input path resolved")
+            collect(c.clip, p)
+    fin = ov.finalize
+    if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
+        plan = _accents.film_burn_plan(fin.accents)  # the shape refusal fires before any path/probe I/O
+        collect(plan.burn, input_paths.get(plan.burn))
+    if not to_check:
+        return
+    deadline = time.monotonic() + min(_CHECK_INPUTS_AGGREGATE_S, len(to_check) * _finalize._PROBE_TIMEOUT_S)
+    for rel, path in to_check:
+        if not path.exists():
+            raise RuntimeError(f"input {rel!r} does not resolve to a file on disk")
+        if path.stat().st_size == 0:
+            raise RuntimeError(f"input {rel!r} is zero bytes")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"ffprobe timed out on {rel!r}")
+        try:
+            has_video = _finalize._has_video(path)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"ffprobe timed out on {rel!r}") from None
+        if not has_video:
+            raise RuntimeError(f"input {rel!r} carries no video stream")
+
+
 # --- 2. prepare ---------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -281,6 +328,7 @@ def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
     as parallel ARMS under ONE `prepare` phase — the voice chain, the bed, the mograph layers and the
     flare scan read none of each other; layers with no frames simply do not appear (mograph.py:143/275)."""
     _check_assets(spec, input_paths)
+    _check_inputs(spec, input_paths)
     tmp = Path(tmp)
     dur = body_duration(spec)
     ov = spec.overlays if spec.mode == "final" else None
@@ -487,23 +535,42 @@ def _speed_line(stderr: bytes) -> str | None:
     return None
 
 
+_FAILURE_HEAD_MARKERS = ("Error initializing complex filters", "Stream specifier", "Invalid argument")
+
+
 def _ffmpeg_failure_message(returncode: int, stderr: bytes | str | None) -> str:
-    """Bound the failure after scrubbing so both the head and terminal cause survive."""
+    """Bound the failure: the tail keeps ffmpeg's terminal cause, the head keeps the specifier/label
+    ffmpeg names FIRST — found anywhere in the FULL text, since only searching an already-cut tail
+    lost a specifier sitting in a short stderr's middle (ticket b34ab41f)."""
     raw = stderr or b""
     rendered = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-    # Scrub before taking the bounded stderr tail: a credential-bearing URL may begin before the
-    # raw tail boundary, and selecting first could leave its sensitive suffix behind.
-    cleaned = safe_text(rendered)[-2000:]
+    # Scrub before bounding: a credential-bearing URL may begin before any cut, and cutting first
+    # could leave its sensitive suffix behind.
+    scrubbed = safe_text(rendered)
     prefix = f"body single-pass ffmpeg exited {returncode}: RuntimeError: "
     # main.py wraps this once more with safe_error(...), whose own 500-char cap must not trim the
     # terminal diagnostic we preserve here.
     room = max(0, 500 - len("RuntimeError: ") - len(prefix))
-    if len(cleaned) > room:
-        marker = " … "
+    if len(scrubbed) <= room:
+        return prefix + scrubbed
+    marker = " … "
+    found = [i for m in _FAILURE_HEAD_MARKERS if (i := scrubbed.find(m)) != -1]
+    idx = min(found) if found else -1
+    if idx == -1:
+        tail = scrubbed[-2000:]
+        if len(tail) <= room:
+            return prefix + tail
         split_room = max(0, room - len(marker))
         head_room = split_room // 2
-        tail_room = split_room - head_room
-        cleaned = cleaned[:head_room] + marker + cleaned[-tail_room:]
+        return prefix + tail[:head_room] + marker + tail[-(split_room - head_room):]
+    line_start = scrubbed.rfind("\n", 0, idx) + 1
+    head_full = scrubbed[line_start:]
+    budget = max(0, room - len(marker))
+    head_budget = min(200, len(head_full), budget)
+    tail_budget = min(250, len(scrubbed), max(0, budget - head_budget))
+    head = head_full[:head_budget].strip()
+    tail = scrubbed[-tail_budget:] if tail_budget else ""
+    cleaned = f"{head}{marker}{tail}" if tail else head
     return prefix + cleaned
 
 

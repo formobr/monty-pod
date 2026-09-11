@@ -889,6 +889,8 @@ def test_prepare_leaves_the_base_bare_when_no_mograph_layer_survived(monkeypatch
 def test_prepare_detects_flares_under_the_prepare_phase(monkeypatch, tmp_path) -> None:
     """The flare decode is the ONE film_burn I/O — it rides prepare's arm pool so assemble stays pure."""
     spec = _spec(_add_film_burn)
+    (tmp_path / "fx__burn.mp4").write_bytes(b"x")
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
     _stub_prepare_passes(monkeypatch, tmp_path)
     calls: list[str] = []
     monkeypatch.setattr(accents, "detect_flares",
@@ -927,6 +929,102 @@ def test_an_unresolved_burn_input_refuses_before_any_pass(monkeypatch, tmp_path)
                         lambda _p: pytest.fail("the flare decode ran on an unresolved input"))
     with pytest.raises(RuntimeError, match="is not resolved"):
         op.prepare(spec, paths, tmp_path, False)
+
+
+# --- _check_inputs: a resolved cutaway/burn that decodes no video stream, refused BY NAME -------------
+
+def _add_broll_final(d):
+    d["inputs"].append({"id": "broll/bad.mp4", "kind": "video", "sha256": SHA, "url": "https://x/bad.mp4"})
+    d["overlays"]["broll_final"] = {
+        "broll": [{"clip": "broll/bad.mp4", "start": 1.0, "preset": "in", "dur": 2.0}]}
+
+
+def test_check_inputs_refuses_an_absent_cutaway(tmp_path) -> None:
+    spec = _spec(_add_broll_final)
+    paths = {**_paths(spec, tmp_path), "broll/bad.mp4": tmp_path / "never-written.mp4"}
+    with pytest.raises(RuntimeError, match="does not resolve to a file"):
+        op._check_inputs(spec, paths)
+
+
+def test_check_inputs_refuses_a_zero_byte_cutaway(tmp_path) -> None:
+    spec = _spec(_add_broll_final)
+    bad = tmp_path / "bad.mp4"
+    bad.write_bytes(b"")
+    with pytest.raises(RuntimeError, match="zero bytes"):
+        op._check_inputs(spec, {**_paths(spec, tmp_path), "broll/bad.mp4": bad})
+
+
+def test_check_inputs_refuses_an_audio_only_cutaway_by_name(tmp_path) -> None:
+    """F2/F3: a beat's clip landed bytes but decodes no video track — refused HERE, by the rel path and
+    the reason, instead of dying deep inside ffmpeg's own filtergraph init."""
+    spec = _spec(_add_broll_final)
+    bad = tmp_path / "bad.mp4"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "anullsrc=r=48000:cl=mono", "-t", "0.2", "-c:a", "aac", str(bad)], check=True)
+    with pytest.raises(RuntimeError, match=r"broll/bad\.mp4.*carries no video stream"):
+        op._check_inputs(spec, {**_paths(spec, tmp_path), "broll/bad.mp4": bad})
+
+
+def test_check_inputs_passes_a_playable_cutaway(tmp_path) -> None:
+    spec = _spec(_add_broll_final)
+    good = tmp_path / "good.mp4"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "color=c=black:s=64x64:d=0.2", "-c:v", "libx264", "-t", "0.2", str(good)],
+                   check=True)
+    op._check_inputs(spec, {**_paths(spec, tmp_path), "broll/bad.mp4": good})
+
+
+def test_check_inputs_refuses_an_unmapped_cutaway_by_name(tmp_path) -> None:
+    """H2: a clip with no input_paths entry used to be silently skipped, dying as an unnamed KeyError
+    later in assembly instead of a named refusal here."""
+    spec = _spec(_add_broll_final)
+    paths = _paths(spec, tmp_path)
+    del paths["broll/bad.mp4"]
+    with pytest.raises(RuntimeError, match=r"broll/bad\.mp4.*no input path resolved"):
+        op._check_inputs(spec, paths)
+
+
+def test_check_inputs_names_a_stalled_probe_distinct_from_no_video(monkeypatch, tmp_path) -> None:
+    """H3/Claude-L: a timed-out probe must not collapse into the same refusal as a clean 'no video'
+    verdict — the ledger line needs to say WHICH fact happened."""
+    spec = _spec(_add_broll_final)
+    bad = tmp_path / "bad.mp4"
+    bad.write_bytes(b"x")
+
+    def stall(_path):
+        raise subprocess.TimeoutExpired(["ffprobe"], 20)
+
+    monkeypatch.setattr(finalize, "_has_video", stall)
+    with pytest.raises(RuntimeError, match=r"ffprobe timed out on 'broll/bad\.mp4'"):
+        op._check_inputs(spec, {**_paths(spec, tmp_path), "broll/bad.mp4": bad})
+
+
+def test_check_inputs_aggregate_deadline_refuses_a_later_probe_by_name(monkeypatch, tmp_path) -> None:
+    """H3: the aggregate cap (probe count × the per-file bound, clipped to 60s) must still name the
+    refusal as a timeout once the budget it was given for the whole batch is spent."""
+    def two_clips(d):
+        _add_broll_final(d)
+        d["inputs"].append({"id": "broll/bad2.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b2"})
+        d["overlays"]["broll_final"]["broll"].append(
+            {"clip": "broll/bad2.mp4", "start": 4.0, "preset": "in", "dur": 2.0})
+    spec = _spec(two_clips)
+    for rel in ("broll/bad.mp4", "broll/bad2.mp4"):
+        (tmp_path / rel.replace("/", "__")).write_bytes(b"x")
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
+    clock = iter([0.0, 0.0, 999.0, 999.0])  # deadline-calc, ok-check(bad), over-budget-check(bad2)
+    monkeypatch.setattr(op.time, "monotonic", lambda: next(clock))
+    with pytest.raises(RuntimeError, match=r"ffprobe timed out on 'broll/bad2\.mp4'"):
+        op._check_inputs(spec, _paths(spec, tmp_path))
+
+
+def test_prepare_refuses_an_absent_broll_final_input_before_any_decode(monkeypatch, tmp_path) -> None:
+    """H3: the door now runs from `prepare` itself, beside `_check_assets` — before mograph/voice decode,
+    not after prepare has already spent that work (moved out of run_encode)."""
+    spec = _spec(_add_broll_final)
+    monkeypatch.setattr(mograph, "_render_layers",
+                        lambda *_a, **_kw: pytest.fail("mograph decoded before the input door"))
+    with pytest.raises(RuntimeError, match="does not resolve to a file on disk"):
+        op.prepare(spec, _paths(spec, tmp_path), tmp_path, False)
 
 
 # --- the door: one VIDEO encode, the loudnorm, both outputs delivered ---------
@@ -1038,6 +1136,8 @@ def test_a_film_burn_door_run_never_reaches_the_multipass_burn(monkeypatch, tmp_
     """_door forbids finalize.apply_accents, so a burn spec passing through IS the proof the one-pass
     graph composited the burn itself; the flare decode rides prepare's arm pool before ffmpeg."""
     monkeypatch.setattr(accents, "detect_flares", lambda _p: [0.3])
+    (tmp_path / "fx__burn.mp4").write_bytes(b"x")
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
     ops: list[str] = []
 
     @contextmanager
@@ -1139,6 +1239,48 @@ def test_run_failure_keeps_terminal_diagnostic_after_long_filtergraph_and_redact
     assert "terminal diagnostic: UNIQUE_FILTERGRAPH_FAILURE" in message
     assert "[redacted-url]" in message
     assert secret not in message and "user:pass" not in message
+
+
+def test_run_failure_keeps_the_specifier_a_tail_only_window_would_lose(monkeypatch):
+    """F1: the offending specifier/label starts ffmpeg's fatal line, but a filter graph dump after it can
+    push that line past the last 2000 chars — the ONE fact a truncated tail used to drop entirely."""
+    specifier_line = "Stream specifier '7:v' in filtergraph description matches no streams."
+    huge_dump = "node=overlay, " * 400
+    stderr = (f"Error initializing complex filters.\n{specifier_line}\n{huge_dump}\n"
+             f"terminal diagnostic: UNIQUE_TAIL_MARKER").encode()
+    assert len(stderr) > 3000
+
+    def boom(*_a, **_k):
+        raise op.subprocess.CalledProcessError(234, "ffmpeg", stderr=stderr)
+
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    with pytest.raises(RuntimeError) as raised:
+        op._run(["ffmpeg"], 10.0)
+
+    message = str(raised.value)
+    assert len(message) <= 500
+    assert "Stream specifier '7:v'" in message and "matches no streams" in message
+    assert "terminal diagnostic: UNIQUE_TAIL_MARKER" in message
+
+
+@pytest.mark.parametrize("total_len", [775, 1800, 3000, 12000])
+def test_run_failure_keeps_the_specifier_across_stderr_sizes(monkeypatch, total_len):
+    """F1 regression: a stderr shorter than the 2000-char tail cut made `kept_from == 0`, which disabled
+    the marker search entirely and dropped a specifier sitting in the middle of a short stderr."""
+    specifier_line = "Stream specifier '7:v' in filtergraph description matches no streams."
+    half = max(0, (total_len - len(specifier_line)) // 2)
+    stderr = ("x" * half + "\n" + specifier_line + "\n" + "y" * half).encode()
+
+    def boom(*_a, **_k):
+        raise op.subprocess.CalledProcessError(217, "ffmpeg", stderr=stderr)
+
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    with pytest.raises(RuntimeError) as raised:
+        op._run(["ffmpeg"], 10.0)
+
+    message = str(raised.value)
+    assert len(message) <= 500
+    assert "Stream specifier '7:v'" in message and "matches no streams" in message
 
 
 @pytest.mark.integration
