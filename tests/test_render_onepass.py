@@ -103,7 +103,10 @@ def _good_video_bytes() -> bytes:
     too, and only actual ffprobe-readable bytes answer that "has video" truthfully."""
     global _GOOD_VIDEO_BYTES
     if _GOOD_VIDEO_BYTES is None:
+        import shutil
         import tempfile
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            pytest.skip("the input door probes real bytes; no ffmpeg/ffprobe on this runner")
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "good.mp4"
             subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
