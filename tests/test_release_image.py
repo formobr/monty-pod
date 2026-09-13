@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,268 +14,241 @@ release = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
 
+OLD_SHA = "a" * 40
+NEW_SHA = "b" * 40
+DIGEST = "sha256:" + "d" * 64
 
-def test_tag_must_be_canonical_semver():
-    assert release.semver("v0.18.6") == (0, 18, 6)
-    for bad in ("0.18.6", "v0.18", "v01.2.3", "v0.18.6-rc1", "latest"):
-        with pytest.raises(release.ReleaseError):
-            release.semver(bad)
+
+def _receipt(sha: str = NEW_SHA, digest: str = DIGEST):
+    return release.ImageReceipt(sha, sha, digest, sha, sha)
+
+
+def _engine(tmp_path: Path, *, sha: str = OLD_SHA, digest: str | None = None) -> Path:
+    engine = tmp_path / "engine"
+    (engine / "scripts/broker").mkdir(parents=True)
+    (engine / "docs/gen").mkdir(parents=True)
+    (engine / "pod-agent").mkdir()
+    (engine / ".venv/bin").mkdir(parents=True)
+    (engine / ".venv/bin/python").touch()
+    image = f"{release.IMAGE_REPO}:{sha}"
+    pin_digest = digest or "sha256:" + "c" * 64
+    (engine / "scripts/broker/pod_image.py").write_text(
+        f'POD_AGENT_IMAGE = "{image}"\nPOD_AGENT_AMD64_DIGEST = "{pin_digest}"\n',
+        encoding="utf-8",
+    )
+    (engine / "docs/gen/POD_IMAGE.md").write_text(
+        f"{image}\n{pin_digest}\n", encoding="utf-8")
+    return engine
+
+
+class FakeCommands:
+    def __init__(self, *, engine: Path, source_sha: str = NEW_SHA, reachable: bool = True):
+        self.engine = engine
+        self.source_sha = source_sha
+        self.current_engine_sha = OLD_SHA
+        self.reachable = reachable
+        self.calls: list[tuple[str, ...]] = []
+
+    def out(self, args, *, cwd=release.REPO, timeout=30):
+        self.calls.append(tuple(args))
+        if args[:2] == ["git", "status"]:
+            return ""
+        if args[:3] == ["git", "rev-parse", "HEAD"]:
+            return self.current_engine_sha if cwd == self.engine / "pod-agent" else self.source_sha
+        raise AssertionError((args, cwd, timeout))
+
+    def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
+        self.calls.append(tuple(args))
+        if args[:2] == ["git", "fetch"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return subprocess.CompletedProcess(args, 0 if self.reachable else 1, "", "")
+        if args[:2] == ["git", "checkout"]:
+            self.current_engine_sha = args[-1]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        raise AssertionError((args, cwd, timeout, check))
+
+
+class GoodRegistry:
+    def __init__(self, *, before=None):
+        self.before = before
+
+    def inspect(self, tag, commit):
+        assert (tag, commit) == (NEW_SHA, NEW_SHA)
+        if self.before is not None:
+            self.before()
+        return _receipt()
+
+
+def test_image_identity_requires_a_full_lowercase_sha():
+    assert release.require_full_sha(NEW_SHA, "image SHA") == NEW_SHA
+    for bad in ("b" * 39, "B" * 40, "v0.18.6", "latest", "sha256:" + "b" * 64):
+        with pytest.raises(release.ReleaseError, match="full lowercase"):
+            release.require_full_sha(bad, "image SHA")
 
 
 def test_index_requires_one_linux_amd64_manifest():
     digest = "sha256:" + "a" * 64
     manifest = {"config": {"digest": "sha256:" + "b" * 64}}
-    root = {"manifests": [{"digest": digest, "platform": {"os": "linux", "architecture": "amd64"}}]}
-    got_digest, got_manifest = release.select_amd64_manifest(
-        root, {}, lambda ref: (manifest, {}) if ref == digest else ({}, {}))
-    assert got_digest == digest and got_manifest == manifest
+    root = {"manifests": [{"digest": digest,
+                            "platform": {"os": "linux", "architecture": "amd64"}}]}
+    assert release.select_amd64_manifest(
+        root, {}, lambda ref: (manifest, {}) if ref == digest else ({}, {}),
+    ) == (digest, manifest)
 
-    with pytest.raises(release.ReleaseError):
-        release.select_amd64_manifest({"manifests": []}, {}, lambda _ref: ({}, {}))
-    with pytest.raises(release.ReleaseError):
-        release.select_amd64_manifest(
-            {"manifests": root["manifests"] * 2}, {}, lambda _ref: ({}, {}))
+    for rows in ([], root["manifests"] * 2,
+                 [{"digest": digest, "platform": {"os": "linux", "architecture": "arm64"}}]):
+        with pytest.raises(release.ReleaseError, match="unique linux/amd64"):
+            release.select_amd64_manifest({"manifests": rows}, {}, lambda _ref: ({}, {}))
 
 
 def test_single_platform_manifest_requires_registry_digest_header():
     doc = {"config": {"digest": "sha256:" + "b" * 64}}
-    with pytest.raises(release.ReleaseError):
+    with pytest.raises(release.ReleaseError, match="immutable digest"):
         release.select_amd64_manifest(doc, {}, lambda _ref: ({}, {}))
     digest, same = release.select_amd64_manifest(
         doc, {"docker-content-digest": "sha256:" + "a" * 64}, lambda _ref: ({}, {}))
     assert digest.endswith("a" * 64) and same is doc
 
 
-def test_image_config_must_name_exact_tagged_commit():
-    tag, commit = "v0.18.6", "c" * 40
+def test_image_config_requires_sha_revision_tag_and_amd64():
     config = {"os": "linux", "architecture": "amd64", "config": {
-        "Labels": {"org.opencontainers.image.revision": commit},
-        "Env": [f"POD_IMAGE_TAG={tag}"],
+        "Labels": {"org.opencontainers.image.revision": NEW_SHA},
+        "Env": [f"POD_IMAGE_TAG={NEW_SHA}"],
     }}
-    assert release.verify_config_identity(config, tag=tag, commit=commit) == (commit, tag)
+    assert release.verify_config_identity(config, tag=NEW_SHA, commit=NEW_SHA) == (NEW_SHA, NEW_SHA)
     with pytest.raises(release.ReleaseError, match="OCI revision"):
-        release.verify_config_identity(config, tag=tag, commit="d" * 40)
+        release.verify_config_identity(config, tag=NEW_SHA, commit="c" * 40)
     with pytest.raises(release.ReleaseError, match="POD_IMAGE_TAG"):
-        release.verify_config_identity(config, tag="v0.18.7", commit=commit)
-    config["os"] = "windows"
+        release.verify_config_identity(config, tag="c" * 40, commit=NEW_SHA)
+    config["architecture"] = "arm64"
     with pytest.raises(release.ReleaseError, match="linux/amd64"):
-        release.verify_config_identity(config, tag=tag, commit=commit)
+        release.verify_config_identity(config, tag=NEW_SHA, commit=NEW_SHA)
 
 
-def test_local_tag_must_be_an_annotated_tag_object():
-    commit = "c" * 40
+def test_source_sha_must_be_clean_head_reachable_from_main(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    commands = FakeCommands(engine=engine)
+    monkeypatch.setattr(release, "REPO", tmp_path / "pod")
+    assert release.verify_source(NEW_SHA, commands) == NEW_SHA
+    assert ("git", "fetch", "--quiet", "origin", "main") in commands.calls
+    assert ("git", "merge-base", "--is-ancestor", NEW_SHA, "origin/main") in commands.calls
 
-    class Lightweight:
-        def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
-            return type("Done", (), {"returncode": 0, "stdout": commit})()
-
-        def out(self, args, *, cwd=release.REPO, timeout=30):
-            return "commit"
-
-    with pytest.raises(release.ReleaseError, match="lightweight"):
-        release.local_tag_commit("v0.18.6", Lightweight(), allow_missing=False)
-
-
-def test_new_tag_must_advance_remote_release_line():
-    class Tags:
-        def out(self, args, *, cwd=release.REPO, timeout=30):
-            return "v0.18.5\nv0.18.7"
-
-    with pytest.raises(release.ReleaseError, match="greater"):
-        release.require_new_tag("v0.18.6", Tags())
-
-
-def test_remote_tag_must_be_annotated_and_peel_to_reachable_commit():
-    commit = "c" * 40
-
-    class FakeCommands:
-        def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
-            return type("Done", (), {"returncode": 0})()
-
-        def out(self, args, *, cwd=release.REPO, timeout=30):
-            return f"{'a' * 40}\trefs/tags/v0.18.6\n{commit}\trefs/tags/v0.18.6^{{}}"
-
-    release.verify_remote("v0.18.6", commit, FakeCommands())
-
-    class Lightweight(FakeCommands):
-        def out(self, args, *, cwd=release.REPO, timeout=30):
-            return f"{commit}\trefs/tags/v0.18.6"
-
-    with pytest.raises(release.ReleaseError, match="lightweight"):
-        release.verify_remote("v0.18.6", commit, Lightweight())
-
-    class NotReachable(FakeCommands):
-        def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
-            rc = 1 if args[:3] == ["git", "merge-base", "--is-ancestor"] else 0
-            return type("Done", (), {"returncode": rc})()
-
+    unreachable = FakeCommands(engine=engine, reachable=False)
     with pytest.raises(release.ReleaseError, match="not reachable"):
-        release.verify_remote("v0.18.6", commit, NotReachable())
+        release.verify_source(NEW_SHA, unreachable)
 
 
-def test_replace_once_refuses_missing_or_duplicate_engine_pins():
-    with pytest.raises(release.ReleaseError):
-        release.replace_once("", r"^PIN=.*$", "PIN=new", "pin")
-    with pytest.raises(release.ReleaseError):
-        release.replace_once("PIN=old\nPIN=older\n", r"^PIN=.*$", "PIN=new", "pin")
-    assert release.replace_once("PIN=old\n", r"^PIN=.*$", "PIN=new", "pin") == "PIN=new\n"
-
-
-def test_engine_verifier_requires_tag_digest_gitlink_and_generated_doc(tmp_path):
-    engine = tmp_path
-    (engine / "scripts/broker").mkdir(parents=True)
-    (engine / "docs/gen").mkdir(parents=True)
-    (engine / "pod-agent").mkdir()
-    digest = "sha256:" + "d" * 64
-    commit = "c" * 40
-    image = f"{release.IMAGE_REPO}:v0.18.6"
-    (engine / "scripts/broker/pod_image.py").write_text(
-        f'POD_AGENT_IMAGE = "{image}"\nPOD_AGENT_AMD64_DIGEST = "{digest}"\n', encoding="utf-8")
-    (engine / "docs/gen/POD_IMAGE.md").write_text(f"{image}\n{digest}\n", encoding="utf-8")
-
-    class FakeCommands:
-        def out(self, args, *, cwd, timeout=30):
-            assert cwd == engine / "pod-agent"
-            if args[:3] == ["git", "rev-parse", "HEAD"]:
-                return commit
-            if args[:3] == ["git", "describe", "--tags"]:
-                return "v0.18.6"
-            raise AssertionError(args)
-
-    receipt = release.ImageReceipt("v0.18.6", commit, digest, commit, "v0.18.6")
-    release.verify_engine(engine, receipt, FakeCommands())
-    (engine / "docs/gen/POD_IMAGE.md").write_text(image, encoding="utf-8")
+def test_engine_verifier_requires_sha_digest_gitlink_and_generated_doc(tmp_path):
+    engine = _engine(tmp_path, sha=NEW_SHA, digest=DIGEST)
+    commands = FakeCommands(engine=engine)
+    commands.current_engine_sha = NEW_SHA
+    release.verify_engine(engine, _receipt(), commands)
+    (engine / "docs/gen/POD_IMAGE.md").write_text(
+        f"{release.IMAGE_REPO}:{NEW_SHA}\n", encoding="utf-8")
     with pytest.raises(release.ReleaseError, match="generated"):
-        release.verify_engine(engine, receipt, FakeCommands())
+        release.verify_engine(engine, _receipt(), commands)
 
 
-def test_engine_update_rolls_back_all_files_and_submodule_on_generator_failure(
-        monkeypatch, tmp_path):
-    engine = tmp_path
-    (engine / "scripts/broker").mkdir(parents=True)
-    (engine / "docs/gen").mkdir(parents=True)
-    (engine / "pod-agent").mkdir()
-    python = engine / ".venv/bin/python"
-    python.parent.mkdir(parents=True)
-    python.touch()
-    old_commit = "a" * 40
-    new_commit = "b" * 40
-    old_pin = ('POD_AGENT_IMAGE = "ghcr.io/formobr/monty-pod:v0.18.5"\n'
-               'POD_AGENT_AMD64_DIGEST = "sha256:' + "c" * 64 + '"\n')
-    old_doc = "old generated receipt\n"
+def test_verify_is_read_only_and_requires_existing_engine_equality(monkeypatch, tmp_path):
+    engine = _engine(tmp_path, sha=NEW_SHA, digest=DIGEST)
+    commands = FakeCommands(engine=engine)
+    commands.current_engine_sha = NEW_SHA
+    monkeypatch.setattr(release, "REPO", tmp_path / "pod")
+    before = {path: path.read_bytes() for path in (
+        engine / "scripts/broker/pod_image.py", engine / "docs/gen/POD_IMAGE.md")}
+    assert release.verify(NEW_SHA, engine, commands, GoodRegistry()) == _receipt()
+    assert {path: path.read_bytes() for path in before} == before
+    assert not any(call[1:2] in (("push",), ("tag",)) or call[:2] == ("gh", "run")
+                   for call in commands.calls)
+
+
+def test_pin_proves_artifact_before_replacing_an_old_engine_pin(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    commands = FakeCommands(engine=engine)
+    monkeypatch.setattr(release, "REPO", tmp_path / "pod")
+
+    def still_old():
+        image, digest = release.engine_pin_values(engine)
+        assert image.endswith(OLD_SHA) and digest.endswith("c" * 64)
+        assert commands.current_engine_sha == OLD_SHA
+
+    def generate(argv, **_kwargs):
+        assert argv[-2:] == ["--only", "doc:pod_image"]
+        image, digest = release.engine_pin_values(engine)
+        (engine / "docs/gen/POD_IMAGE.md").write_text(f"{image}\n{digest}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(release.subprocess, "run", generate)
+    assert release.pin(NEW_SHA, engine, commands, GoodRegistry(before=still_old)) == _receipt()
+    assert release.engine_pin_values(engine) == (f"{release.IMAGE_REPO}:{NEW_SHA}", DIGEST)
+    assert commands.current_engine_sha == NEW_SHA
+    assert NEW_SHA in (engine / "docs/gen/POD_IMAGE.md").read_text(encoding="utf-8")
+    assert not any(call[1:2] in (("push",), ("tag",)) or call[:2] == ("gh", "run")
+                   for call in commands.calls)
+
+
+@pytest.mark.parametrize("failure", ["missing", "wrong-platform", "ambiguous-platform"])
+def test_registry_refusal_leaves_every_pin_path_unchanged(monkeypatch, tmp_path, failure):
+    engine = _engine(tmp_path)
+    commands = FakeCommands(engine=engine)
+    monkeypatch.setattr(release, "REPO", tmp_path / "pod")
+    paths = (engine / "scripts/broker/pod_image.py", engine / "docs/gen/POD_IMAGE.md")
+    before = {path: path.read_bytes() for path in paths}
+
+    class RefusingRegistry:
+        def inspect(self, _tag, _commit):
+            if failure == "missing":
+                raise release.ReleaseError("GHCR image is not published")
+            if failure == "wrong-platform":
+                release.verify_config_identity(
+                    {"os": "linux", "architecture": "arm64", "config": {}},
+                    tag=NEW_SHA, commit=NEW_SHA)
+            release.select_amd64_manifest({"manifests": []}, {}, lambda _ref: ({}, {}))
+            raise AssertionError("unreachable")
+
+    with pytest.raises(release.ReleaseError):
+        release.pin(NEW_SHA, engine, commands, RefusingRegistry())
+    assert {path: path.read_bytes() for path in paths} == before
+    assert commands.current_engine_sha == OLD_SHA
+
+
+def test_update_rolls_back_files_and_submodule_on_generator_failure(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    commands = FakeCommands(engine=engine)
     pin_file = engine / "scripts/broker/pod_image.py"
     doc_file = engine / "docs/gen/POD_IMAGE.md"
-    pin_file.write_text(old_pin, encoding="utf-8")
-    doc_file.write_text(old_doc, encoding="utf-8")
-
-    class FakeCommands:
-        current = old_commit
-
-        def out(self, args, *, cwd=release.REPO, timeout=30):
-            if args[:2] == ["git", "status"]:
-                return ""
-            if args[:3] == ["git", "rev-parse", "HEAD"]:
-                return self.current
-            raise AssertionError(args)
-
-        def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
-            if args[:2] == ["git", "fetch"]:
-                return type("Done", (), {"returncode": 0})()
-            if args[:2] == ["git", "checkout"]:
-                self.current = args[-1]
-                return type("Done", (), {"returncode": 0})()
-            raise AssertionError(args)
-
-    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs:
-                        type("Done", (), {"returncode": 1})())
-    commands = FakeCommands()
-    receipt = release.ImageReceipt("v0.18.6", new_commit, "sha256:" + "d" * 64,
-                                   new_commit, "v0.18.6")
+    before = (pin_file.read_bytes(), doc_file.read_bytes())
+    monkeypatch.setattr(release.subprocess, "run", lambda argv, **_kwargs:
+                        subprocess.CompletedProcess(argv, 1, "", ""))
     with pytest.raises(release.ReleaseError, match="generator failed"):
-        release.update_engine(engine, receipt, commands)
-    assert pin_file.read_text(encoding="utf-8") == old_pin
-    assert doc_file.read_text(encoding="utf-8") == old_doc
-    assert commands.current == old_commit
+        release.update_engine(engine, _receipt(), commands)
+    assert (pin_file.read_bytes(), doc_file.read_bytes()) == before
+    assert commands.current_engine_sha == OLD_SHA
 
 
-def test_workflow_and_dockerfile_carry_tag_and_revision_build_identity():
+def test_workflow_publishes_only_the_successful_main_push_sha():
     repo = SCRIPT.parents[1]
     workflow = (repo / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     dockerfile = (repo / "Dockerfile").read_text(encoding="utf-8")
-    assert "IMAGE_TAG=${{ github.ref_name }}" in workflow
+    assert "needs: test" in workflow
+    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in workflow
+    assert "IMAGE_TAG=${{ github.sha }}" in workflow
     assert "IMAGE_REVISION=${{ github.sha }}" in workflow
+    assert "ghcr.io/${{ github.repository }}:${{ github.sha }}" in workflow
+    assert "github.ref_name" not in workflow
+    assert "ghcr.io/${{ github.repository }}:latest" not in workflow
+    assert 'tags: ["v*"]' not in workflow
+    assert "packages: write" in workflow and "password: ${{ secrets.GITHUB_TOKEN }}" in workflow
+    assert "push: true" in workflow
     assert "ARG IMAGE_REVISION=unknown" in dockerfile
     assert "org.opencontainers.image.revision=${IMAGE_REVISION}" in dockerfile
 
 
-def test_dry_run_is_the_only_release_path_that_skips_mutations(monkeypatch, tmp_path):
-    commit = "c" * 40
-
-    class FakeCommands:
-        def __init__(self):
-            self.mutations = []
-
-        def out(self, args, *, cwd=release.REPO, timeout=30):
-            if args[:2] == ["git", "status"]:
-                return ""
-            if args[:3] == ["git", "rev-parse", "HEAD"]:
-                return commit
-            if args[:3] == ["git", "tag", "--list"]:
-                return "v0.18.5"
-            if args[:3] == ["git", "cat-file", "-t"]:
-                return "tag"
-            raise AssertionError(args)
-
-        def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
-            if args[:4] == ["git", "rev-parse", "--verify", "refs/tags/v0.18.6^{commit}"]:
-                return type("Done", (), {"returncode": 1, "stdout": ""})()
-            self.mutations.append(args)
-            raise AssertionError(args)
-
-    commands = FakeCommands()
-    monkeypatch.setattr(release, "REPO", tmp_path / "pod")
-    (tmp_path / "engine").mkdir()
-    assert release.release("v0.18.6", tmp_path / "engine", commands, object(),
-                           dry_run=True, ci_timeout_s=1800) is None
-    assert commands.mutations == []
-
-
-def test_existing_exact_annotated_tag_resumes_after_interrupted_release(monkeypatch, tmp_path):
-    commit = "c" * 40
-    digest = "sha256:" + "d" * 64
-    calls: list[list[str]] = []
-
-    class FakeCommands:
-        def out(self, args, *, cwd=release.REPO, timeout=30):
-            if args[:2] == ["git", "status"]:
-                return ""
-            if args[:3] == ["git", "rev-parse", "HEAD"]:
-                return commit
-            if args[:3] == ["git", "cat-file", "-t"]:
-                return "tag"
-            if args[:3] == ["git", "tag", "--list"]:
-                return "v0.18.5\nv0.18.6"
-            raise AssertionError(args)
-
-        def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
-            calls.append(args)
-            if args[:3] == ["git", "rev-parse", "--verify"]:
-                return type("Done", (), {"returncode": 0, "stdout": commit})()
-            return type("Done", (), {"returncode": 0, "stdout": ""})()
-
-    receipt = release.ImageReceipt("v0.18.6", commit, digest, commit, "v0.18.6")
-
-    class FakeRegistry:
-        def inspect(self, tag, tagged_commit):
-            assert (tag, tagged_commit) == ("v0.18.6", commit)
-            return receipt
-
-    monkeypatch.setattr(release, "REPO", tmp_path / "pod")
-    monkeypatch.setattr(release, "verify_remote", lambda *args: None)
-    monkeypatch.setattr(release, "wait_for_ci", lambda *args, **kwargs: None)
-    monkeypatch.setattr(release, "update_engine", lambda *args: None)
-    got = release.release("v0.18.6", tmp_path / "engine", FakeCommands(), FakeRegistry(),
-                          dry_run=False, ci_timeout_s=1800)
-    assert got == receipt
-    assert not any(args[:3] == ["git", "tag", "-a"] for args in calls)
-    assert ["git", "push", "origin", "HEAD:main"] in calls
+def test_cli_and_module_have_no_release_build_or_ci_wait_path():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'for name in ("pin", "verify")' in source
+    assert "wait_for_ci" not in source
+    assert "git\", \"push" not in source
+    assert "git\", \"tag" not in source
+    assert "gh\", \"run" not in source

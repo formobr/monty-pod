@@ -3,7 +3,6 @@ name: ci
 on:
   push:
     branches: ["**"]
-    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -22,7 +21,7 @@ jobs:
 
   image:
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,23 +45,20 @@ jobs:
           context: .
           push: true
           # REGISTRY cache, not `type=gha`, and mode=max, not min — both are forced, not preference:
-          #   • the Actions cache is scoped per ref, and this job only ever runs on a `v*` TAG. A cache
-          #     written under tag v0.12.0 is unreadable from tag v0.13.0, so type=gha would miss every
-          #     single time while looking like it works.
+          #   • the registry cache is shared across main commits whose immutable SHA tags must all publish.
           #   • the costly work (apt+CUDA repo 54s, `pip install torch` 108s) lives in the `pydeps`
           #     BUILDER stage. mode=min exports only the final image's layers, so buildkit would have to
           #     re-run pydeps to learn what `COPY --from=pydeps` even resolves to. Only mode=max keeps it.
-          # Re-export is near-free on a code-only tag: blobs already in the registry are matched by digest
+          # Re-export is near-free on a code-only commit: blobs already in the registry are matched by digest
           # and skipped, so what gets pushed is the manifest, not the 4 GB again.
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
-          # The image can then NAME ITSELF in a refusal ("image v0.6.2 does not carry op X"), which is the
+          # The image can then NAME ITSELF in a refusal ("image <sha> does not carry op X"), which is the
           # first thing anyone reading that error needs to know.
           build-args: |
-            IMAGE_TAG=${{ github.ref_name }}
+            IMAGE_TAG=${{ github.sha }}
             IMAGE_REVISION=${{ github.sha }}
           secrets: |
             hf_token=${{ secrets.HF_TOKEN }}
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
