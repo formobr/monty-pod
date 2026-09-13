@@ -1019,7 +1019,7 @@ def test_check_inputs_refuses_an_unmapped_cutaway_by_name(tmp_path) -> None:
 
 
 def test_check_inputs_names_a_stalled_probe_distinct_from_no_video(monkeypatch, tmp_path) -> None:
-    """H3/Claude-L: a timed-out probe must not collapse into the same refusal as a clean 'no video'
+    """H3/review: a timed-out probe must not collapse into the same refusal as a clean 'no video'
     verdict — the ledger line needs to say WHICH fact happened."""
     spec = _spec(_add_broll_final)
     _write_base(tmp_path)
