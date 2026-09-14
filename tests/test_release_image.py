@@ -44,11 +44,13 @@ def _engine(tmp_path: Path, *, sha: str = OLD_SHA, digest: str | None = None) ->
 
 
 class FakeCommands:
-    def __init__(self, *, engine: Path, source_sha: str = NEW_SHA, reachable: bool = True):
+    def __init__(self, *, engine: Path, source_sha: str = NEW_SHA, reachable: bool = True,
+                 target_has_object: bool = True):
         self.engine = engine
         self.source_sha = source_sha
         self.current_engine_sha = OLD_SHA
         self.reachable = reachable
+        self.target_has_object = target_has_object
         self.calls: list[tuple[str, ...]] = []
 
     def out(self, args, *, cwd=release.REPO, timeout=30):
@@ -61,11 +63,16 @@ class FakeCommands:
 
     def run(self, args, *, cwd=release.REPO, timeout=30, check=True):
         self.calls.append(tuple(args))
+        if args[:3] == ["git", "cat-file", "-e"]:
+            return subprocess.CompletedProcess(args, 0 if self.target_has_object else 1, "", "")
         if args[:2] == ["git", "fetch"]:
+            if cwd == self.engine / "pod-agent" and args[3:] == [str(release.REPO), "HEAD"]:
+                self.target_has_object = True
             return subprocess.CompletedProcess(args, 0, "", "")
         if args[:3] == ["git", "merge-base", "--is-ancestor"]:
             return subprocess.CompletedProcess(args, 0 if self.reachable else 1, "", "")
         if args[:2] == ["git", "checkout"]:
+            assert self.target_has_object
             self.current_engine_sha = args[-1]
             return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError((args, cwd, timeout, check))
@@ -217,6 +224,31 @@ def test_pin_proves_artifact_before_replacing_an_old_engine_pin(monkeypatch, tmp
     assert NEW_SHA in (engine / "docs/gen/POD_IMAGE.md").read_text(encoding="utf-8")
     assert not any(call[1:2] in (("push",), ("tag",)) or call[:2] == ("gh", "run")
                    for call in commands.calls)
+    assert commands.calls.count(("git", "fetch", "--quiet", "origin", "main")) == 1
+    assert not any(call[:3] == ("git", "fetch", "--quiet") and str(release.REPO) in call
+                   for call in commands.calls)
+
+
+def test_pin_copies_a_missing_commit_from_the_verified_local_source_without_a_second_network_fetch(
+        monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    source = tmp_path / "verified-source"
+    source.mkdir()
+    commands = FakeCommands(engine=engine, target_has_object=False)
+    monkeypatch.setattr(release, "REPO", source)
+
+    def generate(argv, **_kwargs):
+        image, digest = release.engine_pin_values(engine)
+        (engine / "docs/gen/POD_IMAGE.md").write_text(f"{image}\n{digest}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(release.subprocess, "run", generate)
+    assert release.pin(NEW_SHA, engine, commands, GoodRegistry()) == _receipt()
+    network = [call for call in commands.calls if call == ("git", "fetch", "--quiet", "origin", "main")]
+    local = [call for call in commands.calls
+             if call == ("git", "fetch", "--quiet", str(source), "HEAD")]
+    assert len(network) == 1 and len(local) == 1
+    assert release.engine_pin_values(engine) == (f"{release.IMAGE_REPO}:{NEW_SHA}", DIGEST)
 
 
 @pytest.mark.parametrize("failure", ["missing", "wrong-platform", "ambiguous-platform"])

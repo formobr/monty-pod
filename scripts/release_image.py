@@ -293,10 +293,14 @@ def update_engine(engine: Path, receipt: ImageReceipt, commands: Commands) -> No
     old_doc = doc_file.read_text(encoding="utf-8")
     old_submodule = commands.out(["git", "rev-parse", "HEAD"], cwd=engine / "pod-agent")
     try:
-        commands.run(["git", "fetch", "--quiet", "origin", "main"],
-                     cwd=engine / "pod-agent", timeout=300)
+        target = engine / "pod-agent"
+        present = commands.run(["git", "cat-file", "-e", f"{receipt.commit}^{{commit}}"],
+                               cwd=target, check=False)
+        if present.returncode:
+            commands.run(["git", "fetch", "--quiet", str(REPO), "HEAD"],
+                         cwd=target, timeout=300)
         commands.run(["git", "checkout", "--quiet", "--detach", receipt.commit],
-                     cwd=engine / "pod-agent")
+                     cwd=target)
         updated = replace_once(old_pin, r'^POD_AGENT_IMAGE\s*=\s*"[^"]+"$',
                                f'POD_AGENT_IMAGE = "{IMAGE_REPO}:{receipt.tag}"', "image")
         updated = replace_once(updated, r'^POD_AGENT_AMD64_DIGEST\s*=\s*"[^"]+"$',
