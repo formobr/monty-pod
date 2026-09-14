@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -34,6 +37,8 @@ ACCEPT = ",".join((
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 ))
+REGISTRY_JSON_MAX_BYTES = 8 * 1024 * 1024
+REGISTRY_WORKER_CLEANUP_S = 0.5
 
 
 class ReleaseError(RuntimeError):
@@ -50,6 +55,38 @@ class _NoCrossHostAuthRedirect(urllib.request.HTTPRedirectHandler):
                 != urllib.parse.urlsplit(newurl).netloc):
             redirected.remove_header("Authorization")
         return redirected
+
+
+def _registry_json_worker(url: str, headers: dict[str, str], socket_timeout: float,
+                          result_path: str) -> None:
+    """Read one whole response out of process so the parent owns the wall clock."""
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        opener = urllib.request.build_opener(_NoCrossHostAuthRedirect())
+        with opener.open(request, timeout=socket_timeout) as response:  # noqa: S310 — fixed GHCR
+            raw = response.read(REGISTRY_JSON_MAX_BYTES + 1)
+            if len(raw) > REGISTRY_JSON_MAX_BYTES:
+                raise ValueError("registry JSON exceeds the bounded response size")
+            payload = {
+                "ok": True,
+                "body": raw.decode("utf-8"),
+                "headers": dict(response.headers.items()),
+            }
+    except BaseException as exc:  # noqa: BLE001 — child reports only the type, never response/token bytes
+        payload = {"ok": False, "error": type(exc).__name__}
+    Path(result_path).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _stop_registry_worker(process: multiprocessing.Process) -> bool:
+    """Return only after the worker is reaped, or report that cleanup failed."""
+    if not process.is_alive():
+        return True
+    process.terminate()
+    process.join(timeout=REGISTRY_WORKER_CLEANUP_S)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=REGISTRY_WORKER_CLEANUP_S)
+    return not process.is_alive()
 
 
 class Commands:
@@ -84,12 +121,39 @@ class Registry:
         self.timeout = timeout
 
     def _json(self, url: str, *, headers: dict[str, str] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
-        request = urllib.request.Request(url, headers=headers or {})
+        deadline = time.monotonic() + self.timeout
+        context = multiprocessing.get_context("fork")
         try:
-            opener = urllib.request.build_opener(_NoCrossHostAuthRedirect())
-            with opener.open(request, timeout=self.timeout) as response:  # noqa: S310 — fixed GHCR
-                body = json.loads(response.read().decode("utf-8"))
-                return body, dict(response.headers.items())
+            with tempfile.TemporaryDirectory(prefix="monty-ghcr-read-") as directory:
+                result_path = Path(directory) / "result.json"
+                process = context.Process(
+                    target=_registry_json_worker,
+                    args=(url, dict(headers or {}), self.timeout, str(result_path)),
+                    name="monty-ghcr-read",
+                    daemon=True,
+                )
+                process.start()
+                process.join(timeout=max(0.0, deadline - time.monotonic()))
+                timed_out = process.is_alive()
+                reaped = _stop_registry_worker(process)
+                exitcode = process.exitcode
+                process.close()
+                if not reaped:
+                    raise ReleaseError("GHCR read worker could not be reaped")
+                if timed_out:
+                    raise ReleaseError(f"GHCR read exceeded {self.timeout:g}s wall-clock deadline")
+                if exitcode != 0 or not result_path.is_file():
+                    raise ReleaseError("GHCR read worker exited without a result")
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                if not result.get("ok"):
+                    raise ReleaseError(f"GHCR read failed ({result.get('error', 'unknown')})")
+                body = json.loads(result["body"])
+                response_headers = result["headers"]
+                if not isinstance(body, dict) or not isinstance(response_headers, dict):
+                    raise ReleaseError("GHCR returned a malformed JSON response")
+                return body, {str(key): str(value) for key, value in response_headers.items()}
+        except ReleaseError:
+            raise
         except Exception as exc:  # noqa: BLE001 — unknown registry state is a release refusal
             raise ReleaseError(f"GHCR read failed ({type(exc).__name__})") from exc
 

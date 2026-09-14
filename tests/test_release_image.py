@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import multiprocessing
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -109,6 +111,35 @@ def test_single_platform_manifest_requires_registry_digest_header():
     digest, same = release.select_amd64_manifest(
         doc, {"docker-content-digest": "sha256:" + "a" * 64}, lambda _ref: ({}, {}))
     assert digest.endswith("a" * 64) and same is doc
+
+
+def test_registry_whole_response_deadline_reaps_a_trickling_reader(monkeypatch):
+    class TricklingResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit=-1):
+            buffered = bytearray()
+            while True:
+                buffered.extend(b" ")
+                time.sleep(0.005)
+
+    class TricklingOpener:
+        def open(self, *_args, **_kwargs):
+            return TricklingResponse()
+
+    monkeypatch.setattr(release.urllib.request, "build_opener", lambda *_args: TricklingOpener())
+    before = {process.pid for process in multiprocessing.active_children()}
+    started = time.monotonic()
+    with pytest.raises(release.ReleaseError, match="wall-clock deadline"):
+        release.Registry(timeout=0.05)._json("https://ghcr.io/trickle")
+    assert time.monotonic() - started < 1.0
+    assert {process.pid for process in multiprocessing.active_children()} == before
 
 
 def test_image_config_requires_sha_revision_tag_and_amd64():
