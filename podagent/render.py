@@ -721,12 +721,12 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                     "timings": {"phase_s": round(time.monotonic() - started, 3)},
                 }.items() if v is not None
             })
+    # function-local: render_onepass imports this module, so a top-level import would cycle.
+    from . import render_onepass as _onepass
     if spec.mode == "final":
-        # function-local: render_onepass imports this module, so a top-level import would cycle.
-        from . import render_onepass as _onepass
-        _onepass.preflight(spec)  # refuses trims/opener/cover before any subprocess (the only door)
+        _onepass.preflight(spec)  # refuses trims/opener/cover/receipt before any subprocess
     else:
-        _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
+        _onepass.preflight_preview(spec)  # the receipt contract alone; other non-goals are final-only
 
     with phase("gpu_probe"):
         cpu_requested = os.environ.get("MONTY_OPS_CPU_ENCODE") == "1"

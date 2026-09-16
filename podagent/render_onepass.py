@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+import math
 import os
 import re
 import subprocess
@@ -105,14 +106,10 @@ class Inputs:
 
 # --- 1. preflight -------------------------------------------------------------
 
-def refusals(spec: RenderSpec) -> list[str]:
-    """The NAMED non-goals this graph hard-refuses, empty on accept — every named reason is a
-    permanent non-goal, not a share to be measured toward a later go/no-go."""
+def _receipt_refusals(spec: RenderSpec) -> list[str]:
+    """The receipt-declaration checks alone: shared by the final door's full refusal list and by
+    preview's own early door, so a preview spec answers to the same contract as final."""
     unimplemented = []
-    if any(o.kind == "cover" for o in spec.outputs):
-        # A declared cover OUTPUT with no overlays.cover block: this graph never writes a cover.png,
-        # so the upload loop would silently skip the deliverable — the half-render this list stops.
-        unimplemented.append("outputs[kind=cover]")
     kinds = [o.kind for o in spec.outputs]
     if "receipt" in kinds:
         if spec.mode != "final":
@@ -121,6 +118,18 @@ def refusals(spec: RenderSpec) -> list[str]:
             # The receipt must be PUT before the master it accounts for; the upload loop walks
             # outputs in order, so a master listed first can land with no proof behind it.
             unimplemented.append("outputs[kind=receipt] declared after outputs[kind=master]")
+    return unimplemented
+
+
+def refusals(spec: RenderSpec) -> list[str]:
+    """The NAMED non-goals this graph hard-refuses, empty on accept — every named reason is a
+    permanent non-goal, not a share to be measured toward a later go/no-go."""
+    unimplemented = []
+    if any(o.kind == "cover" for o in spec.outputs):
+        # A declared cover OUTPUT with no overlays.cover block: this graph never writes a cover.png,
+        # so the upload loop would silently skip the deliverable — the half-render this list stops.
+        unimplemented.append("outputs[kind=cover]")
+    unimplemented += _receipt_refusals(spec)
     ov = spec.overlays if spec.mode == "final" else None
     if ov is None:
         return unimplemented
@@ -138,6 +147,18 @@ def preflight(spec: RenderSpec) -> None:
     render.render_spec, so a v6 spec cannot half-render through this door either."""
     _finalize.declared_grid(spec.timeline.fps)  # the ONLY refusal a lost render is worse than
     unimplemented = refusals(spec)
+    if unimplemented:
+        raise NotImplementedError(
+            f"body single-pass graph does not composite these yet (opener/junction waves): {unimplemented}")
+    if spec.mode == "final" and any(o.kind == "receipt" for o in spec.outputs):
+        producer()
+
+
+def preflight_preview(spec: RenderSpec) -> None:
+    """Preview's door onto the same receipt contract final uses, so a preview spec declaring one
+    refuses before any subprocess instead of paying for its own composite first."""
+    _finalize.declared_grid(spec.timeline.fps)
+    unimplemented = _receipt_refusals(spec)
     if unimplemented:
         raise NotImplementedError(
             f"body single-pass graph does not composite these yet (opener/junction waves): {unimplemented}")
@@ -195,18 +216,25 @@ def _is_still_image(path: Path) -> bool:
     return nb.isdigit() and int(nb) == 1
 
 
-def _broll_loop_bounds(spec: RenderSpec, input_paths: dict) -> dict[str, float]:
-    """input id -> ffmpeg `-t` for every broll cutaway needing `-loop 1`, by declared or probed kind."""
+def _broll_loop_bounds(spec: RenderSpec, input_paths: dict,
+                       probes: dict[str, dict] | None = None) -> dict[str, float]:
+    """input id -> ffmpeg `-t` for every broll cutaway needing `-loop 1`, by declared or probed kind.
+    `probes` reuses an already-run ffprobe (prepare's own mis-declared-photo check) instead of a
+    second one, when the caller has one."""
     ov = spec.overlays if spec.mode == "final" else None
     if ov is None or ov.broll_final is None:
         return {}
     kinds = {inp.id: inp.kind for inp in spec.inputs}
+    probes = probes or {}
     bounds: dict[str, float] = {}
     for c in ov.broll_final.broll:
         if c.dur is None:
             continue
-        if kinds.get(c.clip) != "image" and not _is_still_image(input_paths[c.clip]):
-            continue
+        if kinds.get(c.clip) != "image":
+            probe = probes.get(c.clip)
+            still = _row_is_still_image(probe) if probe is not None else _is_still_image(input_paths[c.clip])
+            if not still:
+                continue
         need = (c.in_ or 0.0) + c.dur + _LOOP_MARGIN_S
         bounds[c.clip] = max(bounds.get(c.clip, 0.0), need)
     return bounds
@@ -234,7 +262,9 @@ def tap_frames_expected(spec: RenderSpec) -> dict[str, int]:
         for i, c in enumerate(ov.broll_final.broll):
             if c.dur is None:
                 raise RuntimeError(f"final broll clip {c.clip!r} has no resolved dur")
-            expected[f"vtap{i}"] = max(1, round(c.dur * fps))
+            # ceil, not round: trim=duration=dur is a half-open [0,dur) window, so a dur landing
+            # mid-frame (n/fps < dur <= (n+1)/fps) still delivers n+1 frames.
+            expected[f"vtap{i}"] = max(1, math.ceil(round(c.dur * fps, 6)))
     if ov is not None and ov.finalize is not None and ov.finalize.logo is not None:
         expected[V_TAP_LOGO] = 1
     return expected
@@ -318,6 +348,7 @@ class Prepared:
     # framemd5 files included (there are none).
     tap_md5: dict[str, Path] = field(default_factory=dict)
     receipt_out: Path | None = None
+    input_probes: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -472,14 +503,20 @@ def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
     if spec.mode == "final" and any(o.kind == "receipt" for o in spec.outputs):
         receipt_out = tmp / "render.receipt.json"
         tap_md5 = {pad: tmp / f"tap_{pad}.framemd5" for pad in tap_pads(spec)}
+    probes: dict[str, dict] = {}
+    if ov is not None and ov.broll_final is not None:
+        kinds = {inp.id: inp.kind for inp in spec.inputs}
+        for c in ov.broll_final.broll:
+            if kinds.get(c.clip) != "image" and c.clip not in probes:
+                probes[c.clip] = _probe_input(input_paths[c.clip])
     return Prepared(
         spec=spec, gpu=gpu, input_paths=input_paths, duration=dur,
         master_out=master_out or tmp / "render.mp4",
         presync_out=presync_out or tmp / "render.presync.mp4",
         filter_script=tmp / "body_onepass.filter",
         bed=bed, audio=audio, layers=got.get("mograph", ()), ass=ass, font_dir=font_dir,
-        flares=got.get("flares", ()), loop_bounds=_broll_loop_bounds(spec, input_paths),
-        tap_md5=tap_md5, receipt_out=receipt_out)
+        flares=got.get("flares", ()), loop_bounds=_broll_loop_bounds(spec, input_paths, probes),
+        tap_md5=tap_md5, receipt_out=receipt_out, input_probes=probes)
 
 
 # --- 3. assemble --------------------------------------------------------------
@@ -646,7 +683,6 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
 RECEIPT_SCHEMA = "monty.render.receipt/1"
 # A build that cannot name itself signs an encode nobody can trace, so these are REFUSALS: a receipt whose
 # producer is a placeholder is worse than no receipt, because the gate on the other side would trust it.
-_PLACEHOLDER_IMAGE = {"dev", "unknown", "latest", "none", "null"}
 _GIT_STAMP_TIMEOUT_S = 10
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 
@@ -668,12 +704,14 @@ def _worktree_stamp() -> str:
 
 
 def producer() -> dict:
-    """WHO wrote this receipt: the image ref baked at build time, else the running checkout."""
+    """WHO wrote this receipt: the baked 40-hex source SHA, else the running checkout — a closed
+    allowlist, since a real image tag is the ONE shape decided (pod-image-identity-is-source-sha)."""
     tag = os.environ.get("POD_IMAGE_TAG", "").strip()
-    if tag and tag.lower() in _PLACEHOLDER_IMAGE:
+    if tag and not _SHA40.fullmatch(tag):
         raise RuntimeError(
-            f"receipt producer: POD_IMAGE_TAG={tag!r} is a placeholder, not an image identity — refusing "
-            "to write a receipt that cannot name the build that encoded it")
+            f"receipt producer: POD_IMAGE_TAG={tag!r} is not a 40-hex source SHA — a placeholder or "
+            "moving tag is not an image identity, and this refuses to write a receipt that cannot "
+            "name the build that encoded it")
     return {"image": tag or _worktree_stamp(), "podagent_version": __version__,
             "spec_version": SPEC_VERSION}
 
@@ -683,11 +721,13 @@ _FRAMEMD5_COLUMNS = 6
 
 
 def read_framemd5(pad: str, path: Path, frames_expected: int) -> dict:
-    """One tap row, counted from the framemd5 file THIS encode wrote. It reports, it never judges: a
-    starved still reads 1 of N and a chain that never ran reads 0, both without raising."""
+    """One tap row, counted from the framemd5 file THIS encode wrote. It reports, it never raises: an
+    unreadable file carries `error` as a field, same contract as `_input_row` (master already paid)."""
+    row = {"pad": pad, "frames_expected": frames_expected, "frames_delivered": 0,
+          "pts_first_s": None, "pts_last_s": None, "distinct_hashes": 0, "first_last_differ": False}
     if not path.exists():
-        raise RuntimeError(f"tap [{pad}]: the encode declared {path} in its own argv and wrote no "
-                           "framemd5 file")
+        row["error"] = f"the encode declared {path} in its own argv and wrote no framemd5 file"
+        return row
     tb: float | None = None
     hashes: list[str] = []
     pts: list[int] = []
@@ -701,51 +741,69 @@ def read_framemd5(pad: str, path: Path, frames_expected: int) -> dict:
             continue
         cols = [c.strip() for c in line.split(",")]
         if len(cols) != _FRAMEMD5_COLUMNS:
-            raise RuntimeError(f"tap [{pad}]: framemd5 row carries {len(cols)} columns, not "
-                               f"{_FRAMEMD5_COLUMNS} — the parsed format changed under us: {line!r}")
+            row["error"] = (f"framemd5 row carries {len(cols)} columns, not {_FRAMEMD5_COLUMNS} — "
+                            f"the parsed format changed under us: {line!r}")
+            return row
         try:
             pts.append(int(cols[2]))
         except ValueError:
-            raise RuntimeError(f"tap [{pad}]: framemd5 pts column is not an integer: {line!r}") from None
+            row["error"] = f"framemd5 pts column is not an integer: {line!r}"
+            return row
         hashes.append(cols[5])
     if tb is None:
-        raise RuntimeError(f"tap [{pad}]: framemd5 file has no '#tb 0: num/den' header, so its pts "
-                           "columns name no unit of time")
-    return {"pad": pad, "frames_expected": frames_expected, "frames_delivered": len(hashes),
-            "pts_first_s": round(pts[0] * tb, 4) if pts else None,
-            "pts_last_s": round(pts[-1] * tb, 4) if pts else None,
-            "distinct_hashes": len(set(hashes)),
-            "first_last_differ": bool(hashes) and hashes[0] != hashes[-1]}
+        row["error"] = "framemd5 file has no '#tb 0: num/den' header, so its pts columns name no unit of time"
+        return row
+    row.update({"frames_delivered": len(hashes),
+               "pts_first_s": round(pts[0] * tb, 4) if pts else None,
+               "pts_last_s": round(pts[-1] * tb, 4) if pts else None,
+               "distinct_hashes": len(set(hashes)),
+               "first_last_differ": bool(hashes) and hashes[0] != hashes[-1]})
+    return row
 
 
 _PROBE_ENTRIES = ("format=format_name,duration:"
                   "stream=index,codec_type,codec_name,width,height,r_frame_rate,nb_frames")
 
 
-def _input_row(iid: str, path: Path) -> dict:
-    """Header-only ffprobe row for one input. A probe failure is a FIELD, not an exception: the encode is
-    already paid for by the time this runs (same contract as grid_verdict)."""
-    row: dict = {"id": iid, "path": str(path)}
+def _probe_input(path: Path) -> dict:
+    """ONE header-only ffprobe, shaped for every later reader (still-image check, receipt row) so none
+    of them needs its own pass over the same bytes. A probe failure is a FIELD, never an exception."""
     try:
         out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", _PROBE_ENTRIES, "-of", "json",
                               str(path)], capture_output=True, text=True,
                              timeout=_finalize._PROBE_TIMEOUT_S)
         data = json.loads(out.stdout or "{}")
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-        row["probe_failed"] = safe_text(str(exc))
-        return row
+        return {"probe_failed": safe_text(str(exc))}
     fmt = data.get("format") or {}
-    row["format_name"] = fmt.get("format_name")
-    row["duration_s"] = fmt.get("duration")
-    row["streams"] = [{k: s.get(k) for k in ("index", "codec_type", "codec_name", "width", "height",
-                                             "r_frame_rate", "nb_frames")}
-                      for s in (data.get("streams") or [])]
+    return {"format_name": fmt.get("format_name"), "duration_s": fmt.get("duration"),
+            "streams": [{k: s.get(k) for k in ("index", "codec_type", "codec_name", "width", "height",
+                                                "r_frame_rate", "nb_frames")}
+                       for s in (data.get("streams") or [])]}
+
+
+def _row_is_still_image(probe: dict) -> bool:
+    """Same verdict as `_is_still_image`, read from an already-run probe instead of a fresh one."""
+    if "probe_failed" in probe:
+        return False
+    fmt = probe.get("format_name") or ""
+    if any(name in fmt.split(",") for name in _STILL_IMAGE_FORMATS):
+        return True
+    nb = next((s.get("nb_frames") for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+    return isinstance(nb, str) and nb.isdigit() and int(nb) == 1
+
+
+def _input_row(iid: str, path: Path, probe: dict | None = None) -> dict:
+    """Header-only ffprobe row for one input, reusing an already-run probe when the caller has one.
+    A probe failure is a FIELD, not an exception: the encode is already paid for by the time this runs."""
+    row: dict = {"id": iid, "path": str(path)}
+    row.update(probe if probe is not None else _probe_input(path))
     return row
 
 
 def _broll_rows(spec: RenderSpec, graph: str) -> list[dict]:
-    """One row per PLANNED cutaway, each cross-checked against the graph the encoder got: a row whose
-    chain or enable window is absent from that text would be a claim about an overlay that never rode."""
+    """One row per PLANNED cutaway, each cross-checked against the graph the encoder got: `error` names
+    a row whose OWN overlay clause never carried its planned window, not just a label found anywhere."""
     ov = spec.overlays if spec.mode == "final" else None
     if ov is None or ov.broll_final is None:
         return []
@@ -754,15 +812,19 @@ def _broll_rows(spec: RenderSpec, graph: str) -> list[dict]:
     for i, c in enumerate(ov.broll_final.broll):
         start, end = c.start, c.start + (c.dur or 0.0)
         enable = f"between(t,{start:.3f},{end:.3f})"
-        # The label is read back AS MERGED (rewire namespaces a builder's internal pads), so the row
-        # names the chain the encoder got rather than the one the builder meant to hand it.
-        found = re.search(rf"\[(b{i}(?:__[A-Za-z0-9_]+)?)\]", graph)
-        if found is None or enable not in graph:
-            raise RuntimeError(f"planned cutaway {c.clip!r} has no chain [b{i}] enabled over "
-                               f"[{start:.3f},{end:.3f}) in the filtergraph this encode ran")
-        rows.append({"clip": c.clip, "input_index": idx[c.clip], "start": round(start, 3),
-                     "end": round(end, 3), "enable": enable, "chain_label": found.group(1),
-                     "tap_pad": f"vtap{i}"})
+        # rewire namespaces a builder's internal pads, so [b{i}] must be read as MERGED, and the match
+        # is bound to ONE overlay clause (not the graph at large) so a swapped chain cannot pass.
+        found = re.search(rf"\[(b{i}(?:__[A-Za-z0-9_]+)?)\]overlay=[^;]*?enable='{re.escape(enable)}'",
+                          graph)
+        row = {"clip": c.clip, "input_index": idx[c.clip], "start": round(start, 3),
+              "end": round(end, 3), "enable": enable, "tap_pad": f"vtap{i}"}
+        if found is None:
+            row["chain_label"] = None
+            row["error"] = (f"planned cutaway {c.clip!r} has no chain [b{i}] enabled over "
+                            f"[{start:.3f},{end:.3f}) in the filtergraph this encode ran")
+        else:
+            row["chain_label"] = found.group(1)
+        rows.append(row)
     return rows
 
 
@@ -796,11 +858,14 @@ def build_receipt(p: Prepared, graph: str, cmd: list[str], wall_s: float) -> dic
         "slug": spec.slug,
         "mode": spec.mode,
         "producer": producer(),
+        # loudnorm is a SEPARATE finished-file pass outside this argv; the PUT master's bytes may
+        # differ from what this argv/graph/taps describe.
+        "describes": "pre_loudnorm_encode",
         "argv": list(cmd),
         "filtergraph": graph,
         # Every DECLARED input, not just the ones the graph decodes: the logo is the asset whose silent
         # absence this whole receipt exists to catch, and it is not a timeline source.
-        "inputs": [_input_row(i.id, p.input_paths[i.id]) for i in spec.inputs
+        "inputs": [_input_row(i.id, p.input_paths[i.id], p.input_probes.get(i.id)) for i in spec.inputs
                    if i.id in p.input_paths],
         "overlays": {"broll": _broll_rows(spec, graph)},
         "logo": _logo_row(spec, p.duration, pads),

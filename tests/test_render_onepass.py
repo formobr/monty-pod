@@ -1675,17 +1675,45 @@ def test_a_preview_spec_may_not_declare_a_receipt() -> None:
         op.preflight(preview)
 
 
+def test_a_preview_spec_declaring_a_receipt_refuses_through_render_spec(monkeypatch) -> None:
+    """LOW-5 fold: preflight only ran on mode=final, so this refusal was unreachable through the
+    production door — a preview spec paid its full encode before the upload loop caught it."""
+    _no_subprocess(monkeypatch)
+    preview = RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
+        "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "u"}],
+        "timeline": {"fps": 30, "width": 320, "height": 240,
+                     "segments": [{"src": "base", "in": 0.0, "out": 2.0, "speed": 1.0}]},
+        "encode": _PHOTO_ENCODE, "outputs": [_RECEIPT_OUT, _MASTER_OUT]})
+    with pytest.raises(NotImplementedError, match="receipt"):
+        render.render_spec(preview, SimpleNamespace())
+
+
 def test_the_producer_names_the_baked_image_tag(monkeypatch) -> None:
     monkeypatch.setenv("POD_IMAGE_TAG", "a" * 40)
     assert op.producer() == {"image": "a" * 40, "podagent_version": op.__version__,
                              "spec_version": 6}
 
 
-@pytest.mark.parametrize("tag", ["dev", "unknown", "latest", "none"])
+@pytest.mark.parametrize("tag", ["dev", "unknown", "latest", "none",
+                                 "monty-pod:latest", "v0.6.0", "g" * 40])
 def test_a_build_that_cannot_name_itself_refuses_to_sign_a_receipt(monkeypatch, tag) -> None:
+    """A closed 40-hex allowlist, not a word blocklist: a moving tag or a non-hex string refuses too,
+    not just the five literal words a Dockerfile default happens to carry."""
     monkeypatch.setenv("POD_IMAGE_TAG", tag)
     with pytest.raises(RuntimeError, match="placeholder"):
         op.producer()
+
+
+def test_a_placeholder_image_tag_refuses_before_any_subprocess(monkeypatch) -> None:
+    """HIGH fold: a paid GPU encode must never be thrown away for a refusal decidable from env alone —
+    the Dockerfile's own default (ARG IMAGE_TAG=dev) must refuse in preflight, before `_run` ever fires."""
+    monkeypatch.setenv("POD_IMAGE_TAG", "dev")
+    calls: list = []
+    monkeypatch.setattr(op, "_run", lambda *a, **_kw: calls.append(a))
+    with pytest.raises(RuntimeError, match="placeholder"):
+        op.preflight(_tap_spec())
+    assert calls == []
 
 
 def test_an_unset_image_tag_stamps_the_running_checkout(monkeypatch) -> None:
@@ -1734,22 +1762,23 @@ def test_read_framemd5_reads_a_chain_that_never_ran_as_zero(tmp_path: Path) -> N
     assert row["first_last_differ"] is False
 
 
-def test_read_framemd5_refuses_a_shape_it_did_not_expect(tmp_path: Path) -> None:
+def test_read_framemd5_reports_a_shape_it_did_not_expect_as_a_field(tmp_path: Path) -> None:
+    """LOW-2 fold: the master is already paid for by the time this reads — a defect is a FIELD."""
     path = tmp_path / "t.framemd5"
     _framemd5(path, 2)
     path.write_text(path.read_text() + "0, 3, 3, 1\n", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="columns"):
-        op.read_framemd5("vtap0", path, 2)
+    row = op.read_framemd5("vtap0", path, 2)
+    assert "columns" in row["error"] and row["frames_delivered"] == 0
 
     no_tb = tmp_path / "u.framemd5"
     _framemd5(no_tb, 1)
     no_tb.write_text("\n".join(ln for ln in no_tb.read_text().splitlines()
                               if not ln.startswith("#tb")), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="#tb"):
-        op.read_framemd5("vtap0", no_tb, 1)
+    row = op.read_framemd5("vtap0", no_tb, 1)
+    assert "#tb" in row["error"]
 
-    with pytest.raises(RuntimeError, match="wrote no framemd5"):
-        op.read_framemd5("vtap0", tmp_path / "absent.framemd5", 1)
+    row = op.read_framemd5("vtap0", tmp_path / "absent.framemd5", 1)
+    assert "wrote no framemd5" in row["error"] and row["frames_delivered"] == 0
 
 
 def test_run_encode_writes_one_receipt_of_the_encode_that_ran(monkeypatch, tmp_path) -> None:
@@ -1779,6 +1808,7 @@ def test_run_encode_writes_one_receipt_of_the_encode_that_ran(monkeypatch, tmp_p
         (90, 90), (90, 90), (1, 1)]
     assert [r["id"] for r in receipt["inputs"]] == [i.id for i in spec.inputs]
     assert receipt["wall"] >= 0.0
+    assert receipt["describes"] == "pre_loudnorm_encode"
 
 
 def test_the_receipt_reads_a_starved_overlay_without_rendering_a_verdict(monkeypatch, tmp_path) -> None:
@@ -1814,10 +1844,20 @@ def test_the_receipt_never_carries_an_output_put_url(monkeypatch, tmp_path) -> N
         op._refuse_secret_leak({"argv": ["ffmpeg", spec.outputs[0].put_url]}, spec)
 
 
-def test_a_planned_cutaway_missing_from_the_graph_refuses_the_receipt() -> None:
+def test_a_planned_cutaway_missing_from_the_graph_reports_an_error_field() -> None:
+    """LOW-2 fold: a graph mismatch after the encode is a defect field, not a lost master."""
     spec = _tap_spec(clips=1, logo=False)
-    with pytest.raises(RuntimeError, match=r"no chain \[b0\]"):
-        op._broll_rows(spec, "[0:v]null[vout]")
+    rows = op._broll_rows(spec, "[0:v]null[vout]")
+    assert rows[0]["chain_label"] is None and "no chain [b0]" in rows[0]["error"]
+
+
+def test_a_planned_cutaways_own_overlay_clause_must_carry_its_own_window() -> None:
+    """LOW-4 fold: a [b0] label sitting elsewhere in the graph (not consumed by ITS overlay) must not
+    let the row pass — the match is pinned to the clause that actually rides [b0] into `overlay=`."""
+    spec = _tap_spec(clips=1, logo=False)
+    decoy = "[x][b0]someotherfilter=enable='between(t,12.000,15.000)'[y]"
+    rows = op._broll_rows(spec, decoy)
+    assert rows[0]["chain_label"] is None and rows[0]["error"]
 
 
 def test_the_door_puts_the_receipt_before_the_master(monkeypatch, tmp_path) -> None:
@@ -1835,6 +1875,30 @@ def test_the_door_puts_the_receipt_before_the_master(monkeypatch, tmp_path) -> N
     assert puts[1][1:] == (_MASTER_OUT["put_url"], "video/mp4")
 
 
+def test_a_missing_framemd5_reports_an_error_but_still_uploads_the_master(monkeypatch, tmp_path) -> None:
+    """LOW-2 fold: a tap file the encode's own argv named but never wrote must not cost the master —
+    the pod counts the defect as a field, the engine judges it."""
+    monkeypatch.setenv("POD_IMAGE_TAG", "b" * 40)
+    spec = _tap_spec(clips=1, logo=False)
+    puts: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(op, "upload", lambda path, url, mime: puts.append((Path(path).name, url, mime)))
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
+    for i in spec.inputs:
+        (tmp_path / i.id.replace("/", "__")).write_bytes(b"x")
+
+    def run(cmd, _budget=None):
+        for opts, dst in _argv(list(cmd))[1]:
+            if not _has_seq(opts, ["-f", "framemd5"]):
+                Path(dst).write_bytes(b"v")
+    monkeypatch.setattr(op, "_run", run)
+
+    d = op.render_body(spec, _paths(spec, tmp_path), tmp_path, False)
+    assert d.outputs == ["receipt", "master"]
+    receipt = json.loads(d.prepared.receipt_out.read_text())
+    assert receipt["taps"][0]["pad"] == "vtap0" and "wrote no framemd5" in receipt["taps"][0]["error"]
+    assert ("render.mp4", _MASTER_OUT["put_url"], "video/mp4") in puts
+
+
 @pytest.mark.integration
 def test_real_tap_counts_the_frames_the_cutaway_actually_delivered(monkeypatch, tmp_path: Path) -> None:
     """The law, proved by ffmpeg's own accounting: the tap of a looped still cutaway delivers exactly
@@ -1847,7 +1911,7 @@ def test_real_tap_counts_the_frames_the_cutaway_actually_delivered(monkeypatch, 
     receipt = op.run_encode(p)
 
     tap = receipt["taps"][0]
-    assert tap["pad"] == "vtap0" and tap["frames_expected"] == 60          # round(2.4 * 25)
+    assert tap["pad"] == "vtap0" and tap["frames_expected"] == 60          # ceil(2.4 * 25)
     assert tap["frames_delivered"] == tap["frames_expected"]
     assert tap["pts_first_s"] == pytest.approx(3.0, abs=0.05)
     assert tap["pts_last_s"] == pytest.approx(3.0 + 59 / 25, abs=0.05)
@@ -1872,11 +1936,26 @@ def test_real_tap_reads_the_unlooped_still_as_one_frame(monkeypatch, tmp_path: P
     assert tap["distinct_hashes"] == 1 and tap["first_last_differ"] is False
 
 
-def _real_cutaway_fixture(tmp_path: Path) -> tuple[Path, Path, RenderSpec]:
+@pytest.mark.integration
+@pytest.mark.parametrize("dur", [2.4, 3.0])
+def test_real_tap_frames_expected_matches_delivered_at_30fps(monkeypatch, tmp_path: Path, dur: float) -> None:
+    """LOW-1 fold: ceil(dur*fps), not round — trim's half-open window must agree with `frames_expected`
+    at a duration landing exactly on a 30fps frame boundary, not just at 25fps."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+    monkeypatch.setenv("POD_IMAGE_TAG", "c" * 40)
+    base, photo, spec = _real_cutaway_fixture(tmp_path, fps=30, dur=dur)
+    p = op.prepare(spec, {"base": base, "broll/photo": photo}, tmp_path, gpu=False)
+    receipt = op.run_encode(p)
+    tap = receipt["taps"][0]
+    assert tap["frames_delivered"] == tap["frames_expected"]
+
+
+def _real_cutaway_fixture(tmp_path: Path, *, fps: int = 25, dur: float = 2.4) -> tuple[Path, Path, RenderSpec]:
     base = tmp_path / "base.mp4"
     subprocess.run([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=8",
+        "-f", "lavfi", "-i", f"testsrc=size=320x240:rate={fps}:duration=8",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=8",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(base),
     ], check=True)
@@ -1888,10 +1967,10 @@ def _real_cutaway_fixture(tmp_path: Path) -> tuple[Path, Path, RenderSpec]:
         "spec_version": 6, "job_id": "tap-cutaway", "slug": "tap-cutaway", "mode": "final",
         "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "unused"},
                    {"id": "broll/photo", "kind": "image", "sha256": SHA, "url": "unused"}],
-        "timeline": {"fps": 25, "width": 320, "height": 240,
+        "timeline": {"fps": fps, "width": 320, "height": 240,
                      "segments": [{"src": "base", "in": 0.0, "out": 8.0, "speed": 1.0}]},
         "overlays": {"broll_final": {"broll": [
-            {"clip": "broll/photo", "start": 3.0, "preset": "in", "dur": 2.4, "in": 0.0}]}},
+            {"clip": "broll/photo", "start": 3.0, "preset": "in", "dur": dur, "in": 0.0}]}},
         "encode": {"video": "libx264", "preset": "medium", "cq": 23, "pix_fmt": "yuv420p",
                    "audio": "aac", "audio_bitrate": "192k"},
         "outputs": [{"id": "receipt", "kind": "receipt", "put_url": "unused-receipt"},
