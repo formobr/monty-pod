@@ -536,6 +536,7 @@ def _run_infer(
     session_id: str,
     rank_parallel: int = 1,
     rank_slots: threading.BoundedSemaphore | None = None,
+    one_kind_resident: bool = False,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag.
 
@@ -576,6 +577,13 @@ def _run_infer(
     work_started = time.monotonic()
     try:
         req = InferRequest.model_validate(raw)
+        if one_kind_resident:
+            # A cached service holds its weights on the card forever, so on a card too small for both kinds
+            # the idle one must go before this load — the kinds are already serialised onto one lane.
+            from .infer_lanes import release_other_kinds
+            dropped = release_other_kinds(req.kind, {"align": align_cache, "clip_rank": rank_cache})
+            if dropped:
+                note(f"dropped {'+'.join(dropped)} weights: this card holds one infer kind at a time")
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
         # same model but carrying different checkpoints must not share a loaded model, and a warm pod that
         # sees the same hash again skips both the fetch and the (dominant) load.
@@ -1090,7 +1098,10 @@ def main() -> None:
     _log_gpu_status()
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
+    from .infer_lanes import card_holds_both_kinds
     rank_width = lane_width()
+    kinds_coexist, residency_why = card_holds_both_kinds()
+    _log(f"infer kinds {'run in parallel' if kinds_coexist else 'take turns on one lane'}: {residency_why}")
     capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width(),
                                 vram_total_mb=vram_total_mb(),
                                 artifact_fetch_workers=range_fetch_width(),
@@ -1129,7 +1140,7 @@ def main() -> None:
             if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
                               yunet_path, not mine, corr_id=pod_job.corr_id,
                               session_id=pod_job.session_id, rank_parallel=rank_width,
-                              rank_slots=rank_slots) and mine:
+                              rank_slots=rank_slots, one_kind_resident=not kinds_coexist) and mine:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None
@@ -1140,7 +1151,8 @@ def main() -> None:
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
             cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool, \
             cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool:
-        _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy, coordinator=coordinator)
+        _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy, coordinator=coordinator,
+                       kinds_coexist=kinds_coexist)
         if coordinator.restart_requested():
             # Runs INSIDE this `with` on purpose — see _drain_and_restart's docstring.
             _drain_and_restart(cp, coordinator)
@@ -1152,9 +1164,11 @@ def _is_clip_rank(pod_job: PodJob) -> bool:
 
 
 def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: Any, heavy: Any,
-                   once: bool = False, coordinator: "RestartCoordinator | None" = None) -> None:
-    """Claim envelopes and hand them to a pool. `once` is the test seam — the production loop never returns
-    on its own; a set restart latch is the one other way out, checked before every new claim wait."""
+                   once: bool = False, coordinator: "RestartCoordinator | None" = None,
+                   kinds_coexist: bool = True) -> None:
+    """Claim envelopes and hand them to a pool; `kinds_coexist=False` folds the rank lane onto the one-wide
+    heavy lane so the weight-holding kinds take turns (infer_lanes). `once` is the test seam — the production
+    loop never returns on its own; a set restart latch is the one other way out, checked before each claim."""
     unhealthy_attempts = 0
     while True:
         if coordinator is not None and coordinator.restart_requested():
@@ -1196,7 +1210,7 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                 if coordinator is not None:
                     coordinator.track("ops", str(corr or raw_meta.get("job_id") or "?"), fut)
             else:
-                pool = rank_pool if _is_clip_rank(pod_job) else heavy_pool
+                pool = rank_pool if (_is_clip_rank(pod_job) and kinds_coexist) else heavy_pool
                 fut = pool.submit(_guarded,
                             lambda j=pod_job, m=raw_meta, q=queued_at:
                             _with_lifecycle(cp, m, q, lambda: heavy(j)), cp, raw_meta)
