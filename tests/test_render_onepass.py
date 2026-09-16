@@ -3,6 +3,7 @@ reference. Connectivity, goldens, reuse-by-spy and the negatives. Nothing here r
 nothing here asserts on a rendered frame (that harness is a later wave)."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import shutil
@@ -1509,3 +1510,390 @@ def test_real_photo_cutaway_survives_its_whole_window(tmp_path: Path) -> None:
         check=True, capture_output=True).stdout
     r, g, b = frame[0], frame[1], frame[2]
     assert r > 180 and g < 80 and b < 80, f"expected the red cutaway at t=3.4, got rgb=({r},{g},{b})"
+
+
+# --- the receipt: the encode's own account of what it delivered (MISC-36) ------
+
+_RECEIPT_OUT = {"id": "receipt", "kind": "receipt",
+                "put_url": "https://x/master.mp4.receipt.json?sig=PUT"}
+_MASTER_OUT = {"id": "master", "kind": "master", "put_url": "https://x/master.mp4?sig=PUT"}
+
+
+def _tap_spec(clips: int = 1, *, logo: bool = True, outputs=None, srcs: int = 3) -> RenderSpec:
+    """`srcs` timeline sources ahead of the cutaways on purpose: the first still then lands on ffmpeg
+    input index 3, the exact argv the tap example in the plan names."""
+    inputs = [{"id": f"base{k}", "kind": "video", "sha256": SHA, "url": "u"} for k in range(srcs)]
+    segments = [{"src": f"base{k}", "in": 0.0, "out": 6.0, "speed": 1.0} for k in range(srcs)]
+    broll = []
+    for i in range(clips):
+        inputs.append({"id": f"broll/{i}.jpg", "kind": "image", "sha256": SHA, "url": "u"})
+        broll.append({"clip": f"broll/{i}.jpg", "start": 12.0 + 4.0 * i, "preset": "in",
+                      "dur": 3.0, "in": 0.0})
+    overlays: dict = {"broll_final": {"broll": broll}}
+    if logo:
+        inputs.append({"id": "brand/logo.png", "kind": "image", "sha256": SHA, "url": "u"})
+        overlays["finalize"] = {"logo": {"asset": "brand/logo.png", "corner": "tr", "width": 150,
+                                        "opacity": 0.55, "margin": 40, "cover_hold": 0.6}}
+    return RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "j-tap", "slug": "tap", "mode": "final", "inputs": inputs,
+        "timeline": {"fps": 30, "width": 320, "height": 240, "segments": segments},
+        "encode": _PHOTO_ENCODE, "overlays": overlays,
+        "outputs": [_RECEIPT_OUT, _MASTER_OUT] if outputs is None else outputs})
+
+
+def _tap_prepared(spec: RenderSpec, tmp_path: Path, *, receipt: bool = True) -> op.Prepared:
+    pads = op.tap_pads(spec) if receipt else []
+    return op.Prepared(
+        spec=spec, gpu=False, input_paths={i.id: tmp_path / i.id.replace("/", "__") for i in spec.inputs},
+        duration=render.body_duration(spec), master_out=tmp_path / "master.mp4",
+        presync_out=tmp_path / "master.presync.mp4", filter_script=tmp_path / "body.filter",
+        tap_md5={pad: tmp_path / f"tap_{pad}.framemd5" for pad in pads},
+        receipt_out=(tmp_path / "render.receipt.json") if receipt else None)
+
+
+def _framemd5(path: Path, frames: int, *, tb: str = "1/30", first_pts: int = 0,
+              distinct: bool = True) -> None:
+    """A framemd5 file in the exact shape ffmpeg writes one, so the parser is pinned to the format and
+    not to our own convenience."""
+    lines = ["#format: frame checksums", "#version: 2", "#hash: MD5", f"#tb 0: {tb}",
+             "#media_type 0: video", "#codec_id 0: rawvideo", "#dimensions 0: 96x96", "#sar 0: 1/1",
+             "#stream#, dts,        pts, duration,     size, hash"]
+    for k in range(frames):
+        h = f"{k if distinct else 0:032x}"
+        lines.append(f"0,{first_pts + k:>11},{first_pts + k:>11},{1:>9},{9216:>9}, {h}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _fake_encode(calls: list, delivered=None):
+    """Stand-in for the ONE ffmpeg run: it creates every destination its argv names, writing a real
+    framemd5 body for the tap outputs (`delivered` overrides frames per pad)."""
+    def run(cmd, _budget=None):
+        calls.append(list(cmd))
+        for opts, dst in _argv(list(cmd))[1]:
+            if _has_seq(opts, ["-f", "framemd5"]):
+                pad = _maps(opts)[0]
+                n = (delivered or {}).get(pad, 1 if pad == "vtaplogo" else 90)
+                _framemd5(Path(dst), n)
+            else:
+                Path(dst).write_bytes(b"v")
+    return run
+
+
+def test_the_tap_forks_the_planned_chain_at_its_end() -> None:
+    """The fork sits after the seat-at-start setpts: a tap taken earlier counts frames the overlay
+    never saw, which is the one thing the receipt exists to answer."""
+    spec = _tap_spec(logo=False)
+    kb = render._kenburns("in", 0.12, 0.08, 90, 320, 240, 30.0)
+    chains = render.build_filtergraph(spec, gpu=False, taps=True).split(";")
+    assert (f"[3:v]trim=start=0:duration=3,setpts=PTS-STARTPTS,fps=30,{kb},"
+            "setpts=PTS-STARTPTS+12.000/TB,split=2[b0][b0t]") in chains
+    assert "[b0t]scale=96:96:flags=neighbor,format=gray[vtap0]" in chains
+    assert render.build_filtergraph(spec, gpu=False) == render.build_filtergraph(
+        spec, gpu=False, taps=False), "taps must be OFF by default — an old engine's spec is untouched"
+
+
+def test_the_tap_is_an_output_of_the_same_single_run(tmp_path: Path) -> None:
+    spec = _tap_spec(logo=False)
+    p = _tap_prepared(spec, tmp_path)
+    graph, cmd = op.assemble(p)
+    assert f"[b0t__cmp]{finalize.TAP_SCALE}[vtap0]" in graph.split(";")
+    _ins, outs = _argv(cmd)
+    assert _maps(outs[-1][0]) == ["vtap0"]
+    assert _has_seq(outs[-1][0], ["-fps_mode", "passthrough", "-f", "framemd5"])
+    assert outs[-1][1] == str(p.tap_md5["vtap0"])
+    assert cmd.count("ffmpeg") == 1
+    assert_connected(graph, ["vmaster", "acomposite", "vtap0"])
+
+
+def test_every_planned_cutaway_and_the_logo_get_exactly_one_tap(tmp_path: Path) -> None:
+    spec = _tap_spec(clips=8)
+    pads = [f"vtap{i}" for i in range(8)] + ["vtaplogo"]
+    assert op.tap_pads(spec) == pads
+    graph, cmd = op.assemble(_tap_prepared(spec, tmp_path))
+    assert sum(1 for c in graph.split(";") if ",split=2[b" in c) == 8
+    assert ",split=2[lg__lgo][lgt__lgo]" in graph
+    assert f"[lgt__lgo]{finalize.TAP_SCALE}[vtaplogo]" in graph.split(";")
+    _ins, outs = _argv(cmd)
+    taps = [o for o in outs if _has_seq(o[0], ["-f", "framemd5"])]
+    assert [_maps(o[0])[0] for o in taps] == pads
+    assert all(_has_seq(o[0], ["-fps_mode", "passthrough"]) for o in taps)
+    assert_connected(graph, ["vmaster", "acomposite", *pads])
+
+
+def test_a_final_spec_that_declares_no_receipt_renders_exactly_as_before(monkeypatch, tmp_path) -> None:
+    """The new-image x old-engine half of the matrix: no receipt output, no taps, no framemd5 files."""
+    spec = _tap_spec(outputs=[_MASTER_OUT])
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
+    for i in spec.inputs:
+        (tmp_path / i.id.replace("/", "__")).write_bytes(b"x")
+    p = op.prepare(spec, _paths(spec, tmp_path), tmp_path, False)
+    assert p.tap_md5 == {} and p.receipt_out is None
+    graph, cmd = op.assemble(p)
+    assert "framemd5" not in cmd and not _has_seq(cmd, ["-fps_mode", "passthrough"])
+    assert "vtap" not in graph
+    monkeypatch.setattr(op, "_run", lambda *_a, **_kw: None)
+    assert op.run_encode(p) is None
+    assert list(tmp_path.glob("*.framemd5")) == []
+
+
+def test_prepare_names_one_framemd5_per_planned_tap(monkeypatch, tmp_path) -> None:
+    spec = _tap_spec(clips=2)
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
+    for i in spec.inputs:
+        (tmp_path / i.id.replace("/", "__")).write_bytes(b"x")
+    p = op.prepare(spec, _paths(spec, tmp_path), tmp_path, False)
+    assert sorted(p.tap_md5) == ["vtap0", "vtap1", "vtaplogo"]
+    assert p.receipt_out == tmp_path / "render.receipt.json"
+    # prepare NAMES them; only the encode may create them (otherwise an empty file reads as 0 delivered)
+    assert all(not path.exists() for path in p.tap_md5.values())
+
+
+def test_assemble_refuses_taps_that_do_not_match_the_plan(tmp_path: Path) -> None:
+    p = _tap_prepared(_tap_spec(clips=1, logo=False), tmp_path)
+    drifted = dataclasses.replace(p, tap_md5={"vtap9": tmp_path / "x.framemd5"})
+    with pytest.raises(RuntimeError, match="do not match"):
+        op.assemble(drifted)
+
+
+def test_the_receipt_output_must_precede_the_master() -> None:
+    late = _tap_spec(outputs=[_MASTER_OUT, _RECEIPT_OUT])
+    assert op.refusals(late) == ["outputs[kind=receipt] declared after outputs[kind=master]"]
+    assert op.refusals(_tap_spec()) == []
+    with pytest.raises(NotImplementedError, match="receipt"):
+        op.preflight(late)
+
+
+def test_a_preview_spec_may_not_declare_a_receipt() -> None:
+    preview = RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
+        "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "u"}],
+        "timeline": {"fps": 30, "width": 320, "height": 240,
+                     "segments": [{"src": "base", "in": 0.0, "out": 2.0, "speed": 1.0}]},
+        "encode": _PHOTO_ENCODE, "outputs": [_RECEIPT_OUT, _MASTER_OUT]})
+    assert op.refusals(preview) == ["outputs[kind=receipt] on mode=preview"]
+    with pytest.raises(NotImplementedError, match="receipt"):
+        op.preflight(preview)
+
+
+def test_the_producer_names_the_baked_image_tag(monkeypatch) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", "a" * 40)
+    assert op.producer() == {"image": "a" * 40, "podagent_version": op.__version__,
+                             "spec_version": 6}
+
+
+@pytest.mark.parametrize("tag", ["dev", "unknown", "latest", "none"])
+def test_a_build_that_cannot_name_itself_refuses_to_sign_a_receipt(monkeypatch, tag) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", tag)
+    with pytest.raises(RuntimeError, match="placeholder"):
+        op.producer()
+
+
+def test_an_unset_image_tag_stamps_the_running_checkout(monkeypatch) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("the in-process contour stamps its own git revision")
+    monkeypatch.delenv("POD_IMAGE_TAG", raising=False)
+    image = op.producer()["image"]
+    assert image.startswith(f"worktree:{op.__version__}+")
+    assert re.fullmatch(r"[0-9a-f]{40}", image.split("+", 1)[1])
+
+
+def test_a_placeholder_image_fails_the_render_instead_of_writing_a_receipt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", "dev")
+    p = _tap_prepared(_tap_spec(clips=1, logo=False), tmp_path)
+    monkeypatch.setattr(op, "_run", _fake_encode([]))
+    with pytest.raises(RuntimeError, match="placeholder"):
+        op.run_encode(p)
+    assert not p.receipt_out.exists()
+
+
+def test_read_framemd5_counts_what_the_encode_wrote(tmp_path: Path) -> None:
+    path = tmp_path / "t.framemd5"
+    _framemd5(path, 90)
+    row = op.read_framemd5("vtap0", path, 90)
+    assert row == {"pad": "vtap0", "frames_expected": 90, "frames_delivered": 90,
+                   "pts_first_s": 0.0, "pts_last_s": round(89 / 30, 4), "distinct_hashes": 90,
+                   "first_last_differ": True}
+
+
+def test_read_framemd5_reads_the_starved_still_as_one_of_its_window(tmp_path: Path) -> None:
+    """THE INCIDENT, in numbers: a still with no loop flags delivers one frame into a 90-frame window."""
+    path = tmp_path / "t.framemd5"
+    _framemd5(path, 1, first_pts=360)
+    row = op.read_framemd5("vtap0", path, 90)
+    assert (row["frames_delivered"], row["frames_expected"]) == (1, 90)
+    assert row["pts_first_s"] == row["pts_last_s"] == 12.0
+    assert row["distinct_hashes"] == 1 and row["first_last_differ"] is False
+
+
+def test_read_framemd5_reads_a_chain_that_never_ran_as_zero(tmp_path: Path) -> None:
+    path = tmp_path / "t.framemd5"
+    _framemd5(path, 0)
+    row = op.read_framemd5("vtap1", path, 45)
+    assert row["frames_delivered"] == 0 and row["distinct_hashes"] == 0
+    assert row["pts_first_s"] is None and row["pts_last_s"] is None
+    assert row["first_last_differ"] is False
+
+
+def test_read_framemd5_refuses_a_shape_it_did_not_expect(tmp_path: Path) -> None:
+    path = tmp_path / "t.framemd5"
+    _framemd5(path, 2)
+    path.write_text(path.read_text() + "0, 3, 3, 1\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="columns"):
+        op.read_framemd5("vtap0", path, 2)
+
+    no_tb = tmp_path / "u.framemd5"
+    _framemd5(no_tb, 1)
+    no_tb.write_text("\n".join(ln for ln in no_tb.read_text().splitlines()
+                              if not ln.startswith("#tb")), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="#tb"):
+        op.read_framemd5("vtap0", no_tb, 1)
+
+    with pytest.raises(RuntimeError, match="wrote no framemd5"):
+        op.read_framemd5("vtap0", tmp_path / "absent.framemd5", 1)
+
+
+def test_run_encode_writes_one_receipt_of_the_encode_that_ran(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", "b" * 40)
+    spec = _tap_spec(clips=2)
+    p = _tap_prepared(spec, tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(op, "_run", _fake_encode(calls))
+    receipt = op.run_encode(p)
+    graph, cmd = op.assemble(p)
+
+    assert len(calls) == 1 and calls[0] == cmd
+    assert receipt["argv"] == cmd
+    assert receipt["filtergraph"] == graph == p.filter_script.read_text()
+    assert json.loads(p.receipt_out.read_text()) == receipt
+    assert receipt["producer"] == {"image": "b" * 40, "podagent_version": op.__version__,
+                                   "spec_version": 6}
+    assert (receipt["schema"], receipt["job_id"], receipt["mode"]) == (op.RECEIPT_SCHEMA, "j-tap", "final")
+    assert receipt["overlays"]["broll"][0] == {
+        "clip": "broll/0.jpg", "input_index": 3, "start": 12.0, "end": 15.0,
+        "enable": "between(t,12.000,15.000)", "chain_label": "b0__cmp", "tap_pad": "vtap0"}
+    assert [r["clip"] for r in receipt["overlays"]["broll"]] == ["broll/0.jpg", "broll/1.jpg"]
+    assert receipt["logo"] == {"input_id": "brand/logo.png",
+                               "enable": f"lt(t,{p.duration:.3f})", "tap": "vtaplogo"}
+    assert [t["pad"] for t in receipt["taps"]] == ["vtap0", "vtap1", "vtaplogo"]
+    assert [(t["frames_delivered"], t["frames_expected"]) for t in receipt["taps"]] == [
+        (90, 90), (90, 90), (1, 1)]
+    assert [r["id"] for r in receipt["inputs"]] == [i.id for i in spec.inputs]
+    assert receipt["wall"] >= 0.0
+
+
+def test_the_receipt_reads_a_starved_overlay_without_rendering_a_verdict(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", "b" * 40)
+    p = _tap_prepared(_tap_spec(clips=1), tmp_path)
+    monkeypatch.setattr(op, "_run", _fake_encode([], delivered={"vtap0": 1, "vtaplogo": 0}))
+    receipt = op.run_encode(p)
+    assert [(t["pad"], t["frames_delivered"], t["frames_expected"]) for t in receipt["taps"]] == [
+        ("vtap0", 1, 90), ("vtaplogo", 0, 1)]
+    assert "verdict" not in receipt and "ok" not in receipt and "defect" not in receipt
+
+
+def test_a_spec_with_no_overlay_at_all_still_writes_a_receipt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", "b" * 40)
+    spec = _tap_spec(clips=0, logo=False)
+    p = _tap_prepared(spec, tmp_path)
+    monkeypatch.setattr(op, "_run", _fake_encode([]))
+    receipt = op.run_encode(p)
+    assert receipt["taps"] == [] and receipt["overlays"]["broll"] == [] and receipt["logo"] is None
+    assert receipt["argv"] and receipt["producer"]["image"] == "b" * 40
+
+
+def test_the_receipt_never_carries_an_output_put_url(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", "b" * 40)
+    spec = _tap_spec(clips=1)
+    p = _tap_prepared(spec, tmp_path)
+    monkeypatch.setattr(op, "_run", _fake_encode([]))
+    op.run_encode(p)
+    text = p.receipt_out.read_text()
+    for o in spec.outputs:
+        assert o.put_url not in text and "sig=PUT" not in text
+    with pytest.raises(RuntimeError, match="put_url"):
+        op._refuse_secret_leak({"argv": ["ffmpeg", spec.outputs[0].put_url]}, spec)
+
+
+def test_a_planned_cutaway_missing_from_the_graph_refuses_the_receipt() -> None:
+    spec = _tap_spec(clips=1, logo=False)
+    with pytest.raises(RuntimeError, match=r"no chain \[b0\]"):
+        op._broll_rows(spec, "[0:v]null[vout]")
+
+
+def test_the_door_puts_the_receipt_before_the_master(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("POD_IMAGE_TAG", "b" * 40)
+    spec = _tap_spec(clips=1, logo=False)
+    puts: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(op, "upload", lambda path, url, mime: puts.append((Path(path).name, url, mime)))
+    monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
+    for i in spec.inputs:
+        (tmp_path / i.id.replace("/", "__")).write_bytes(b"x")
+    monkeypatch.setattr(op, "_run", _fake_encode([]))
+    d = op.render_body(spec, _paths(spec, tmp_path), tmp_path, False)
+    assert d.outputs == ["receipt", "master"]
+    assert puts[0] == ("render.receipt.json", _RECEIPT_OUT["put_url"], "application/json")
+    assert puts[1][1:] == (_MASTER_OUT["put_url"], "video/mp4")
+
+
+@pytest.mark.integration
+def test_real_tap_counts_the_frames_the_cutaway_actually_delivered(monkeypatch, tmp_path: Path) -> None:
+    """The law, proved by ffmpeg's own accounting: the tap of a looped still cutaway delivers exactly
+    the frames its window planned for, counted from the framemd5 the encode itself wrote."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+    monkeypatch.setenv("POD_IMAGE_TAG", "c" * 40)
+    base, photo, spec = _real_cutaway_fixture(tmp_path)
+    p = op.prepare(spec, {"base": base, "broll/photo": photo}, tmp_path, gpu=False)
+    receipt = op.run_encode(p)
+
+    tap = receipt["taps"][0]
+    assert tap["pad"] == "vtap0" and tap["frames_expected"] == 60          # round(2.4 * 25)
+    assert tap["frames_delivered"] == tap["frames_expected"]
+    assert tap["pts_first_s"] == pytest.approx(3.0, abs=0.05)
+    assert tap["pts_last_s"] == pytest.approx(3.0 + 59 / 25, abs=0.05)
+    assert receipt["overlays"]["broll"][0]["tap_pad"] == "vtap0"
+    assert p.master_out.is_file()
+
+
+@pytest.mark.integration
+def test_real_tap_reads_the_unlooped_still_as_one_frame(monkeypatch, tmp_path: Path) -> None:
+    """The incident, read by the receipt: with the loop flags gone the still delivers ONE frame into a
+    60-frame window and the master still encodes — exactly the silent no-op this accounting ends."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+    monkeypatch.setenv("POD_IMAGE_TAG", "c" * 40)
+    base, photo, spec = _real_cutaway_fixture(tmp_path)
+    monkeypatch.setattr(op, "_broll_loop_bounds", lambda *_a, **_kw: {})
+    p = op.prepare(spec, {"base": base, "broll/photo": photo}, tmp_path, gpu=False)
+    assert p.loop_bounds == {}
+    receipt = op.run_encode(p)
+    tap = receipt["taps"][0]
+    assert (tap["frames_delivered"], tap["frames_expected"]) == (1, 60)
+    assert tap["distinct_hashes"] == 1 and tap["first_last_differ"] is False
+
+
+def _real_cutaway_fixture(tmp_path: Path) -> tuple[Path, Path, RenderSpec]:
+    base = tmp_path / "base.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=8",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=8",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(base),
+    ], check=True)
+    photo = tmp_path / "photo.jpg"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc=size=320x240:rate=1", "-frames:v", "1", str(photo)],
+                   check=True)
+    spec = RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "tap-cutaway", "slug": "tap-cutaway", "mode": "final",
+        "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "unused"},
+                   {"id": "broll/photo", "kind": "image", "sha256": SHA, "url": "unused"}],
+        "timeline": {"fps": 25, "width": 320, "height": 240,
+                     "segments": [{"src": "base", "in": 0.0, "out": 8.0, "speed": 1.0}]},
+        "overlays": {"broll_final": {"broll": [
+            {"clip": "broll/photo", "start": 3.0, "preset": "in", "dur": 2.4, "in": 0.0}]}},
+        "encode": {"video": "libx264", "preset": "medium", "cq": 23, "pix_fmt": "yuv420p",
+                   "audio": "aac", "audio_bitrate": "192k"},
+        "outputs": [{"id": "receipt", "kind": "receipt", "put_url": "unused-receipt"},
+                    {"id": "master", "kind": "master", "put_url": "unused-master"}]})
+    return base, photo, spec

@@ -244,10 +244,19 @@ def _kenburns(preset: str, amount: float, pan_zoom: float, n: int, w: int, h: in
             f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps={_num(fps)}")
 
 
-def _broll_chains(spec: RenderSpec, idx: dict[str, int], base_label: str) -> list[str]:
+def broll_tap_pads(spec: RenderSpec) -> list[str]:
+    """The framemd5 tap pad of every PLANNED cutaway, by position — one name shared by graph, argv and
+    receipt, so a tap nobody allocated dies in `rewire` instead of being counted as another chain's."""
+    if not _has_broll(spec):
+        return []
+    return [f"vtap{i}" for i in range(len(spec.overlays.broll_final.broll))]
+
+
+def _broll_chains(spec: RenderSpec, idx: dict[str, int], base_label: str,
+                  taps: bool = False) -> list[str]:
     """Overlay every resolved cutaway onto [base_label] → [vout]: Ken Burns move (scale-2x→zoompan per the
     clip's preset/amount), trim [in,in+dur], seat at `start`, ride authored slide/push (overlay x/y) or
-    dissolve (alpha fade). Audio untouched."""
+    dissolve (alpha fade). Audio untouched. `taps` forks each cutaway to its own framemd5 pad."""
     assert spec.overlays is not None and spec.overlays.broll_final is not None
     clips = spec.overlays.broll_final.broll
     w, h = spec.timeline.width, spec.timeline.height
@@ -263,10 +272,15 @@ def _broll_chains(spec: RenderSpec, idx: dict[str, int], base_label: str) -> lis
         j = idx[c.clip]
         kb = _kenburns(c.preset, c.amount if c.amount is not None else 0.12, 0.08,
                        max(1, round(c.dur * fps)), w, h, fps)
+        # The fork sits at the END of the chain: a tap taken any earlier would count frames the overlay
+        # never saw, which is the whole question the receipt exists to answer.
+        tail = f",split=2[b{i}][b{i}t]" if taps else f"[b{i}]"
         chains.append(
             f"[{j}:v]trim=start={_num(c.in_ or 0.0)}:duration={_num(c.dur)},setpts=PTS-STARTPTS,"
-            f"fps={_num(fps)},{kb},setpts=PTS-STARTPTS+{start:.3f}/TB{frag}[b{i}]"
+            f"fps={_num(fps)},{kb},setpts=PTS-STARTPTS+{start:.3f}/TB{frag}{tail}"
         )
+        if taps:
+            chains.append(f"[b{i}t]{_finalize.TAP_SCALE}[vtap{i}]")
         xy = _broll_slide_xy(c, start, end)
         over = f"overlay=x='{xy[0]}':y='{xy[1]}':" if xy else "overlay="
         out_label = "vout" if i == last else f"o{i}"
@@ -395,7 +409,7 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
 
 
 def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = None,
-                      terminal_bt709: bool = True) -> str:
+                      terminal_bt709: bool = True, taps: bool = False) -> str:
     """Pure: the -filter_complex string trimming, speed-adjusting, motion-treating and concatenating
     every timeline segment into [vout]/[aout], compositing final b-roll, and mixing music when `audio`."""
     idx = {iid: n for n, iid in enumerate(input_ids(spec))}
@@ -436,7 +450,7 @@ def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = Non
     else:
         chains.append(f"{''.join(pads)}concat=n={n}:v=1:a=0[{base_v}]")
     if _has_broll(spec):
-        chains += _broll_chains(spec, idx, base_v)
+        chains += _broll_chains(spec, idx, base_v, taps)
     if audio is not None:
         chains += _audio_mix_chains(audio)
     # Frame-level metadata wins over the encoder context, especially on the Vulkan/NVENC path.
@@ -739,7 +753,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             # preflight already ran above; the one-pass graph is the ONLY final encode core.
             from . import render_onepass as _onepass
             prepared = _onepass.prepare(spec, input_paths, tmp, gpu, phase=phase)
-            _onepass.run_encode(prepared, phase=phase)
+            receipt = _onepass.run_encode(prepared, phase=phase)
+            receipt_out = prepared.receipt_out if receipt is not None else None
             master = prepared.master_out
             # The pre-accent reference; its PUT below still gates on `fin` — guard_sync reads an
             # absent presync object as "the tail never ran" (contract), regardless of which core built it.
@@ -751,6 +766,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             # preview carries no overlays (models.py:423-424) — a single composite pass with no
             # audio pre-pass, no mograph/captions/cover, camera `motion` only.
             out = tmp / "render.mp4"
+            receipt_out = None
             cmd = build_command(spec, input_paths, out, gpu, (), None)
             with phase("ffmpeg"):
                 try:
@@ -795,6 +811,16 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                     raise RuntimeError(
                         f"output {o.id!r} kind=cover has no producer "
                         "(the-cover-weld-arm-is-deleted-with-the-multipass-path)")
+                if o.kind == "receipt":
+                    # Ordered before the master by preflight, so the deliverable never lands ahead of
+                    # the account of what produced it.
+                    if receipt_out is None:
+                        raise RuntimeError(
+                            f"output {o.id!r} kind=receipt has no producer (only a mode=final one-pass "
+                            "encode writes one)")
+                    upload(receipt_out, o.put_url, "application/json")
+                    done.append(o.id)
+                    continue
                 if o.kind == "presync":
                     if fin is not None:
                         upload(presync, o.put_url, "video/mp4")

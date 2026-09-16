@@ -772,6 +772,7 @@
       }
     },
     "output": {
+      "description": "One declared destination. `receipt` is the render's own accounting of what it actually encoded (argv, filtergraph, one framemd5 tap per planned overlay, the image that wrote it) and is OPTIONAL — a spec that declares none renders exactly as before; when declared on a mode=final spec it must precede the `master` entry, so the deliverable can never land ahead of its proof.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -790,7 +791,8 @@
             "master",
             "cache",
             "cover",
-            "presync"
+            "presync",
+            "receipt"
           ]
         },
         "put_url": {

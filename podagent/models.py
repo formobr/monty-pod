@@ -399,7 +399,9 @@ class SpecOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
-    kind: Literal["proxy", "master", "cache", "cover", "presync"]   # cover = the standalone cover.png deliverable
+    # cover = the standalone cover.png deliverable; `receipt` must stay OPTIONAL — an engine declaring
+    # none renders exactly as before, which is the only thing that lets a new image serve an old engine.
+    kind: Literal["proxy", "master", "cache", "cover", "presync", "receipt"]
     put_url: str = Field(min_length=1)
 
 

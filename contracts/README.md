@@ -73,9 +73,18 @@ Transport conventions:
 ## outputs
 
 `outputs[].kind` says what a PUT is for: `master` (the deliverable), `cover` (the standalone cover.png),
-`proxy`, `cache`, and `presync` — the composite as it stood BEFORE the delivery tail. `presync` exists so
-the origin can measure the finished master against a video-identical reference and attribute any A/V drift
-to the tail; it is uploaded only when a `finalize` block actually ran.
+`proxy`, `cache`, `presync` — the composite as it stood BEFORE the delivery tail — and `receipt`.
+`presync` exists so the origin can measure the finished master against a video-identical reference and
+attribute any A/V drift to the tail; it is uploaded only when a `finalize` block actually ran.
+
+`receipt` (mode=final only, **optional**, and when declared it must precede the `master` entry so the
+deliverable never lands ahead of its account) is a JSON object the render writes about ITSELF: the `argv`
+and `filtergraph` that ran, serialized after the encode returned; the `producer` block naming the image
+that wrote it (a placeholder there fails the render); one `overlays.broll[]` row per planned cutaway and a
+`logo` block; `taps[]` carrying `{pad, frames_expected, frames_delivered, pts_first_s, pts_last_s,
+distinct_hashes, first_last_differ}` counted from framemd5 outputs of that same single ffmpeg run — a
+planned overlay that delivered nothing reads 0, a starved still reads 1 of N; header-only `inputs[]` probe
+rows; and `wall`, the encode seconds. The pod COUNTS — the verdict is the origin's.
 
 ## align payload (binary, not JSON-schema'd)
 

@@ -35,6 +35,10 @@ _POS = {
 WM_CANVAS_W = 1200
 WM_CANVAS_H = 600
 
+# The framemd5 tap every overlay is counted through. 96x96 gray with a nearest-neighbour scale so the hash
+# is cheap AND stable: a filtered downscale would make two identical source frames hash apart.
+TAP_SCALE = "scale=96:96:flags=neighbor,format=gray"
+
 
 def _run(cmd: list[str], what: str, *, timeout_s: int | None = None,
          check: bool = True, text: bool = False) -> subprocess.CompletedProcess:
@@ -163,14 +167,18 @@ def _terminal_bt709(fc: str, out_v: str) -> str:
 # --- 1. persistent body logo --------------------------------------------------
 
 def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_end: float, *,
-                     base_v: str = "0:v", logo_v: str = "1:v", out_v: str = "vout") -> str:
-    """Persistent corner logo over the BODY only (t < body_end); the cover end-card carries its own."""
+                     base_v: str = "0:v", logo_v: str = "1:v", out_v: str = "vout",
+                     tap_v: str | None = None) -> str:
+    """Persistent corner logo over the BODY only (t < body_end); the cover end-card carries its own.
+    `tap_v` forks the prepared logo frame to a framemd5 pad — the overlay's own input, so a logo that
+    delivered nothing reads 0 there instead of hiding behind a master that looks fine."""
     # The three labels are parameters for the same reason watermark_filter's are: in a merged graph
     # input 1 is another timeline SOURCE, so a hardcoded [1:v] alpha-blends a video clip as the "logo".
     x = f"W-w-{margin}" if corner in ("tr", "br") else f"{margin}"
     y = f"H-h-{margin}" if corner in ("bl", "br") else f"{margin}"
-    return (f"[{logo_v}]format=rgba,colorchannelmixer=aa={opacity},scale={width}:-1:flags=lanczos[lg];"
-            f"[{base_v}][lg]overlay={x}:{y}:enable='lt(t,{body_end:.3f})'[{out_v}]")
+    prep = f"[{logo_v}]format=rgba,colorchannelmixer=aa={opacity},scale={width}:-1:flags=lanczos"
+    head = f"{prep}[lg];" if tap_v is None else f"{prep},split=2[lg][lgt];[lgt]{TAP_SCALE}[{tap_v}];"
+    return head + f"[{base_v}][lg]overlay={x}:{y}:enable='lt(t,{body_end:.3f})'[{out_v}]"
 
 
 # --- 2. animated watermark ----------------------------------------------------
