@@ -155,6 +155,51 @@ def _check_assets(spec: RenderSpec, input_paths: dict) -> None:
                 raise RuntimeError(f"finalize.watermark asset {ref!r} is not a resolved inputs[] id")
 
 
+# Demuxer names ffprobe reports for a single-frame image — the declared kind can lie, this cannot.
+_STILL_IMAGE_FORMATS = {"image2", "jpeg_pipe", "png_pipe", "webp_pipe", "bmp_pipe", "gif_pipe", "tiff_pipe"}
+# Slack past the downstream trim's own [in_, in_+dur) read, not a real duration.
+_LOOP_MARGIN_S = 0.5
+
+
+def _is_still_image(path: Path) -> bool:
+    """A bare `-i` on a single-frame source silently drops its cutaway (root cause) — this catches a mis-declared photo."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "format=format_name:stream=nb_frames",
+             "-of", "default=nw=1", str(path)],
+            capture_output=True, text=True, timeout=_finalize._PROBE_TIMEOUT_S).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    fmt = nb = ""
+    for line in out.splitlines():
+        key, _, val = line.partition("=")
+        if key == "format_name":
+            fmt = val
+        elif key == "nb_frames":
+            nb = val
+    if any(name in fmt.split(",") for name in _STILL_IMAGE_FORMATS):
+        return True
+    return nb.isdigit() and int(nb) == 1
+
+
+def _broll_loop_bounds(spec: RenderSpec, input_paths: dict) -> dict[str, float]:
+    """input id -> ffmpeg `-t` for every broll cutaway needing `-loop 1`, by declared or probed kind."""
+    ov = spec.overlays if spec.mode == "final" else None
+    if ov is None or ov.broll_final is None:
+        return {}
+    kinds = {inp.id: inp.kind for inp in spec.inputs}
+    bounds: dict[str, float] = {}
+    for c in ov.broll_final.broll:
+        if c.dur is None:
+            continue
+        if kinds.get(c.clip) != "image" and not _is_still_image(input_paths[c.clip]):
+            continue
+        need = (c.in_ or 0.0) + c.dur + _LOOP_MARGIN_S
+        bounds[c.clip] = max(bounds.get(c.clip, 0.0), need)
+    return bounds
+
+
 def _check_inputs(spec: RenderSpec, input_paths: dict) -> None:
     """Refuse a resolved timeline/cutaway/burn input with no video stream before ffmpeg's graph init
     buries the same fact in a truncated "Stream specifier … matches no streams" (ticket b34ab41f); a
@@ -228,6 +273,7 @@ class Prepared:
     ass: Path | None = None
     font_dir: Path | None = None
     flares: tuple[float, ...] = ()
+    loop_bounds: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -383,7 +429,7 @@ def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
         presync_out=presync_out or tmp / "render.presync.mp4",
         filter_script=tmp / "body_onepass.filter",
         bed=bed, audio=audio, layers=got.get("mograph", ()), ass=ass, font_dir=font_dir,
-        flares=got.get("flares", ()))
+        flares=got.get("flares", ()), loop_bounds=_broll_loop_bounds(spec, input_paths))
 
 
 # --- 3. assemble --------------------------------------------------------------
@@ -400,7 +446,10 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
     inputs = Inputs()
     spec_pads: dict[str, str] = {}
     for iid in _render.input_ids(spec):
-        n = inputs.add(p.input_paths[iid])
+        bound = p.loop_bounds.get(iid)
+        # A still image otherwise yields one frame at PTS 0 and EOFs before its overlay window opens.
+        flags = ("-loop", "1", "-framerate", _render._num(fps), "-t", _render._num(bound)) if bound else ()
+        n = inputs.add(p.input_paths[iid], *flags)
         spec_pads[f"{n}:v"] = f"{n}:v"
         spec_pads[f"{n}:a"] = f"{n}:a"
     if p.bed is not None:
@@ -601,6 +650,9 @@ def run_encode(p: Prepared, phase=_no_phase) -> None:
     behind the router, so render_spec and render_body cannot diverge on it."""
     graph, cmd = assemble(p)
     p.filter_script.write_text(graph, encoding="utf-8")
+    # Owner rule (all logs visible): the exact argv/filtergraph this encode runs, once, before it runs.
+    print(f"[onepass] argv: {cmd}", file=sys.stderr, flush=True)
+    print(f"[onepass] filter_complex: {graph}", file=sys.stderr, flush=True)
     with phase("ffmpeg"):
         _run(cmd, encode_budget_s(p.duration))
 

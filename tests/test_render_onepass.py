@@ -675,6 +675,87 @@ def test_input_side_decoder_and_loop_flags() -> None:
     assert all("libvpx-vp9" not in fl and "-stream_loop" not in fl for fl in others)
 
 
+# --- photo cutaway loop (MISC-34: a bare `-i` on a still silently drops the whole cutaway) --------
+
+_PHOTO_BASE = {"id": "base", "kind": "video", "sha256": SHA, "url": "u"}
+_PHOTO_STILL = {"id": "broll/photo.jpg", "kind": "image", "sha256": SHA, "url": "u"}
+_PHOTO_VIDEO_CLIP = {"id": "broll/clip.mp4", "kind": "video", "sha256": SHA, "url": "u"}
+_PHOTO_ENCODE = {"video": "libx264", "preset": "medium", "cq": 23, "pix_fmt": "yuv420p",
+                 "audio": "aac", "audio_bitrate": "192k"}
+_PHOTO_TIMELINE = {"fps": 30, "width": 320, "height": 240,
+                   "segments": [{"src": "base", "in": 0.0, "out": 20.0, "speed": 1.0}]}
+
+
+def _photo_spec(still_kind: str = "image") -> RenderSpec:
+    return RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
+        "inputs": [_PHOTO_BASE, {**_PHOTO_STILL, "kind": still_kind}, _PHOTO_VIDEO_CLIP],
+        "timeline": _PHOTO_TIMELINE, "encode": _PHOTO_ENCODE,
+        "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
+        "overlays": {"broll_final": {"broll": [
+            {"clip": "broll/photo.jpg", "start": 3.0, "preset": "in", "dur": 2.4, "in": 0.0},
+            {"clip": "broll/clip.mp4", "start": 8.0, "preset": "in", "dur": 1.5, "in": 0.0},
+        ]}},
+    })
+
+
+_PHOTO_PATHS = {"base": Path("/w/base"), "broll/photo.jpg": Path("/w/photo.jpg"),
+                "broll/clip.mp4": Path("/w/clip.mp4")}
+
+
+def _photo_prepared(spec: RenderSpec, loop_bounds: dict) -> op.Prepared:
+    return op.Prepared(spec=spec, gpu=False, input_paths=_PHOTO_PATHS,
+                       duration=render.body_duration(spec), master_out=Path("/w/master.mp4"),
+                       presync_out=Path("/w/master.presync.mp4"), filter_script=Path("/w/body.filter"),
+                       loop_bounds=loop_bounds)
+
+
+def test_declared_photo_kind_gets_loop_and_video_kind_does_not(monkeypatch) -> None:
+    spec = _photo_spec()
+    monkeypatch.setattr(op, "_is_still_image", lambda _p: False)  # declared kind alone must decide
+    bounds = op._broll_loop_bounds(spec, _PHOTO_PATHS)
+    assert bounds == {"broll/photo.jpg": pytest.approx(2.9)}  # in(0)+dur(2.4)+margin(0.5)
+    _graph, cmd = op.assemble(_photo_prepared(spec, bounds))
+    ins, _outs = _argv(cmd)
+    flags = {path: fl for fl, path in ins}
+    assert flags["/w/photo.jpg"] == ("-loop", "1", "-framerate", "30", "-t", "2.9")
+    assert flags["/w/clip.mp4"] == ()
+
+
+def test_misdeclared_photo_loops_via_probed_frame_count(monkeypatch) -> None:
+    """A `kind: video` input that is really a 1-frame still must still loop (defensive probe)."""
+    spec = _photo_spec(still_kind="video")
+    monkeypatch.setattr(op, "_is_still_image", lambda p: p.name == "photo.jpg")
+    bounds = op._broll_loop_bounds(spec, _PHOTO_PATHS)
+    assert "broll/photo.jpg" in bounds and "broll/clip.mp4" not in bounds
+
+
+def test_correctly_declared_video_is_never_probed(monkeypatch) -> None:
+    """The cheap declared-kind check must short-circuit the ffprobe call, not just its outcome."""
+    spec = _photo_spec()
+    calls: list[Path] = []
+    monkeypatch.setattr(op, "_is_still_image", lambda p: calls.append(p) or False)
+    op._broll_loop_bounds(spec, _PHOTO_PATHS)
+    assert calls == [Path("/w/clip.mp4")]
+
+
+def test_run_encode_logs_argv_and_filtergraph_once(monkeypatch, capsys, tmp_path: Path) -> None:
+    spec = _photo_spec()
+    bounds = op._broll_loop_bounds(spec, _PHOTO_PATHS)
+    p = op.Prepared(spec=spec, gpu=False, input_paths=_PHOTO_PATHS,
+                    duration=render.body_duration(spec), master_out=tmp_path / "master.mp4",
+                    presync_out=tmp_path / "master.presync.mp4",
+                    filter_script=tmp_path / "body.filter", loop_bounds=bounds)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(op, "_run", lambda cmd, _budget: calls.append(cmd))
+    op.run_encode(p)
+    assert len(calls) == 1
+    err = capsys.readouterr().err
+    assert err.count("[onepass] argv:") == 1
+    assert err.count("[onepass] filter_complex:") == 1
+    assert "-loop" in err and "/w/photo.jpg" in err
+
+
 def test_every_external_pad_names_an_allocated_input() -> None:
     """A builder's hardcoded [1:v] must never survive: in the merged argv input 1 is another timeline
     SOURCE, and blending a video clip in as the "logo" raises nothing anywhere."""
@@ -1383,3 +1464,48 @@ def test_real_onepass_master_survives_loudnorm_bt709_tagged(tmp_path: Path) -> N
     assert stream["color_space"] == "bt709"
     assert stream["color_primaries"] == "bt709"
     assert stream["color_transfer"] == "bt709"
+
+
+@pytest.mark.integration
+def test_real_photo_cutaway_survives_its_whole_window(tmp_path: Path) -> None:
+    """MISC-34 repro through the actual argv builder: a 1-frame still cutaway over [3.0, 5.4) on a
+    12s base must still be visible at t=3.4 — before this fix overlay's eof_action=pass silently let
+    the base frame through the whole window instead (root cause: a bare `-i` on the still)."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+
+    base = tmp_path / "base.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=12",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=12",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(base),
+    ], check=True)
+    photo = tmp_path / "photo.jpg"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=red:s=320x240", "-frames:v", "1", str(photo)],
+                   check=True)
+
+    spec = RenderSpec.model_validate({
+        "spec_version": 6, "job_id": "photo-cutaway", "slug": "photo-cutaway", "mode": "final",
+        "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "unused"},
+                   {"id": "broll/photo", "kind": "image", "sha256": SHA, "url": "unused"}],
+        "timeline": {"fps": 25, "width": 320, "height": 240,
+                     "segments": [{"src": "base", "in": 0.0, "out": 12.0, "speed": 1.0}]},
+        "overlays": {"broll_final": {"broll": [
+            {"clip": "broll/photo", "start": 3.0, "preset": "in", "dur": 2.4, "in": 0.0},
+        ]}},
+        "encode": {"video": "libx264", "preset": "medium", "cq": 23, "pix_fmt": "yuv420p",
+                    "audio": "aac", "audio_bitrate": "192k"},
+        "outputs": [{"id": "master", "kind": "master", "put_url": "unused"}],
+    })
+    p = op.prepare(spec, {"base": base, "broll/photo": photo}, tmp_path, gpu=False)
+    assert p.loop_bounds == {"broll/photo": pytest.approx(2.9)}
+    op.run_encode(p)
+
+    frame = subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "3.4", "-i", str(p.master_out),
+         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        check=True, capture_output=True).stdout
+    r, g, b = frame[0], frame[1], frame[2]
+    assert r > 180 and g < 80 and b < 80, f"expected the red cutaway at t=3.4, got rgb=({r},{g},{b})"
