@@ -24,6 +24,7 @@ from . import mograph as _mograph
 from . import render as _render
 from .cp import upload
 from .models import SPEC_VERSION, RenderSpec
+from .ops.dry import CONTOUR_DRY_CLAIMS as _CONTOUR_DRY_CLAIMS
 from .ops.dry import armed as _contour_dry_armed
 from .render import body_duration
 from .sanitize import safe_text
@@ -874,6 +875,8 @@ def build_receipt(p: Prepared, graph: str, cmd: list[str], wall_s: float) -> dic
         "taps": [read_framemd5(pad, p.tap_md5[pad], expected[pad]) for pad in pads],
         "wall": round(wall_s, 3),
     }
+    if _contour_dry_armed():
+        receipt["contour_dry"] = {"claims": dict(_CONTOUR_DRY_CLAIMS)}
     _refuse_secret_leak(receipt, spec)
     return receipt
 

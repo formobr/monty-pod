@@ -13,6 +13,14 @@ from . import registry
 
 ARM_ENV = "MONTY_OPS_CONTOUR_DRY"
 
+# Mirrored byte-for-byte at scripts/plan_match.py::CONTOUR_DRY_CLAIMS (pod-agent is a separate repo, so this
+# is the one place both sides must move together — MISC-62 lock 4 refuses a receipt whose tuple has moved).
+CONTOUR_DRY_CLAIMS: dict[str, str] = {
+    "taps": "plan-derived, not measured", "pixels": "not rendered", "vram": "not exercised",
+    "nvenc": "not exercised", "weights": "cache presence only", "graph": "really built",
+    "argv": "really built", "store": "real PUT/GET",
+}
+
 # A stand-in for real work never legitimately runs longer than the smallest thing that could stall it.
 _LAVFI_BUDGET_S = 30.0
 
