@@ -118,14 +118,51 @@ def _write_audio(dst: Path, *, op_name: str) -> None:
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
 
-def _write_video(dst: Path, *, op_name: str) -> None:
+def _has_audio_stream(path: Path) -> bool:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+         "-of", "csv=p=0", str(path)],
+        check=True, capture_output=True, text=True, timeout=_LAVFI_BUDGET_S)
+    return bool(proc.stdout.strip())
+
+
+# Only a VIDEO-kind bound input is a candidate — the one file whose real audio a placeholder must reflect.
+def _content_input(op: registry.Op, inputs: dict[str, Path]) -> Path | None:
+    for port in op.inputs:
+        if port.kind != "video":
+            continue
+        raw = inputs.get(port.id)
+        if raw is None:
+            continue
+        path = Path(raw)
+        if path.exists():
+            return path
+    return None
+
+
+def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    args = _VIDEO_EXT_ARGS.get(dst.suffix.lower())
-    if args is None:
+    if dst.suffix.lower() not in _VIDEO_EXT_ARGS:
         raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "video")
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-           "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
-           "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=1", "-t", "1", *args, str(dst)]
+    if audio_src is None:
+        # No video-kind input bound at all — nothing real to reflect, stays fully synthetic.
+        args = _VIDEO_EXT_ARGS[dst.suffix.lower()]
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
+               "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=1", "-t", "1", *args, str(dst)]
+    elif _has_audio_stream(audio_src):
+        # `-shortest` against an infinite colour source sizes the output to the real audio's own duration.
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-i", str(audio_src),
+               "-f", "lavfi", "-i", "color=c=black:s=64x64",
+               "-map", "1:v", "-map", "0:a",
+               "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+               "-c:a", "copy", "-shortest", str(dst)]
+    else:
+        # Real input, genuinely no audio track — the placeholder gets none, never a fabricated anullsrc.
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
+               "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
 
@@ -207,15 +244,18 @@ def _write_json(dst: Path, *, op_name: str, params: dict[str, Any], inputs: dict
 
 
 _WRITER: dict[str, Callable[..., None]] = {
-    "video": _write_video,
     "audio": _write_audio,
     "image": _write_image,
 }
 
 
-def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inputs: dict[str, Path]) -> None:
+def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inputs: dict[str, Path],
+              audio_src: Path | None = None) -> None:
     if kind == "json":
         _write_json(dst, op_name=op_name, params=params, inputs=inputs)
+        return
+    if kind == "video":
+        _write_video(dst, op_name=op_name, audio_src=audio_src)
         return
     fn = _WRITER.get(kind)
     if fn is None:
@@ -226,11 +266,13 @@ def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inp
 def _handler(op: registry.Op) -> Callable[..., None]:
     def run(*, params: dict[str, Any], inputs: dict[str, Path], outputs: dict[str, Any]) -> None:
         declared = {p.id: p for p in op.outputs}
+        audio_src = _content_input(op, inputs)
         for port_id, dst in outputs.items():
             port = declared[port_id]
             targets = dst if isinstance(dst, list) else [dst]
             for one in targets:
-                _fill_one(Path(one), port.kind, op_name=op.op, params=params, inputs=inputs)
+                _fill_one(Path(one), port.kind, op_name=op.op, params=params, inputs=inputs,
+                          audio_src=audio_src)
     return run
 
 

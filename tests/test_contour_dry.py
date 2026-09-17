@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tarfile
@@ -254,6 +255,95 @@ def test_stub_video_placeholder_honours_declared_extension(tmp_path, ext):
         check=True, capture_output=True, text=True).stdout)
     codecs = {s["codec_name"] for s in probed["streams"]}
     assert codecs == {"h264", "aac"}, f"{dst.name}: expected h264+aac streams, got {codecs}"
+
+
+def _probe_audio_stream(path: Path) -> dict:
+    probed = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+         "stream=codec_name,sample_rate,channels:format=duration", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True).stdout)
+    return probed
+
+
+def _mean_volume_db(path: Path) -> float:
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=30)
+    m = re.search(r"mean_volume:\s*(-?\d+\.?\d*)\s*dB", proc.stderr)
+    assert m, f"volumedetect produced no mean_volume:\n{proc.stderr}"
+    return float(m.group(1))
+
+
+def _integrated_lufs(path: Path) -> float:
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=30)
+    matches = re.findall(r"I:\s*(-?\d+\.?\d*)\s*LUFS", proc.stderr)
+    assert matches, f"ebur128 produced no integrated loudness:\n{proc.stderr}"
+    return float(matches[-1])
+
+
+def test_stub_video_placeholder_copies_real_audio_from_a_video_kind_input(tmp_path):
+    """MISC-62: emit_plan's LufsUnmeasured came from a stub proxy with fabricated silence — the placeholder
+    must instead carry the bound input's own audio bytes so measure.master reads something real."""
+    dst = tmp_path / "cut.mp4"
+    dry._write_video(dst, op_name="cut.apply", audio_src=FIXTURE)
+    src_probe = _probe_audio_stream(FIXTURE)["streams"][0]
+    dst_probe = _probe_audio_stream(dst)
+    assert len(dst_probe["streams"]) == 1, "no input audio must not be fabricated back in"
+    got = dst_probe["streams"][0]
+    assert got["codec_name"] == src_probe["codec_name"]
+    assert got["sample_rate"] == src_probe["sample_rate"]
+    assert got["channels"] == src_probe["channels"]
+    src_dur = float(json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(FIXTURE)],
+        check=True, capture_output=True, text=True).stdout)["format"]["duration"])
+    dst_dur = float(dst_probe["format"]["duration"])
+    assert abs(dst_dur - src_dur) < 0.1, "stream-copy must preserve the real input's own duration"
+    lufs = _integrated_lufs(dst)
+    assert lufs > -70.0, f"placeholder audio measured as silence ({lufs} LUFS) — it must be real bytes"
+
+
+def test_stub_video_placeholder_copies_a_silent_input_as_silent(tmp_path):
+    silent_src = tmp_path / "silent.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", "color=c=blue:s=64x64:r=1:d=1",
+         "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo:d=1",
+         "-shortest", "-c:v", "libx264", "-c:a", "aac", str(silent_src)],
+        check=True, capture_output=True, timeout=30)
+    dst = tmp_path / "cut.mp4"
+    dry._write_video(dst, op_name="cut.apply", audio_src=silent_src)
+    assert len(_probe_audio_stream(dst)["streams"]) == 1, "a bound silent input still carries an audio port"
+    assert _mean_volume_db(dst) < -50.0, "a silent-input placeholder must copy silence, not fabricate signal"
+
+
+def test_stub_video_placeholder_with_no_input_audio_yields_no_audio_track(tmp_path):
+    video_only_src = tmp_path / "video_only.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", "color=c=red:s=64x64:r=1:d=1",
+         "-c:v", "libx264", str(video_only_src)],
+        check=True, capture_output=True, timeout=30)
+    dst = tmp_path / "cut.mp4"
+    dry._write_video(dst, op_name="cut.apply", audio_src=video_only_src)
+    assert _probe_audio_stream(dst)["streams"] == [], "no input audio must never become a fabricated track"
+
+
+def test_cut_apply_stub_handler_wires_the_bound_src_into_dst_audio(tmp_path):
+    """End-to-end through dry.resolve()/_content_input, not just _write_video directly."""
+    outputs = _run_stub(tmp_path, "cut.apply", params=_JSON_STUB_PARAMS["cut.apply"],
+                         inputs={"src": FIXTURE})
+    assert len(_probe_audio_stream(outputs["dst"])["streams"]) == 1
+    assert _integrated_lufs(outputs["dst"]) > -70.0
+
+
+def test_stub_video_placeholder_with_no_bound_input_stays_fully_synthetic(tmp_path):
+    """No `audio_src` at all (media.fetch, mograph.render, ...) — the pre-MISC-62 fallback is untouched."""
+    dst = tmp_path / "cut.mp4"
+    dry._write_video(dst, op_name="cut.apply", audio_src=None)
+    codecs = {s["codec_name"] for s in _probe_audio_stream(dst)["streams"]}
+    assert codecs == {"aac"}
 
 
 def test_stub_audio_placeholder_refuses_unsupported_extension_by_name(tmp_path):
