@@ -1,18 +1,27 @@
-"""pod-agent/tests/test_contour_dry_matrix.py — MISC-62: the pod-side half of the dry stub x engine reader matrix; mirrors tests/test_dry_stub_reader_matrix.py with an independent params roster (lock 4)."""
+"""pod-agent/tests/test_contour_dry_matrix.py — MISC-62: the pod-side half of the dry stub x engine reader
+matrix; mirrors tests/test_dry_stub_reader_matrix.py with an independent params roster (lock 4). Pod-only:
+no engine-module import, no engine-source read — those value-semantics checks live in the engine's file."""
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
-import sys
 from pathlib import Path
+
+import pytest
 
 from podagent.ops import dry, pack, registry
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]
+# monty-pod ships no media fixture; tests that bind one skip via `_NEEDS_FIXTURE` rather than assume it.
 FIXTURE = REPO / "dev/localpod/fixtures/contour-smoke.mp4"
-sys.path.insert(0, str(REPO / "scripts"))
 
-_ALL_OPS = sorted(p.stem for p in (REPO / "pod-agent/contracts/ops").glob("*.json"))
+_HAS_FFMPEG = shutil.which("ffmpeg") is not None
+_HAS_FFPROBE = shutil.which("ffprobe") is not None
+_NEEDS_FFMPEG = pytest.mark.skipif(
+    not (_HAS_FFMPEG and _HAS_FFPROBE), reason="ffmpeg/ffprobe not on this runner")
+
+_ALL_OPS = sorted(p.stem for p in (REPO / "contracts/ops").glob("*.json"))
 _STUB_OPS = sorted(n for n in _ALL_OPS if dry._CLASSIFICATION[n][0] == dry.STUB)
 _REAL_OPS = sorted(n for n in _ALL_OPS if dry._CLASSIFICATION[n][0] == dry.REAL)
 
@@ -30,11 +39,13 @@ _EXTRA_PARAMS = {"media.cut_proxy": {"max_h": 360}}
 _UNDERIVABLE = {"media.pcm", "media.still"}
 
 
-def _produce(tmp_path: Path, op_name: str):
+def _produce(tmp_path: Path, op_name: str, *, only: set[str] | None = None):
     op = registry.get(op_name)
     fn = dry.resolve(op)
     outputs: dict[str, object] = {}
     for port in op.outputs:
+        if only is not None and port.id not in only:
+            continue
         ext = {"video": ".mp4", "audio": ".m4a", "image": ".png", "json": ".json"}[port.kind]
         name = f"{op_name.replace('.', '_')}_{port.id}"
         outputs[port.id] = ([tmp_path / f"{name}_{i}{ext}" for i in range(2)] if port.many
@@ -68,6 +79,7 @@ def test_real_ops_resolve_to_the_pack_handler(monkeypatch):
     assert {"media.audio", "cut.audio", "measure.audio"} <= set(_REAL_OPS)
 
 
+@_NEEDS_FFMPEG
 def test_dry_stub_output_x_engine_reader_matrix(tmp_path):
     failures: list[str] = []
     informational: list[str] = []
@@ -98,42 +110,11 @@ def test_dry_stub_output_x_engine_reader_matrix(tmp_path):
     assert not failures, msg
 
 
-def test_cut_apply_stub_durs_feed_apply_edl_reader(tmp_path):
-    line = (REPO / "scripts/apply_edl.py").read_text(encoding="utf-8").splitlines()[305]
-    assert '"rdurs"' in line, "scripts/apply_edl.py:306 no longer reads \"rdurs\" — fix the line number here"
+def test_cut_apply_stub_durs_matches_contract_shape(tmp_path):
+    # No engine-source read here (unlike apply_edl.py:306) — that proof lives in the engine's own matrix.
     keep = _JSON_PARAMS["cut.apply"]["keep"]
-    outputs = _produce(tmp_path, "cut.apply")
+    outputs = _produce(tmp_path, "cut.apply", only={"durs"})
     doc = json.loads(outputs["durs"].read_text(encoding="utf-8"))
     rdurs = doc["rdurs"]
     assert len(rdurs) == len(keep)
     assert abs(sum(rdurs) - sum(e - s for s, e in keep)) < 1e-3
-
-
-def test_measure_audio_real_input_is_not_judged_digital_silence(tmp_path):
-    import audio_triage
-    import check_clipping
-
-    op = registry.get("measure.audio")
-    fn = dry.resolve(op)
-    dst = tmp_path / "measured.json"
-    fn(params={}, inputs={"src": FIXTURE}, outputs={"measured": dst})
-    m = json.loads(dst.read_text(encoding="utf-8"))
-    clip = check_clipping.verdict(m.get("windows") or [])
-    tj = audio_triage.assess_measured(m.get("levels") or {}, clip, windows=m.get("windows"))
-    assert tj.get("action") != "refuse", f"source_gate would refuse the fixture as digitally silent: {tj}"
-
-
-def test_media_cut_proxy_stub_carries_real_audio_for_lufs(tmp_path):
-    import check_master
-
-    outputs = _produce(tmp_path, "media.cut_proxy")
-    lufs = check_master.measure(str(outputs["dst"])).get("lufs")
-    assert lufs is not None, "check_master.measure() read no integrated loudness off the STUB proxy"
-
-
-def test_clip_rank_stub_scores_clear_the_shortlist_floor():
-    import broll_resolve
-
-    scores, _ = dry._clip_rank_group_verdict(5)
-    cleared = [broll_resolve._clears_siglip_floor({"_sig": s}) for s in scores]
-    assert any(cleared), f"no clip_rank stub score cleared the shortlist floor: {scores}"

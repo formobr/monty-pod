@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -15,7 +16,14 @@ from podagent import main as podagent_main
 from podagent.ops import dry, pack, registry
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
-FIXTURE = Path(__file__).resolve().parents[2] / "dev/localpod/fixtures/contour-smoke.mp4"
+# parents[1] (this repo), never parents[2] (an enclosing engine checkout) — monty-pod ships no fixture.
+FIXTURE = Path(__file__).resolve().parents[1] / "dev/localpod/fixtures/contour-smoke.mp4"
+
+_HAS_FFMPEG = shutil.which("ffmpeg") is not None
+_HAS_FFPROBE = shutil.which("ffprobe") is not None
+_NEEDS_FFMPEG = pytest.mark.skipif(
+    not (_HAS_FFMPEG and _HAS_FFPROBE), reason="ffmpeg/ffprobe not on this runner")
+_NEEDS_FIXTURE = pytest.mark.skipif(not FIXTURE.exists(), reason="contour-smoke.mp4 not shipped here")
 
 _ALL_OP_NAMES = sorted(p.stem for p in CONTRACTS.glob("ops/*.json"))
 _STUB_OP_NAMES = sorted(n for n in _ALL_OP_NAMES if dry._CLASSIFICATION[n][0] == dry.STUB)
@@ -54,15 +62,22 @@ _ENGINE_READER_ROSTER: list[tuple[str, str, str]] = [
 _JSON_STUB_OP_NAMES = sorted({op for op, _, _ in _ENGINE_READER_ROSTER})
 
 
-def _run_stub(tmp_path: Path, op_name: str, *, params: dict | None = None, inputs: dict | None = None):
+def _run_stub(tmp_path: Path, op_name: str, *, params: dict | None = None, inputs: dict | None = None,
+              only: set[str] | None = None):
     op = registry.get(op_name)
     fn = dry.resolve(op)
     outputs = {}
     for port in op.outputs:
+        if only is not None and port.id not in only:
+            continue
         ext = {"video": ".mp4", "audio": ".m4a", "image": ".png", "json": ".json"}[port.kind]
         outputs[port.id] = tmp_path / f"{op_name}_{port.id}{ext}"
     fn(params=params or {}, inputs=inputs or {}, outputs=outputs)
     return outputs
+
+
+def _json_port_id(op_name: str) -> str:
+    return next(p.id for p in registry.get(op_name).outputs if p.kind == "json")
 
 
 def test_armed_reads_only_its_own_env(monkeypatch):
@@ -79,6 +94,7 @@ def test_every_declared_op_is_classified():
     assert missing == [], f"contracts/ops/*.json op(s) with no dry-tier row in dry._CLASSIFICATION: {missing}"
 
 
+@_NEEDS_FFMPEG
 @pytest.mark.parametrize("op_name", [n for n in _STUB_OP_NAMES if n not in _UNDERIVABLE_JSON_FIELD])
 def test_every_stubbed_op_yields_its_declared_outputs_in_dry_mode(tmp_path, op_name, monkeypatch):
     op = registry.get(op_name)
@@ -104,7 +120,7 @@ def test_cut_apply_stub_derives_rdurs_from_keep_spans(tmp_path):
     durations must exist, one per keep span, and sum to the planned (params-only) duration within 1 ms."""
     keep = [[0.0, 1.234], [5.0, 7.89], [10.0, 10.5]]
     planned = sum(e - s for s, e in keep)
-    outputs = _run_stub(tmp_path, "cut.apply", params={"keep": keep, "fps_grid": 30.0})
+    outputs = _run_stub(tmp_path, "cut.apply", params={"keep": keep, "fps_grid": 30.0}, only={"durs"})
     doc = json.loads(outputs["durs"].read_text())
     assert len(doc["rdurs"]) == len(keep), "scripts/project.py:66 requires len(rdurs) == len(keep)"
     assert abs(sum(doc["rdurs"]) - planned) < 1e-3, "sum(rdurs) must match the planned duration within 1ms"
@@ -112,7 +128,8 @@ def test_cut_apply_stub_derives_rdurs_from_keep_spans(tmp_path):
 
 def test_cut_apply_stub_folds_speed_into_rdurs(tmp_path):
     keep = [[0.0, 2.0]]
-    outputs = _run_stub(tmp_path, "cut.apply", params={"keep": keep, "fps_grid": 30.0, "speed": 1.2})
+    outputs = _run_stub(tmp_path, "cut.apply", params={"keep": keep, "fps_grid": 30.0, "speed": 1.2},
+                         only={"durs"})
     doc = json.loads(outputs["durs"].read_text())
     assert doc["rdurs"] == pytest.approx([2.0 / 1.2])
 
@@ -122,7 +139,7 @@ def test_media_sheet_stub_meta_matches_the_readers_own_validation(tmp_path):
     params = _JSON_STUB_PARAMS["media.sheet"]
     n = len(params["captions"])
     outputs = _run_stub(tmp_path, "media.sheet", params=params,
-                         inputs={"tile0": Path("/tmp/does-not-matter-for-presence")})
+                         inputs={"tile0": Path("/tmp/does-not-matter-for-presence")}, only={"meta"})
     meta = json.loads(outputs["meta"].read_text())
     assert set(meta) == {"cells", "drawn", "width", "height"}
     assert meta["cells"] == n
@@ -136,7 +153,7 @@ def test_media_sheet_stub_meta_matches_the_readers_own_validation(tmp_path):
 def test_media_image_tile_stub_meta_matches_the_readers_own_validation(tmp_path):
     params = _JSON_STUB_PARAMS["media.image_tile"]
     n = len(params["urls"])
-    outputs = _run_stub(tmp_path, "media.image_tile", params=params)
+    outputs = _run_stub(tmp_path, "media.image_tile", params=params, only={"meta"})
     meta = json.loads(outputs["meta"].read_text())
     assert set(meta) == {"cells", "drawn", "width", "height"}
     assert meta["cells"] == n
@@ -149,15 +166,14 @@ def test_media_image_tile_stub_meta_matches_the_readers_own_validation(tmp_path)
 def test_engine_reader_roster_lands_or_refuses_by_name(tmp_path, op_name, field, _reader):
     """One row per (op, field, reader-file:line). A reader added without a stub field reds HERE by name,
     not three layers down at a KeyError the way MISC-62's apply_edl.py:306 did."""
+    json_port = _json_port_id(op_name)
     if op_name in _UNDERIVABLE_JSON_FIELD:
         # frames/sample_rate/channels share ONE op-level refusal (dry.py::_synth_media_pcm_meta).
         with pytest.raises(dry.DryStubUnderivedField) as ei:
-            _run_stub(tmp_path, op_name)
+            _run_stub(tmp_path, op_name, only={json_port})
         assert ei.value.op_name == op_name
         return
-    outputs = _run_stub(tmp_path, op_name, params=_JSON_STUB_PARAMS.get(op_name, {}))
-    op = registry.get(op_name)
-    json_port = next(p.id for p in op.outputs if p.kind == "json")
+    outputs = _run_stub(tmp_path, op_name, params=_JSON_STUB_PARAMS.get(op_name, {}), only={json_port})
     doc = json.loads(outputs[json_port].read_text())
     assert field in doc, f"{op_name}: {_reader} reads {field!r}, which the dry synth never produced"
 
@@ -165,7 +181,7 @@ def test_engine_reader_roster_lands_or_refuses_by_name(tmp_path, op_name, field,
 def test_underivable_json_field_refuses_by_name(tmp_path):
     for op_name, (field, _reader) in _UNDERIVABLE_JSON_FIELD.items():
         with pytest.raises(dry.DryStubUnderivedField) as ei:
-            _run_stub(tmp_path, op_name)
+            _run_stub(tmp_path, op_name, only={_json_port_id(op_name)})
         assert ei.value.op_name == op_name
         assert ei.value.field == field
 
@@ -188,6 +204,7 @@ def _fake_pack_tar(tmp_path: Path, module_name: str, body: str) -> object:
     return Ref()
 
 
+@_NEEDS_FIXTURE
 def test_real_op_resolves_through_the_activated_pack_not_the_synthetic_stub(tmp_path, monkeypatch):
     """Routing proof, not an astats re-implementation: pod-agent is public and never vendors the tuned
     handler (podagent/ops/pack.py WHY THIS EXISTS), so the fake pack's `run` only has to be REAL in the
@@ -236,6 +253,21 @@ def test_unknown_output_kind_refuses_by_name(tmp_path):
         dry._fill_one(tmp_path / "x", "browser", op_name="fake.op", params={}, inputs={})
 
 
+@pytest.mark.parametrize("ext", [".mp3", ".wav", ".m4a", ".aac"])
+def test_stub_audio_placeholder_argv_matches_declared_extension(monkeypatch, tmp_path, ext):
+    captured = {}
+
+    def _fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(dry.subprocess, "run", _fake_run)
+    dry._write_audio(tmp_path / f"out{ext}", op_name="media.pcm")
+    assert captured["cmd"][0] == "ffmpeg"
+    assert set(dry._AUDIO_EXT_ARGS[ext]).issubset(captured["cmd"]), f"{ext}: codec args missing from argv"
+
+
+@_NEEDS_FFMPEG
 @pytest.mark.parametrize("ext,codec", [(".mp3", "mp3"), (".wav", "pcm_s16le"), (".m4a", "aac"), (".aac", "aac")])
 def test_stub_audio_placeholder_honours_declared_extension(tmp_path, ext, codec):
     dst = tmp_path / f"out{ext}"
@@ -246,6 +278,21 @@ def test_stub_audio_placeholder_honours_declared_extension(tmp_path, ext, codec)
     assert probed["streams"][0]["codec_name"] == codec, f"{dst.name}: wrong codec for its own container"
 
 
+@pytest.mark.parametrize("ext", [".mp4", ".mov"])
+def test_stub_video_placeholder_argv_matches_declared_extension(monkeypatch, tmp_path, ext):
+    captured = {}
+
+    def _fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(dry.subprocess, "run", _fake_run)
+    dry._write_video(tmp_path / f"out{ext}", op_name="cut.apply")
+    assert captured["cmd"][0] == "ffmpeg"
+    assert set(dry._VIDEO_EXT_ARGS[ext]).issubset(captured["cmd"]), f"{ext}: codec args missing from argv"
+
+
+@_NEEDS_FFMPEG
 @pytest.mark.parametrize("ext", [".mp4", ".mov"])
 def test_stub_video_placeholder_honours_declared_extension(tmp_path, ext):
     dst = tmp_path / f"out{ext}"
@@ -283,6 +330,8 @@ def _integrated_lufs(path: Path) -> float:
     return float(matches[-1])
 
 
+@_NEEDS_FFMPEG
+@_NEEDS_FIXTURE
 def test_stub_video_placeholder_copies_real_audio_from_a_video_kind_input(tmp_path):
     """MISC-62: emit_plan's LufsUnmeasured came from a stub proxy with fabricated silence — the placeholder
     must instead carry the bound input's own audio bytes so measure.master reads something real."""
@@ -304,6 +353,7 @@ def test_stub_video_placeholder_copies_real_audio_from_a_video_kind_input(tmp_pa
     assert lufs > -70.0, f"placeholder audio measured as silence ({lufs} LUFS) — it must be real bytes"
 
 
+@_NEEDS_FFMPEG
 def test_stub_video_placeholder_copies_a_silent_input_as_silent(tmp_path):
     silent_src = tmp_path / "silent.mp4"
     subprocess.run(
@@ -318,6 +368,7 @@ def test_stub_video_placeholder_copies_a_silent_input_as_silent(tmp_path):
     assert _mean_volume_db(dst) < -50.0, "a silent-input placeholder must copy silence, not fabricate signal"
 
 
+@_NEEDS_FFMPEG
 def test_stub_video_placeholder_with_no_input_audio_yields_no_audio_track(tmp_path):
     video_only_src = tmp_path / "video_only.mp4"
     subprocess.run(
@@ -330,6 +381,8 @@ def test_stub_video_placeholder_with_no_input_audio_yields_no_audio_track(tmp_pa
     assert _probe_audio_stream(dst)["streams"] == [], "no input audio must never become a fabricated track"
 
 
+@_NEEDS_FFMPEG
+@_NEEDS_FIXTURE
 def test_cut_apply_stub_handler_wires_the_bound_src_into_dst_audio(tmp_path):
     """End-to-end through dry.resolve()/_content_input, not just _write_video directly."""
     outputs = _run_stub(tmp_path, "cut.apply", params=_JSON_STUB_PARAMS["cut.apply"],
@@ -338,6 +391,7 @@ def test_cut_apply_stub_handler_wires_the_bound_src_into_dst_audio(tmp_path):
     assert _integrated_lufs(outputs["dst"]) > -70.0
 
 
+@_NEEDS_FFMPEG
 def test_stub_video_placeholder_with_no_bound_input_stays_fully_synthetic(tmp_path):
     """No `audio_src` at all (media.fetch, mograph.render, ...) — the pre-MISC-62 fallback is untouched."""
     dst = tmp_path / "cut.mp4"
