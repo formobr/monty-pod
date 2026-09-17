@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -111,7 +112,43 @@ def test_json_output_is_readable_json(tmp_path):
 
 def test_unknown_output_kind_refuses_by_name(tmp_path):
     with pytest.raises(registry.OpError):
-        dry._fill_one(tmp_path / "x", "browser", seed="s")
+        dry._fill_one(tmp_path / "x", "browser", seed="s", op_name="fake.op")
+
+
+@pytest.mark.parametrize("ext,codec", [(".mp3", "mp3"), (".wav", "pcm_s16le"), (".m4a", "aac"), (".aac", "aac")])
+def test_stub_audio_placeholder_honours_declared_extension(tmp_path, ext, codec):
+    dst = tmp_path / f"out{ext}"
+    dry._write_audio(dst, op_name="media.pcm")
+    probed = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "json", str(dst)],
+        check=True, capture_output=True, text=True).stdout)
+    assert probed["streams"][0]["codec_name"] == codec, f"{dst.name}: wrong codec for its own container"
+
+
+@pytest.mark.parametrize("ext", [".mp4", ".mov"])
+def test_stub_video_placeholder_honours_declared_extension(tmp_path, ext):
+    dst = tmp_path / f"out{ext}"
+    dry._write_video(dst, op_name="cut.apply")
+    probed = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "json", str(dst)],
+        check=True, capture_output=True, text=True).stdout)
+    codecs = {s["codec_name"] for s in probed["streams"]}
+    assert codecs == {"h264", "aac"}, f"{dst.name}: expected h264+aac streams, got {codecs}"
+
+
+def test_stub_audio_placeholder_refuses_unsupported_extension_by_name(tmp_path):
+    with pytest.raises(dry.DryStubUnsupportedOutput, match="media.pcm.*\\.ogg"):
+        dry._write_audio(tmp_path / "out.ogg", op_name="media.pcm")
+
+
+def test_stub_video_placeholder_refuses_unsupported_extension_by_name(tmp_path):
+    with pytest.raises(dry.DryStubUnsupportedOutput, match="cut.apply.*\\.webm"):
+        dry._write_video(tmp_path / "out.webm", op_name="cut.apply")
+
+
+def test_cheap_cpu_audio_ops_are_real_not_stub():
+    for op_name in ("cut.audio", "media.audio"):
+        assert dry._CLASSIFICATION[op_name][0] == dry.REAL, f"{op_name} must stay REAL under contour-dry"
 
 
 def test_boot_refuses_dry_arm_off_the_local_contour(monkeypatch):

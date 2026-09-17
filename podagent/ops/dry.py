@@ -38,13 +38,14 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     "measure.source": (REAL, "ffprobe-class ingest numbers (dims, rotation, codec, pix_fmt, ...)"),
     "media.range_frames": (REAL, "Range-only frame reader — decode-only sampling, no full encode"),
     "media.range_filmstrip": (REAL, "Range-only filmstrip reader — decode-only sampling, no full encode"),
+    # cassette replays this mp3 against the audio-LLM, so the bytes must be real, not synthetic.
+    "cut.audio": (REAL, "per-segment trim/fade/atempo AUDIO-ONLY encode — CPU ffmpeg, no video_encode argv"),
+    "media.audio": (REAL, "full-file audio demux to mp3 — CPU ffmpeg, no video_encode argv"),
 
     "camera.apply": (STUB, "GPU (libplacebo) crop-trajectory render to pixels"),
     "cut.apply": (STUB, "per-segment trim/atempo render + concat + crossfade encode"),
-    "cut.audio": (STUB, "per-segment trim/fade/atempo audio encode"),
     "edit.splice": (STUB, "trim+concat re-encode"),
     "edit.weld": (STUB, "film-burn transition composite + encode"),
-    "media.audio": (STUB, "full-file audio demux/transcode to mp3"),
     "media.cut_proxy": (STUB, "proxy encode"),
     "media.filmstrip": (STUB, "frame sampling + hstack composite image encode"),
     "media.frames": (STUB, "per-fraction frame extraction, image encode"),
@@ -78,20 +79,57 @@ def armed() -> bool:
     return os.environ.get(ARM_ENV, "").strip() not in ("", "0")
 
 
-def _write_lavfi(dst: Path, *, video: bool) -> None:
+class DryStubUnsupportedOutput(RuntimeError):
+    """A STUB port's declared output path has an extension the placeholder writer has no codec/container
+    mapping for — refused by name here, before ffmpeg gets a mismatched target and raises its own opaque
+    CalledProcessError two layers down."""
+
+    def __init__(self, op_name: str, ext: str, kind: str) -> None:
+        super().__init__(
+            f"contour-dry: {op_name!r} declares a {kind!r} output with extension {ext!r}, which has no "
+            f"placeholder codec/container mapping in podagent/ops/dry.py — add one or use a supported "
+            f"extension")
+
+
+# Extension -> ffmpeg codec/container args a 1s lavfi source can honestly be muxed into.
+_AUDIO_EXT_ARGS: dict[str, list[str]] = {
+    ".mp3": ["-c:a", "libmp3lame", "-q:a", "5"],
+    ".wav": ["-c:a", "pcm_s16le"],
+    ".m4a": ["-c:a", "aac", "-b:a", "8k"],
+    ".aac": ["-c:a", "aac", "-b:a", "8k"],
+}
+_VIDEO_EXT_ARGS: dict[str, list[str]] = {
+    ".mp4": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "8k"],
+    ".mov": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "8k"],
+}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+
+
+def _write_audio(dst: Path, *, op_name: str) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if video:
-        src = ["-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1"]
-        codec = ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
-    else:
-        src = ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=1"]
-        codec = ["-c:a", "aac", "-b:a", "8k"]
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *src, "-t", "1", *codec, str(dst)]
+    args = _AUDIO_EXT_ARGS.get(dst.suffix.lower())
+    if args is None:
+        raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "audio")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=1", "-t", "1", *args, str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
 
-def _write_image(dst: Path) -> None:
+def _write_video(dst: Path, *, op_name: str) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
+    args = _VIDEO_EXT_ARGS.get(dst.suffix.lower())
+    if args is None:
+        raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "video")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
+           "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=1", "-t", "1", *args, str(dst)]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
+
+
+def _write_image(dst: Path, *, op_name: str) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.suffix.lower() not in _IMAGE_EXTS:
+        raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "image")
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
            "-f", "lavfi", "-i", "color=c=black:s=64x64", "-frames:v", "1", str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
@@ -103,21 +141,21 @@ def _write_json(dst: Path, *, seed: str) -> None:
                    encoding="utf-8")
 
 
-_WRITER: dict[str, Callable[[Path], None]] = {
-    "video": lambda p: _write_lavfi(p, video=True),
-    "audio": lambda p: _write_lavfi(p, video=False),
+_WRITER: dict[str, Callable[..., None]] = {
+    "video": _write_video,
+    "audio": _write_audio,
     "image": _write_image,
 }
 
 
-def _fill_one(dst: Path, kind: str, *, seed: str) -> None:
+def _fill_one(dst: Path, kind: str, *, seed: str, op_name: str) -> None:
     if kind == "json":
         _write_json(dst, seed=seed)
         return
     fn = _WRITER.get(kind)
     if fn is None:
         raise registry.OpError(f"contour-dry: no synthesis rule for output kind {kind!r}")
-    fn(dst)
+    fn(dst, op_name=op_name)
 
 
 def _handler(op: registry.Op) -> Callable[..., None]:
@@ -127,7 +165,7 @@ def _handler(op: registry.Op) -> Callable[..., None]:
             port = declared[port_id]
             targets = dst if isinstance(dst, list) else [dst]
             for i, one in enumerate(targets):
-                _fill_one(Path(one), port.kind, seed=f"{op.op}:{port_id}:{i}")
+                _fill_one(Path(one), port.kind, seed=f"{op.op}:{port_id}:{i}", op_name=op.op)
     return run
 
 
