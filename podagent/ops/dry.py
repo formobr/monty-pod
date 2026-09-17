@@ -3,7 +3,7 @@
 straight through to the pack's own handler (see `_CLASSIFICATION`)."""
 from __future__ import annotations
 
-import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -135,10 +135,72 @@ def _write_image(dst: Path, *, op_name: str) -> None:
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
 
-def _write_json(dst: Path, *, seed: str) -> None:
+# A field neither params nor bound inputs can honestly produce is refused BY NAME, never guessed
+# (MISC-62: cut.apply's placeholder durs.rdurs was exactly that guess — scripts/apply_edl.py:306).
+class DryStubUnderivedField(RuntimeError):
+    def __init__(self, op_name: str, field: str, *, why: str) -> None:
+        self.op_name, self.field = op_name, field
+        super().__init__(
+            f"contour-dry: {op_name!r} stub cannot derive JSON field {field!r} from its params/inputs "
+            f"({why}) — never guessed")
+
+
+def _synth_cut_apply_durs(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
+    # rdurs read at scripts/apply_edl.py:306/260 and scripts/project.py:66 (needs len == len(keep)).
+    speed = float(params.get("speed", 1.0)) or 1.0
+    return {"rdurs": [(float(e) - float(s)) / speed for s, e in params["keep"]]}
+
+
+def _synth_media_sheet_meta(params: dict[str, Any], inputs: dict[str, Path]) -> dict[str, Any]:
+    # {cells,drawn,width,height} read at scripts/broll_resolve.py:3105-3114; width/height replay the pure
+    # canvas_size() at scripts/montyops/media_sheet.py:150-158; drawn mirrors its own input-presence check.
+    n = len(params.get("captions") or [])
+    cols = max(1, min(int(params["cols"]), n)) if n else 1
+    rows = (n + cols - 1) // cols if n else 1
+    gap, head = int(params["gap"]), int(params["head"])
+    cellw = int(params["cell_w"]) + gap
+    cellh = int(params["cell_h"]) + int(params["caption_h"]) + gap
+    drawn = sorted(i for i in range(n) if inputs.get(f"tile{i}") is not None)
+    return {"cells": n, "drawn": drawn, "width": gap + cols * cellw, "height": head + rows * cellh}
+
+
+def _synth_media_image_tile_meta(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
+    # Same shape read at scripts/broll_resolve.py:3104-3114; fused sheet call is cols=len(urls) one row
+    # (scripts/montyops/media_image_tile.py:70-73); drawn=[] is the honest fact — no GET runs under a stub.
+    n = len(params["urls"])
+    return {"cells": n, "drawn": [], "width": int(params["width"]) * n, "height": int(params["height"])}
+
+
+def _synth_media_pcm_meta(_params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
+    # frames/sample_rate/channels read at scripts/cut_v3.py:476-479; frames is the EXACT decode count per
+    # the contract's own parity note, and no param carries source duration — refused, never approximated.
+    raise DryStubUnderivedField("media.pcm", "frames", why="exact decode count needs a real decode")
+
+
+def _synth_media_still_meta(_params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
+    # dark/bbox/mark_w/mark_h/width/height/finished/plated/rasterizer read at scripts/broll_resolve.py:2231
+    # and scripts/fetch_photo.py:1633-1931; all come off probe(src)'s pixel/host reality, none off params.
+    raise DryStubUnderivedField("media.still", "dark", why="pixel/alpha/host facts, not a param function")
+
+
+_JSON_SYNTH: dict[str, Callable[[dict[str, Any], dict[str, Path]], dict[str, Any]]] = {
+    "cut.apply": _synth_cut_apply_durs,
+    "media.sheet": _synth_media_sheet_meta,
+    "media.image_tile": _synth_media_image_tile_meta,
+    "media.pcm": _synth_media_pcm_meta,
+    "media.still": _synth_media_still_meta,
+}
+
+
+def _write_json(dst: Path, *, op_name: str, params: dict[str, Any], inputs: dict[str, Path]) -> None:
+    synth = _JSON_SYNTH.get(op_name)
+    if synth is None:
+        raise registry.OpError(
+            f"contour-dry: {op_name!r} declares a JSON output with no plan-derivation rule in "
+            f"podagent/ops/dry.py::_JSON_SYNTH — a placeholder JSON is refused, add a synth function")
+    doc = synth(params, inputs)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text('{"contour_dry": true, "seed": "%s"}' % hashlib.sha256(seed.encode()).hexdigest()[:12],
-                   encoding="utf-8")
+    dst.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
 
 
 _WRITER: dict[str, Callable[..., None]] = {
@@ -148,9 +210,9 @@ _WRITER: dict[str, Callable[..., None]] = {
 }
 
 
-def _fill_one(dst: Path, kind: str, *, seed: str, op_name: str) -> None:
+def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inputs: dict[str, Path]) -> None:
     if kind == "json":
-        _write_json(dst, seed=seed)
+        _write_json(dst, op_name=op_name, params=params, inputs=inputs)
         return
     fn = _WRITER.get(kind)
     if fn is None:
@@ -159,13 +221,13 @@ def _fill_one(dst: Path, kind: str, *, seed: str, op_name: str) -> None:
 
 
 def _handler(op: registry.Op) -> Callable[..., None]:
-    def run(*, params: dict[str, Any], inputs: dict[str, Path], outputs: dict[str, Any]) -> None:  # noqa: ARG001
+    def run(*, params: dict[str, Any], inputs: dict[str, Path], outputs: dict[str, Any]) -> None:
         declared = {p.id: p for p in op.outputs}
         for port_id, dst in outputs.items():
             port = declared[port_id]
             targets = dst if isinstance(dst, list) else [dst]
-            for i, one in enumerate(targets):
-                _fill_one(Path(one), port.kind, seed=f"{op.op}:{port_id}:{i}", op_name=op.op)
+            for one in targets:
+                _fill_one(Path(one), port.kind, op_name=op.op, params=params, inputs=inputs)
     return run
 
 
