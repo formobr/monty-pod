@@ -616,23 +616,29 @@ def _run_infer(
                     align_svc = align_cache[req.weights.sha256] = AlignService(req.model, wdir)
             infer_s = align_svc.run(req.align, req.put_url, note)
         elif req.kind == "clip_rank":
-            from .infer_cliprank import ClipRankService
-            from .weights import ensure
+            from .ops import dry as _ops_dry
 
             assert req.clip_rank is not None and req.weights is not None
-            rank_svc = rank_cache.get(req.weights.sha256)
-            if rank_svc is None:
-                # Lanes race here; the SECOND one must wait for the load, not start its own.
-                with _SVC_LOAD_LOCK:
-                    rank_svc = rank_cache.get(req.weights.sha256)
-                    if rank_svc is None:
-                        with phase("weights_fetch"):
-                            wdir = ensure(req.weights, req.model, note)
-                        with phase("model_load"):
-                            note(f"loading {req.model}")
-                            rank_svc = rank_cache[req.weights.sha256] = ClipRankService(
-                                req.model, wdir, parallel=rank_parallel, slots=rank_slots)
-            rank_run = rank_svc.run(req.clip_rank, req.put_url, note)
+            if _ops_dry.armed():
+                # no weights, no card: real SigLIP on identical STUB pixels would shortlist nothing.
+                rank_run = _ops_dry.run_clip_rank(req.clip_rank, req.put_url, note)
+            else:
+                from .infer_cliprank import ClipRankService
+                from .weights import ensure
+
+                rank_svc = rank_cache.get(req.weights.sha256)
+                if rank_svc is None:
+                    # Lanes race here; the SECOND one must wait for the load, not start its own.
+                    with _SVC_LOAD_LOCK:
+                        rank_svc = rank_cache.get(req.weights.sha256)
+                        if rank_svc is None:
+                            with phase("weights_fetch"):
+                                wdir = ensure(req.weights, req.model, note)
+                            with phase("model_load"):
+                                note(f"loading {req.model}")
+                                rank_svc = rank_cache[req.weights.sha256] = ClipRankService(
+                                    req.model, wdir, parallel=rank_parallel, slots=rank_slots)
+                rank_run = rank_svc.run(req.clip_rank, req.put_url, note)
             infer_s = rank_run.infer_s
             work_timings = rank_run.timings
         else:

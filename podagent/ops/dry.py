@@ -6,7 +6,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from . import pack, registry
@@ -237,3 +240,31 @@ def resolve(op: registry.Op) -> Callable[..., None]:
         # `runner.py` activates the ops pack before it ever picks this seam, dry or not — safe to call.
         return pack.resolve(op.handler)
     return _handler(op)
+
+
+def _clip_rank_group_verdict(n: int) -> tuple[list[float], list[None]]:
+    """Strictly descending scores over ALL candidates: real SigLIP on identical STUB placeholder pixels
+    would score every candidate near-equally, clearing no relevance floor and shortlisting nothing."""
+    return [round(max(0.05, 0.95 - 0.05 * i), 4) for i in range(n)], [None] * n
+
+
+def run_clip_rank(params: Any, put_url: str, progress: Callable[[str], None] | None = None) -> SimpleNamespace:
+    """The dry-tier stand-in for `infer_cliprank.ClipRankService.run` — same `(infer_s, timings)` shape,
+    no weights loaded, no GPU touched, and the PUT contract kept so the resolver reads it identically."""
+    from .. import cp
+    from ..models import ClipRankGroupResult, ClipRankPayload
+
+    t0 = time.monotonic()
+    groups = []
+    for g in params.groups:
+        scores, embeds = _clip_rank_group_verdict(len(g.image_urls))
+        groups.append(ClipRankGroupResult(scores=scores, embeds=embeds))
+    payload = ClipRankPayload(model="contour-dry-stub", groups=groups)
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "clip_rank.json"
+        out.write_text(payload.model_dump_json())
+        cp.upload(out, put_url, "application/json")
+    infer_s = time.monotonic() - t0
+    if progress is not None:
+        progress(f"contour-dry clip_rank stub: {len(groups)} group(s), deterministic descending scores")
+    return SimpleNamespace(infer_s=infer_s, timings={"infer_s": round(infer_s, 3), "work_s": round(infer_s, 3)})

@@ -288,3 +288,49 @@ def test_boot_is_a_noop_when_the_switch_is_off(monkeypatch):
     monkeypatch.delenv(dry.ARM_ENV, raising=False)
     monkeypatch.setenv("POD_IMAGE_TAG", "a" * 40)
     podagent_main._refuse_dry_off_local_contour()
+
+
+# ── MISC-62 L3c: the clip_rank dry stub — deterministic, ≥1 winner per beat, no weights loaded ─────────────
+def test_run_clip_rank_scores_descend_and_never_tie(monkeypatch):
+    """Real SigLIP on identical STUB pixels would score every candidate the same — this stub must not."""
+    from podagent import cp as _cp
+    from podagent.models import ClipRankGroup, ClipRankParams
+
+    uploaded = {}
+
+    def _fake_upload(src, _url, _ct=None):
+        uploaded["body"] = json.loads(src.read_text())
+
+    monkeypatch.setattr(_cp, "upload", _fake_upload)
+    params = ClipRankParams(groups=[
+        ClipRankGroup(intent="crypto", image_urls=["https://x/a.jpg", "https://x/b.jpg", "https://x/c.jpg"]),
+        ClipRankGroup(intent="finance", image_urls=["https://x/d.jpg"]),
+    ])
+    run = dry.run_clip_rank(params, "https://put.example/clip_rank.json")
+    assert run.infer_s >= 0.0 and "infer_s" in run.timings
+    body = uploaded["body"]
+    assert len(body["groups"]) == 2
+    g0 = body["groups"][0]["scores"]
+    assert g0 == sorted(g0, reverse=True) and len(set(g0)) == len(g0), g0
+    assert all(len(g["scores"]) >= 1 for g in body["groups"]), "every beat must yield at least one winner"
+    assert body["groups"][1]["scores"][0] > 0
+
+
+def test_run_clip_rank_never_touches_torch_or_the_card(monkeypatch):
+    """No weights fetch, no `AutoModel.from_pretrained` — proved by refusing to import torch at all."""
+    import builtins
+
+    from podagent import cp as _cp
+    from podagent.models import ClipRankGroup, ClipRankParams
+
+    real_import = builtins.__import__
+
+    def _no_torch(name, *a, **k):
+        if name == "torch" or name.startswith("transformers"):
+            raise AssertionError(f"the dry clip_rank stub imported {name!r} — it must never touch the card")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_torch)
+    monkeypatch.setattr(_cp, "upload", lambda *_a, **_k: None)
+    params = ClipRankParams(groups=[ClipRankGroup(intent="x", image_urls=["https://x/a.jpg"])])
+    dry.run_clip_rank(params, "https://put.example/clip_rank.json")
