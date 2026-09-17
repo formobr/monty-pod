@@ -34,7 +34,7 @@ from ..artifact import log
 from ..cp import download, put_trace, retry, upload
 from ..identity import worker_identity
 from ..sanitize import safe_error
-from . import gpu_admission, inputcache, pack, registry, resultcache
+from . import dry, gpu_admission, inputcache, pack, registry, resultcache
 
 MAX_PARALLEL_ENV = "OPS_MAX_PARALLEL"
 
@@ -1067,7 +1067,8 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     declared_out = {p.id: p for p in op.outputs}
     outputs = _bind_outputs(step, op, out_dir)
 
-    fn = pack.resolve(op.handler)
+    # dry.armed() is the ONLY other resolver this seam may reach — see dry.py's own docstring for the lock.
+    fn = dry.resolve(op) if dry.armed() else pack.resolve(op.handler)
     # resultcache.execute() discards fn's return; a handler that hands back a dict (media.normalize's argv
     # facts) is caught here instead of widening resultcache's own signature, which ~14 tests pin as bool.
     handler_result: dict[str, Any] = {}

@@ -4,6 +4,7 @@ accents, logo and watermark in a single pass, the ONLY final encode core render.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import hashlib
 import json
 import math
 import os
@@ -23,6 +24,7 @@ from . import mograph as _mograph
 from . import render as _render
 from .cp import upload
 from .models import SPEC_VERSION, RenderSpec
+from .ops.dry import armed as _contour_dry_armed
 from .render import body_duration
 from .sanitize import safe_text
 
@@ -934,6 +936,39 @@ def _ffmpeg_failure_message(returncode: int, stderr: bytes | str | None) -> str:
     return prefix + cleaned
 
 
+def _dry_lavfi(dst: Path, *, w: int, h: int, dur: float, grid: str, with_audio: bool) -> None:
+    src = ["-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={grid}:d={dur:.3f}"]
+    maps = ["-map", "0:v"]
+    if with_audio:
+        src += ["-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo:d={dur:.3f}"]
+        maps += ["-map", "1:a"]
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *src, *maps,
+           "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "ultrafast", *_finalize._BT709,
+           *(["-c:a", "aac"] if with_audio else []), str(dst)]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=_ENCODE_FLOOR_S)
+
+
+def _dry_framemd5(dst: Path, n_frames: int) -> None:
+    lines = ["#tb 0: 1/1"]
+    for i in range(max(0, n_frames)):
+        lines.append(f"0,{i},{i},1,1,{hashlib.sha256(str(i).encode()).hexdigest()}")
+    dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _run_dry(p: Prepared, cmd: list[str]) -> None:
+    """Contour-dry stand-in for the ONE real filtergraph subprocess: every declared output this argv would
+    have written (master, presync, every framemd5 tap) lands via a cheap lavfi source at the PLAN's own
+    duration/size/fps instead — `assemble`'s real graph/argv is judged by `build_receipt`, never this."""
+    grid = _finalize.declared_grid(p.spec.timeline.fps)
+    w, h = p.spec.timeline.width, p.spec.timeline.height
+    _dry_lavfi(p.master_out, w=w, h=h, dur=p.duration, grid=grid, with_audio=True)
+    if str(p.presync_out) in cmd:
+        _dry_lavfi(p.presync_out, w=_REF_W, h=_REF_H, dur=p.duration, grid=grid, with_audio=True)
+    expected = tap_frames_expected(p.spec)
+    for pad, path in p.tap_md5.items():
+        _dry_framemd5(path, expected.get(pad, 0))
+
+
 def _run(cmd: list[str], budget_s: float) -> None:
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, timeout=budget_s)
@@ -958,7 +993,10 @@ def run_encode(p: Prepared, phase=_no_phase) -> dict | None:
     print(f"[onepass] filter_complex: {graph}", file=sys.stderr, flush=True)
     with phase("ffmpeg"):
         t0 = time.monotonic()
-        _run(cmd, encode_budget_s(p.duration))
+        if _contour_dry_armed():
+            _run_dry(p, cmd)
+        else:
+            _run(cmd, encode_budget_s(p.duration))
         wall = time.monotonic() - t0
     if p.receipt_out is None:
         return None

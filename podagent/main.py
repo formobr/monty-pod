@@ -223,6 +223,21 @@ def _env_or_exit(name: str) -> str:
     return val
 
 
+def _refuse_dry_off_local_contour() -> None:
+    """Twin of `prod_contour.is_production()`, on the pod's own visible fact: a rented pod's image always
+    bakes `POD_IMAGE_TAG` (registry.image_tag()); the local worktree process never does."""
+    from .ops.dry import ARM_ENV, armed
+    from .ops.registry import image_tag
+
+    if not armed():
+        return
+    tag = image_tag()
+    if not tag.startswith("unknown"):
+        _log(f"{ARM_ENV} is set but POD_IMAGE_TAG={tag!r} names a baked image — this is not the local "
+             f"contour the dry switch is for; refusing to boot")
+        sys.exit(2)
+
+
 @contextlib.contextmanager
 def _llm_correlation(corr_id: str | None):
     """Delegate one product corr to the keyless control-plane LLM proxy.
@@ -1083,6 +1098,7 @@ def _drain_and_restart(cp: ControlPlane, coordinator: RestartCoordinator, *,
 
 
 def main() -> None:
+    _refuse_dry_off_local_contour()
     cp_url = _env_or_exit("CP_URL")
     job_token = _env_or_exit("JOB_TOKEN")
     mark_rented_pod()  # THIS read of JOB_TOKEN is the boot credential, not ambient state — tell cp.py so

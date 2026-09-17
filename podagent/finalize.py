@@ -6,10 +6,12 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 import subprocess
 from fractions import Fraction
 from pathlib import Path
 
+from .ops.dry import armed as _contour_dry_armed
 from .sanitize import safe_error
 
 # bt709 SIGNAL (tag, no convert) — an untagged master makes platforms GUESS the colourspace.
@@ -294,6 +296,11 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     ln = fin.loudnorm
     if ln is None:
         return src
+    if _contour_dry_armed():
+        # A synthetic dry master is bit-exact silence; loudnorm's own measure refuses non-finite LUFS
+        # (master_af above), so this copies the declared output instead of running a measure doomed to raise.
+        shutil.copyfile(src, out)
+        return out
     aim = round(ln.tp - TP_HEADROOM_DB, 2)
     mv = _measure(src, ln, aim)
     if mv is None:
