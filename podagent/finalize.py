@@ -241,9 +241,20 @@ _LUFS_TOL_DB = 3.0       # the band the box's own check_master judges the delive
 # One full-length audio decode/encode runs far above realtime (render.py's _AUDIO_PASS_WALL_S, same class);
 # a level pass that does not is wedged, and a wedge must fail loud rather than absorb the stage.
 _AUDIO_PASS_WALL_S = 300
-_MAKEUP_TRIGGER_LU = 1.0
+# The make-up's deadband, a sixth of the band above: whatever the make-up DECLINES to give back is carried
+# straight into the delivery, and the aac encode of a limited waveform then moves the level again. At the old
+# 1.0 LU trigger a +0.86 LU residual was left alone and delivered -15.02 against a -14.0 target - inside the
+# box's band, outside the band a master is supposed to land ON. Below half a LU another full decode+limiter
+# trip buys nothing audible.
+_MAKEUP_TRIGGER_LU = round(_LUFS_TOL_DB / 6.0, 2)
+# One make-up pass is not a fixed point: the brickwall eats part of the very gain it is handed, so the
+# residual SHRINKS rather than vanishes and the levelling has to be repeated until it is inside the deadband.
+# Bounded, because a master whose loudness lives in the transients the ceiling removes would be chased for
+# ever; the budget, not the operator's patience, is what ends the chase.
+_MAX_MAKEUP_PASSES = 3
 # a residual this large means the integrated loudness was carried by transients the ceiling just removed;
-# giving it back would only feed the limiter again, so it is a refusal, not a louder retry.
+# giving it back would only feed the limiter again, so it is a refusal, not a louder retry. The cap is on the
+# TOTAL make-up gain, so spreading the same chase over the pass budget cannot buy past it.
 _MAKEUP_MAX_DB = 12.0
 
 
@@ -368,30 +379,44 @@ def _pcm_pass(src: Path, dst: Path, af: str) -> bool:
 
 
 def _make_up(lvl: Path, mk: Path, ln, tp_aim: float) -> Path:
-    """The brickwall removes exactly the transients a click-carried integrated loudness was made of, so
-    the levelled PCM is re-measured and given back the residual — under the same ceiling, once."""
-    d = _measure(lvl, ln, tp_aim)
-    try:
-        i, tp = float(d["input_i"]), float(d["input_tp"])
-    except (TypeError, KeyError, ValueError):
-        print("[finalize] master: levelled PCM UNVERIFIED — no make-up, the encode decides")
-        return lvl
-    residual = ln.i - i
-    print(f"[finalize] master: levelled lufs={i} tp={tp} (residual {residual:+.2f} LU)")
-    if residual <= _MAKEUP_TRIGGER_LU:
-        return lvl
-    if residual > _MAKEUP_MAX_DB:
-        raise RuntimeError(
-            f"[finalize] master: OFF-CONTRACT after limiter lufs={i} target={ln.i} "
-            f"(residual {residual:+.2f} LU over the {_MAKEUP_MAX_DB} dB make-up cap) — a master whose "
-            f"loudness lives only in the transients the ceiling removes is not a montage, refusing")
-    if not _pcm_pass(lvl, mk, f"volume={residual:.2f}dB,{limiter_af(tp_aim)}"):
-        print("[finalize] master: make-up pass failed -> shipping the levelled PCM")
-        return lvl
-    d2 = _measure(mk, ln, tp_aim)
-    got = f"lufs={d2['input_i']} tp={d2['input_tp']}" if d2 else "UNVERIFIED"
-    print(f"[finalize] master: make-up {residual:+.2f} dB -> {got}")
-    return mk
+    """The brickwall removes exactly the transients a click-carried integrated loudness was made of, so the
+    levelled PCM is re-measured and given back the residual — under the same ceiling. It converges rather
+    than corrects once: the ceiling eats part of each make-up too, so the gap closes in steps and the loop
+    re-measures after every one of them until the residual is inside the deadband or the budget is spent.
+    `lvl` and `mk` are the only two scratch names the caller cleans up, so the passes ping-pong between
+    them — whichever one is not the current PCM is free to be overwritten."""
+    current, applied, spent = lvl, 0.0, 0
+    while True:
+        d = _measure(current, ln, tp_aim)
+        try:
+            i, tp = float(d["input_i"]), float(d["input_tp"])
+        except (TypeError, KeyError, ValueError):
+            print("[finalize] master: levelled PCM UNVERIFIED — no make-up, the encode decides"
+                  if not spent else
+                  f"[finalize] master: make-up {applied:+.2f} dB -> UNVERIFIED")
+            return current
+        residual = ln.i - i
+        if not spent:
+            print(f"[finalize] master: levelled lufs={i} tp={tp} (residual {residual:+.2f} LU)")
+        else:
+            print(f"[finalize] master: make-up {applied:+.2f} dB -> lufs={i} tp={tp} "
+                  f"(residual {residual:+.2f} LU, make-up pass {spent}/{_MAX_MAKEUP_PASSES})")
+        if abs(residual) <= _MAKEUP_TRIGGER_LU:
+            return current
+        if applied + residual > _MAKEUP_MAX_DB:
+            raise RuntimeError(
+                f"[finalize] master: OFF-CONTRACT after limiter lufs={i} target={ln.i} "
+                f"(residual {residual:+.2f} LU over the {_MAKEUP_MAX_DB} dB make-up cap) — a master whose "
+                f"loudness lives only in the transients the ceiling removes is not a montage, refusing")
+        if spent >= _MAX_MAKEUP_PASSES:
+            print(f"[finalize] master: make-up budget spent ({_MAX_MAKEUP_PASSES} passes, {applied:+.2f} dB "
+                  f"given back) — residual {residual:+.2f} LU stands, the encode's verdict decides")
+            return current
+        dst = mk if current is lvl else lvl
+        if not _pcm_pass(current, dst, f"volume={residual:.2f}dB,{limiter_af(tp_aim)}"):
+            print("[finalize] master: make-up pass failed -> shipping the levelled PCM")
+            return current
+        current, applied, spent = dst, applied + residual, spent + 1
 
 
 def _measure(path: Path, ln, tp_aim: float) -> dict | None:
