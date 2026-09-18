@@ -3,6 +3,7 @@
 straight through to the pack's own handler (see `_CLASSIFICATION`)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -40,7 +41,6 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     "measure.silence": (REAL, "silencedetect spans + RMS envelope — ffmpeg reads only"),
     "measure.source": (REAL, "ffprobe-class ingest numbers (dims, rotation, codec, pix_fmt, ...)"),
     "media.range_frames": (REAL, "Range-only frame reader — decode-only sampling, no full encode"),
-    "media.range_filmstrip": (REAL, "Range-only filmstrip reader — decode-only sampling, no full encode"),
     # cassette replays this mp3 against the audio-LLM, so the bytes must be real, not synthetic.
     "cut.audio": (REAL, "per-segment trim/fade/atempo AUDIO-ONLY encode — CPU ffmpeg, no video_encode argv"),
     "media.audio": (REAL, "full-file audio demux to mp3 — CPU ffmpeg, no video_encode argv"),
@@ -68,6 +68,7 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     "media.fetch": (STUB, "origin GET — external network"),
     "media.image_filmstrip": (STUB, "public still-image origin GET + filmstrip render"),
     "media.image_tile": (STUB, "public still-image origin(s) GET + tile composite"),
+    "media.range_filmstrip": (STUB, "public clip origin Range GETs + filmstrip render — external network"),
 }
 
 
@@ -177,6 +178,36 @@ def _write_image(dst: Path, *, op_name: str) -> None:
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
 
+def _cell_colour(url: str, index: int) -> str:
+    digest = hashlib.sha256(f"{url}#{index}".encode("utf-8")).digest()
+    return f"0x{digest[0]:02x}{digest[1]:02x}{digest[2]:02x}"
+
+
+# The origin url IS the candidate's identity here; nothing else in params distinguishes one clip's strip
+# from another's, and two candidates sharing one placeholder would hide a mis-addressed tile downstream.
+def _write_filmstrip(dst: Path, *, op_name: str, params: dict[str, Any]) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.suffix.lower() not in _IMAGE_EXTS:
+        raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "image")
+    positions = params.get("positions")
+    if not isinstance(positions, list) or not positions:
+        raise registry.OpError(
+            f"contour-dry: {op_name!r} stub cannot lay out a strip without a non-empty `positions` list")
+    url = str(params.get("url") or "")
+    cell_w, cell_h = int(params["width"]), int(params["height"])
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    for i in range(len(positions)):
+        cmd += ["-f", "lavfi", "-i", f"color=c={_cell_colour(url, i)}:s={cell_w}x{cell_h}"]
+    if len(positions) > 1:
+        chain = "".join(f"[{i}:v]" for i in range(len(positions)))
+        cmd += ["-filter_complex", f"{chain}hstack=inputs={len(positions)}"]
+    cmd += ["-frames:v", "1", str(dst)]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
+
+
+_IMAGE_SYNTH: dict[str, Callable[..., None]] = {"media.range_filmstrip": _write_filmstrip}
+
+
 # A field neither params nor bound inputs can honestly produce is refused BY NAME, never guessed
 # (MISC-62: cut.apply's placeholder durs.rdurs was exactly that guess — scripts/apply_edl.py:306).
 class DryStubUnderivedField(RuntimeError):
@@ -219,8 +250,21 @@ def _synth_media_still_meta(_params: dict[str, Any], _inputs: dict[str, Path]) -
     raise DryStubUnderivedField("media.still", "dark", why="pixel/alpha/host facts, not a param function")
 
 
+def _synth_range_filmstrip_receipt(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
+    # Shape read back by scripts/fetch_broll.py:1537; `object_bytes` is the ORIGIN object's size, which only
+    # the GET this stub abolishes could know — so this is empty_receipt()'s shape, never a fabricated green.
+    return {
+        "schema_version": 1, "status": "failed", "reason": "", "origin_class": "transient",
+        "object_bytes": None, "origin_bytes": 0, "proven_bytes": 0,
+        "byte_cap": max(0, int(params.get("max_origin_bytes") or 0)),
+        "range_requests": 0, "whole_attempts": 0, "whole_reads": 0, "ignored_range_responses": 0,
+        "cap_exceeded": False, "outputs_expected": 1, "outputs_present": 1,
+    }
+
+
 _JSON_SYNTH: dict[str, Callable[[dict[str, Any], dict[str, Path]], dict[str, Any]]] = {
     "cut.apply": _synth_cut_apply_durs,
+    "media.range_filmstrip": _synth_range_filmstrip_receipt,
     "media.sheet": _synth_media_sheet_meta,
     "media.image_tile": _synth_media_image_tile_meta,
     "media.still": _synth_media_still_meta,
@@ -251,6 +295,9 @@ def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inp
         return
     if kind == "video":
         _write_video(dst, op_name=op_name, audio_src=audio_src)
+        return
+    if kind == "image" and (image_synth := _IMAGE_SYNTH.get(op_name)) is not None:
+        image_synth(dst, op_name=op_name, params=params)
         return
     fn = _WRITER.get(kind)
     if fn is None:

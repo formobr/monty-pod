@@ -34,6 +34,9 @@ _JSON_PARAMS = {
     "media.image_tile": {"urls": ["https://example.com/a.jpg", "https://example.com/b.jpg",
                                    "https://example.com/c.jpg"],
                           "width": 48, "height": 48, "fit": "cover"},
+    "media.range_filmstrip": {"url": "https://example.com/matrix.mp4", "positions": [0.25, 0.75],
+                               "width": 48, "height": 48, "fit": "cover",
+                               "max_origin_bytes": 1024 * 1024},
 }
 _EXTRA_PARAMS = {"media.cut_proxy": {"max_h": 360}}
 _UNDERIVABLE = {"media.still"}

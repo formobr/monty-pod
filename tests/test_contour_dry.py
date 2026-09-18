@@ -36,6 +36,9 @@ _JSON_STUB_PARAMS: dict[str, dict] = {
                      "bg": [0, 0, 0], "captions": [[{"text": "a"}], [{"text": "b"}]]},
     "media.image_tile": {"urls": ["https://example.com/a.jpg", "https://example.com/b.jpg"],
                           "width": 64, "height": 64, "fit": "cover"},
+    "media.range_filmstrip": {"url": "https://example.com/clip.mp4", "positions": [0.12, 0.5, 0.85],
+                               "width": 64, "height": 96, "fit": "cover",
+                               "max_origin_bytes": 16 * 1024 * 1024},
 }
 # op -> (field it cannot derive, engine reader file:line that needs it)
 _UNDERIVABLE_JSON_FIELD: dict[str, tuple[str, str]] = {
@@ -53,6 +56,10 @@ _ENGINE_READER_ROSTER: list[tuple[str, str, str]] = [
     ("media.image_tile", "height", "scripts/broll_resolve.py:3109"),
     ("media.image_tile", "drawn", "scripts/broll_resolve.py:3111"),
     ("media.still", "dark", "scripts/broll_resolve.py:2231"),
+    ("media.range_filmstrip", "status", "scripts/run_ledger.py:2366"),
+    ("media.range_filmstrip", "origin_bytes", "scripts/run_ledger.py:2371"),
+    ("media.range_filmstrip", "byte_cap", "scripts/run_ledger.py:2373"),
+    ("media.range_filmstrip", "outputs_present", "scripts/run_ledger.py:2379"),
 ]
 
 _JSON_STUB_OP_NAMES = sorted({op for op, _, _ in _ENGINE_READER_ROSTER})
@@ -408,6 +415,46 @@ def test_stub_video_placeholder_refuses_unsupported_extension_by_name(tmp_path):
 def test_cheap_cpu_audio_ops_are_real_not_stub():
     for op_name in ("cut.audio", "media.audio", "media.pcm"):
         assert dry._CLASSIFICATION[op_name][0] == dry.REAL, f"{op_name} must stay REAL under contour-dry"
+
+
+def test_range_filmstrip_is_a_stub_so_the_dry_broll_lane_fetches_no_clip_bytes():
+    assert dry._CLASSIFICATION["media.range_filmstrip"][0] == dry.STUB
+    assert "net" in registry.get("media.range_filmstrip").needs
+
+
+@_NEEDS_FFMPEG
+def test_range_filmstrip_stub_draws_one_deterministic_cell_per_requested_position(tmp_path):
+    params = _JSON_STUB_PARAMS["media.range_filmstrip"]
+    first = _run_stub(tmp_path / "a", "media.range_filmstrip", params=params, only={"strip"})["strip"]
+    second = _run_stub(tmp_path / "b", "media.range_filmstrip", params=params, only={"strip"})["strip"]
+    assert first.read_bytes() == second.read_bytes(), "the same candidate must draw the same strip"
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+         "-of", "csv=p=0", str(first)], capture_output=True, text=True, timeout=20)
+    n = len(params["positions"])
+    assert probe.stdout.strip() == f"{params['width'] * n},{params['height']}"
+    other = dict(params, url="https://example.com/another.mp4")
+    third = _run_stub(tmp_path / "c", "media.range_filmstrip", params=other, only={"strip"})["strip"]
+    assert third.read_bytes() != first.read_bytes(), "two candidates may not share one placeholder strip"
+
+
+@_NEEDS_FFMPEG
+def test_range_filmstrip_stub_receipt_never_claims_bytes_it_did_not_read(tmp_path):
+    outputs = _run_stub(tmp_path, "media.range_filmstrip",
+                        params=_JSON_STUB_PARAMS["media.range_filmstrip"])
+    doc = json.loads(outputs["receipt"].read_text())
+    assert doc["object_bytes"] is None and doc["status"] != "ok", "a stub may not fabricate a green receipt"
+    assert doc["origin_bytes"] == doc["range_requests"] == doc["whole_attempts"] == 0
+    assert doc["outputs_present"] == doc["outputs_expected"] == 1, "the placeholder strip really landed"
+    assert outputs["strip"].stat().st_size > 0
+
+
+def test_range_filmstrip_stub_refuses_a_strip_with_no_positions(tmp_path):
+    with pytest.raises(registry.OpError, match="positions"):
+        _run_stub(tmp_path, "media.range_filmstrip",
+                  params={"url": "https://example.com/c.mp4", "positions": [], "width": 64, "height": 64,
+                          "max_origin_bytes": 65536},
+                  only={"strip"})
 
 
 @_NEEDS_FIXTURE
