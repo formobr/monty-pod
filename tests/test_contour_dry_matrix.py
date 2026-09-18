@@ -36,7 +36,7 @@ _JSON_PARAMS = {
                           "width": 48, "height": 48, "fit": "cover"},
 }
 _EXTRA_PARAMS = {"media.cut_proxy": {"max_h": 360}}
-_UNDERIVABLE = {"media.pcm", "media.still"}
+_UNDERIVABLE = {"media.still"}
 
 
 def _produce(tmp_path: Path, op_name: str, *, only: set[str] | None = None):

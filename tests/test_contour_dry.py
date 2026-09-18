@@ -39,7 +39,6 @@ _JSON_STUB_PARAMS: dict[str, dict] = {
 }
 # op -> (field it cannot derive, engine reader file:line that needs it)
 _UNDERIVABLE_JSON_FIELD: dict[str, tuple[str, str]] = {
-    "media.pcm": ("frames", "scripts/cut_v3.py:476"),
     "media.still": ("dark", "scripts/broll_resolve.py:2231"),
 }
 # (op, field, engine reader file:line) for every STUB op's JSON output this dry tier must satisfy.
@@ -53,9 +52,6 @@ _ENGINE_READER_ROSTER: list[tuple[str, str, str]] = [
     ("media.image_tile", "width", "scripts/broll_resolve.py:3108"),
     ("media.image_tile", "height", "scripts/broll_resolve.py:3109"),
     ("media.image_tile", "drawn", "scripts/broll_resolve.py:3111"),
-    ("media.pcm", "frames", "scripts/cut_v3.py:476"),
-    ("media.pcm", "sample_rate", "scripts/cut_v3.py:477"),
-    ("media.pcm", "channels", "scripts/cut_v3.py:477"),
     ("media.still", "dark", "scripts/broll_resolve.py:2231"),
 ]
 
@@ -168,7 +164,6 @@ def test_engine_reader_roster_lands_or_refuses_by_name(tmp_path, op_name, field,
     not three layers down at a KeyError the way MISC-62's apply_edl.py:306 did."""
     json_port = _json_port_id(op_name)
     if op_name in _UNDERIVABLE_JSON_FIELD:
-        # frames/sample_rate/channels share ONE op-level refusal (dry.py::_synth_media_pcm_meta).
         with pytest.raises(dry.DryStubUnderivedField) as ei:
             _run_stub(tmp_path, op_name, only={json_port})
         assert ei.value.op_name == op_name
@@ -411,8 +406,42 @@ def test_stub_video_placeholder_refuses_unsupported_extension_by_name(tmp_path):
 
 
 def test_cheap_cpu_audio_ops_are_real_not_stub():
-    for op_name in ("cut.audio", "media.audio"):
+    for op_name in ("cut.audio", "media.audio", "media.pcm"):
         assert dry._CLASSIFICATION[op_name][0] == dry.REAL, f"{op_name} must stay REAL under contour-dry"
+
+
+@_NEEDS_FIXTURE
+def test_media_pcm_derives_frames_from_the_bound_input_with_no_prior_state(tmp_path, monkeypatch):
+    """MISC-72 routing proof, mirrors test_real_op_resolves_through_the_activated_pack_not_the_synthetic_stub."""
+    pack.reset_for_tests()
+    ref = _fake_pack_tar(
+        tmp_path, "media_pcm",
+        "import json\n"
+        "def run(*, params, inputs, outputs):\n"
+        "    src = inputs['src']\n"
+        "    size = src.stat().st_size\n"
+        "    outputs['pcm'].write_bytes(b'RIFF' + bytes(16))\n"
+        "    outputs['meta'].write_text(json.dumps({'frames': size, 'sample_rate': 16000, 'channels': 1}))\n",
+    )
+    monkeypatch.setenv(pack.PACK_CACHE_ENV, str(tmp_path / "cache"))
+    sys.modules.pop("montyops", None)
+    sys.modules.pop("montyops.media_pcm", None)
+    pack.activate(ref)
+
+    assert dry._CLASSIFICATION["media.pcm"][0] == dry.REAL
+    op = registry.get("media.pcm")
+    fn = dry.resolve(op)
+    pcm_dst, meta_dst = tmp_path / "out.wav", tmp_path / "out.json"
+    fn(params={}, inputs={"src": FIXTURE}, outputs={"pcm": pcm_dst, "meta": meta_dst})
+
+    meta = json.loads(meta_dst.read_text())
+    assert meta["frames"] == FIXTURE.stat().st_size, "the real handler must see the real bound fixture"
+    assert meta["sample_rate"] == 16000 and meta["channels"] == 1
+    assert pcm_dst.exists() and pcm_dst.stat().st_size > 0
+
+    pack.reset_for_tests()
+    sys.modules.pop("montyops", None)
+    sys.modules.pop("montyops.media_pcm", None)
 
 
 def test_boot_refuses_dry_arm_off_the_local_contour(monkeypatch):

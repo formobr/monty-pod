@@ -44,6 +44,9 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     # cassette replays this mp3 against the audio-LLM, so the bytes must be real, not synthetic.
     "cut.audio": (REAL, "per-segment trim/fade/atempo AUDIO-ONLY encode — CPU ffmpeg, no video_encode argv"),
     "media.audio": (REAL, "full-file audio demux to mp3 — CPU ffmpeg, no video_encode argv"),
+    # frames/sample_rate/channels are the EXACT decode count (no param carries source duration) — a stub
+    # can only guess or refuse, so this pays one real ffmpeg pass on the bound input, like media.audio.
+    "media.pcm": (REAL, "full-file audio decode to PCM wav — CPU ffmpeg, no video_encode argv"),
 
     "camera.apply": (STUB, "GPU (libplacebo) crop-trajectory render to pixels"),
     "cut.apply": (STUB, "per-segment trim/atempo render + concat + crossfade encode"),
@@ -54,7 +57,6 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     "media.frames": (STUB, "per-fraction frame extraction, image encode"),
     "media.image_scale": (STUB, "image normalize + re-encode"),
     "media.normalize": (STUB, "canonical ingest encode (GPU_ADMISSION.HEAVY_GPU_OPS)"),
-    "media.pcm": (STUB, "full-file audio decode to PCM wav"),
     "media.scale": (STUB, "video downscale + re-encode"),
     "media.sheet": (STUB, "contact-sheet composite + image encode"),
     "media.still": (STUB, "vector rasterise + contain composite + image encode"),
@@ -211,12 +213,6 @@ def _synth_media_image_tile_meta(params: dict[str, Any], _inputs: dict[str, Path
     return {"cells": n, "drawn": [], "width": int(params["width"]) * n, "height": int(params["height"])}
 
 
-def _synth_media_pcm_meta(_params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
-    # frames/sample_rate/channels read at scripts/cut_v3.py:476-479; frames is the EXACT decode count per
-    # the contract's own parity note, and no param carries source duration — refused, never approximated.
-    raise DryStubUnderivedField("media.pcm", "frames", why="exact decode count needs a real decode")
-
-
 def _synth_media_still_meta(_params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
     # dark/bbox/mark_w/mark_h/width/height/finished/plated/rasterizer read at scripts/broll_resolve.py:2231
     # and scripts/fetch_photo.py:1633-1931; all come off probe(src)'s pixel/host reality, none off params.
@@ -227,7 +223,6 @@ _JSON_SYNTH: dict[str, Callable[[dict[str, Any], dict[str, Path]], dict[str, Any
     "cut.apply": _synth_cut_apply_durs,
     "media.sheet": _synth_media_sheet_meta,
     "media.image_tile": _synth_media_image_tile_meta,
-    "media.pcm": _synth_media_pcm_meta,
     "media.still": _synth_media_still_meta,
 }
 
