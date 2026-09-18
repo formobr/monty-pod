@@ -140,3 +140,87 @@ def test_a_non_driver_break_also_restores_the_preset_icd(monkeypatch):
     monkeypatch.setattr(agent_main.shutil, "which", lambda _name: None)
     assert agent_main._vulkan_preflight(_CP()) is False
     assert os.environ["VK_ICD_FILENAMES"] == "/opt/custom/operator_icd.json"
+
+
+# ── MISC-101: ranks_tried=default must arrive with the WHY, not just the symptom ───────────────────────
+def _ldconfig_without_egl(cmd, *_a, **_k):
+    return subprocess.CompletedProcess(
+        cmd, 0,
+        stdout=("\tlibnvidia-ml.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1\n"
+                "\tlibcuda.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so.1\n"
+                "\tlibnvidia-ptxjitcompiler.so.1 (libc6,x86-64) => /usr/lib/libnvidia-ptxjitcompiler.so.1\n"),
+        stderr="")
+
+
+def _host_without_graphics_userspace(cmd, *_a, **_k):
+    if cmd[0] == "ldconfig":
+        return _ldconfig_without_egl(cmd)
+    if cmd[0] == "nvidia-smi":
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"580.126.18\n", stderr=b"")
+    assert cmd[0] == "ffmpeg"
+    return _run(1, b"Failed to create Vulkan instance: VK_ERROR_INCOMPATIBLE_DRIVER\n")
+
+
+def test_default_rank_evidence_names_the_missing_egl_the_icd_dirs_and_the_caps(monkeypatch, tmp_path):
+    """exit 187 with ranks_tried=default said only that the loader found nothing — it could not tell an
+    image fault from a host that exposes the GPU with no GL/EGL userspace at all."""
+    monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
+    monkeypatch.setattr(subprocess, "run", _host_without_graphics_userspace)
+    monkeypatch.setattr(agent_main.shutil, "which", lambda _name: None)
+    icd = tmp_path / "icd.d"
+    icd.mkdir()
+    (icd / "nvidia_icd.json").write_text("{}")
+    monkeypatch.setattr(agent_main, "_VULKAN_ICD_DIRS", (str(icd), str(tmp_path / "gone")))
+
+    capacity: dict = {}
+    assert agent_main._vulkan_preflight(_CP(), capacity=capacity) is False
+    detail = capacity["vulkan_detail"]
+
+    assert "ranks_tried=default" in detail and "egl-" not in detail
+    assert "no libEGL_nvidia.so.0 in ldconfig" in detail
+    assert f"{icd}: nvidia_icd.json" in detail
+    assert f"{tmp_path / 'gone'}: absent" in detail
+    assert "caps=all" in detail
+    assert "libnvidia-ml.so.1" in detail and "libnvidia-ptxjitcompiler.so.1" in detail
+    assert "libcuda.so.1" not in detail, "the nvidia grep is the filter, exactly as an operator would run it"
+    assert "/usr/lib/x86_64-linux-gnu" not in detail, "library NAMES only, never the resolved paths"
+    assert "driver_version=580.126.18" in detail
+
+
+def test_an_unset_capability_variable_is_a_named_absence_not_a_blank(monkeypatch, tmp_path):
+    monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+    monkeypatch.setattr(subprocess, "run", _host_without_graphics_userspace)
+    monkeypatch.setattr(agent_main.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(agent_main, "_VULKAN_ICD_DIRS", (str(tmp_path),))
+
+    capacity: dict = {}
+    agent_main._vulkan_preflight(_CP(), capacity=capacity)
+    assert "caps=UNSET" in capacity["vulkan_detail"]
+    assert f"{tmp_path}: empty" in capacity["vulkan_detail"]
+
+
+def test_a_huge_ffmpeg_dump_is_trimmed_and_the_host_evidence_is_not(monkeypatch, tmp_path):
+    """The ffmpeg stderr repeats itself and the box can be re-run; the host evidence dies with the pod, so
+    it is the half that must never be the one cut to fit the payload budget."""
+    monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "compute,utility")
+    monkeypatch.setattr(agent_main, "_VULKAN_ICD_DIRS", (str(tmp_path),))
+    monkeypatch.setattr(agent_main.shutil, "which", lambda _name: None)
+    noise = b"x" * 40000
+
+    def fake_run(cmd, *a, **k):
+        if cmd[0] == "ldconfig":
+            return _ldconfig_without_egl(cmd)
+        if cmd[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"580.126.18\n", stderr=b"")
+        assert cmd[0] == "ffmpeg"
+        return _run(1, noise)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    capacity: dict = {}
+    agent_main._vulkan_preflight(_CP(), capacity=capacity)
+    detail = capacity["vulkan_detail"]
+
+    evidence = agent_main._vulkan_host_evidence(_ldconfig_without_egl(["ldconfig"]).stdout, None)
+    assert evidence in detail, "the evidence arrived whole"
+    assert "chars omitted" in detail, "the dump, not the evidence, paid for the budget"
+    assert len(detail) < agent_main._VULKAN_DETAIL_BUDGET + len(evidence) + 400

@@ -392,17 +392,69 @@ def _nvdec_or_refuse(cp: "ControlPlane") -> None:
 # libplacebo's own floor — never lower (the-gpu-verdict-carries-its-evidence-or-it-is-not-a-verdict).
 _VULKAN_EGL_API_VERSIONS = ("1.3.0", "1.2.0")
 _VULKAN_EGL_ICD_PATH = "/tmp/nvidia_egl_icd.json"
+# Where a loader looks for ICD manifests when VK_ICD_FILENAMES says nothing: listing both separates "the
+# runtime injected nothing" from "it injected a manifest the driver refused".
+_VULKAN_ICD_DIRS = ("/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d")
+# The evidence is never the half that gets cut: it is the only half a later reader cannot reconstruct.
+_VULKAN_DETAIL_BUDGET = 1500
+_VULKAN_STDERR_MIN_EDGE = 150     # even a huge evidence block leaves the probe's own first and last lines
+_VULKAN_EVIDENCE_MAX_LIBS = 12
 
 
-def _egl_icd_lib() -> str | None:
+def _egl_icd_lib(ldconfig_out: str | None = None) -> str | None:
     """libEGL_nvidia.so.0 via ldconfig -p — the headless ICD (libGLX_nvidia is the X11 front a headless pod
     lacks). Called only once the default-discovery rank has already failed."""
+    out = _ldconfig_p() if ldconfig_out is None else ldconfig_out
+    return next((ln.split()[-1] for ln in out.splitlines() if "libEGL_nvidia.so.0" in ln), None)
+
+
+def _ldconfig_p() -> str:
+    """The loader's library table, or "" when ldconfig cannot run. ONE read per preflight: the ICD fallback
+    and the evidence below ask the same question of it."""
     import subprocess
     try:
-        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=10).stdout or ""
+        return subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=10).stdout or ""
     except (OSError, subprocess.SubprocessError):
-        return None
-    return next((ln.split()[-1] for ln in out.splitlines() if "libEGL_nvidia.so.0" in ln), None)
+        return ""
+
+
+def _nvidia_ldconfig_names(ldconfig_out: str) -> list[str]:
+    """SONAMEs of the loader's nvidia entries, de-duplicated. NAMES only: the resolved path adds no fact the
+    name does not, and it is the noisier half of the line."""
+    names: list[str] = []
+    for line in ldconfig_out.splitlines():
+        if "nvidia" not in line.lower():
+            continue
+        name = line.strip().split(" ", 1)[0]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _icd_dir_listing(path: str) -> str:
+    """"<dir>: a.json" / ": empty" / ": absent" — an unreadable directory is a NAMED absence, never silently
+    the same fact as an empty one."""
+    try:
+        entries = sorted(entry.name for entry in Path(path).iterdir())
+    except OSError:
+        return f"{path}: absent"
+    return f"{path}: {','.join(entries) if entries else 'empty'}"
+
+
+def _vulkan_host_evidence(ldconfig_out: str, lib: str | None) -> str:
+    """WHY the ladder could not even start. `ranks_tried=default` alone cannot tell "our image is broken"
+    from "this host exposes the GPU without the GL/EGL userspace, so no libEGL_nvidia.so.0 exists and the
+    fallback rank never ran", and the box is gone before anyone asks. NVIDIA_DRIVER_CAPABILITIES is a
+    capability word list, never a credential: its VALUE is the point of quoting it."""
+    head = ("no libEGL_nvidia.so.0 in ldconfig" if lib is None
+            else "libEGL_nvidia.so.0 present in ldconfig")
+    icds = "; ".join(_icd_dir_listing(d) for d in _VULKAN_ICD_DIRS)
+    caps = os.environ.get("NVIDIA_DRIVER_CAPABILITIES")
+    names = _nvidia_ldconfig_names(ldconfig_out)
+    shown = names[:_VULKAN_EVIDENCE_MAX_LIBS]
+    libs = ",".join(shown) + (f",+{len(names) - len(shown)} more" if len(names) > len(shown) else "")
+    return (f"{head}; icd.d: {icds}; caps={caps if caps is not None else 'UNSET'}; "
+            f"nvidia libs: {libs or 'none'}")
 
 
 def _write_egl_icd_manifest(lib: str, api_version: str) -> str:
@@ -462,7 +514,8 @@ def _vulkan_preflight(cp: "ControlPlane", *, capacity: dict[str, Any] | None = N
         return True
     detail = brief
 
-    lib = _egl_icd_lib()
+    ldconfig_out = _ldconfig_p()
+    lib = _egl_icd_lib(ldconfig_out)
     if lib is None:
         _log("WARNING no libEGL_nvidia.so.0 — no synthesized ICD fallback is possible")
     else:
@@ -485,10 +538,13 @@ def _vulkan_preflight(cp: "ControlPlane", *, capacity: dict[str, Any] | None = N
         else:
             os.environ["VK_ICD_FILENAMES"] = preset_icd
 
+    evidence = _vulkan_host_evidence(ldconfig_out, lib)
     if raw_stderr:
-        detail = f"{detail}: {_bounded_stderr(raw_stderr, edge=750)}"  # ~1500 chars — the evidence budget
+        # The ffmpeg dump yields the budget to the host evidence, never the other way round.
+        edge = max(_VULKAN_STDERR_MIN_EDGE, (_VULKAN_DETAIL_BUDGET - len(evidence)) // 2)
+        detail = f"{detail}: {_bounded_stderr(raw_stderr, edge=edge)}"
     driver = _nvidia_driver_version()
-    detail = f"{detail} · ranks_tried={','.join(ranks_tried)} · driver_version={driver}"
+    detail = (f"{detail} · ranks_tried={','.join(ranks_tried)} · driver_version={driver} · {evidence}")
     if summary := _vulkaninfo_summary():
         detail = f"{detail} · {summary}"
     detail = safe_text(detail)
