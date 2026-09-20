@@ -160,7 +160,10 @@ def test_sfx_mix_delays_sounds_over_master_with_limiter():
     g = ";".join(render._audio_mix_chains(a))
     assert "[2:a]adelay=12560:all=1,volume=0.4[sx0]" in g
     assert "[3:a]adelay=52870:all=1,volume=0.5[sx1]" in g
-    assert "[amaster][sx0][sx1]amix=inputs=3:normalize=0:duration=first[mx]" in g
+    # the cues are summed and limited on their OWN bus, at a ceiling under the voice's TP — not on the master
+    assert "[sx0][sx1]amix=inputs=2:normalize=0:duration=longest[sxmix]" in g
+    assert f"[sxmix]alimiter=limit={render._num(render._SFX_BUS_CEILING)}:attack=5:release=50:level=false[sxbus]" in g
+    assert "[amaster][sxbus]amix=inputs=2:normalize=0:duration=first[mx]" in g
     assert "alimiter=limit=0.79" in g and g.endswith("[aout]")
 
 

@@ -301,6 +301,12 @@ def _has_broll(spec: RenderSpec) -> bool:
 _VOICE_LUFS, _TP, _LRA = -20.0, -1.5, 11
 _MUSIC_LUFS = -33.0
 _DUCK = 3
+# SFX BUS LAW — Twin of scripts/add_whoosh.BUS_LU_UNDER_VOICE / sfx_bus_ceiling_linear (registry/sfx.yaml
+# is the declared bus law: every cue sits this many LU under the voice). The SFX bus's OWN limiter sits at
+# this ceiling so an SFX transient gain-reduces only ITSELF, never the voice (MISC-142: a shared whole-mix
+# brickwall used to duck the voice for the length of every cue — the "SFX too loud" pumping complaint).
+_SFX_BUS_LU_UNDER_VOICE = 10.5
+_SFX_BUS_CEILING = (10 ** (_TP / 20)) * (10 ** (-_SFX_BUS_LU_UNDER_VOICE / 20))
 # One full-length audio decode/encode runs far above realtime; minutes of source fit well under this.
 # A pass that does not is wedged, and a wedge must fail loud, not absorb the stage (deadline law).
 _AUDIO_PASS_WALL_S = 300
@@ -399,9 +405,15 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
         for i, (sidx, at, gain) in enumerate(a.sfx):
             chains.append(f"[{sidx}:a]adelay={int(round(at * 1000))}:all=1,volume={_num(gain)}[sx{i}]")
             labels.append(f"[sx{i}]")
-        # amix SUMS sfx onto the master → cap the tips with a lookahead limiter (peak-safe last stage).
-        chains.append(f"[amaster]{''.join(labels)}amix=inputs={len(a.sfx) + 1}:normalize=0:duration=first[mx]")
-        # 0.79 (−2.05 dB) not 0.84: this limiter runs at 48k without the 192k oversample the premix one has, and inter-sample peaks overshoot ~0.5 dB past the sample ceiling — measured −0.93 dBTP against the −1.0 gate
+        # SFX BUS (MISC-142): summed and limited on their OWN bus, BEFORE joining the voice/music master —
+        # the old shared whole-mix limiter gain-reduced the VOICE for the length of every SFX transient
+        # (the "SFX too loud" pumping). `_SFX_BUS_CEILING` leaves _SFX_BUS_LU_UNDER_VOICE LU of headroom
+        # under the voice's own true-peak ceiling, so this limiter only ever caps the SFX pile-up.
+        chains.append(f"{''.join(labels)}amix=inputs={len(a.sfx)}:normalize=0:duration=longest[sxmix]")
+        chains.append(f"[sxmix]alimiter=limit={_num(_SFX_BUS_CEILING)}:attack=5:release=50:level=false[sxbus]")
+        chains.append("[amaster][sxbus]amix=inputs=2:normalize=0:duration=first[mx]")
+        # 0.79 (−2.05 dB) not 0.84: this limiter runs at 48k without the 192k oversample the premix one has, and inter-sample peaks overshoot ~0.5 dB past the sample ceiling — measured −0.93 dBTP against the −1.0 gate.
+        # SAFETY NET only now: a correctly declared sfx bus above never reaches it on the fixture (tests/test_sfx_bus_level.py).
         chains.append("[mx]alimiter=limit=0.79:attack=5:release=50:level=false[aout]")
     else:
         chains.append("[amaster]anull[aout]")
