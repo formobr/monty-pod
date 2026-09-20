@@ -298,13 +298,19 @@ def _has_broll(spec: RenderSpec) -> bool:
 
 # locked audio chain (add_music.sh + memory voice-audio-chain): voice -20 LUFS denoise-only (no comp/deharsh),
 # music bed -33 LUFS, gentle sidechain duck. Master -14 loudnorm is a later step (after cover), not here.
-_VOICE_LUFS, _TP, _LRA = -20.0, -1.5, 11
+# `_TP` is the PREMIX ceiling only — delivery renormalises (finalize.py loudnorm -14 LUFS/TP -1.0, untouched),
+# so this number is free to move; it is -6.0 (not -1.5) so the MISC-142 headroom budget below closes. Twin:
+# scripts/add_whoosh.VOICE_TP_DB / scripts/montyops/opener_build._VOICE_TP_DB.
+_VOICE_LUFS, _TP, _LRA = -20.0, -6.0, 11
 _MUSIC_LUFS = -33.0
 _DUCK = 3
 # SFX BUS LAW — Twin of scripts/add_whoosh.BUS_LU_UNDER_VOICE / sfx_bus_ceiling_linear (registry/sfx.yaml
 # is the declared bus law: every cue sits this many LU under the voice). The SFX bus's OWN limiter sits at
 # this ceiling so an SFX transient gain-reduces only ITSELF, never the voice (MISC-142: a shared whole-mix
 # brickwall used to duck the voice for the length of every cue — the "SFX too loud" pumping complaint).
+# MISC-142 headroom budget, LINEAR (dB headroom figures do not sum, amplitudes do — tests/test_sfx_bus_level.py
+# proves both directions): no-music arm 10**(_TP/20) + _SFX_BUS_CEILING = 0.650811 <= 0.79; music arm 0.63
+# (the premix alimiter below) + _SFX_BUS_CEILING = 0.779624 <= 0.79 — the tightest arm, ~0.10 dB of margin.
 _SFX_BUS_LU_UNDER_VOICE = 10.5
 _SFX_BUS_CEILING = (10 ** (_TP / 20)) * (10 ** (-_SFX_BUS_LU_UNDER_VOICE / 20))
 # One full-length audio decode/encode runs far above realtime; minutes of source fit well under this.
@@ -413,7 +419,10 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
         chains.append(f"[sxmix]alimiter=limit={_num(_SFX_BUS_CEILING)}:attack=5:release=50:level=false[sxbus]")
         chains.append("[amaster][sxbus]amix=inputs=2:normalize=0:duration=first[mx]")
         # 0.79 (−2.05 dB) not 0.84: this limiter runs at 48k without the 192k oversample the premix one has, and inter-sample peaks overshoot ~0.5 dB past the sample ceiling — measured −0.93 dBTP against the −1.0 gate.
-        # SAFETY NET only now: a correctly declared sfx bus above never reaches it on the fixture (tests/test_sfx_bus_level.py).
+        # SAFETY NET, provably: _TP=-6.0 (not the old -1.5) makes both `[amaster]` arms + `_SFX_BUS_CEILING`
+        # sum to <=0.79 in LINEAR amplitude (no-music 0.650811, music 0.779624 — the tightest arm, ~0.10 dB
+        # of margin) — this alimiter is declared to never gain-reduce a correctly declared bus, not merely
+        # hoped to (tests/test_sfx_bus_level.py; the pre-fix numbers fail the same assertion).
         chains.append("[mx]alimiter=limit=0.79:attack=5:release=50:level=false[aout]")
     else:
         chains.append("[amaster]anull[aout]")
