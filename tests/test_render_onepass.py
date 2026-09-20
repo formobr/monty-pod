@@ -239,12 +239,17 @@ _COMPOSITE = [
     '[0:v]trim=start=0:end=6,setpts=(PTS-STARTPTS)/1,scale=1080:1920:flags=lanczos,setsar=1[v0__cmp]',
     '[0:v]trim=start=10:end=15,setpts=(PTS-STARTPTS)/1.25,scale=1080:1920:flags=lanczos,setsar=1[v1__cmp]',
     '[v0__cmp][v1__cmp]concat=n=2:v=1:a=0[vcomposite]',
-    '[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,apad=whole_dur=10,asplit=2[vc1__cmp][vc2__cmp]',
+    # post-loudnorm voice gain + premix alimiter ceiling (MISC-142 round-2): both derived from render's
+    # own declared constants, not hand-typed literals, so a future constant change moves these pins with
+    # the code (proof this pin actually guards the property: it fails on pre-fold render.py, which has no
+    # volume= stage between LRA=11 and apad and a bare 0.63 alimiter literal).
+    f'[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,volume={render._num(render._VOICE_POST_GAIN_DB)}dB,'
+    'apad=whole_dur=10,asplit=2[vc1__cmp][vc2__cmp]',
     '[1:a]volume=1.0[bg0__cmp]',
     '[bg0__cmp][vc2__cmp]sidechaincompress=threshold=0.06:ratio=3:attack=20:release=500[bg__cmp]',
     '[vc1__cmp][bg__cmp]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[premix__cmp]',
-    '[premix__cmp]aresample=192000,alimiter=limit=0.63:attack=5:release=50:level=false,'
-    'aresample=48000[amaster__cmp]',
+    f'[premix__cmp]aresample=192000,alimiter=limit={render._num(render._PREMIX_ALIMITER_CEILING)}:'
+    'attack=5:release=50:level=false,aresample=48000[amaster__cmp]',
     '[amaster__cmp]anull[acomposite]',
 ]
 # no music, no sfx: segment audio rides the concat itself, which emits TWO distinct pads

@@ -140,7 +140,10 @@ def test_music_audio_graph_mixes_voice_and_bed():
     g = render.build_filtergraph(spec, gpu=False, audio=a)
     # video concatenates WITHOUT audio (a=0); the mix owns [aout]
     assert "concat=n=1:v=1:a=0[vout]" in g
-    assert "[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,apad=whole_dur=60" in g
+    # post-loudnorm voice gain (MISC-142 round-2): derived from render's own declared constant, not a
+    # hand-typed literal, so a future _VOICE_POST_GAIN_DB change moves this pin with the code.
+    assert (f"[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,"
+            f"volume={render._num(render._VOICE_POST_GAIN_DB)}dB,apad=whole_dur=60") in g
     assert "sidechaincompress=threshold=0.06:ratio=3" in g  # locked DUCK
     assert "amix=inputs=2:duration=first:dropout_transition=0:normalize=0" in g
     assert "[bg0]" in g and g.strip().endswith(f"[vout]{render._BT709_SET_PARAMS}[vout]")
