@@ -596,11 +596,13 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
         # the old shared whole-mix limiter gain-reduced the VOICE for the length of every SFX transient
         # (the "SFX too loud" pumping). `_SFX_BUS_CEILING` leaves _SFX_BUS_LU_UNDER_VOICE LU of headroom
         # under the voice's own true-peak ceiling, so this limiter only ever caps the SFX pile-up.
-        # MISC-142 round-5: a kinetic-typing stem's `gain` (`SpecSfx`, sent by `final_dispatch.resolve_sfx`)
+        # MISC-142 round-6: a kinetic-typing stem's `gain` (`SpecSfx`, sent by `final_dispatch.resolve_sfx`)
         # ALSO arrives here, indistinguishable from a resolved cue (this wire carries `sound/at/gain` only —
-        # no `kind`, so it cannot pick a different bus). `add_whoosh.stem_gain_for_voice` derives that gain
-        # so the stem's own worst-case peak (`typing_sfx.PEAK_CAP`) never exceeds `_SFX_BUS_CEILING` either —
-        # this limiter stays a safety net for the stem too, not a routine gain-reducer.
+        # no `kind`, so it cannot pick a different bus) — and that is now TRUE of the sound as well as of
+        # the wire: the stem is conditioned to the catalogue's own source level before it is sent
+        # (`typing_sfx._condition_to_library_level`), so it arrives at `add_whoosh.cue_gain_for_voice`'s
+        # number with a cue's worst-case peak (`condition_sfx.TP_LIMIT`), which is what `_SFX_BUS_CEILING`
+        # was sized against — this limiter stays a safety net for the stem too, not a routine gain-reducer.
         chains.append(f"{''.join(labels)}amix=inputs={len(a.sfx)}:normalize=0:duration=longest[sxmix]")
         chains.append(f"[sxmix]alimiter=limit={_num(_SFX_BUS_CEILING)}:attack=5:release=50:level=false[sxbus]")
         chains.append("[amaster][sxbus]amix=inputs=2:normalize=0:duration=first[mx]")
