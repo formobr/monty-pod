@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
@@ -110,6 +111,82 @@ def _gpu_crop(keyframes: list[MotionKeyframe], interp: str, w: int, h: int) -> s
 def _cpu_crop(keyframes: list[MotionKeyframe], w: int, h: int) -> str:
     """CPU fallback: no animation in v1 — a static crop at the first keyframe rect, then scale."""
     x0, y0, w0, h0 = keyframes[0].rect
+    return (
+        f"crop=w=iw*{_num(w0)}:h=ih*{_num(h0)}:x=iw*{_num(x0)}:y=ih*{_num(y0)},"
+        f"scale={w}:{h}:flags=lanczos,setsar=1"
+    )
+
+
+# ── zoom-space crop builders (MISC-141, fold round 1) ─────────────────────────────────────────────
+# Twin of scripts/montyops/camera_apply.py's ZKF/`_zoom_piecewise`/`zoom_z_expr`/`zoom_center_expr`/
+# `zoom_gpu_crop`/`zoom_cpu_crop`, pinned byte-equal in tests/test_op_camera_apply.py. Not reached by any
+# MotionSegment today (interp="cos" trajectories are not yet routed through this composite renderer — see
+# that test's parity notes) but kept in lock-step so a future unification cannot drift the two apart.
+
+@dataclass(frozen=True)
+class ZoomKeyframe:
+    """A zoom-space bake keyframe: the planner's OWN parameter (z, head_x, eye_y), not a rect — each carries
+    its OWN `interp` for the interval it opens."""
+    t: float
+    z: float
+    head_x: float
+    eye_y: float
+    interp: str
+
+
+def _zoom_piecewise(vals: list[float], keyframes: list[ZoomKeyframe]) -> str:
+    """Piecewise interpolation of ONE scalar (z, head_x or eye_y) over segment time `t`, each interval eased
+    by ITS OWN keyframe's `interp`."""
+    if len(keyframes) == 1:
+        return _num(vals[0])
+    times = [kf.t for kf in keyframes]
+    expr = _num(vals[-1])  # else-branch once t is past the final keyframe
+    for i in range(len(keyframes) - 2, -1, -1):
+        dt = times[i + 1] - times[i]
+        p = "1" if dt <= 0 else f"clip((t-{_num(times[i])})/{_num(dt)},0,1)"
+        eased = _ease(keyframes[i].interp, p)
+        lerp = f"({_num(vals[i])}+({_num(vals[i + 1])}-{_num(vals[i])})*({eased}))"
+        expr = f"if(lt(t,{_num(times[i + 1])}),{lerp},{expr})"
+    return expr
+
+
+def zoom_z_expr(keyframes: list[ZoomKeyframe]) -> str:
+    return _zoom_piecewise([kf.z for kf in keyframes], keyframes)
+
+
+def zoom_center_expr(keyframes: list[ZoomKeyframe], attr: str) -> str:
+    return _zoom_piecewise([getattr(kf, attr) for kf in keyframes], keyframes)
+
+
+def zoom_gpu_crop(keyframes: list[ZoomKeyframe], geom: dict[str, float], ax: float, ay: float,
+                  w: int, h: int) -> str:
+    """`rect_at`'s own fold (x_px = crop_x + head_x*sw - ax*(sw/z), w_px = sw/z, ...), built as one ffmpeg
+    expression per component instead of sampled in Python."""
+    z = zoom_z_expr(keyframes)
+    hx = zoom_center_expr(keyframes, "head_x")
+    hy = zoom_center_expr(keyframes, "eye_y")
+    sw, sh = _num(geom["sw"]), _num(geom["sh"])
+    cover_w, cover_h = _num(geom["cover_w"]), _num(geom["cover_h"])
+    cx = f"(({_num(geom['crop_x'])})+({hx})*{sw}-{_num(ax)}*({sw}/({z})))/{cover_w}*iw"
+    cy = f"(({_num(geom['crop_y'])})+({hy})*{sh}-{_num(ay)}*({sh}/({z})))/{cover_h}*ih"
+    cw = f"({sw}/({z}))/{cover_w}*iw"
+    ch = f"({sh}/({z}))/{cover_h}*ih"
+    return (
+        "format=yuv420p,hwupload,"
+        f"libplacebo=w={w}:h={h}:crop_x='{cx}':crop_y='{cy}':crop_w='{cw}':crop_h='{ch}',"
+        "hwdownload,format=yuv420p,setrange=range=tv"
+    )
+
+
+def zoom_cpu_crop(keyframes: list[ZoomKeyframe], geom: dict[str, float], ax: float, ay: float,
+                  w: int, h: int) -> str:
+    """CPU fallback: no animation (v1) — a static crop at the first keyframe's own rect (via `rect_at`'s
+    fold), then scale."""
+    kf = keyframes[0]
+    x0 = (geom["crop_x"] + kf.head_x * geom["sw"] - ax * (geom["sw"] / kf.z)) / geom["cover_w"]
+    y0 = (geom["crop_y"] + kf.eye_y * geom["sh"] - ay * (geom["sh"] / kf.z)) / geom["cover_h"]
+    w0 = (geom["sw"] / kf.z) / geom["cover_w"]
+    h0 = (geom["sh"] / kf.z) / geom["cover_h"]
     return (
         f"crop=w=iw*{_num(w0)}:h=ih*{_num(h0)}:x=iw*{_num(x0)}:y=ih*{_num(y0)},"
         f"scale={w}:{h}:flags=lanczos,setsar=1"
