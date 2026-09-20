@@ -297,8 +297,7 @@ def _has_broll(spec: RenderSpec) -> bool:
 
 
 # locked audio chain (add_music.sh + memory voice-audio-chain): voice -20 LUFS denoise-only (no comp/deharsh),
-# music bed -33 LUFS (offset below), gentle sidechain duck. Master -14 loudnorm is a later step (after
-# cover), not here.
+# music bed -33 LUFS, gentle sidechain duck. Master -14 loudnorm is a later step (after cover), not here.
 # `_TP` is the loudnorm TP= ARGUMENT — EXACTLY origin/main, never touched by the SFX headroom budget.
 # MISC-142 ROUND-2 FOLD (codex r2 HIGH1): round-1 bought SFX headroom by moving `_TP` itself to -6.0. ffmpeg's
 # `linear=true` two-pass loudnorm silently REVERTS TO DYNAMIC MODE whenever the measured input's linearly-
@@ -307,19 +306,24 @@ def _has_broll(spec: RenderSpec) -> bool:
 # compressor and silently missed -20 LUFS integrated on ordinary takes (proven: tests/test_sfx_bus_level.py's
 # ffmpeg probe measures `normalization_type` flipping linear->dynamic between TP=-1.5 and TP=-6.0 on the
 # SAME measured values). `_TP` stays put; the SFX headroom instead comes from a deterministic GAIN STAGE
-# applied AFTER loudnorm (see `_audio_mix_chains`'s `volume=` on the voice leg) — that gain does not feed
-# loudnorm's own linear/dynamic decision at all, so it cannot trip the fallback.
+# applied AFTER loudnorm (see below) — that gain does not feed loudnorm's own linear/dynamic decision at all,
+# so it cannot trip the fallback.
 _VOICE_LUFS, _TP, _LRA = -20.0, -1.5, 11
 # `_PREMIX_VOICE_TP_DB` is the DECLARED premix ceiling every render twin locks to (twin of
-# scripts/add_whoosh.VOICE_TP_DB / scripts/montyops/opener_build._VOICE_TP_DB) — realized on the actual
-# voice audio by `_VOICE_POST_GAIN_DB`, a fixed `volume=` stage after loudnorm, never by loudnorm's TP arg.
+# scripts/add_whoosh.VOICE_TP_DB / scripts/montyops/opener_build._VOICE_TP_DB) — realized by
+# `_VOICE_POST_GAIN_DB`, a fixed `volume=` stage, never by loudnorm's TP arg.
 _PREMIX_VOICE_TP_DB = -6.0
 _VOICE_POST_GAIN_DB = _PREMIX_VOICE_TP_DB - _TP    # -4.5 dB: 0.8414(TP=-1.5) * 10**(-4.5/20) = 0.501187(-6.0dBTP)
-# The bed's own prerender target carries the SAME fixed offset (one source: `_VOICE_POST_GAIN_DB`), so the
-# declared voice-music gap (-20 - (-33) = 13 LU) is unchanged even though the voice's post-gain premix level
-# now sits below its loudnorm target — delivery renormalises (finalize.py -14 LUFS/TP -1.0, untouched), so
-# both moving together by the same amount is free.
-_MUSIC_LUFS = -33.0 + _VOICE_POST_GAIN_DB
+# MISC-142 ROUND-3 FOLD (codex r3 HIGH1 = claude r3 HIGH1): round-2 put this gain on the VOICE leg, BEFORE
+# the `asplit` that feeds the sidechain KEY — the duck's detector got 4.5 dB quieter while `threshold=0.06`
+# stayed an ABSOLUTE level, so the bed almost stopped ducking (measured: ~4 dB GR -> ~1 dB GR), silently
+# breaking the declared `brands/cryptomonkeys/brand.yaml` `audio.music_duck_db`. The gain now applies ONCE,
+# to the FINISHED premix (voice+bed already mixed, see `_audio_mix_chains`) — every stage upstream of that
+# (voice loudnorm, `_MUSIC_LUFS`, the bed `volume=`, the sidechain key/threshold, the voice+bed `amix`) is
+# therefore BYTE-IDENTICAL to origin/main, and moving voice+bed together after they are already mixed is
+# free (delivery renormalises: finalize.py -14 LUFS/TP -1.0, untouched). The bed's own prerender target no
+# longer needs an offset at all — restored to plain -33.0.
+_MUSIC_LUFS = -33.0
 _DUCK = 3
 # SFX BUS LAW — Twin of scripts/add_whoosh.BUS_LU_UNDER_VOICE / sfx_bus_ceiling_linear (registry/sfx.yaml
 # is the declared bus law: every cue sits this many LU under the voice). The SFX bus's OWN limiter sits at
@@ -408,9 +412,10 @@ def _measure_loudnorm(voice: Path, pre: str) -> str:
 
 
 def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
-    """Normalize the track to the `_MUSIC_LUFS` bed (-33 LUFS, offset by the same fixed gain the voice's
-    premix carries — see `_MUSIC_LUFS`), then loop+seek it to exactly `dur`. Order matters: loudnorm on an
-    infinite loop truncates, so normalize the finite track first, then loop the fixed bed."""
+    """Normalize the track to the `_MUSIC_LUFS` bed (-33 LUFS, origin/main's plain target — round-3 fold
+    removed the round-2 offset here, since the SFX headroom gain now applies once to the finished premix,
+    not to the voice before it is mixed with this bed), then loop+seek it to exactly `dur`. Order matters:
+    loudnorm on an infinite loop truncates, so normalize the finite track first, then loop the fixed bed."""
     norm = tmp / "music_norm.flac"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(music),
                     "-af", f"loudnorm=I={_num(_MUSIC_LUFS)}:TP=-2:LRA=11", "-ar", "48000", "-ac", "2",
@@ -423,23 +428,31 @@ def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
 
 
 def _audio_mix_chains(a: _AudioMix) -> list[str]:
-    """Voice (clean → measured loudnorm → a fixed post-loudnorm gain → padded) mixed with the ducked bed
-    (when music), then the accent SFX summed on top with a peak-safe limiter → [aout]. The `volume=` stage
-    right after `{a.vln}` is the ONLY place the SFX headroom budget touches the voice (MISC-142 round-2):
-    loudnorm's own TP argument is untouched from origin/main (see `_TP`'s comment above), so it cannot trip
-    ffmpeg's silent linear->dynamic fallback. Bed level is its own normalize target, not a volume filter
-    here (see `_MUSIC_LUFS`)."""
+    """Voice (clean → measured loudnorm → padded) mixed with the ducked bed (when music), then the accent
+    SFX summed on top with a peak-safe limiter → [aout].
+
+    MISC-142 ROUND-3 FOLD (codex r3 HIGH1 = claude r3 HIGH1): round-2 put the SFX headroom gain on the
+    voice leg, BEFORE the `asplit` that hands the sidechain its KEY — the duck's detector went 4.5 dB
+    quieter while `threshold=0.06` stayed an ABSOLUTE level, so the bed almost stopped ducking under the
+    voice. The gain now applies ONCE, on `[premix]`, AFTER the voice+bed `amix` — so the voice loudnorm, the
+    bed level, the sidechain key/threshold and the amix itself are the exact stages origin/main runs (see
+    tests/test_render_broll.py / test_render_onepass.py's byte-diff against the main graph), and the duck
+    keys off the SAME -20 LUFS signal origin/main measures against a threshold that never moved. The gain is
+    applied BEFORE the alimiter (not after): that lets the alimiter keep ONE declared ceiling
+    (`_PREMIX_ALIMITER_CEILING`, the final target the SFX budget already derives from) instead of needing a
+    second, pre-gain-scale constant kept in sync with `_VOICE_POST_GAIN_DB` by hand. The no-music arm has no
+    sidechain to protect, so it keeps the gain directly on the voice leg."""
     dur = _num(a.dur)
     voice_gain = f"volume={_num(_VOICE_POST_GAIN_DB)}dB"
     chains: list[str] = []
     if a.bed_idx is not None:
         chains += [
-            f"[{a.voice_idx}:a]{a.clean},{a.vln},{voice_gain},apad=whole_dur={dur},asplit=2[vc1][vc2]",
+            f"[{a.voice_idx}:a]{a.clean},{a.vln},apad=whole_dur={dur},asplit=2[vc1][vc2]",
             f"[{a.bed_idx}:a]volume=1.0[bg0]",
             f"[bg0][vc2]sidechaincompress=threshold=0.06:ratio={_DUCK}:attack=20:release=500[bg]",
             "[vc1][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[premix]",
-            f"[premix]aresample=192000,alimiter=limit={_num(_PREMIX_ALIMITER_CEILING)}:attack=5:release=50:"
-            "level=false,aresample=48000[amaster]",
+            f"[premix]{voice_gain},aresample=192000,alimiter=limit={_num(_PREMIX_ALIMITER_CEILING)}:"
+            "attack=5:release=50:level=false,aresample=48000[amaster]",
         ]
     else:
         chains.append(f"[{a.voice_idx}:a]{a.clean},{a.vln},{voice_gain},apad=whole_dur={dur}[amaster]")

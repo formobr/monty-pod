@@ -140,12 +140,16 @@ def test_music_audio_graph_mixes_voice_and_bed():
     g = render.build_filtergraph(spec, gpu=False, audio=a)
     # video concatenates WITHOUT audio (a=0); the mix owns [aout]
     assert "concat=n=1:v=1:a=0[vout]" in g
-    # post-loudnorm voice gain (MISC-142 round-2): derived from render's own declared constant, not a
-    # hand-typed literal, so a future _VOICE_POST_GAIN_DB change moves this pin with the code.
-    assert (f"[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,"
-            f"volume={render._num(render._VOICE_POST_GAIN_DB)}dB,apad=whole_dur=60") in g
-    assert "sidechaincompress=threshold=0.06:ratio=3" in g  # locked DUCK
+    # MISC-142 round-3: the voice loudnorm, bed volume, sidechain key/threshold and voice+bed amix are
+    # byte-identical to origin/main; the SFX headroom gain moves to [premix], AFTER the amix, so it cannot
+    # touch the sidechain's KEY (round-2's HIGH — the duck almost stopped ducking).
+    assert "[0:a]highpass=f=80,loudnorm=I=-20:TP=-1.5:LRA=11,apad=whole_dur=60,asplit=2[vc1][vc2]" in g
+    assert "sidechaincompress=threshold=0.06:ratio=3" in g  # locked DUCK, unchanged detector level
     assert "amix=inputs=2:duration=first:dropout_transition=0:normalize=0" in g
+    # post-amix premix gain (MISC-142 round-3): derived from render's own declared constant, not a
+    # hand-typed literal, so a future _VOICE_POST_GAIN_DB change moves this pin with the code.
+    assert (f"[premix]volume={render._num(render._VOICE_POST_GAIN_DB)}dB,aresample=192000,"
+            f"alimiter=limit={render._num(render._PREMIX_ALIMITER_CEILING)}:") in g
     assert "[bg0]" in g and g.strip().endswith(f"[vout]{render._BT709_SET_PARAMS}[vout]")
 
 
