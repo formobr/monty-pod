@@ -163,8 +163,11 @@ def _zoom_piecewise(vals: list[float], keyframes: list[ZoomKeyframe]) -> str:
 
 def zoom_bump_expr(punches: list[BumpKeyframe]) -> str:
     """The punch's own additive curve (fold round 2) — always linear, built with the SAME `_zoom_piecewise`
-    chain the ramp uses. 0 outside its own span falls out of that chain's clamp because a punch's first and
-    last breakpoint are always 0 by construction (head_trajectory.bake_punches_for_span)."""
+    chain the ramp uses. Outside its own span, the chain's clamp holds the value at whichever ENDPOINT
+    breakpoint is nearest — 0 for an ordinary punch (first/last breakpoint at its own attack start / release
+    end), but NOT always 0: a punch spanning the whole segment (fold round 3, codex LOW) is already mid-hold
+    at both edges, so both endpoint breakpoints carry `depth`, and the clamp correctly holds that value
+    outside the span too (fold round 4, codex LOW-2 — the old docstring's "always 0" was already false)."""
     if not punches:
         return "0"
     return _zoom_piecewise([p.bump for p in punches], punches)
@@ -204,18 +207,23 @@ def zoom_gpu_crop(keyframes: list[ZoomKeyframe], geom: dict[str, float], ax: flo
 
 def _bump_value_at(t: float, punches: list[BumpKeyframe]) -> float:
     """Python-side twin of `zoom_bump_expr`'s piecewise-linear curve, evaluated at ONE instant — only the CPU
-    static fallback (v1, first keyframe only) needs a number instead of an ffmpeg expression."""
+    static fallback (v1, first keyframe only) needs a number instead of an ffmpeg expression. Outside the
+    breakpoint span, clamps to the NEAREST endpoint's own value (matching `_zoom_piecewise`'s clip-to-boundary
+    behaviour) rather than hard-coding 0 — fold round 4, codex LOW-2: a whole-span punch (fold round 3) can
+    make that endpoint value `depth`, not 0, and the two twins must agree."""
     if not punches:
         return 0.0
     pts = sorted(punches, key=lambda p: p.t)
-    if t <= pts[0].t or t >= pts[-1].t:
-        return 0.0
+    if t <= pts[0].t:
+        return pts[0].bump
+    if t >= pts[-1].t:
+        return pts[-1].bump
     for a, b in zip(pts, pts[1:]):
         if a.t <= t <= b.t:
             span = b.t - a.t
             p = 0.0 if span <= 0 else max(0.0, min(1.0, (t - a.t) / span))
             return a.bump + (b.bump - a.bump) * p
-    return 0.0
+    return pts[-1].bump
 
 
 def zoom_cpu_crop(keyframes: list[ZoomKeyframe], geom: dict[str, float], ax: float, ay: float,
