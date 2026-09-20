@@ -117,21 +117,32 @@ def _cpu_crop(keyframes: list[MotionKeyframe], w: int, h: int) -> str:
     )
 
 
-# ── zoom-space crop builders (MISC-141, fold round 1) ─────────────────────────────────────────────
-# Twin of scripts/montyops/camera_apply.py's ZKF/`_zoom_piecewise`/`zoom_z_expr`/`zoom_center_expr`/
-# `zoom_gpu_crop`/`zoom_cpu_crop`, pinned byte-equal in tests/test_op_camera_apply.py. Not reached by any
-# MotionSegment today (interp="cos" trajectories are not yet routed through this composite renderer — see
-# that test's parity notes) but kept in lock-step so a future unification cannot drift the two apart.
+# ── zoom-space crop builders (MISC-141, fold round 1 + round 2) ────────────────────────────────────
+# Twin of scripts/montyops/camera_apply.py's ZKF/BumpKF/`_zoom_piecewise`/`zoom_z_expr`/`zoom_bump_expr`/
+# `zoom_center_expr`/`zoom_gpu_crop`/`zoom_cpu_crop`, pinned byte-equal in tests/test_op_camera_apply.py. Not
+# reached by any MotionSegment today (interp="cos" trajectories are not yet routed through this composite
+# renderer — see that test's parity notes) but kept in lock-step so a future unification cannot drift apart.
 
 @dataclass(frozen=True)
 class ZoomKeyframe:
-    """A zoom-space bake keyframe: the planner's OWN parameter (z, head_x, eye_y), not a rect — each carries
-    its OWN `interp` for the interval it opens."""
+    """A zoom-space RAMP keyframe: the shot's own RAW cosine ramp — `z` never includes a punch bump or the
+    1.001 floor (fold round 2; `zoom_z_expr` composes both analytically). Each keyframe carries its OWN
+    `interp` for the interval it opens (always "cos" since round 2 — a ramp point is exact between a shot's
+    own two boundaries)."""
     t: float
     z: float
     head_x: float
     eye_y: float
     interp: str
+
+
+@dataclass(frozen=True)
+class BumpKeyframe:
+    """A punch's own additive bump (fold round 2): genuinely piecewise LINEAR in time, so no per-point
+    `interp` varies — composes multiplicatively with the shot's ramp in `zoom_z_expr`."""
+    t: float
+    bump: float
+    interp: str = "linear"
 
 
 def _zoom_piecewise(vals: list[float], keyframes: list[ZoomKeyframe]) -> str:
@@ -150,8 +161,21 @@ def _zoom_piecewise(vals: list[float], keyframes: list[ZoomKeyframe]) -> str:
     return expr
 
 
-def zoom_z_expr(keyframes: list[ZoomKeyframe]) -> str:
-    return _zoom_piecewise([kf.z for kf in keyframes], keyframes)
+def zoom_bump_expr(punches: list[BumpKeyframe]) -> str:
+    """The punch's own additive curve (fold round 2) — always linear, built with the SAME `_zoom_piecewise`
+    chain the ramp uses. 0 outside its own span falls out of that chain's clamp because a punch's first and
+    last breakpoint are always 0 by construction (head_trajectory.bake_punches_for_span)."""
+    if not punches:
+        return "0"
+    return _zoom_piecewise([p.bump for p in punches], punches)
+
+
+def zoom_z_expr(keyframes: list[ZoomKeyframe], punches: list[BumpKeyframe] = ()) -> str:
+    """`z(t) = max(1.001, ramp(t)*(1+bump(t)))` (fold round 2) — the SAME composition
+    head_trajectory.zoom_at computes, built analytically instead of sampled."""
+    ramp = _zoom_piecewise([kf.z for kf in keyframes], keyframes)
+    bump = zoom_bump_expr(list(punches))
+    return f"max(1.001,({ramp})*(1+({bump})))"
 
 
 def zoom_center_expr(keyframes: list[ZoomKeyframe], attr: str) -> str:
@@ -159,10 +183,10 @@ def zoom_center_expr(keyframes: list[ZoomKeyframe], attr: str) -> str:
 
 
 def zoom_gpu_crop(keyframes: list[ZoomKeyframe], geom: dict[str, float], ax: float, ay: float,
-                  w: int, h: int) -> str:
+                  w: int, h: int, punches: list[BumpKeyframe] = ()) -> str:
     """`rect_at`'s own fold (x_px = crop_x + head_x*sw - ax*(sw/z), w_px = sw/z, ...), built as one ffmpeg
     expression per component instead of sampled in Python."""
-    z = zoom_z_expr(keyframes)
+    z = zoom_z_expr(keyframes, punches)
     hx = zoom_center_expr(keyframes, "head_x")
     hy = zoom_center_expr(keyframes, "eye_y")
     sw, sh = _num(geom["sw"]), _num(geom["sh"])
@@ -178,15 +202,32 @@ def zoom_gpu_crop(keyframes: list[ZoomKeyframe], geom: dict[str, float], ax: flo
     )
 
 
+def _bump_value_at(t: float, punches: list[BumpKeyframe]) -> float:
+    """Python-side twin of `zoom_bump_expr`'s piecewise-linear curve, evaluated at ONE instant — only the CPU
+    static fallback (v1, first keyframe only) needs a number instead of an ffmpeg expression."""
+    if not punches:
+        return 0.0
+    pts = sorted(punches, key=lambda p: p.t)
+    if t <= pts[0].t or t >= pts[-1].t:
+        return 0.0
+    for a, b in zip(pts, pts[1:]):
+        if a.t <= t <= b.t:
+            span = b.t - a.t
+            p = 0.0 if span <= 0 else max(0.0, min(1.0, (t - a.t) / span))
+            return a.bump + (b.bump - a.bump) * p
+    return 0.0
+
+
 def zoom_cpu_crop(keyframes: list[ZoomKeyframe], geom: dict[str, float], ax: float, ay: float,
-                  w: int, h: int) -> str:
+                  w: int, h: int, punches: list[BumpKeyframe] = ()) -> str:
     """CPU fallback: no animation (v1) — a static crop at the first keyframe's own rect (via `rect_at`'s
-    fold), then scale."""
+    fold, floor+bump composed at that one instant), then scale."""
     kf = keyframes[0]
-    x0 = (geom["crop_x"] + kf.head_x * geom["sw"] - ax * (geom["sw"] / kf.z)) / geom["cover_w"]
-    y0 = (geom["crop_y"] + kf.eye_y * geom["sh"] - ay * (geom["sh"] / kf.z)) / geom["cover_h"]
-    w0 = (geom["sw"] / kf.z) / geom["cover_w"]
-    h0 = (geom["sh"] / kf.z) / geom["cover_h"]
+    z0 = max(1.001, kf.z * (1.0 + _bump_value_at(kf.t, list(punches))))
+    x0 = (geom["crop_x"] + kf.head_x * geom["sw"] - ax * (geom["sw"] / z0)) / geom["cover_w"]
+    y0 = (geom["crop_y"] + kf.eye_y * geom["sh"] - ay * (geom["sh"] / z0)) / geom["cover_h"]
+    w0 = (geom["sw"] / z0) / geom["cover_w"]
+    h0 = (geom["sh"] / z0) / geom["cover_h"]
     return (
         f"crop=w=iw*{_num(w0)}:h=ih*{_num(h0)}:x=iw*{_num(x0)}:y=ih*{_num(y0)},"
         f"scale={w}:{h}:flags=lanczos,setsar=1"

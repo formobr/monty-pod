@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "perceptual",
-    "note": "The SHOT is JUDGEMENT and never crosses (detect_track / head_geometry / plan_shots / plan_punches decide it on the brain); only the rect keyframes it emits cross as params, and this op turns them into pixels. Two reasons it is not bit_exact. (1) Since MISC-141 the keyframes are ONE pair per shot (its own start/end rect) with interp:cos — camera_apply/podagent bake `0.5-0.5*cos(PI*p)` between them, reproducing the planner's ease_cos exactly on a no-punch ramp; a punch's fast attack/release (its bump is linear in time, not cosine) is where the bake diverges most from the true reciprocal-zoom curve (measured worst ~0.034 of the frame, tests/test_head_trajectory.py). Trajectories persisted before this change still carry interp:linear over a dense 0.1s-step grid and still bake (the branch was not removed). (2) The primary render is GPU libplacebo on BOTH local and pod (the dev box and the rented pod both have Vulkan), so those two agree structurally — the crop filtergraph is pinned BYTE-EQUAL to the pod's rect renderer (podagent.render._gpu_crop) in the engine's parity suite — but a Vulkan-less box (driverless CI) falls back to a STATIC crop at the first keyframe, exactly as podagent.render._cpu_crop does in the final composite; that fallback is declared, not hidden. Tolerance for the GPU-vs-GPU path: PSNR >= 40 dB / SSIM >= 0.99 frame-to-frame is the intended bar (dominated by encoder quantisation, not geometry); UNPROVEN in a CPU-only environment with no GPU to run a real libplacebo render, so only the filtergraph STRINGS are pinned."
+    "note": "The SHOT is JUDGEMENT and never crosses (detect_track / head_geometry / plan_shots / plan_punches decide it on the brain); only the trajectory it emits crosses as params, and this op turns it into pixels. Two reasons it is not bit_exact. (1) Since MISC-141 fold round 2 the zoom-space shape (`geom` present) carries a MIX of ramp keyframes (t/z/head_x/eye_y/interp, exactly 2 per shot, the shot's own RAW cosine ramp) and punch bump keyframes (t/bump, a punch's own piecewise-linear accent) — camera_apply/podagent compose `z(t) = max(1.001, ramp(t)*(1+bump(t)))` analytically, at every frame, reproducing head_trajectory.zoom_at EXACTLY rather than approximately (measured worst < 1e-3 of the frame on a real 18-shot/63s/1-accent fixture, tests/test_camera_path_smoothness.py — round 1 measured 0.043 sampling the composed z into 2 points per shot). A shot count past the 80-vertex expression ceiling CHUNKS into trim+crop+concat pieces whose internal boundaries are snapped to the render's own frame grid (`geom.fps`), never RDP-thinned (invalid once a keyframe pair means \"ease this cosine\"). The legacy rect-space shape (no `geom`, keyframes carry `t`/`rect`, one top-level `interp`) is unchanged from before MISC-141 and still bakes any trajectory persisted before the fold. (2) The primary render is GPU libplacebo on BOTH local and pod (the dev box and the rented pod both have Vulkan), so those two agree structurally — the crop filtergraph is pinned BYTE-EQUAL to the pod's rect/zoom renderers (podagent.render) in the engine's parity suite — but a Vulkan-less box (driverless CI) falls back to a STATIC crop at the first keyframe, exactly as podagent.render._cpu_crop/zoom_cpu_crop does in the final composite; that fallback is declared, not hidden. Tolerance for the GPU-vs-GPU path: PSNR >= 40 dB / SSIM >= 0.99 frame-to-frame is the intended bar (dominated by encoder quantisation, not geometry); UNPROVEN in a CPU-only environment with no GPU to run a real libplacebo render, so only the filtergraph STRINGS are pinned."
   },
   "inputs": [
     {"id": "src", "kind": "video"}
@@ -17,31 +17,35 @@
   "params": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["keyframes", "interp", "out_w", "out_h", "encode_profile"],
     "properties": {
       "keyframes": {
         "type": "array",
         "minItems": 1,
-        "description": "The camera trajectory as DATA: per-frame crop rects in SOURCE fractions, emitted by head_trajectory.trajectory_for_keeps. Because cover is a uniform scale, a cover fraction IS a source fraction, so each rect applies straight to iw/ih (podagent.render.anim_expr, the SAME renderer the preview uses). Times are seconds on the segment clock.",
-        "items": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["t", "rect"],
-          "properties": {
-            "t": {"type": "number", "minimum": 0},
-            "rect": {
-              "type": "array",
-              "minItems": 4,
-              "maxItems": 4,
-              "items": {"type": "number", "minimum": 0, "maximum": 1},
-              "description": "[x, y, w, h] crop window, each in [0,1]."
-            }
-          }
-        }
+        "description": "The camera trajectory as DATA. Legacy shape (no top-level `geom`): per-frame crop rects in SOURCE fractions, emitted by head_trajectory.trajectory_for_keeps, eased by the single top-level `interp`. Zoom shape (`geom` present, MISC-141 fold rounds 1-2): a MIX of RAMP points (`t`/`z`/`head_x`/`eye_y`/`interp` — the shot's own zoom and centre, no punch bump or floor baked in, exactly 2 per shot) and BUMP points (`t`/`bump` only — a punch's own piecewise-linear accent); camera.apply tells the two apart by which of `z`/`bump` an entry carries and composes `max(1.001, ramp*(1+bump))` analytically. Times are seconds on the segment clock. The exact per-item shape is pinned by ARM below (a rect item cannot sneak into a zoom-shape payload or vice-versa — `additionalProperties` alone cannot see across a `oneOf` branch, so each arm restates its own `keyframes.items`)."
       },
       "interp": {
         "enum": ["linear", "ease_in", "ease_out", "ease_in_out", "cos"],
-        "description": "How adjacent keyframes are eased. Since MISC-141 the planner emits `cos` (0.5-0.5*cos(PI*p)) — a shot's own two boundary keyframes reproduce its ease_cos ramp exactly, no dense sampling needed; `linear` is kept for trajectories persisted before this change and for the other eased overlay presets that still use this enum."
+        "description": "The LEGACY shape's single top-level ease, governing every `t`/`rect` interval. Absent from the zoom shape, where each ramp keyframe carries its own `interp` instead."
+      },
+      "geom": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["crop_x", "crop_y", "sw", "sh", "cover_w", "cover_h", "ax", "ay", "fps"],
+        "properties": {
+          "crop_x": {"type": "number"},
+          "crop_y": {"type": "number"},
+          "sw": {"type": "number", "exclusiveMinimum": 0},
+          "sh": {"type": "number", "exclusiveMinimum": 0},
+          "cover_w": {"type": "number", "exclusiveMinimum": 0},
+          "cover_h": {"type": "number", "exclusiveMinimum": 0},
+          "ax": {"type": "number"},
+          "ay": {"type": "number"},
+          "fps": {
+            "type": "number", "exclusiveMinimum": 0,
+            "description": "The render's own frame rate (MISC-141 fold round 2) — used ONLY to snap a chunk splitter's internal trim boundary to a real frame's pts, never to resample the output (camera.apply never emits an fps filter)."
+          }
+        },
+        "description": "Source geometry + anchor + fps, constant for the whole segment (MISC-141 fold round 1-2) — camera.apply folds z back into a rect exactly as head_trajectory.rect_at does. Present only on the zoom shape."
       },
       "out_w": {"type": "integer", "minimum": 16, "maximum": 3840, "multipleOf": 2},
       "out_h": {"type": "integer", "minimum": 16, "maximum": 3840, "multipleOf": 2},
@@ -49,7 +53,72 @@
         "enum": ["preview", "final"],
         "description": "Named quality tier, NOT encoder flags. head_dyn.mp4 is an INTERMEDIATE re-encoded downstream, so `final` runs a high-quality cq (14) to limit compounding generation loss; `preview` trades quality for the 720x1280 proxy. The nvenc/libx264 ladder is tuning and stays in the handler (scripts/render_profile.py is the same SSOT pattern)."
       }
-    }
+    },
+    "oneOf": [
+      {
+        "description": "Legacy rect-space shape (pre-MISC-141, or any trajectory.json persisted before it).",
+        "required": ["keyframes", "interp", "out_w", "out_h", "encode_profile"],
+        "not": {"required": ["geom"]},
+        "properties": {
+          "keyframes": {
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["t", "rect"],
+              "properties": {
+                "t": {"type": "number", "minimum": 0},
+                "rect": {
+                  "type": "array",
+                  "minItems": 4,
+                  "maxItems": 4,
+                  "items": {"type": "number", "minimum": 0, "maximum": 1},
+                  "description": "[x, y, w, h] crop window, each in [0,1]."
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "description": "Zoom-space shape (MISC-141 fold rounds 1-2).",
+        "required": ["keyframes", "geom", "out_w", "out_h", "encode_profile"],
+        "not": {"required": ["interp"]},
+        "properties": {
+          "keyframes": {
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["t", "z", "head_x", "eye_y", "interp"],
+                  "properties": {
+                    "t": {"type": "number", "minimum": 0},
+                    "z": {"type": "number", "exclusiveMinimum": 0},
+                    "head_x": {"type": "number"},
+                    "eye_y": {"type": "number"},
+                    "interp": {
+                      "enum": ["linear", "ease_in", "ease_out", "ease_in_out", "cos"],
+                      "description": "How this keyframe's interval eases into the next. MISC-141 fold round 2 always emits \"cos\" here — a ramp point is exact between a shot's own two boundaries."
+                    }
+                  },
+                  "description": "A RAMP point: the shot's own z/centre, no punch bump or floor baked in."
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["t", "bump"],
+                  "properties": {
+                    "t": {"type": "number", "minimum": 0},
+                    "bump": {"type": "number", "minimum": 0}
+                  },
+                  "description": "A BUMP point: a punch's own additive accent — always linear, no `interp` carried."
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
   },
   "handler": "montyops.camera_apply:run"
 }
