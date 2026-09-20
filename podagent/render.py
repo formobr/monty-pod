@@ -427,22 +427,54 @@ def _has_broll(spec: RenderSpec) -> bool:
 
 
 # locked audio chain (add_music.sh + memory voice-audio-chain): voice -20 LUFS denoise-only (no comp/deharsh),
-# music bed -33 LUFS, gentle sidechain duck. Master -14 loudnorm is a later step (after cover), not here.
-# `_TP` is the PREMIX ceiling only — delivery renormalises (finalize.py loudnorm -14 LUFS/TP -1.0, untouched),
-# so this number is free to move; it is -6.0 (not -1.5) so the MISC-142 headroom budget below closes. Twin:
-# scripts/add_whoosh.VOICE_TP_DB / scripts/montyops/opener_build._VOICE_TP_DB.
-_VOICE_LUFS, _TP, _LRA = -20.0, -6.0, 11
-_MUSIC_LUFS = -33.0
+# music bed -33 LUFS (offset below), gentle sidechain duck. Master -14 loudnorm is a later step (after
+# cover), not here.
+# `_TP` is the loudnorm TP= ARGUMENT — EXACTLY origin/main, never touched by the SFX headroom budget.
+# MISC-142 ROUND-2 FOLD (codex r2 HIGH1): round-1 bought SFX headroom by moving `_TP` itself to -6.0. ffmpeg's
+# `linear=true` two-pass loudnorm silently REVERTS TO DYNAMIC MODE whenever the measured input's linearly-
+# normalized true peak would exceed the target TP (documented ffmpeg contract) — a normal voice's ~12-16 dB
+# speech crest routinely lands its linear TP around -4..-8 dBTP, so at TP=-6.0 it fell back to a gated
+# compressor and silently missed -20 LUFS integrated on ordinary takes (proven: tests/test_sfx_bus_level.py's
+# ffmpeg probe measures `normalization_type` flipping linear->dynamic between TP=-1.5 and TP=-6.0 on the
+# SAME measured values). `_TP` stays put; the SFX headroom instead comes from a deterministic GAIN STAGE
+# applied AFTER loudnorm (see `_audio_mix_chains`'s `volume=` on the voice leg) — that gain does not feed
+# loudnorm's own linear/dynamic decision at all, so it cannot trip the fallback.
+_VOICE_LUFS, _TP, _LRA = -20.0, -1.5, 11
+# `_PREMIX_VOICE_TP_DB` is the DECLARED premix ceiling every render twin locks to (twin of
+# scripts/add_whoosh.VOICE_TP_DB / scripts/montyops/opener_build._VOICE_TP_DB) — realized on the actual
+# voice audio by `_VOICE_POST_GAIN_DB`, a fixed `volume=` stage after loudnorm, never by loudnorm's TP arg.
+_PREMIX_VOICE_TP_DB = -6.0
+_VOICE_POST_GAIN_DB = _PREMIX_VOICE_TP_DB - _TP    # -4.5 dB: 0.8414(TP=-1.5) * 10**(-4.5/20) = 0.501187(-6.0dBTP)
+# The bed's own prerender target carries the SAME fixed offset (one source: `_VOICE_POST_GAIN_DB`), so the
+# declared voice-music gap (-20 - (-33) = 13 LU) is unchanged even though the voice's post-gain premix level
+# now sits below its loudnorm target — delivery renormalises (finalize.py -14 LUFS/TP -1.0, untouched), so
+# both moving together by the same amount is free.
+_MUSIC_LUFS = -33.0 + _VOICE_POST_GAIN_DB
 _DUCK = 3
 # SFX BUS LAW — Twin of scripts/add_whoosh.BUS_LU_UNDER_VOICE / sfx_bus_ceiling_linear (registry/sfx.yaml
 # is the declared bus law: every cue sits this many LU under the voice). The SFX bus's OWN limiter sits at
 # this ceiling so an SFX transient gain-reduces only ITSELF, never the voice (MISC-142: a shared whole-mix
 # brickwall used to duck the voice for the length of every cue — the "SFX too loud" pumping complaint).
-# MISC-142 headroom budget, LINEAR (dB headroom figures do not sum, amplitudes do — tests/test_sfx_bus_level.py
-# proves both directions): no-music arm 10**(_TP/20) + _SFX_BUS_CEILING = 0.650811 <= 0.79; music arm 0.63
-# (the premix alimiter below) + _SFX_BUS_CEILING = 0.779624 <= 0.79 — the tightest arm, ~0.10 dB of margin.
 _SFX_BUS_LU_UNDER_VOICE = 10.5
-_SFX_BUS_CEILING = (10 ** (_TP / 20)) * (10 ** (-_SFX_BUS_LU_UNDER_VOICE / 20))
+_SFX_BUS_CEILING = (10 ** (_PREMIX_VOICE_TP_DB / 20)) * (10 ** (-_SFX_BUS_LU_UNDER_VOICE / 20))
+# The music arm's shared [premix] alimiter (voice+bed, pre-SFX) sits at the SAME declared ceiling as the
+# voice's own premix TP — one number stands in for "the component sharing [amaster] with the SFX bus" on
+# both arms, so the budget below is symmetric instead of a second hand-typed literal (codex r2 LOW: this
+# used to be a bare 0.63 nobody re-derived when the voice ceiling moved).
+_PREMIX_ALIMITER_CEILING = 10 ** (_PREMIX_VOICE_TP_DB / 20)
+# The whole-mix "safety net" alimiter below [mx] — codex r2 HIGH2: this limiter runs at 48k with NO 192k
+# oversample (unlike the premix one above), so its real inter-sample peak overshoots the nominal sample
+# ceiling by ~0.5 dB (measured on this exact limiter, see the `[mx]alimiter` comment in `_audio_mix_chains`).
+# `add_whoosh.bus_fits_under` folds that measured overshoot plus a declared >=1.0 dB safety margin into the
+# budget inequality (ISP_OVERSHOOT_DB / SAFETY_MARGIN_DB), so "safety net" is checked against what the 48k
+# limiter actually delivers, not against its sample-domain ceiling alone.
+_WHOLE_MIX_LIMIT = 0.79
+# MISC-142 headroom budget, round-2 (LINEAR, with the ISP overshoot + safety margin folded in — dB headroom
+# figures do not sum, amplitudes do; tests/test_sfx_bus_level.py::add_whoosh.bus_fits_under proves both
+# directions): both arms now share ONE ceiling (_PREMIX_ALIMITER_CEILING == the voice's own premix TP
+# ceiling, 0.501187) + _SFX_BUS_CEILING (0.149624) = 0.650811 <= 0.79 * 10**(-(0.5+1.0)/20) = 0.664702 —
+# ~0.18 dB of margin past the declared overshoot+safety buffer, on the TIGHTEST arm (both arms are equal now).
+
 # One full-length audio decode/encode runs far above realtime; minutes of source fit well under this.
 # A pass that does not is wedged, and a wedge must fail loud, not absorb the stage (deadline law).
 _AUDIO_PASS_WALL_S = 300
@@ -506,8 +538,9 @@ def _measure_loudnorm(voice: Path, pre: str) -> str:
 
 
 def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
-    """Normalize the track to the -33 LUFS bed, then loop+seek it to exactly `dur`. Order matters:
-    loudnorm on an infinite loop truncates, so normalize the finite track first, then loop the fixed bed."""
+    """Normalize the track to the `_MUSIC_LUFS` bed (-33 LUFS, offset by the same fixed gain the voice's
+    premix carries — see `_MUSIC_LUFS`), then loop+seek it to exactly `dur`. Order matters: loudnorm on an
+    infinite loop truncates, so normalize the finite track first, then loop the fixed bed."""
     norm = tmp / "music_norm.flac"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(music),
                     "-af", f"loudnorm=I={_num(_MUSIC_LUFS)}:TP=-2:LRA=11", "-ar", "48000", "-ac", "2",
@@ -520,21 +553,26 @@ def _prerender_bed(music: Path, mstart: float, dur: float, tmp: Path) -> Path:
 
 
 def _audio_mix_chains(a: _AudioMix) -> list[str]:
-    """Voice (clean → measured loudnorm → padded) mixed with the ducked -33 bed (when music), then the
-    accent SFX summed on top with a peak-safe limiter → [aout]. Bed level is its normalize, not volume."""
+    """Voice (clean → measured loudnorm → a fixed post-loudnorm gain → padded) mixed with the ducked bed
+    (when music), then the accent SFX summed on top with a peak-safe limiter → [aout]. The `volume=` stage
+    right after `{a.vln}` is the ONLY place the SFX headroom budget touches the voice (MISC-142 round-2):
+    loudnorm's own TP argument is untouched from origin/main (see `_TP`'s comment above), so it cannot trip
+    ffmpeg's silent linear->dynamic fallback. Bed level is its own normalize target, not a volume filter
+    here (see `_MUSIC_LUFS`)."""
     dur = _num(a.dur)
+    voice_gain = f"volume={_num(_VOICE_POST_GAIN_DB)}dB"
     chains: list[str] = []
     if a.bed_idx is not None:
         chains += [
-            f"[{a.voice_idx}:a]{a.clean},{a.vln},apad=whole_dur={dur},asplit=2[vc1][vc2]",
+            f"[{a.voice_idx}:a]{a.clean},{a.vln},{voice_gain},apad=whole_dur={dur},asplit=2[vc1][vc2]",
             f"[{a.bed_idx}:a]volume=1.0[bg0]",
             f"[bg0][vc2]sidechaincompress=threshold=0.06:ratio={_DUCK}:attack=20:release=500[bg]",
             "[vc1][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[premix]",
-            "[premix]aresample=192000,alimiter=limit=0.63:attack=5:release=50:level=false,"
-            "aresample=48000[amaster]",
+            f"[premix]aresample=192000,alimiter=limit={_num(_PREMIX_ALIMITER_CEILING)}:attack=5:release=50:"
+            "level=false,aresample=48000[amaster]",
         ]
     else:
-        chains.append(f"[{a.voice_idx}:a]{a.clean},{a.vln},apad=whole_dur={dur}[amaster]")
+        chains.append(f"[{a.voice_idx}:a]{a.clean},{a.vln},{voice_gain},apad=whole_dur={dur}[amaster]")
 
     if a.sfx:
         labels = []
@@ -548,12 +586,15 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
         chains.append(f"{''.join(labels)}amix=inputs={len(a.sfx)}:normalize=0:duration=longest[sxmix]")
         chains.append(f"[sxmix]alimiter=limit={_num(_SFX_BUS_CEILING)}:attack=5:release=50:level=false[sxbus]")
         chains.append("[amaster][sxbus]amix=inputs=2:normalize=0:duration=first[mx]")
-        # 0.79 (−2.05 dB) not 0.84: this limiter runs at 48k without the 192k oversample the premix one has, and inter-sample peaks overshoot ~0.5 dB past the sample ceiling — measured −0.93 dBTP against the −1.0 gate.
-        # SAFETY NET, provably: _TP=-6.0 (not the old -1.5) makes both `[amaster]` arms + `_SFX_BUS_CEILING`
-        # sum to <=0.79 in LINEAR amplitude (no-music 0.650811, music 0.779624 — the tightest arm, ~0.10 dB
-        # of margin) — this alimiter is declared to never gain-reduce a correctly declared bus, not merely
-        # hoped to (tests/test_sfx_bus_level.py; the pre-fix numbers fail the same assertion).
-        chains.append("[mx]alimiter=limit=0.79:attack=5:release=50:level=false[aout]")
+        # 0.79 (−2.05 dB) not 0.84: this limiter runs at 48k without the 192k oversample the premix one has,
+        # and inter-sample peaks overshoot ~0.5 dB past the sample ceiling — measured −0.93 dBTP against the
+        # −1.0 gate. SAFETY NET (not "provably never" — the measured ~0.5 dB ISP overshoot above is real):
+        # `_PREMIX_ALIMITER_CEILING` (== the voice's own premix TP ceiling, 0.501187) + `_SFX_BUS_CEILING`
+        # (0.149624) sum to 0.650811 in LINEAR amplitude on BOTH arms (they now share one ceiling), which
+        # `add_whoosh.bus_fits_under` checks against 0.79 * 10**(-(ISP_OVERSHOOT_DB+SAFETY_MARGIN_DB)/20) =
+        # 0.664702 — the declared overshoot plus a >=1.0 dB safety margin, not the bare sample ceiling
+        # (tests/test_sfx_bus_level.py; the pre-fix numbers fail the same assertion).
+        chains.append(f"[mx]alimiter=limit={_num(_WHOLE_MIX_LIMIT)}:attack=5:release=50:level=false[aout]")
     else:
         chains.append("[amaster]anull[aout]")
     return chains
