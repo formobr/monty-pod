@@ -64,6 +64,10 @@ def _ease(interp: str, p: str) -> str:
         return f"1-(1-({p}))*(1-({p}))"
     if interp == "ease_in_out":
         return f"({p})*({p})*(3-2*({p}))"  # smoothstep
+    if interp == "cos":
+        # head_trajectory's own ease_cos (0.5-0.5*cos(PI*p)) — the planner's shot ramp, baked exactly
+        # between its two endpoint keyframes rather than resampled (MISC-141).
+        return f"(0.5-0.5*cos(PI*({p})))"
     return f"({p})"  # linear
 
 
