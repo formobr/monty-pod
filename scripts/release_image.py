@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -39,6 +38,10 @@ ACCEPT = ",".join((
 ))
 REGISTRY_JSON_MAX_BYTES = 8 * 1024 * 1024
 REGISTRY_WORKER_CLEANUP_S = 0.5
+# Internal-only CLI verb, never in --help: `Registry._json` re-invokes THIS FILE as a fresh `python`
+# process for the read (see the class docstring for why). Not a subparser, so a stray extra positional
+# argument can never route here from a human's own `pin`/`verify` call.
+REGISTRY_WORKER_ARG = "_registry-read"
 
 
 class ReleaseError(RuntimeError):
@@ -57,9 +60,11 @@ class _NoCrossHostAuthRedirect(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
-def _registry_json_worker(url: str, headers: dict[str, str], socket_timeout: float,
-                          result_path: str) -> None:
-    """Read one whole response out of process so the parent owns the wall clock."""
+def _registry_json_worker(url: str, headers: dict[str, str], socket_timeout: float) -> dict[str, Any]:
+    """One bounded read. NEVER RAISES — every ordinary failure (HTTP error, decode error, a response over
+    the bounded size) comes back as `{"ok": False, "error": <type name only, never response/token bytes>}`
+    so the caller (in-process in a test, or the isolated `_registry-read` child in production) can tell an
+    ANSWERED-but-red read from a read that never answered at all."""
     try:
         request = urllib.request.Request(url, headers=headers)
         opener = urllib.request.build_opener(_NoCrossHostAuthRedirect())
@@ -67,26 +72,39 @@ def _registry_json_worker(url: str, headers: dict[str, str], socket_timeout: flo
             raw = response.read(REGISTRY_JSON_MAX_BYTES + 1)
             if len(raw) > REGISTRY_JSON_MAX_BYTES:
                 raise ValueError("registry JSON exceeds the bounded response size")
-            payload = {
-                "ok": True,
-                "body": raw.decode("utf-8"),
-                "headers": dict(response.headers.items()),
-            }
-    except BaseException as exc:  # noqa: BLE001 — child reports only the type, never response/token bytes
-        payload = {"ok": False, "error": type(exc).__name__}
-    Path(result_path).write_text(json.dumps(payload), encoding="utf-8")
+            return {"ok": True, "body": raw.decode("utf-8"), "headers": dict(response.headers.items())}
+    except BaseException as exc:  # noqa: BLE001 — see docstring
+        return {"ok": False, "error": type(exc).__name__}
 
 
-def _stop_registry_worker(process: multiprocessing.Process) -> bool:
-    """Return only after the worker is reaped, or report that cleanup failed."""
-    if not process.is_alive():
-        return True
-    process.terminate()
-    process.join(timeout=REGISTRY_WORKER_CLEANUP_S)
-    if process.is_alive():
-        process.kill()
-        process.join(timeout=REGISTRY_WORKER_CLEANUP_S)
-    return not process.is_alive()
+def _run_registry_worker() -> int:
+    """The `_registry-read` child's own entry point: `{"url", "headers", "timeout"}` on stdin, the
+    worker's own JSON payload on stdout, exit 0. Reading stdin (never argv) keeps the GHCR bearer header
+    out of `ps`/`/proc/<pid>/cmdline` — argv is world-readable on this box, stdin is not. A non-zero or
+    signal exit past this point is the INTERPRETER dying (OOM-kill, segfault) — every ORDINARY registry
+    failure is `{"ok": false, ...}` on stdout with exit 0, never a process death."""
+    request = json.loads(sys.stdin.read())
+    payload = _registry_json_worker(str(request["url"]), dict(request.get("headers") or {}),
+                                    float(request["timeout"]))
+    sys.stdout.write(json.dumps(payload))
+    return 0
+
+
+def _exit_detail(returncode: int | None) -> str:
+    """The child's own exit, named: `subprocess.CompletedProcess.returncode` is the process's own return
+    code when it exited cleanly, and NEGATIVE the signal number that killed it on POSIX (Python's own
+    convention, matching `os.wait`). TRK-79: this is the whole reason a dead-with-no-result child used to
+    be reported as one bare sentence — the exit that would have named OOM-kill vs a plain non-zero return
+    was read and then thrown away."""
+    if returncode is None:
+        return "returncode=None (never observed one)"
+    if returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"killed by {name} (exitcode={returncode})"
+    return f"exitcode={returncode}"
 
 
 class Commands:
@@ -121,37 +139,42 @@ class Registry:
         self.timeout = timeout
 
     def _json(self, url: str, *, headers: dict[str, str] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
-        deadline = time.monotonic() + self.timeout
-        context = multiprocessing.get_context("fork")
+        # TRK-79: `verify`/`pin` runs this from the engine's own image-boot proof, which the landing/ship
+        # threaded proof pool (`proof_units.py`'s `run_units`, `ThreadPoolExecutor`) calls from a WORKER
+        # THREAD. `multiprocessing`'s fork context only clones the calling thread, so a lock any sibling
+        # thread held is frozen mid-state in the child, and the child can die with no result for reasons
+        # that have nothing to do with the read itself (measured: the same read passed 71s earlier on
+        # v0.20.70) — and `spawn`/`forkserver` need the target to be importable BY NAME from a fresh
+        # interpreter, which this module is not when `_boot_probe_registry_module` (release_all.py) or
+        # this test file load it via `importlib.util.spec_from_file_location`. A genuine `subprocess` —
+        # re-invoking THIS FILE by its own resolved path, which is correct however this module was loaded
+        # — has neither problem: no inherited threads/locks, and no by-name import at all.
         try:
-            with tempfile.TemporaryDirectory(prefix="monty-ghcr-read-") as directory:
-                result_path = Path(directory) / "result.json"
-                process = context.Process(
-                    target=_registry_json_worker,
-                    args=(url, dict(headers or {}), self.timeout, str(result_path)),
-                    name="monty-ghcr-read",
-                    daemon=True,
-                )
-                process.start()
-                process.join(timeout=max(0.0, deadline - time.monotonic()))
-                timed_out = process.is_alive()
-                reaped = _stop_registry_worker(process)
-                exitcode = process.exitcode
-                process.close()
-                if not reaped:
-                    raise ReleaseError("GHCR read worker could not be reaped")
-                if timed_out:
-                    raise ReleaseError(f"GHCR read exceeded {self.timeout:g}s wall-clock deadline")
-                if exitcode != 0 or not result_path.is_file():
-                    raise ReleaseError("GHCR read worker exited without a result")
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-                if not result.get("ok"):
-                    raise ReleaseError(f"GHCR read failed ({result.get('error', 'unknown')})")
-                body = json.loads(result["body"])
-                response_headers = result["headers"]
-                if not isinstance(body, dict) or not isinstance(response_headers, dict):
-                    raise ReleaseError("GHCR returned a malformed JSON response")
-                return body, {str(key): str(value) for key, value in response_headers.items()}
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), REGISTRY_WORKER_ARG],
+                input=json.dumps({"url": url, "headers": dict(headers or {}), "timeout": self.timeout}),
+                capture_output=True, text=True, timeout=self.timeout + REGISTRY_WORKER_CLEANUP_S,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ReleaseError(f"GHCR read exceeded {self.timeout:g}s wall-clock deadline") from exc
+        except OSError as exc:
+            raise ReleaseError(f"GHCR read worker could not start ({type(exc).__name__}: {exc})") from exc
+        try:
+            if result.returncode != 0:
+                raise ReleaseError(
+                    f"GHCR read worker exited without a result ({_exit_detail(result.returncode)})")
+            try:
+                payload = json.loads(result.stdout)
+            except (ValueError, TypeError) as exc:
+                raise ReleaseError(
+                    f"GHCR read worker printed a malformed result ({type(exc).__name__})") from exc
+            if not payload.get("ok"):
+                raise ReleaseError(f"GHCR read failed ({payload.get('error', 'unknown')})")
+            body = json.loads(payload["body"])
+            response_headers = payload["headers"]
+            if not isinstance(body, dict) or not isinstance(response_headers, dict):
+                raise ReleaseError("GHCR returned a malformed JSON response")
+            return body, {str(key): str(value) for key, value in response_headers.items()}
         except ReleaseError:
             raise
         except Exception as exc:  # noqa: BLE001 — unknown registry state is a release refusal
@@ -350,6 +373,10 @@ def verify(image_sha: str, engine: Path, commands: Commands, registry: Registry)
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    if argv[:1] == [REGISTRY_WORKER_ARG]:
+        # `Registry._json`'s own isolated child, never a human-facing verb — no subparser, no --help entry.
+        return _run_registry_worker()
     parser = argparse.ArgumentParser(description="verify or pin an already-published monty-pod SHA image")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("pin", "verify"):

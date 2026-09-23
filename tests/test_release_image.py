@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
-import multiprocessing
+import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -120,33 +121,45 @@ def test_single_platform_manifest_requires_registry_digest_header():
     assert digest.endswith("a" * 64) and same is doc
 
 
-def test_registry_whole_response_deadline_reaps_a_trickling_reader(monkeypatch):
-    class TricklingResponse:
-        headers = {}
+def test_registry_whole_response_deadline_reaps_a_trickling_reader():
+    """TRK-79: `_json` now runs the read in a genuine SUBPROCESS (re-invoking this file), so a
+    `monkeypatch` of `release.urllib.request` in THIS process is invisible to it — process isolation is
+    exactly the point. Exercised for real instead: a loopback socket that sends headers and then trickles
+    the body forever, never closing, so only the subprocess's own outer deadline can end the read."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    stop = threading.Event()
 
-        def __enter__(self):
-            return self
+    def serve() -> None:
+        try:
+            server.settimeout(2.0)
+            conn, _ = server.accept()
+        except OSError:
+            return
+        try:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n")
+            while not stop.is_set():
+                try:
+                    conn.sendall(b" ")
+                except OSError:
+                    return
+                time.sleep(0.01)
+        finally:
+            conn.close()
 
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _limit=-1):
-            buffered = bytearray()
-            while True:
-                buffered.extend(b" ")
-                time.sleep(0.005)
-
-    class TricklingOpener:
-        def open(self, *_args, **_kwargs):
-            return TricklingResponse()
-
-    monkeypatch.setattr(release.urllib.request, "build_opener", lambda *_args: TricklingOpener())
-    before = {process.pid for process in multiprocessing.active_children()}
-    started = time.monotonic()
-    with pytest.raises(release.ReleaseError, match="wall-clock deadline"):
-        release.Registry(timeout=0.05)._json("https://ghcr.io/trickle")
-    assert time.monotonic() - started < 1.0
-    assert {process.pid for process in multiprocessing.active_children()} == before
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(release.ReleaseError, match="wall-clock deadline"):
+            release.Registry(timeout=0.2)._json(f"http://127.0.0.1:{port}/trickle")
+        assert time.monotonic() - started < 5.0
+    finally:
+        stop.set()
+        server.close()
+        thread.join(timeout=2.0)
 
 
 def test_image_config_requires_sha_revision_tag_and_amd64():
