@@ -354,6 +354,9 @@ def _nvdec_or_refuse(cp: "ControlPlane") -> None:
                   "-i", "color=c=black:s=256x256:d=0.1", "-c:v", "hevc_nvenc", "-preset", "p5",
                   "-frames:v", "1", probe_mp4]
         # `hwdownload` requires a HARDWARE frame; unlike bare `-hwaccel cuda` it cannot fall back to software.
+        # MISC-188 EXEMPTION: `probe_mp4` is a single 1-frame 256x256 synthetic clip this same function just
+        # encoded — no frame-threading DPB pressure, nowhere near NVDEC's 32-surface pool, so no `-threads`
+        # pin (tests/test_nvdec_decode_threads.py).
         decode = ["ffmpeg", "-v", "error", "-init_hw_device", "cuda=gpu", "-hwaccel", "cuda",
                   "-hwaccel_output_format", "cuda", "-i", probe_mp4,
                   "-vf", "hwdownload,format=nv12", "-f", "null", "-"]
