@@ -239,9 +239,12 @@ def _synth_media_sheet_meta(params: dict[str, Any], inputs: dict[str, Path]) -> 
 
 def _synth_media_image_tile_meta(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
     # Same shape read at scripts/broll_resolve.py:3104-3114; fused sheet call is cols=len(urls) one row
-    # (scripts/montyops/media_image_tile.py:70-73); drawn=[] is the honest fact — no GET runs under a stub.
+    # (scripts/montyops/media_image_tile.py:70-73). `drawn` reports every requested cell as drawn — no GET
+    # runs under a stub, but broll_resolve.py:2381-2386 drops a candidate whose cell is missing from `drawn`
+    # ("preview did not render"), so an honest empty list makes every photo-lane candidate under dry fail at
+    # fetch_broll, not just skip the fetch, whenever the LLM picked asset auto/photo (TRK-90/MISC-189).
     n = len(params["urls"])
-    return {"cells": n, "drawn": [], "width": int(params["width"]) * n, "height": int(params["height"])}
+    return {"cells": n, "drawn": list(range(n)), "width": int(params["width"]) * n, "height": int(params["height"])}
 
 
 def _synth_media_still_meta(_params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:

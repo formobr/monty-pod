@@ -154,6 +154,9 @@ def test_media_sheet_stub_meta_matches_the_readers_own_validation(tmp_path):
 
 
 def test_media_image_tile_stub_meta_matches_the_readers_own_validation(tmp_path):
+    """TRK-90: an empty `drawn` made scripts/broll_resolve.py:2381-2386 drop every photo-lane candidate
+    ("preview did not render") whenever the LLM picked asset auto/photo under the dry tier — the stub must
+    report every requested cell as drawn, like a real fetch+composite would for cells it actually placed."""
     params = _JSON_STUB_PARAMS["media.image_tile"]
     n = len(params["urls"])
     outputs = _run_stub(tmp_path, "media.image_tile", params=params, only={"meta"})
@@ -162,7 +165,7 @@ def test_media_image_tile_stub_meta_matches_the_readers_own_validation(tmp_path)
     assert meta["cells"] == n
     assert meta["width"] == params["width"] * n
     assert meta["height"] == params["height"]
-    assert meta["drawn"] == [], "no network GET runs under a stub — nothing was really drawn"
+    assert meta["drawn"] == list(range(n)), "every requested cell must be reported drawn under the dry tier"
 
 
 @pytest.mark.parametrize("op_name,field,_reader", _ENGINE_READER_ROSTER)
