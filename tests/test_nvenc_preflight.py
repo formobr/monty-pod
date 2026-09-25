@@ -15,10 +15,13 @@ def _isolated_live_mark(monkeypatch, tmp_path):
 
 
 class _CP:
-    def __init__(self, *, accept: bool = True) -> None:
+    def __init__(self, *, accept: bool = True, identity_reject: bool = False) -> None:
         self.events: list[dict] = []
         self.waits: list[bool] = []
         self.accept = accept
+        self.identity_reject = identity_reject
+        self.announce_calls = 0
+        self.settle_calls = 0
 
     def note(self, ev: dict) -> None:
         self.events.append(ev)
@@ -26,6 +29,25 @@ class _CP:
     def send_event(self, ev: dict, *, wait: bool = False) -> bool:
         self.events.append(ev)
         self.waits.append(wait)
+        return self.accept
+
+    # ── TRK-105: `_report_ready` drives readiness through these instead of a plain send_event ──────
+    def announce_ready(self, ev: dict) -> tuple[str, int]:
+        self.announce_calls += 1
+        self.events.append(dict(ev))
+        self.waits.append(True)
+        return ("fake-stream", self.announce_calls)
+
+    def readiness_wall_s(self) -> float:
+        return 0.0
+
+    def await_settled(self, key: tuple[str, int], timeout: float) -> bool:
+        self.settle_calls += 1
+        if self.identity_reject:
+            from podagent.event_stream import FrameRejected
+            frame = {"type": "event", "stream_id": key[0], "seq": key[1],
+                     "event": {"stage": "boot", "status": "step", "phase": "ready"}}
+            raise FrameRejected(frame, {"status": 403, "error": "session/job does not match token"})
         return self.accept
 
 
@@ -187,6 +209,10 @@ def test_ready_is_sent_synchronously_only_after_a_successful_probe(monkeypatch):
             timeline.append(str(ev.get("phase")))
             return super().send_event(ev, wait=wait)
 
+        def announce_ready(self, ev: dict) -> tuple[str, int]:
+            timeline.append(str(ev.get("phase")))
+            return super().announce_ready(ev)
+
     cp = _OrderedCP()
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: timeline.append("boot"))
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: timeline.append("nvenc_probe"))
@@ -211,20 +237,43 @@ def test_a_failed_probe_never_emits_ready(monkeypatch):
     assert not [e for e in cp.events if e.get("phase") == "ready"]
 
 
-def test_an_ambiguous_ready_ack_stops_before_capacity_or_dispatch():
+class _StopTest(Exception):
+    """Escapes `_report_ready`'s otherwise-infinite backoff loop from inside a bounded test."""
+
+
+def _sleep_n_times_then_stop(n: int, sleeps: list[float]):
+    def _fake_sleep(s: float) -> None:
+        sleeps.append(s)
+        if len(sleeps) >= n:
+            raise _StopTest()
+    return _fake_sleep
+
+
+def test_an_ambiguous_readiness_ack_backs_off_and_keeps_retrying_never_exits(monkeypatch):
+    """TRK-105/PLAN.md §2: `_report_ready` must never raise or exit out of a mere ambiguous ACK — it backs
+    off and retries the SAME durable frame in bounded rounds forever; only the pool's own `unready_claimed`
+    rotation (out of this slice's scope) ever ends a pod stuck here."""
     cp = _CP(accept=False)
-    with pytest.raises(agent_main.DeliveryPending, match="readiness ACK remains ambiguous"):
+    sleeps: list[float] = []
+    monkeypatch.setattr(agent_main.time, "sleep", _sleep_n_times_then_stop(3, sleeps))
+
+    with pytest.raises(_StopTest):
         agent_main._report_ready(cp)
+    assert cp.announce_calls == 1, "one durable head-of-queue readiness frame, not a fresh one every round"
+    assert cp.settle_calls == 3
+    assert len(sleeps) == 3
     assert cp.events[-1]["phase"] == "ready"
 
 
-def test_main_never_reaches_dispatch_when_ready_ack_is_ambiguous(monkeypatch):
+def test_main_never_reaches_dispatch_while_readiness_stays_ambiguous(monkeypatch):
     cp = _CP(accept=False)
     dispatched = False
 
     def _dispatch(*_a, **_k):
         nonlocal dispatched
         dispatched = True
+
+    sleeps: list[float] = []
 
     monkeypatch.setenv("CP_URL", "https://control-plane.example")
     monkeypatch.setenv("JOB_TOKEN", "opaque-test-token")
@@ -236,8 +285,29 @@ def test_main_never_reaches_dispatch_when_ready_ack_is_ambiguous(monkeypatch):
     monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
     monkeypatch.setattr(agent_main, "_dispatch_loop", _dispatch)
+    monkeypatch.setattr(agent_main.time, "sleep", _sleep_n_times_then_stop(2, sleeps))
 
-    with pytest.raises(agent_main.DeliveryPending, match="readiness ACK remains ambiguous"):
+    with pytest.raises(_StopTest):
         agent_main.main()
-    assert not dispatched, "the pod claimed work despite an unacknowledged readiness verdict"
+    assert not dispatched, "the pod must never claim work while its own readiness is still unsettled"
     assert not [e for e in cp.events if e.get("phase") == "capacity"]
+
+
+def test_readiness_identity_rejection_exits_4_not_a_crash(monkeypatch):
+    """PLAN.md §2: the ONE readiness outcome that still ends the process — a DEFINITIVE verdict on the
+    worker's OWN identity, not a mere ambiguity — exits honestly at 4, the same code every other
+    transport-unhealthy give-up uses, instead of an uncaught crash."""
+    cp = _CP(identity_reject=True)
+    monkeypatch.setenv("CP_URL", "https://control-plane.example")
+    monkeypatch.setenv("JOB_TOKEN", "opaque-test-token")
+    monkeypatch.setattr(agent_main, "ControlPlane", lambda *_a, **_k: cp)
+    monkeypatch.setattr(agent_main.signal, "signal", lambda *_a, **_k: None)
+    monkeypatch.setattr(agent_main, "_log_gpu_status", lambda: None)
+    monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: None)
+    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
+
+    with pytest.raises(SystemExit) as e:
+        agent_main.main()
+    assert e.value.code == 4

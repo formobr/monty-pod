@@ -266,6 +266,9 @@ def test_out_of_order_acks_are_not_settled_ahead_of_the_durable_head(
 
 def test_later_window_4xx_latches_admission_before_its_predecessors_settle(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PLAN.md §1: only a worker-identity ("closes_admission") verdict needs this early reader-side latch
+    at all — a boot/ready frame's 422 is exactly that class, unlike an ordinary one-job frame's 422/403
+    (which dead-letters but leaves admission open, tested elsewhere)."""
     verdict_sent = threading.Event()
     release_predecessors = threading.Event()
     sender_gate = threading.Event()
@@ -286,7 +289,10 @@ def test_later_window_4xx_latches_admission_before_its_predecessors_settle(
     with _server(handler) as base:
         stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
         for n in range(3):
-            stream.send_event(_event(step=f"n{n}"), wait=False)
+            # A boot/ready-stage frame is the one class where a 422 closes admission (identity of the
+            # WORKER, not of one job) — an ordinary event/result/job_ack frame would dead-letter but leave
+            # admission open, which this test is not exercising.
+            stream.send_event(_event(stage="boot", phase="ready", step=f"n{n}"), wait=False)
         sender_gate.set()
         assert verdict_sent.wait(1)
         _wait_for(lambda: isinstance(stream._admission_error, FrameRejected))
@@ -626,6 +632,9 @@ def test_unknown_or_malformed_ack_never_retires_a_frame(
 
 
 def test_4xx_is_durably_dead_lettered_and_fails_the_caller(tmp_path: Path) -> None:
+    """PLAN.md §1: a result's 422 names ONE correlation only — dead-letter that frame and fail its own
+    caller, but job admission stays open for every other correlation (a result/job_ack frame is never the
+    boot/ready class that would close it)."""
     path = tmp_path / "outbox.json"
 
     def handler(ws: Any) -> None:
@@ -639,8 +648,7 @@ def test_4xx_is_durably_dead_lettered_and_fails_the_caller(tmp_path: Path) -> No
         assert stream.pending_count() == 0
         stream._accept_job(_job())
         assert stream._inbox == {}
-        with pytest.raises(FrameRejected):
-            stream.claim(0.1)
+        assert stream.claim(0.1) is None, "one dead-lettered correlation must not close job admission"
         stream.close()
 
     state = json.loads(path.read_text())
@@ -662,13 +670,17 @@ def test_async_4xx_dead_letters_without_accumulating_an_outcome(tmp_path: Path) 
         _wait_for(lambda: bool(json.loads(path.read_text())["rejected"]))
         assert stream.pending_count() == 0
         assert stream._delivery_outcomes == {}
-        with pytest.raises(FrameRejected):
-            stream.claim(0.1)
+        assert stream.claim(0.1) is None, "an ordinary (non-boot) frame's 422 must not close admission"
         stream.close()
 
 
-def test_409_is_transport_retried_not_dead_lettered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """codex#25: a readiness/identity race answers 409, not a content verdict — retry it like a 5xx."""
+def test_job_ack_409_texts_are_one_frame_verdicts_admission_stays_open(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PLAN.md §1: pod_stream_test.go's TestFleetReplayIsStampedWithAdmissionStream/
+    TestPodFrameRefusalTextsArePinned pin these exact 409 prefixes as per-DELIVERY verdicts — the api's own
+    replay (or this pod's dedup re-ack) is what eventually lands the job, so THIS job_ack frame alone
+    dead-letters while every other correlation's admission stays open. This supersedes codex#25's old
+    'retry every 409 forever' rule for these two named texts specifically."""
     monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
     path = tmp_path / "outbox.json"
     hits = 0
@@ -677,23 +689,52 @@ def test_409_is_transport_retried_not_dead_lettered(tmp_path: Path, monkeypatch:
         nonlocal hits
         frame = json.loads(ws.recv())
         hits += 1
-        ws.send(_ack(frame, status=409, error="job_ack arrived before readiness"))
+        ws.send(_ack(frame, status=409, error="job_ack arrived before readiness: no durable receipt yet"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(FrameRejected, match="409"):
+            stream.send_job_ack({
+                "delivery_id": "c", "corr_id": "c", "attempt_id": _ATTEMPT_ID,
+                "client_recv_mono_ns": 1,
+            })
+        assert hits == 1
+        assert stream.pending_count() == 0, "the job_ack frame itself dead-letters, not retries forever"
+        assert stream.claim(0.1) is None, "admission must stay open behind a one-frame verdict"
+        state = json.loads(path.read_text())
+        assert len(state["rejected"]) == 1
+        stream.close()
+
+
+def test_unmatched_409_keeps_todays_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """codex#25: a 409 whose text names no verdict in PLAN.md §1's table is still a transport race — retry
+    it like a 5xx, never dead-letter on an unrecognised reason."""
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
+    path = tmp_path / "outbox.json"
+    hits = 0
+
+    def handler(ws: Any) -> None:
+        nonlocal hits
+        frame = json.loads(ws.recv())
+        hits += 1
+        ws.send(_ack(frame, status=409, error="some other transient conflict"))
 
     with _server(handler) as base:
         stream = EventStream(base, "token", outbox_path=path)
         with pytest.raises(DeliveryPending):
             stream.send_result(_result())
         assert hits == 1
-        assert stream.pending_count() == 1, "a 409 must remain durable, not move to dead-letter"
+        assert stream.pending_count() == 1, "an unmatched 409 must remain durable, not move to dead-letter"
         state = json.loads(path.read_text())
         assert state["rejected"] == []
         stream.close()
 
 
-def test_403_is_durably_dead_lettered_and_fails_the_caller(tmp_path: Path) -> None:
-    """codex#20: Go's 403 'unknown or expired fleet corr_id' is a permanent identity verdict — the
-    attribution row is gone, so retrying the identical frame can never make it valid; dead-letter it
-    like 422, not retry it forever like the readiness-race 409."""
+def test_403_is_durably_dead_lettered_and_admission_stays_open(tmp_path: Path) -> None:
+    """codex#20 + PLAN.md §1: Go's 403 'unknown or expired fleet corr_id' is a permanent verdict on ONE
+    correlation — the attribution row is gone, so retrying the identical frame can never make it valid.
+    Dead-letter it and fail its own caller, but — unlike codex#20's original blanket close — every OTHER
+    correlation's job admission stays open, since nothing about the WORKER's own identity is in question."""
     path = tmp_path / "outbox.json"
 
     def handler(ws: Any) -> None:
@@ -705,6 +746,7 @@ def test_403_is_durably_dead_lettered_and_fails_the_caller(tmp_path: Path) -> No
         with pytest.raises(FrameRejected, match="403"):
             stream.send_result(_result())
         assert stream.pending_count() == 0
+        assert stream.claim(0.1) is None, "a one-frame 403 verdict must not close job admission"
         stream.close()
 
     state = json.loads(path.read_text())
@@ -730,6 +772,24 @@ def test_403_dead_letters_on_first_verdict_without_retrying(
         with pytest.raises(FrameRejected, match="403"):
             stream.send_result(_result())
         assert hits == 1, "a 403 verdict must dead-letter on the first ACK, never replayed for retry"
+        stream.close()
+
+
+def test_identity_wrong_403_still_closes_admission(tmp_path: Path) -> None:
+    """PLAN.md §1: unlike a one-frame 403, a WORKER-identity verdict (here, a boot/ready-class frame) still
+    fails closed — nothing about this worker will ever validate, so no other correlation may claim either."""
+    path = tmp_path / "outbox.json"
+
+    def handler(ws: Any) -> None:
+        frame = json.loads(ws.recv())
+        ws.send(_ack(frame, status=403, error="session/job does not match token"))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=path)
+        with pytest.raises(FrameRejected, match="403"):
+            stream.send_event(_event(phase="started"), wait=True)
+        with pytest.raises(FrameRejected):
+            stream.claim(0.1)
         stream.close()
 
 

@@ -21,7 +21,7 @@ import requests
 from pydantic import ValidationError
 
 from .cp import ControlPlane, mark_rented_pod
-from .event_stream import DeliveryPending, TransportUnhealthy
+from .event_stream import DeliveryPending, FrameRejected, TransportUnhealthy
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 from .sanitize import safe_error, safe_text, safe_traceback
 
@@ -582,7 +582,14 @@ def _vulkaninfo_summary() -> str:
 
 
 def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None) -> None:
-    """Open admission only after the capability verdict itself is durably acknowledged by the box."""
+    """Open admission only once the capability verdict is durably acknowledged — but never by ending the
+    process on a mere ambiguity (TRK-105). A stuck ACK backs off and keeps retrying in bounded rounds
+    forever; the ONLY door this loop itself walks out of early is a DEFINITIVE identity verdict on the
+    ready frame itself (this worker's own identity will never validate), which still exits honestly at 4,
+    same as every other transport-unhealthy give-up. A pod that can never confirm readiness at all is
+    someone else's job to end — the pool's own `unready_claimed` rotation (deadline.yaml
+    `pod_readiness_round` / `pool_unready_claimed`), never this loop giving up on itself.
+    """
     event: dict[str, Any] = {
         "stage": "boot",
         "status": "step",
@@ -591,11 +598,24 @@ def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None)
     }
     if capacity is not None:
         event["capacity"] = dict(capacity)
-    accepted = cp.send_event(event, wait=True)
-    if not accepted:
-        # EventStream already latched DeliveryPending before returning False. Raising here keeps main from
-        # reaching capacity or the dispatch loop even if a test double (or future transport) only returns it.
-        raise DeliveryPending("boot readiness ACK remains ambiguous; refusing job admission")
+    key = cp.announce_ready(event)
+    round_n = 0
+    while True:
+        round_n += 1
+        try:
+            if cp.await_settled(key, cp.readiness_wall_s()):
+                return
+        except FrameRejected as e:
+            if e.ack.get("status") == 0:
+                # The delivery-pending cap dead-lettered this exact ready frame from ambiguity, not from a
+                # real verdict — re-announce fresh at the head and keep going.
+                _log("readiness dead-lettered after its own delivery-pending cap; "
+                     "re-announcing at the head with a fresh seq")
+                key = cp.announce_ready(event)
+                continue
+            raise
+        _log(f"readiness pending round {round_n}")
+        time.sleep(_TRANSPORT_UNHEALTHY_BACKOFF_S)
 
 
 def _run_infer(
@@ -1187,16 +1207,17 @@ def main() -> None:
                                 vram_total_mb=vram_total_mb(),
                                 artifact_fetch_workers=range_fetch_width(),
                                 usable_cores=usable_cores())
-    _capability_preflight(cp, capacity=capacity)
-    # On reconnect the API resets credit. Replay the ACKed readiness verdict
-    # together with capacity; this event is installed only after preflight.
-    cp.set_bootstrap_event({
-        "stage": "boot",
-        "status": "step",
-        "phase": "ready",
-        "step": "capability preflight passed",
-        "capacity": capacity,
-    })
+    try:
+        _capability_preflight(cp, capacity=capacity)
+    except TransportUnhealthy as e:
+        # `_report_ready` raises only for a DEFINITIVE identity verdict on the ready frame itself (every
+        # other ambiguity backs off and retries internally, forever) — exit honestly, same code every
+        # other transport-unhealthy give-up uses, instead of an uncaught crash (TRK-105).
+        _log(f"boot readiness carries a worker-identity verdict that can never resolve: {safe_error(e)}")
+        _mark_stopped()
+        sys.exit(4)
+    # `_report_ready` already installed this exact event as the reconnect bootstrap (cp.announce_ready);
+    # every future reconnect replays it on its own, no separate call needed here.
 
     yunet_path = Path(os.environ.get("MODEL_YUNET", "/opt/models/yunet.onnx"))
     align_cache: dict[str, "AlignService"] = {}

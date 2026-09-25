@@ -211,6 +211,27 @@ class ControlPlane:
         """Replay a worker admission event after each WebSocket reconnect."""
         self._stream.set_bootstrap_event(self._stamped(payload))
 
+    def announce_ready(self, payload: dict[str, Any]) -> tuple[str, int]:
+        """Install `payload` as the reconnect bootstrap AND push it to the outbox head right now, so it
+        wins the wire race against anything else pending on this or any future connection. Returns the
+        frame's identity for `await_settled`/`readiness_key`."""
+        stamped = self._stamped(payload)
+        self._stream.set_bootstrap_event(stamped)
+        return self._stream.announce_ready(stamped)
+
+    def readiness_key(self) -> tuple[str, int] | None:
+        """The identity of the readiness frame still awaiting a verdict, or None once it settles."""
+        return self._stream.readiness_key()
+
+    def await_settled(self, key: tuple[str, int], timeout: float) -> bool:
+        """One bounded round toward `key`'s verdict; False on a bare timeout, never a raise (see
+        EventStream.await_settled)."""
+        return self._stream.await_settled(key, timeout)
+
+    def readiness_wall_s(self) -> float:
+        """The wall one readiness round waits before the caller logs and retries."""
+        return event_stream._delivery_wall_s()
+
     def report_infer_result(self, payload: dict[str, Any]) -> bool:
         """Deliver the real InferResult on the typed result frame. No result→event downgrade exists."""
         return self.send_result(dict(payload))

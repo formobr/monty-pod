@@ -29,6 +29,18 @@ class _CP:
         self.waits.append(wait)
         return self.accept
 
+    # ── TRK-105: `_report_ready` drives readiness through these instead of a plain send_event ──────
+    def announce_ready(self, ev: dict) -> tuple[str, int]:
+        self.events.append(dict(ev))
+        self.waits.append(True)
+        return ("fake-stream", len(self.waits))
+
+    def readiness_wall_s(self) -> float:
+        return 0.0
+
+    def await_settled(self, key: tuple[str, int], timeout: float) -> bool:
+        return self.accept
+
 
 def _run(returncode: int = 0, stderr: bytes = b"") -> object:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=b"", stderr=stderr)

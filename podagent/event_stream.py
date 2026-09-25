@@ -57,9 +57,57 @@ DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 3
 _ADMISSION_WAKE = object()
-# 422 and 403 are the only permanent content verdicts (Go says THIS frame's identity/content will never
-# validate); every other 4xx, 409 readiness/identity races included, is a transport race — retry, don't dead-letter.
-_CONTENT_REJECT_STATUSES = frozenset({422, 403})
+# The verdict table (PLAN.md §1), matched by (frame kind, status, exact/prefix error text) against the
+# literal texts pod_stream_test.go's TestPodFrameRefusalTextsArePinned pins on the real api. A "one_frame"
+# verdict is permanent for THIS correlation only — dead-letter it, keep job admission open for every other
+# correlation. A "closes_admission" verdict means the WORKER's own identity is wrong — nothing about this
+# pod will ever validate, so admission closes like every other permanent content verdict.
+_ONE_FRAME_EXACT_TEXTS = frozenset({
+    "job_ack corr is not owned by this worker",
+    "stream_id+seq reused with different payload",
+    "corr_id/result_key already names a different terminal",
+    "unknown or expired fleet corr_id",
+    "fleet corr attribution does not match frame",
+    "fleet corr attribution does not match result",
+    "late_terminal_unknown",
+})
+_ONE_FRAME_PREFIXES = (
+    "pod delivery identity conflict: ",
+    "job_ack arrived before readiness: ",
+)
+# Named for the drift test (tests/test_pod_stream_contract_drift.py) and for readers of this table; an
+# UNMATCHED 403/422 text also closes admission (today's fail-closed latch), so this set does not narrow
+# `_classify_verdict`'s 403 branch — it documents which texts are KNOWN to mean a worker-identity verdict.
+_CLOSES_ADMISSION_EXACT_TEXTS = frozenset({
+    "ready event is not session-owned",
+    "fleet infrastructure frame is not fleet-owned",
+    "shared fleet event requires corr attribution",
+    "session/job does not match token",
+})
+
+
+def _is_boot_frame(frame: dict[str, Any]) -> bool:
+    """A boot/ready event names no one job; every result/job_ack, and every other event, names exactly
+    one correlation. Only this class of frame gets 422's identity-closes-admission treatment."""
+    if frame.get("type") != "event":
+        return False
+    event = frame.get("event")
+    return isinstance(event, dict) and event.get("stage") == "boot"
+
+
+def _classify_verdict(frame: dict[str, Any], status: int, error: str) -> str | None:
+    """"one_frame" | "closes_admission" | None (no permanent verdict — transport-retry, unchanged)."""
+    if status == 403:
+        if error in _ONE_FRAME_EXACT_TEXTS or any(error.startswith(p) for p in _ONE_FRAME_PREFIXES):
+            return "one_frame"
+        return "closes_admission"  # unmatched 403 keeps today's fail-closed latch
+    if status == 422:
+        return "closes_admission" if _is_boot_frame(frame) else "one_frame"
+    if status == 409:
+        if error in _ONE_FRAME_EXACT_TEXTS or any(error.startswith(p) for p in _ONE_FRAME_PREFIXES):
+            return "one_frame"
+        return None  # unmatched 409 keeps today's retry
+    return None
 
 
 def _delivery_wall_s() -> float:
@@ -138,6 +186,21 @@ class EventStream:
         # mixing an old identity into the new stream makes server-side dedupe unable to identify a replay.
         self._stream_id, self._next_seq = uuid.uuid4().hex, 1
         self._outbox, self._rejected, self._inbox, self._delivery_meta = self._load()
+        # Every loaded frame is durably stamped with a PRIOR incarnation's stream_id (this one is freshly
+        # minted above). A boot/ready frame among them is stale telemetry only — this incarnation announces
+        # its OWN readiness fresh, at the head, once capability preflight passes — so replaying an inherited
+        # one would just race a duplicate under a dead identity. Everything else (results, job_acks) still
+        # replays: those durably owe a caller their exact verdict.
+        kept, dropped = [], 0
+        for _frame in self._outbox:
+            if _is_boot_frame(_frame):
+                dropped += 1
+            else:
+                kept.append(_frame)
+        if dropped:
+            self._outbox = kept
+            _log(f"dropped {dropped} inherited boot/ready frame(s) from a prior stream id at load "
+                 "— this incarnation's own readiness goes out fresh")
         for row in self._rejected:
             _log(f"durable dead-letter quarantined at boot: {self._frame_identity_line(row.get('frame', {}))} "
                  "— that one identity stays refused, the rest of the agent is not bricked by it")
@@ -372,8 +435,12 @@ class EventStream:
             self._work.notify_all()
             return seq, waiter
 
-    def _append_bootstrap_head(self, payload: dict[str, Any]) -> int:
-        """Insert durably at the outbox HEAD: this frame must win the wire race against anything pending."""
+    def _append_bootstrap_head(self, payload: dict[str, Any], *, arm_waiter: bool = False) -> int:
+        """Insert durably at the outbox HEAD: this frame must win the wire race against anything pending.
+
+        `arm_waiter` installs this frame's delivery waiter in the SAME locked transition as the durable
+        append, so a caller that wants to `await_settled` it can never race the sender loop settling it
+        before the waiter exists."""
         normalized = event_payload(payload)
         with self._work:
             seq = self._next_seq
@@ -389,8 +456,54 @@ class EventStream:
                 error = TransportUnhealthy(f"durable bootstrap append failed: {safe_error(e)}")
                 self._latch_locked(error, storage=True)
                 raise error from e
+            if arm_waiter:
+                self._delivery_waiters[(self._stream_id, seq)] = threading.Event()
             self._work.notify_all()
             return seq
+
+    def announce_ready(self, payload: dict[str, Any]) -> tuple[str, int]:
+        """Durably install `payload` at the outbox HEAD as this stream's pending readiness frame, with its
+        delivery waiter already armed. `await_settled(readiness_key(), ...)` drives it in bounded rounds;
+        it never raises out of a mere ambiguity (main.py `_report_ready` WHY)."""
+        seq = self._append_bootstrap_head(payload, arm_waiter=True)
+        with self._state:
+            self._pending_bootstrap_key = (self._stream_id, seq)
+            return self._pending_bootstrap_key
+
+    def readiness_key(self) -> tuple[str, int] | None:
+        """The (stream_id, seq) identity of the readiness frame still awaiting a verdict, or None once
+        it settles."""
+        with self._state:
+            return self._pending_bootstrap_key
+
+    def await_settled(self, key: tuple[str, int], timeout: float) -> bool:
+        """One bounded round toward `key`'s verdict. True = accepted. False = still ambiguous inside
+        `timeout` — the frame stays durable and this may be called again for the next round; the waiter
+        this installs (or reuses) stays armed across rounds, so a verdict landing in the caller's own
+        between-round gap is never lost. A transient DeliveryPending tick from the sender's own bounded
+        retry cadence is swallowed exactly like a bare timeout; only a DEFINITIVE verdict (accept, or a
+        permanent reject/abandon) ever raises or returns True."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._work:
+                waiter = self._delivery_waiters.get(key)
+                if waiter is None:
+                    waiter = threading.Event()
+                    self._delivery_waiters[key] = waiter
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not waiter.wait(remaining):
+                return False
+            with self._work:
+                outcome = self._delivery_outcomes.pop(key, False)
+                if isinstance(outcome, DeliveryPending):
+                    # Non-terminal: re-arm a fresh waiter under the SAME key for the sender's next tick (or
+                    # an eventual real verdict), and keep waiting out the remainder of this round's wall.
+                    self._delivery_waiters[key] = threading.Event()
+                    continue
+                self._delivery_waiters.pop(key, None)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return bool(outcome)
 
     def pending_count(self) -> int:
         with self._state:
@@ -610,7 +723,7 @@ class EventStream:
                 if (isinstance(self._admission_error, DeliveryPending)
                         and not self._outbox and self._storage_error is None):
                     self._admission_error = None
-            elif disposition in ("rejected", "abandoned"):
+            elif disposition in ("rejected", "abandoned", "one_frame"):
                 if self._outbox and (str(self._outbox[0]["stream_id"]),
                                      int(self._outbox[0]["seq"])) == key:
                     popped = self._outbox.pop(0)
@@ -632,12 +745,17 @@ class EventStream:
                 self._wire_sends.pop(key, None)
                 self._pending_settlement_attempts.pop(key, None)
                 if disposition == "rejected":
+                    # A worker-identity verdict: admission closes, same as every other permanent content
+                    # verdict a naive reader would fail-closed on.
                     self._latch_locked(outcome)
-                elif (isinstance(self._admission_error, DeliveryPending)
-                        and not self._outbox and self._storage_error is None):
-                    # This corr alone is lost (already logged loudly by the caller); every other corr's
-                    # admission must not stay closed behind a frame this process has given up retrying.
-                    self._admission_error = None
+                else:
+                    if disposition == "one_frame":
+                        self._release_reassigned_job_locked(frame, ack)
+                    if (isinstance(self._admission_error, DeliveryPending)
+                            and not self._outbox and self._storage_error is None):
+                        # This corr alone is lost (already logged loudly by the caller); every other corr's
+                        # admission must not stay closed behind a frame this process has given up retrying.
+                        self._admission_error = None
             else:
                 # Retry exhaustion is not a verdict. Keep the frame durably at the head and continue bounded
                 # background attempts, but close admission until the ordered voice catches up.
@@ -648,6 +766,27 @@ class EventStream:
                 self._delivery_outcomes[key] = outcome
                 waiter.set()
             self._work.notify_all()
+
+    def _release_reassigned_job_locked(self, frame: dict[str, Any], ack: dict[str, Any] | None) -> None:
+        """job_ack 403 'corr is not owned by this worker': the CP already handed this correlation to a
+        DIFFERENT worker. If it is still sitting UNCLAIMED in this pod's own inbox, drop it — otherwise
+        this pod would still try to run and report work it no longer owns. Called with the lock held."""
+        if frame.get("type") != "job_ack" or ack is None:
+            return
+        if str(ack.get("error") or "") != "job_ack corr is not owned by this worker":
+            return
+        job_ack = frame.get("job_ack") or {}
+        corr = str(job_ack.get("corr_id") or job_ack.get("delivery_id") or "")
+        if not corr or corr not in self._inbox or corr in self._claimed_ids:
+            return
+        self._inbox.pop(corr, None)
+        self._delivery_meta.pop(corr, None)
+        self._queued_ids.discard(corr)
+        try:
+            self._persist_locked()
+        except BaseException as e:
+            _log(f"failed to drop reassigned job {corr!r} from inbox ({safe_error(e)}); it stays durable "
+                 "and may be reclaimed until the CP's own reassignment overrides it")
 
     @staticmethod
     def _frame_key(frame: dict[str, Any]) -> tuple[str, int]:
@@ -685,9 +824,16 @@ class EventStream:
                 ack = acks.get(key)
                 status = int(ack["status"]) if ack is not None else 0
                 delivery_s = time.monotonic() - started[key]
+                verdict = _classify_verdict(frame, status, str(ack.get("error") or "")) if ack is not None else None
                 if 200 <= status < 300:
                     outcomes[key] = ("accepted", ack, delivery_s)
-                elif status in _CONTENT_REJECT_STATUSES:
+                elif verdict == "one_frame":
+                    _log(f"frame seq={frame['seq']} REJECTED status={status} "
+                         f"reason={safe_text(ack.get('error') or '', 200)} "
+                         "— moved to durable dead-letter; this correlation alone is lost, job admission "
+                         "stays open")
+                    outcomes[key] = ("one_frame", ack, delivery_s)
+                elif verdict == "closes_admission":
                     _log(f"frame seq={frame['seq']} REJECTED status={status} "
                          f"reason={safe_text(ack.get('error') or '', 200)} "
                          "— moved to durable dead-letter")
@@ -986,14 +1132,17 @@ class EventStream:
                     self._acks[key] = ack
                     waiter = self._ack_waiters.get(key)
                     status = int(ack["status"])
-                    if status in _CONTENT_REJECT_STATUSES:
-                        # Ordered persistence may wait for an earlier ACK. Admission cannot: the peer already
-                        # made a deterministic verdict, so no new paid job may enter during that gap.
+                    if status in (403, 422, 409):
                         frame = next(
                             (item for item in self._outbox if self._frame_key(item) == key), None)
                         if frame is None:
                             raise ProtocolError(f"ACK {key[0]}:{key[1]} has no durable frame")
-                        self._latch_locked(FrameRejected(dict(frame), ack))
+                        if _classify_verdict(frame, status, str(ack.get("error") or "")) == "closes_admission":
+                            # Ordered persistence may wait for an earlier ACK. Admission cannot: the peer
+                            # already made a deterministic worker-identity verdict, so no new paid job may
+                            # enter during that gap. A "one_frame"/unmatched-409 verdict settles normally,
+                            # through `_deliver_window`/`_settle` below — admission stays open for it.
+                            self._latch_locked(FrameRejected(dict(frame), ack))
             except Exception as e:  # noqa: BLE001 - malformed peer means connection is unsafe
                 _log(f"reader rejected server frame ({safe_error(e)})")
                 self._fail_connection(conn, safe_error(e))
@@ -1023,6 +1172,12 @@ class EventStream:
                 return False
             with self._state:
                 self._conn = conn
+                if (isinstance(self._admission_error, DeliveryPending) and not self._outbox
+                        and self._storage_error is None):
+                    # MISC-200: a successful open with nothing left to retry is itself proof the transport
+                    # is healthy again — today only a settle clears this latch, which strands admission
+                    # closed if the outbox drained (e.g. via startup replay) before any socket ever opened.
+                    self._admission_error = None
             # The first connection may already have the same event in the
             # outbox (ControlPlane sends it normally). On reconnect append one
             # only when no identical durable frame is pending, preserving the
