@@ -309,6 +309,74 @@ def test_stub_video_placeholder_honours_declared_extension(tmp_path, ext):
     assert codecs == {"h264", "aac"}, f"{dst.name}: expected h264+aac streams, got {codecs}"
 
 
+def _probe_stream_codec(path: Path) -> str:
+    probed = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True).stdout)
+    return probed["streams"][0]["codec_name"]
+
+
+# media.fetch declares `dst` as kind `video` in its contract (contracts/ops/media.fetch.json) but the op
+# is also used to fetch stills — a binding can hand it a `.jpg`/`.png` path. TRK-101: the dry stub must
+# resolve its placeholder writer off that bound extension, the same way runner.py::_ext lets the bound
+# extension win over the port's declared kind, or it refuses a case prod never hits.
+@_NEEDS_FFMPEG
+def test_media_fetch_stub_writes_an_image_placeholder_for_a_jpg_binding(tmp_path):
+    op = registry.get("media.fetch")
+    assert next(p.kind for p in op.outputs if p.id == "dst") == "video", \
+        "contract drifted off the kind this test exercises — media.fetch.dst is no longer 'video'"
+    fn = dry.resolve(op)
+    dst = tmp_path / "still.jpg"
+    fn(params={"url": "https://example.com/a.jpg"}, inputs={}, outputs={"dst": dst})
+    assert dst.exists() and dst.stat().st_size > 0
+    assert _probe_stream_codec(dst) == "mjpeg"
+
+
+@_NEEDS_FFMPEG
+def test_media_fetch_stub_writes_an_image_placeholder_for_a_png_binding(tmp_path):
+    op = registry.get("media.fetch")
+    fn = dry.resolve(op)
+    dst = tmp_path / "still.png"
+    fn(params={"url": "https://example.com/a.png"}, inputs={}, outputs={"dst": dst})
+    assert dst.exists() and dst.stat().st_size > 0
+    assert _probe_stream_codec(dst) == "png"
+
+
+@_NEEDS_FFMPEG
+def test_media_fetch_stub_still_writes_a_video_placeholder_for_an_mp4_binding(tmp_path):
+    op = registry.get("media.fetch")
+    fn = dry.resolve(op)
+    dst = tmp_path / "clip.mp4"
+    fn(params={"url": "https://example.com/a.mp4"}, inputs={}, outputs={"dst": dst})
+    assert dst.exists() and dst.stat().st_size > 0
+    assert _probe_stream_codec(dst) == "h264"
+
+
+def test_media_fetch_stub_unsupported_extension_still_refuses_by_name(tmp_path):
+    op = registry.get("media.fetch")
+    fn = dry.resolve(op)
+    dst = tmp_path / "weird.xyz"
+    with pytest.raises(dry.DryStubUnsupportedOutput, match=r"\.xyz"):
+        fn(params={"url": "https://example.com/a.xyz"}, inputs={}, outputs={"dst": dst})
+
+
+def test_svg_binding_writes_literal_vector_markup_not_through_ffmpeg(tmp_path):
+    dst = tmp_path / "still.svg"
+    dry._write_image(dst, op_name="media.fetch")
+    assert dst.exists()
+    text = dst.read_text(encoding="utf-8")
+    assert text.strip().startswith("<svg"), "an .svg placeholder must be literal markup, not a raster mux"
+
+
+@pytest.mark.parametrize("kind,ext,expect", [
+    ("video", ".jpg", "image"), ("video", ".mp4", "video"), ("video", ".xyz", "video"),
+    ("image", ".mp4", "video"), ("image", ".png", "image"), ("image", ".svg", "image"),
+    ("audio", ".mp3", "audio"), ("audio", ".xyz", "audio"),
+])
+def test_resolve_media_class_prefers_bound_extension_over_kind(kind, ext, expect):
+    assert dry._resolve_media_class(kind, ext) == expect
+
+
 def _probe_audio_stream(path: Path) -> dict:
     probed = json.loads(subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",

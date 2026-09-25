@@ -108,7 +108,13 @@ _VIDEO_EXT_ARGS: dict[str, list[str]] = {
     ".mp4": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "8k"],
     ".mov": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "8k"],
 }
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+# Raster stills the placeholder can honestly mux through ffmpeg (`ffmpeg -formats`/`-muxers` on this
+# build: png/jpeg/webp all have a raster muxer; svg does not — confirmed empty `ffmpeg -muxers | grep svg`).
+_RASTER_IMAGE_EXTS: set[str] = {".png", ".jpg", ".jpeg", ".webp"}
+# Vector — no ffmpeg muxer exists for it, so its placeholder is written as literal markup, not piped
+# through ffmpeg (see _write_image below).
+_VECTOR_IMAGE_EXTS = {".svg"}
+_IMAGE_EXTS = _RASTER_IMAGE_EXTS | _VECTOR_IMAGE_EXTS
 
 
 def _write_audio(dst: Path, *, op_name: str) -> None:
@@ -171,8 +177,16 @@ def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None) -> N
 
 def _write_image(dst: Path, *, op_name: str) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.suffix.lower() not in _IMAGE_EXTS:
-        raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "image")
+    ext = dst.suffix.lower()
+    if ext in _VECTOR_IMAGE_EXTS:
+        # No ffmpeg muxer exists for svg — write literal minimal markup instead of piping through ffmpeg.
+        dst.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">'
+            '<rect width="64" height="64" fill="#000000"/></svg>',
+            encoding="utf-8")
+        return
+    if ext not in _RASTER_IMAGE_EXTS:
+        raise DryStubUnsupportedOutput(op_name, ext, "image")
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
            "-f", "lavfi", "-i", "color=c=black:s=64x64", "-frames:v", "1", str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
@@ -187,7 +201,8 @@ def _cell_colour(url: str, index: int) -> str:
 # from another's, and two candidates sharing one placeholder would hide a mis-addressed tile downstream.
 def _write_filmstrip(dst: Path, *, op_name: str, params: dict[str, Any]) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.suffix.lower() not in _IMAGE_EXTS:
+    # Raster only: the hstack composite below is an ffmpeg filter_complex, which has no vector (svg) target.
+    if dst.suffix.lower() not in _RASTER_IMAGE_EXTS:
         raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "image")
     positions = params.get("positions")
     if not isinstance(positions, list) or not positions:
@@ -291,18 +306,36 @@ _WRITER: dict[str, Callable[..., None]] = {
 }
 
 
+# Mirrors runner.py::_ext's own precedence (runner.py:381-395, "Prefer the extension the binding's
+# destination already implies … fall back to the port kind's default"): `_bind_outputs` in runner.py
+# builds `dst` for BOTH the real and the dry seam, so by the time it reaches here the bound extension has
+# already won over `port.kind` once, at path-naming time (media.fetch declares `dst` as kind `video` but
+# is also used for stills, so a binding can hand this a `.jpg`/`.png`/`.svg` path). The stub must pick its
+# placeholder WRITER off that same already-resolved extension, not re-derive a `.mp4` path off `kind` and
+# refuse it — `kind` is only the fallback, for an extension this tier does not itself recognise.
+def _resolve_media_class(kind: str, ext: str) -> str:
+    if ext in _IMAGE_EXTS:
+        return "image"
+    if ext in _VIDEO_EXT_ARGS:
+        return "video"
+    if ext in _AUDIO_EXT_ARGS:
+        return "audio"
+    return kind
+
+
 def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inputs: dict[str, Path],
               audio_src: Path | None = None) -> None:
     if kind == "json":
         _write_json(dst, op_name=op_name, params=params, inputs=inputs)
         return
-    if kind == "video":
+    resolved = _resolve_media_class(kind, dst.suffix.lower())
+    if resolved == "video":
         _write_video(dst, op_name=op_name, audio_src=audio_src)
         return
-    if kind == "image" and (image_synth := _IMAGE_SYNTH.get(op_name)) is not None:
+    if resolved == "image" and (image_synth := _IMAGE_SYNTH.get(op_name)) is not None:
         image_synth(dst, op_name=op_name, params=params)
         return
-    fn = _WRITER.get(kind)
+    fn = _WRITER.get(resolved)
     if fn is None:
         raise registry.OpError(f"contour-dry: no synthesis rule for output kind {kind!r}")
     fn(dst, op_name=op_name)
