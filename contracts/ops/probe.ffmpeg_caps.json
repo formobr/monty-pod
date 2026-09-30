@@ -1,0 +1,27 @@
+{
+  "op": "probe.ffmpeg_caps",
+  "version": 1,
+  "summary": "Measure what THIS pod's ffmpeg/GPU build can do to a synthetic HLG clip (release/probe/hdr-hlg-v1.mp4): ffmpeg version, the pod ffmpeg build/asset it runs, hwaccels, filters, GPU facts from nvidia-smi, a probe of the fixture and, per candidate decode/encode path, whether it works. Measurement only — it chooses no decode path; which candidate the pool uses is the brain's.",
+  "needs": ["video_encode"],
+  "judgement": false,
+  "parity": {
+    "mode": "bit_exact",
+    "note": "`caps` is the bit_exact target: on one pod build, the same fixture yields the same capability facts. Timings (per-candidate wall_s / realtime_factor / peak_vram_delta_mb) are MEASUREMENTS that vary run to run, and they ride the separate `caps_timings` output for exactly that reason — so the parity claim on `caps` never has to carry a clock."
+  },
+  "inputs": [
+    {"id": "src", "kind": "video"}
+  ],
+  "outputs": [
+    {"id": "caps", "kind": "json", "durable": true},
+    {"id": "caps_timings", "kind": "json", "durable": true}
+  ],
+  "params": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pod_ffmpeg_build": {"type": "string"},
+      "pod_ffmpeg_asset": {"type": "string"}
+    }
+  },
+  "handler": "montyops.probe_ffmpeg_caps:run"
+}

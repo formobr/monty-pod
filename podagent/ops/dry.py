@@ -41,6 +41,8 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     "measure.silence": (REAL, "silencedetect spans + RMS envelope — ffmpeg reads only"),
     "measure.source": (REAL, "ffprobe-class ingest numbers (dims, rotation, codec, pix_fmt, ...)"),
     "media.range_frames": (REAL, "Range-only frame reader — decode-only sampling, no full encode"),
+    # a stubbed probe reports fake capability facts, defeating the whole op (TRK-108).
+    "probe.ffmpeg_caps": (REAL, "ffmpeg encode/decode candidates + nvidia-smi read against the bound fixture"),
     # cassette replays this mp3 against the audio-LLM, so the bytes must be real, not synthetic.
     "cut.audio": (REAL, "per-segment trim/fade/atempo AUDIO-ONLY encode — CPU ffmpeg, no video_encode argv"),
     "media.audio": (REAL, "full-file audio demux to mp3 — CPU ffmpeg, no video_encode argv"),

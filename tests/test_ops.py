@@ -493,6 +493,24 @@ def test_a_chain_this_image_can_run_passes_preflight():
     runner.preflight_chain(OpChain(job_id="j", pack=_PACK, steps=[_step("a"), _step("b", needs=["a"])]))
 
 
+def test_the_registry_carries_probe_ffmpeg_caps_and_preflight_chain_admits_it():
+    """THE TRK-108 INCIDENT. The engine shipped the `probe.ffmpeg_caps` handler in the ops pack, but no image
+    declared the op, so the pool's boot encoder probe was refused at claim (`does not carry op(s)
+    ['probe.ffmpeg_caps']`) and every pod served UNPROBED. NEGATIVE: delete
+    contracts/ops/probe.ffmpeg_caps.json and both the registry assert and the preflight below fail."""
+    from podagent.ops import runner
+
+    op = registry.all_ops()["probe.ffmpeg_caps"]
+    assert op.judgement is False, "the probe measures; which decode path to use is the brain's"
+    assert {p.id for p in op.outputs} == {"caps", "caps_timings"}
+    from podagent.ops import dry
+    assert dry._CLASSIFICATION["probe.ffmpeg_caps"][0] == dry.REAL, "a stubbed probe reports fake capability facts"
+    runner.preflight_chain(OpChain(job_id="j", pack=_PACK, steps=[_step(
+        "probe", op="probe.ffmpeg_caps", params={"pod_ffmpeg_build": "b", "pod_ffmpeg_asset": "a"},
+        outputs=[{"port": "caps", "url": "https://x/caps.json"},
+                 {"port": "caps_timings", "url": "https://x/caps_timings.json"}])]))
+
+
 # ── ONE step, N addressable outputs (runner.ARITY_WHY) ───────────────────────────────────────────
 
 def _frames_step(sid="g", n=3, **kw):
