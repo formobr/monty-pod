@@ -50,7 +50,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── builder: resolve the python stack ONCE, then park it in per-bucket staging roots ──────────────────
-# pip resolves the versions (no hand-pinned nvidia wheel list to drift from torch's own requirements), and
+# pip resolves the dependency graph (no hand-pinned nvidia wheel list to drift from torch's own requirements),
+# but every version it may pick is fixed by constraints.txt (`-c`): the full freeze of the last image that
+# served correctly. An unconstrained resolve moved 8 packages on a rebuild that only added an apt line —
+# websockets 17.0.1 -> 17.1 among them — and every pod on it looped its stream
+# (docs/research/pod-image-pinned-python-deps.md). A version moves only by an explicit edit of that file. And
 # the bucketing MOVES the trees apart, never copies them: a bucket that left a file behind would ship it
 # twice, and a duplicated 900 MB library is exactly the defect this stage exists to remove.
 #
@@ -64,8 +68,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # concurrent downloads, and the biggest is 658 MB where the single blob was 4163.
 # The last bucket is a SWEEP, not a list: a new dependency lands there instead of silently not shipping.
 FROM base AS pydeps
+COPY constraints.txt /tmp/constraints.txt
 RUN set -eux; \
-    python3 -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128; \
+    python3 -m pip install --no-cache-dir -c /tmp/constraints.txt torch torchaudio --index-url https://download.pytorch.org/whl/cu128; \
     # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
     # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
     # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
@@ -77,7 +82,7 @@ RUN set -eux; \
     # requests/urllib3 FLOORED here for the same --no-deps reason as transformers above: pyproject's deps
     # never reach the image. urllib3 1.x has enforce_content_length but defaults it OFF; 2.x flips the
     # default to ON, so the floor is what makes cp.py's short-body detection load-bearing, not optional.
-    python3 -m pip install --no-cache-dir transformers==4.57.6 opencv-python-headless numpy 'requests>=2.32,<3' 'urllib3>=2,<3' pydantic huggingface_hub soundfile Pillow jsonschema websockets; \
+    python3 -m pip install --no-cache-dir -c /tmp/constraints.txt transformers==4.57.6 opencv-python-headless numpy 'requests>=2.32,<3' 'urllib3>=2,<3' pydantic huggingface_hub soundfile Pillow jsonschema websockets; \
     SP=/usr/local/lib/python3.11/dist-packages; \
     bucket() { n="$1"; shift; for p in "$@"; do d="/stage/$n/$(dirname "$p")"; mkdir -p "$d"; mv "$SP/$p" "$d/"; done; }; \
     bucket 01 nvidia/cudnn; \
@@ -169,7 +174,8 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY podagent/ ./podagent/
 COPY contracts/ ./contracts/
-RUN python3 -m pip install --no-cache-dir --no-deps .
+COPY constraints.txt /tmp/constraints.txt
+RUN python3 -m pip install --no-cache-dir --no-deps -c /tmp/constraints.txt .
 
 # mograph is now COMPLETE on the pod: node above is the runtime, and the Remotion bundle
 # (node_modules + src + render_batch.mjs) is delivered per job as `motion_plan.bundle` — a presigned tar
