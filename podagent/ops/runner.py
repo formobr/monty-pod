@@ -20,6 +20,7 @@ import contextvars
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -61,6 +62,60 @@ op — `op_backend.py`'s budget and retry policy are unchanged — it only remov
 "assume dead" and "wait blind" that a pod which is neither erroring nor finishing forced on every reader of
 this incident.
 """
+
+
+INFRA_FAULT_WHY = """
+TRK-123: a pod whose op ends in an INFRASTRUCTURE-class run_error stops claiming at once and says so.
+
+The control plane's pool condemns a worker on the first infrastructure-class `run_error` it classifies (engine
+scripts/broker/pod_pool_service.classify_infra_error over registry/pod_defect_classes.yaml), but until that
+fence lands this process kept claiming, and the next job went onto the same broken card. So the pod decides
+the SAME question on the SAME text at run_error time: a match emits one `infra_fault` event (class in
+`timings.error_class`, the open dict the pool already honours by name) and trips the process-wide sink main
+installs, which stops the claim loop. A non-infra run_error changes nothing. The heavy-slot admission error
+is classified too: `GpuAdmissionTimeout` (the registry's `gpu_admission_timeout`, sourced from this package's
+own gpu_admission.py) is raised by the admission wait, before any run_started, so it never reaches run_error.
+The pod does not idle after a fault either way: main drains in-flight work and exits (code 5).
+
+The patterns are the pool's own, not a pod invention — copied from registry/pod_defect_classes.yaml `classes:`
+(engine a5350d3a8). Encoder errors and CUDA OOM sit under that file's `not_infrastructure:` (MISC-209, owner
+2026-09-30: an encoder error is OUR argv/driver parameters, never the rented card; an OOM is job-caused), so
+they never classify here either. Fencing on a text the pool does not condemn would leave a pod alive,
+unfenced and never claiming — the very latch MISC-200 forbids. Change these rows only with the registry.
+"""
+
+# registry/pod_defect_classes.yaml `classes:` — (name, patterns). `GpuAdmissionTimeout` is this package's own
+# class (podagent/ops/gpu_admission.py); the second is the boot capability verdict's defect name.
+_INFRA_CLASSES: Final = (
+    ("gpu_admission_timeout", (re.compile(r"\bGpuAdmissionTimeout\b"),)),
+    ("vulkan_false", (re.compile(r"\bvulkan_false\b"),)),
+)
+
+# Installed by main's ops lane for the chain it runs (contextvars reach every step thread: run_chain submits
+# each step under `contextvars.copy_context()`); called with the class name on an infra-class run_error.
+infra_fault_sink: contextvars.ContextVar[Any] = contextvars.ContextVar("infra_fault_sink", default=None)
+
+
+def infra_class(exc: BaseException) -> str | None:
+    """The infrastructure class this error names, or None (INFRA_FAULT_WHY). Matched on `safe_error(exc)` —
+    byte for byte the `error` text the run_error frame carries to the pool."""
+    text = safe_error(exc)
+    for name, patterns in _INFRA_CLASSES:
+        if any(p.search(text) for p in patterns):
+            return name
+    return None
+
+
+def _report_infra_fault(live: Any, exc: BaseException) -> None:
+    """After a run_error: an infra-class one stops this pod's claiming (the sink) and says so on the wire
+    (INFRA_FAULT_WHY). Sink first — a refused report must not leave the pod claiming onto the broken card."""
+    klass = infra_class(exc)
+    if klass is None:
+        return
+    sink = infra_fault_sink.get()
+    if sink is not None:
+        sink(klass)
+    live("infra_fault", exc=exc, error_class=klass)
 
 
 def _run_heartbeat(live: Any, t0: float, stop: threading.Event, tick: float) -> None:
@@ -1022,7 +1077,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     def live(phase: str, *, started: float | None = None,
              exc: BaseException | None = None, timings: dict[str, float] | None = None,
              outputs: list[dict[str, Any]] | None = None, outcome: str | None = None,
-             worker: str | None = None) -> None:
+             worker: str | None = None, error_class: str | None = None) -> None:
         if emit is None:
             return
         payload: dict[str, Any] = {
@@ -1041,6 +1096,9 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
             # the wire event vocabulary is CLOSED (StreamEventFields extra="forbid"), so the worker name
             # rides inside `timings` — the one open dict the contract already carries end to end
             payload.setdefault("timings", {})["worker"] = worker
+        if error_class is not None:
+            # same closed-vocabulary reason as `worker`; the pool honours `timings.error_class` by name
+            payload.setdefault("timings", {})["error_class"] = error_class
         if started is not None:
             payload.setdefault("timings", {})["phase_s"] = round(time.monotonic() - started, 3)
         if exc is not None:
@@ -1136,10 +1194,14 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         if run_announced:
             live("run_error", started=t0, exc=exc,
                  timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
+            _report_infra_fault(live, exc)
         elif heavy:
             # a refused/timed-out admission must CLOSE the wait it announced, or the ledger reads a park
             # that never ended as a park still going
             live("heavy_slot_wait_error", started=slot_ready, exc=exc, worker=worker_identity())
+            # GpuAdmissionTimeout — the registry's `gpu_admission_timeout` class — is raised HERE, by the
+            # admission wait, never after run_started; classifying only at run_error would never see it.
+            _report_infra_fault(live, exc)
         raise
     dt = time.monotonic() - t0
     timing.run_s = dt

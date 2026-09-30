@@ -199,6 +199,10 @@ class ControlPlane:
         """Best-effort measurement context for a terminal; absence never changes work success."""
         return self._stream.timeline_context(corr_id)
 
+    def interrupt_claim(self) -> None:
+        """Wake a blocked poll_job() so the dispatch loop re-checks its stop latches now, not after the wall."""
+        self._stream.interrupt_claim()
+
     def close_stream(self) -> None:
         """Say out loud what was never acknowledged, and let the socket go."""
         self._stream.close()

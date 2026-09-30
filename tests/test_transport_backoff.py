@@ -1,5 +1,6 @@
 """codex#25: a broken durable voice must retry bounded, then exit honestly — never spin forever and never
-die silently on an ambiguous (DeliveryPending) verdict the durable sender is still retrying in the background."""
+die early on an ambiguous (DeliveryPending) verdict the durable sender is still retrying in the background
+(its own, larger cap: tests/test_infra_fault_stops_claims.py)."""
 from __future__ import annotations
 
 import pytest
@@ -23,7 +24,7 @@ def _fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agent_main.time, "sleep", lambda _s: None)
 
 
-def test_delivery_pending_retries_forever_and_never_exits(
+def test_delivery_pending_retries_below_its_cap_and_never_hits_the_transport_exit(
         monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
     calls_before_bail = 50

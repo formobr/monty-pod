@@ -59,6 +59,7 @@ DISABLED = os.environ.get("POD_STREAM", "").strip() == "0"
 _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 3
 _ADMISSION_WAKE = object()
+_CLAIM_INTERRUPT = object()   # interrupt_claim(): the claim in progress returns None so its caller re-checks
 # The verdict table (PLAN.md §1), matched by (frame kind, status, exact/prefix error text) against the
 # literal texts pod_stream_test.go's TestPodFrameRefusalTextsArePinned pins on the real api. A "one_frame"
 # verdict is permanent for THIS correlation only — dead-letter it, keep job admission open for every other
@@ -180,6 +181,11 @@ class EventStream:
         self._delivery_outcomes: dict[tuple[str, int], bool | BaseException] = {}
         self._admission_error: TransportUnhealthy | None = None
         self._storage_error: TransportUnhealthy | None = None
+        # True while `_admission_error` is the one a storage latch set, so the storage recovery (a later
+        # durable write that succeeds) reopens admission it closed — and never one a verdict closed.
+        self._admission_from_storage = False
+        # The admission error a storage latch displaced — restored, not dropped, when storage recovers.
+        self._admission_before_storage: TransportUnhealthy | None = None
         # Admission state that must be replayed on every newly opened socket
         # (for example worker capacity/ready). The payload is not a claim or
         # result; it is appended to the same durable ordered outbox so it
@@ -375,11 +381,29 @@ class EventStream:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+        if self._storage_error is not None:
+            # MISC-200: a durable write that succeeds is the storage latch's recovery point. Without it the
+            # latch set by one failed write outlived the fault forever: every later append re-raised it and
+            # admission stayed closed on a volume that had long since recovered.
+            _log(f"durable state writable again — clearing storage latch ({safe_error(self._storage_error)})")
+            self._storage_error = None
+            if self._admission_from_storage:
+                before = self._admission_before_storage
+                # A verdict the storage latch displaced stays latched; a DeliveryPending only while there
+                # is still something to deliver (its own clearing points need an outbox frame to settle).
+                if isinstance(before, DeliveryPending) and not self._outbox:
+                    before = None
+                self._admission_error = before
+                self._admission_from_storage = False
+                self._admission_before_storage = None
 
     def _latch_locked(self, error: TransportUnhealthy, *, storage: bool = False) -> None:
         before = self._admission_error
         if self._admission_error is None or not isinstance(error, DeliveryPending):
+            if storage and not self._admission_from_storage:
+                self._admission_before_storage = self._admission_error
             self._admission_error = error
+            self._admission_from_storage = storage
         if storage:
             self._storage_error = self._storage_error or error
         if self._admission_error is not before or storage:
@@ -413,7 +437,12 @@ class EventStream:
             raise error from e
         with self._work:
             if self._storage_error is not None:
-                raise self._storage_error
+                # Probe the recovery point before refusing: rewriting the current durable state is exactly
+                # the write that failed, and success clears the latch (see `_persist_locked`).
+                try:
+                    self._persist_locked()
+                except BaseException:
+                    raise self._storage_error from None
             corr_id = str(normalized.get("corr_id") or "")
             if kind == "result" and corr_id in self._result_corrs_locked():
                 # This corr_id alone is refused, not the process: latching here would brick every OTHER
@@ -1351,6 +1380,8 @@ class EventStream:
             except queue.Empty:
                 return None
             with self._work:
+                if item is _CLAIM_INTERRUPT:
+                    return None
                 if item is _ADMISSION_WAKE:
                     if self._admission_error is not None:
                         raise self._admission_error
@@ -1365,6 +1396,11 @@ class EventStream:
                 self._queued_ids.discard(delivery_id)
                 self._claimed_ids.add(delivery_id)
                 return dict(job)
+
+    def interrupt_claim(self) -> None:
+        """Make the claim in progress (or the next one) return None at once, without latching admission:
+        its caller has a reason to stop claiming that the stream does not own (main's infra-fault latch)."""
+        self._jobs.put(_CLAIM_INTERRUPT)
 
     def close(self) -> None:
         with self._work:

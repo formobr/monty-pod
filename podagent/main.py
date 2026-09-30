@@ -21,7 +21,7 @@ import requests
 from pydantic import ValidationError
 
 from .cp import ControlPlane, mark_rented_pod
-from .event_stream import DeliveryPending, FrameRejected, TransportUnhealthy
+from .event_stream import DELIVERY_PENDING_MAX_ATTEMPTS, DeliveryPending, FrameRejected, TransportUnhealthy
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 from .sanitize import safe_error, safe_text, safe_traceback
 
@@ -832,15 +832,30 @@ def _tag(ev: dict[str, Any], corr_id: str | None, session_id: str | None) -> dic
     return ev
 
 
+def _infra_fault_reporter(cp: ControlPlane, coordinator: "RestartCoordinator") -> Any:
+    """The sink runner calls on an infra-class error: latch the coordinator, THEN wake the claim the dispatch
+    loop is almost always blocked in — otherwise the next pushed job is taken onto the condemned card before
+    the loop ever re-reads the latch."""
+    def _report(error_class: str) -> None:
+        coordinator.report_infra_fault(error_class)
+        cp.interrupt_claim()
+    return _report
+
+
 def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str,
              coordinator: "RestartCoordinator | None" = None) -> None:
     """Run an op chain. Dispatch is a registry LOOKUP, never a per-op branch (tests/test_ops_dispatch_is_a_lookup.py).
     A RESTART_REQUIRED return means the pack generation flipped; coordinator hears about it, no terminal is built."""
-    from .ops.runner import RESTART_REQUIRED, run_chain
+    from .ops.runner import RESTART_REQUIRED, infra_fault_sink, run_chain
 
     try:
         with _llm_correlation(corr_id):
-            result = run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
+            token = infra_fault_sink.set(
+                _infra_fault_reporter(cp, coordinator) if coordinator is not None else None)
+            try:
+                result = run_chain(chain, cp, corr_id=corr_id, session_id=session_id)
+            finally:
+                infra_fault_sink.reset(token)
         if result is RESTART_REQUIRED:
             reason = f"chain {chain.job_id} names ops-pack {chain.pack.sha256[:12]}, this process activated a different one"
             if coordinator is None:
@@ -1040,6 +1055,10 @@ _FLIP_MAX_PER_HOUR = 3
 _FLIP_WINDOW_S = 3600.0
 
 
+class InfraFaultRefused(RuntimeError):
+    """A job claimed after this pod's infra-fault latch tripped (runner.INFRA_FAULT_WHY) — released, never run."""
+
+
 class RestartRefused(RuntimeError):
     """Too many ops-pack generation flips in too short a window — this is ping-pong, not convergence."""
 
@@ -1096,7 +1115,9 @@ def _kill_orphan_children() -> None:
 
 
 class RestartCoordinator:
-    """One process-wide latch a pack-generation flip trips, plus the future registry the drain waits on."""
+    """One process-wide latch a pack-generation flip trips, plus the future registry the drain waits on.
+    A second latch, `infra_fault`, is tripped by an infrastructure-class run_error (runner.INFRA_FAULT_WHY):
+    either one stops the claim loop before its next claim."""
 
     _POOLS = ("ops", "heavy", "rank")
 
@@ -1105,6 +1126,8 @@ class RestartCoordinator:
         self._lock = threading.Lock()
         self._reason = ""
         self._target_pack = ""
+        self._infra_fault = threading.Event()
+        self._infra_class = ""
         # Keyed by the future's OWN identity — a label (corr_id) can repeat and a second future silently
         # overwriting the first's slot would drop it from `pending` early, not just at completion.
         self._futures: dict[str, dict[int, tuple[str, "cf.Future[Any]"]]] = {p: {} for p in self._POOLS}
@@ -1118,6 +1141,24 @@ class RestartCoordinator:
 
     def restart_requested(self) -> bool:
         return self._latch.is_set()
+
+    def report_infra_fault(self, error_class: str) -> None:
+        """First class wins; later faults on the same broken card add nothing the pool needs."""
+        with self._lock:
+            if not self._infra_fault.is_set():
+                self._infra_class = error_class
+        self._infra_fault.set()
+
+    def infra_fault(self) -> bool:
+        return self._infra_fault.is_set()
+
+    @property
+    def infra_class(self) -> str:
+        with self._lock:
+            return self._infra_class
+
+    def stop_claiming(self) -> bool:
+        return self.restart_requested() or self.infra_fault()
 
     @property
     def reason(self) -> str:
@@ -1147,6 +1188,35 @@ class RestartCoordinator:
                     for pool, entries in self._futures.items() if entries}
 
 
+def _drain_pending(coordinator: RestartCoordinator, drain_s: float, sleep: Any) -> list[str]:
+    """Wait (bounded) for the tracked futures; returns the labels still in flight at the deadline."""
+    deadline = time.monotonic() + drain_s
+    while True:
+        pending = coordinator.pending()
+        if not pending:
+            return []
+        if time.monotonic() >= deadline:
+            return [f"{pool}:{key}" for pool, keys in pending.items() for key in keys]
+        sleep(0.1)
+
+
+def _drain_and_stop_on_infra_fault(cp: ControlPlane, coordinator: RestartCoordinator, *,
+                                   drain_s: float | None = None, sleep: Any = time.sleep,
+                                   kill_orphans: Any = None) -> None:
+    """runner.INFRA_FAULT_WHY: the claim loop already stopped. Let in-flight chains land their terminals
+    (bounded, the restart drain's wall), then stop honestly — never an exec, which would claim onto the same
+    card, and never an idle process that looks ready and takes nothing (MISC-200)."""
+    klass = coordinator.infra_class
+    _log(f"infra fault ({klass}) — admission closed, draining in-flight chains before stopping")
+    abandoned = _drain_pending(coordinator, drain_s if drain_s is not None else _restart_drain_s(), sleep)
+    if abandoned:
+        _log(f"infra-fault drain deadline expired with {len(abandoned)} chain(s) still in flight: {abandoned}")
+    cp.close_stream()
+    (kill_orphans or _kill_orphan_children)()
+    _mark_stopped()
+    sys.exit(5)
+
+
 def _drain_and_restart(cp: ControlPlane, coordinator: RestartCoordinator, *,
                        drain_s: float | None = None, sleep: Any = time.sleep,
                        execv: Any = os.execv, now: Any = time.time,
@@ -1156,20 +1226,16 @@ def _drain_and_restart(cp: ControlPlane, coordinator: RestartCoordinator, *,
     propagate loud on purpose — neither is a restart."""
     reason = coordinator.reason
     target = coordinator.target_pack
+    # The flip guard runs BEFORE close_stream() on purpose (MISC-200 kept this order): a refused flip is not
+    # a restart — RestartRefused propagates loud with the stream still open, so the in-flight chains' terminals
+    # and the crash itself still reach the control plane. Closing first would leave a process that can neither
+    # restart nor report (tests/test_pack_restart.py::test_a_refused_flip_never_closes_the_stream_or_execs).
     _record_flip_or_refuse(target, now=now())
     _log(f"ops-pack generation changed ({reason}) — closing admission and draining before restart")
     cp.close_stream()
-    deadline = time.monotonic() + (drain_s if drain_s is not None else _restart_drain_s())
-    abandoned: list[str] = []
-    while True:
-        pending = coordinator.pending()
-        if not pending:
-            break
-        if time.monotonic() >= deadline:
-            abandoned = [f"{pool}:{key}" for pool, keys in pending.items() for key in keys]
-            _log(f"restart drain deadline expired with {len(abandoned)} chain(s) still in flight: {abandoned}")
-            break
-        sleep(0.1)
+    abandoned = _drain_pending(coordinator, drain_s if drain_s is not None else _restart_drain_s(), sleep)
+    if abandoned:
+        _log(f"restart drain deadline expired with {len(abandoned)} chain(s) still in flight: {abandoned}")
     (kill_orphans or _kill_orphan_children)()
     _mark_planned_restart(reason, abandoned)
     argv = [sys.executable, "-m", "podagent.main"]
@@ -1255,6 +1321,9 @@ def main() -> None:
             cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool:
         _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy, coordinator=coordinator,
                        kinds_coexist=kinds_coexist)
+        if coordinator.infra_fault():
+            # Before a pending restart: an exec onto the same broken card would claim onto it again.
+            _drain_and_stop_on_infra_fault(cp, coordinator)
         if coordinator.restart_requested():
             # Runs INSIDE this `with` on purpose — see _drain_and_restart's docstring.
             _drain_and_restart(cp, coordinator)
@@ -1270,15 +1339,20 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                    kinds_coexist: bool = True) -> None:
     """Claim envelopes and hand them to a pool; `kinds_coexist=False` folds the rank lane onto the one-wide
     heavy lane so the weight-holding kinds take turns (infer_lanes). `once` is the test seam — the production
-    loop never returns on its own; a set restart latch is the one other way out, checked before each claim."""
+    loop never returns on its own; a set restart or infra-fault latch is the one other way out, checked before
+    each claim."""
     unhealthy_attempts = 0
+    pending_attempts = 0
     while True:
-        if coordinator is not None and coordinator.restart_requested():
+        if coordinator is not None and coordinator.stop_claiming():
+            if coordinator.infra_fault():
+                _log(f"infra fault ({coordinator.infra_class}) — this pod claims nothing more")
             return
         try:
             t_poll = time.monotonic()
             job = cp.poll_job()          # a wait on the live socket, not a request (cp.poll_job WHY)
             unhealthy_attempts = 0
+            pending_attempts = 0
             if job is None:
                 idle = time.monotonic() - t_poll
                 if idle < _MIN_POLL_INTERVAL_S:
@@ -1289,6 +1363,13 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
 
             received_at = time.monotonic()
             raw_meta = _raw_job_meta(job)
+            if coordinator is not None and coordinator.infra_fault():
+                # The fault landed while this claim was already in flight: the job is ours (acked on receipt),
+                # so release it with a terminal the control plane can reroute — never run it on this card.
+                _log(f"infra fault ({coordinator.infra_class}) — refusing claimed job {raw_meta.get('job_id')}")
+                _dispatch_validation_terminal(cp, raw_meta, InfraFaultRefused(
+                    f"pod infra fault ({coordinator.infra_class}): refusing work on this card"))
+                return
             _lifecycle(cp, phase="received", **raw_meta)
             try:
                 pod_job = PodJob.model_validate(job)
@@ -1326,8 +1407,18 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
             time.sleep(5)
         except DeliveryPending as e:
             # A transient subclass of TransportUnhealthy: the durable sender is still retrying in the
-            # background, so this must never count toward — or trigger — the bounded exit below.
-            _log(f"control-plane delivery pending, retrying: {safe_error(e)}")
+            # background, so it never counts toward the TransportUnhealthy cap below — but it has its own
+            # (MISC-200): the event stream dead-letters a frame after DELIVERY_PENDING_MAX_ATTEMPTS, and a
+            # claim loop that sleeps on DeliveryPending past that same count is a pod «ready» that never
+            # takes work. Consecutive only — any healthy poll resets it.
+            pending_attempts += 1
+            if pending_attempts > DELIVERY_PENDING_MAX_ATTEMPTS:
+                _log(f"control-plane delivery-pending cap ({DELIVERY_PENDING_MAX_ATTEMPTS}) exceeded after "
+                     f"{pending_attempts} consecutive attempts; exiting honestly: {safe_error(e)}")
+                _mark_stopped()
+                sys.exit(4)
+            _log(f"control-plane delivery pending (attempt {pending_attempts}/{DELIVERY_PENDING_MAX_ATTEMPTS}), "
+                 f"retrying: {safe_error(e)}")
             time.sleep(_TRANSPORT_UNHEALTHY_BACKOFF_S)
         except TransportUnhealthy as e:
             unhealthy_attempts += 1
