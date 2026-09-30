@@ -38,9 +38,11 @@ from .stream_models import StreamAck, StreamJob, event_payload, job_ack_payload,
 
 try:  # pragma: no cover - import shape is exercised through the no-module branch
     import websockets.sync.client as _ws_client
+    from websockets.exceptions import ConnectionClosed as _ConnectionClosed
     _WS_IMPORT_ERROR: str | None = None
 except Exception as e:  # noqa: BLE001 - absence means the only lane cannot open
     _ws_client = None  # type: ignore[assignment]
+    _ConnectionClosed = None  # type: ignore[assignment,misc]
     _WS_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 
@@ -95,8 +97,15 @@ def _is_boot_frame(frame: dict[str, Any]) -> bool:
     return isinstance(event, dict) and event.get("stage") == "boot"
 
 
+def _is_reopen_report(frame: dict[str, Any]) -> bool:
+    """MISC-209's diagnostic `stream_reopen` event: best-effort, it never blocks or closes anything."""
+    return _is_boot_frame(frame) and frame["event"].get("phase") == "stream_reopen"
+
+
 def _classify_verdict(frame: dict[str, Any], status: int, error: str) -> str | None:
     """"one_frame" | "closes_admission" | None (no permanent verdict — transport-retry, unchanged)."""
+    if _is_reopen_report(frame) and status in (403, 409, 422):
+        return "one_frame"  # a refused diagnostic says nothing about the worker's identity
     if status == 403:
         if error in _ONE_FRAME_EXACT_TEXTS or any(error.startswith(p) for p in _ONE_FRAME_PREFIXES):
             return "one_frame"
@@ -181,6 +190,12 @@ class EventStream:
         # Sender-loop exhaustion cycles per frame identity, since only a bounded count of ambiguous
         # cycles should be able to keep any one frame — and the admission it closes — alive forever.
         self._pending_settlement_attempts: dict[tuple[str, int], int] = {}
+        # MISC-209: why the live socket last closed. A rented pod's stderr is unreadable, so the reason rides
+        # to the control plane as the first event on the next socket (`timings.stream_reopen`).
+        self._conn_opened_mono: float | None = None
+        self._last_ack_mono: float | None = None
+        self._last_close: dict[str, Any] | None = None
+        self._pending_reopen_key: tuple[str, int] | None = None
 
         # A process incarnation owns one new stream id. Frames restored from disk keep THEIR original id/seq;
         # mixing an old identity into the new stream makes server-side dedupe unable to identify a replay.
@@ -632,6 +647,14 @@ class EventStream:
 
                 with self._state:
                     head = dict(self._outbox[0]) if self._outbox else None
+                while head is not None and _is_reopen_report(head) and (
+                        self._frame_key(head) in attempted or self._frame_key(head) in self._wire_attempts):
+                    # An undelivered reopen report is dropped, not retried: the next reopen reports afresh,
+                    # and a report re-inserted every cycle must not keep the real head from its cap below.
+                    # `_wire_attempts` also covers reports `_deliver_window` spliced in after `attempted`.
+                    self._settle(head, "abandoned", None, 0.0)
+                    with self._state:
+                        head = dict(self._outbox[0]) if self._outbox else None
                 if head is not None and self._frame_key(head) in attempted:
                     head_key = self._frame_key(head)
                     with self._work:
@@ -695,6 +718,22 @@ class EventStream:
         with self._work:
             if self._pending_bootstrap_key == key:
                 self._pending_bootstrap_key = None
+            if self._pending_reopen_key == key:
+                self._pending_reopen_key = None
+            if disposition != "accepted" and _is_reopen_report(frame):
+                # Diagnostics only: no dead-letter row, no latch, no waiter — just leave the outbox.
+                if self._outbox and self._frame_key(self._outbox[0]) == key:
+                    popped = self._outbox.pop(0)
+                    try:
+                        self._persist_locked()
+                    except BaseException as e:
+                        self._outbox.insert(0, popped)
+                        raise TransportUnhealthy(f"durable reopen-report drop failed: {safe_error(e)}") from e
+                self._wire_attempts.pop(key, None)
+                self._wire_sends.pop(key, None)
+                self._pending_settlement_attempts.pop(key, None)
+                self._work.notify_all()
+                return
             outcome: bool | BaseException
             if disposition == "accepted":
                 if self._outbox and (str(self._outbox[0]["stream_id"]),
@@ -809,14 +848,17 @@ class EventStream:
                     time.sleep(REOPEN_BACKOFF_S)
                 continue
             with self._state:
-                bootstrap_key = self._pending_bootstrap_key
-            if bootstrap_key is not None and (not pending or self._frame_key(pending[0]) != bootstrap_key):
-                with self._state:
-                    head_frame = next(
-                        (dict(f) for f in self._outbox if self._frame_key(f) == bootstrap_key), None)
-                if head_frame is not None:
-                    pending = [head_frame] + [f for f in pending if self._frame_key(f) != bootstrap_key]
-                    started.setdefault(bootstrap_key, time.monotonic())
+                # Head frames installed by `_ensure_open` after this window was sliced: the reopen reason
+                # first (it describes the socket before this one), then readiness.
+                head_keys = [k for k in (self._pending_reopen_key, self._pending_bootstrap_key)
+                             if k is not None]
+                head_frames = [dict(f) for k in head_keys for f in self._outbox if self._frame_key(f) == k]
+            if head_frames and [self._frame_key(f) for f in pending[:len(head_frames)]] != [
+                    self._frame_key(f) for f in head_frames]:
+                keys = {self._frame_key(f) for f in head_frames}
+                pending = head_frames + [f for f in pending if self._frame_key(f) not in keys]
+                for key in keys:
+                    started.setdefault(key, time.monotonic())
             acks = self._exchange_window(pending)
             retry: list[dict[str, Any]] = []
             for frame in pending:
@@ -896,7 +938,7 @@ class EventStream:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _log(f"frame window write exceeded the shared {FRAME_WALL_S}s wall")
-                self._fail_connection(conn, "write/ACK wall expired")
+                self._fail_connection(conn, "write/ACK wall expired", "write_wall")
                 break
             if write_done.wait(min(0.02, remaining)):
                 break
@@ -905,7 +947,7 @@ class EventStream:
                     break
         if write_errors:
             _log(f"frame window write failed ({safe_error(write_errors[0])})")
-            self._fail_connection(conn, f"write: {safe_error(write_errors[0])}")
+            self._fail_connection(conn, f"write: {safe_error(write_errors[0])}", "write_error")
 
         for key in keys:
             ready[key].wait(max(0.0, deadline - time.monotonic()))
@@ -919,7 +961,9 @@ class EventStream:
         if len(acks) != len(keys):
             missing = len(keys) - len(acks)
             _log(f"frame window has {missing}/{len(keys)} unacknowledged after {FRAME_WALL_S}s")
-            self._fail_connection(conn, "ack timeout or invalid ACK")
+            self._fail_connection(
+                conn, f"{missing}/{len(keys)} unacknowledged after {FRAME_WALL_S}s", "ack_wall",
+                unacked=missing)
         return acks
 
     # ── strict server frames ───────────────────────────────────────────────────────────────────────
@@ -1128,6 +1172,7 @@ class EventStream:
                 seq = int(ack["seq"])
                 key = (str(ack["stream_id"]), seq)
                 with self._work:
+                    self._last_ack_mono = time.monotonic()
                     self._record_clock_sample_locked(key, ack, client_recv_mono_ns)
                     self._acks[key] = ack
                     waiter = self._ack_waiters.get(key)
@@ -1145,7 +1190,8 @@ class EventStream:
                             self._latch_locked(FrameRejected(dict(frame), ack))
             except Exception as e:  # noqa: BLE001 - malformed peer means connection is unsafe
                 _log(f"reader rejected server frame ({safe_error(e)})")
-                self._fail_connection(conn, safe_error(e))
+                closed = _ConnectionClosed is not None and isinstance(e, _ConnectionClosed)
+                self._fail_connection(conn, safe_error(e), "server_close" if closed else "reader_error")
                 return
             if waiter is not None:
                 waiter.set()
@@ -1172,6 +1218,7 @@ class EventStream:
                 return False
             with self._state:
                 self._conn = conn
+                self._conn_opened_mono = time.monotonic()
                 if (isinstance(self._admission_error, DeliveryPending) and not self._outbox
                         and self._storage_error is None):
                     # MISC-200: a successful open with nothing left to retry is itself proof the transport
@@ -1198,11 +1245,36 @@ class EventStream:
                     return False
                 with self._state:
                     self._pending_bootstrap_key = (self._stream_id, seq)
+            self._install_reopen_report()
             self._reader = threading.Thread(
                 target=self._read_loop, args=(conn,), name="pod-stream-reader", daemon=True)
             self._reader.start()
             _log(f"open ✓ endpoint={safe_endpoint(self._url)} stream={self._stream_id}")
             return True
+
+    def _install_reopen_report(self) -> None:
+        """Put the previous socket's close reason at the outbox head, ahead of readiness, so it is the first
+        frame this socket carries. `stage=boot` without a corr is the fleet-infrastructure shape the api
+        accepts on a shared lane; the reason itself rides in `timings`, the one open dict of the wire."""
+        with self._state:
+            close, self._last_close = self._last_close, None
+        if close is None:
+            return
+        event = {
+            "stage": "boot",
+            "status": "step",
+            "phase": "stream_reopen",
+            "step": f"stream reopened after {close['class']} close",
+            "timings": {"stream_reopen": close},
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            seq = self._append_bootstrap_head(event)
+        except Exception as e:  # noqa: BLE001 - diagnostics must never block the socket that carries work
+            _log(f"stream_reopen report not persisted ({safe_error(e)})")
+            return
+        with self._state:
+            self._pending_reopen_key = (self._stream_id, seq)
 
     @staticmethod
     def _shutdown_conn(conn: Any) -> None:
@@ -1231,11 +1303,28 @@ class EventStream:
             threading.Thread(
                 target=close_connection, name="pod-stream-force-close", daemon=True).start()
 
-    def _fail_connection(self, conn: Any, why: str) -> None:
+    def _fail_connection(self, conn: Any, why: str, reason: str = "other", *,
+                         unacked: int | None = None) -> None:
+        """`reason` is one of ack_wall | write_wall | write_error | reader_error | server_close | other.
+        `unacked` defaults to the in-flight ACK waiters still armed on this socket."""
         with self._state:
             if self._conn is conn:
                 self._conn = None
                 waiters = list(self._ack_waiters.values())
+                # Only the close of the LIVE socket is recorded: a second failure path observing the same
+                # dead socket (the ACK wall after a write wall, the reader after a forced shutdown) would
+                # otherwise overwrite the first, true reason.
+                now = time.monotonic()
+                self._last_close = {
+                    "class": reason,
+                    "message": safe_text(why, 200),
+                    "open_s": round(now - self._conn_opened_mono, 3)
+                    if self._conn_opened_mono is not None else None,
+                    "unacked": unacked if unacked is not None else sum(
+                        1 for key in self._ack_waiters if key not in self._acks),
+                    "since_last_ack_s": round(now - self._last_ack_mono, 3)
+                    if self._last_ack_mono is not None else None,
+                }
             else:
                 # A reader from the previous socket may observe its close after a reconnect already installed
                 # new ACK waiters under the same frame identities. It must not wake the new connection's window.

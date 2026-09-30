@@ -110,7 +110,10 @@ class _FakeFleetApi:
             except Exception:
                 return
             kind = frame.get("type")
-            if kind == "event" and (frame.get("event") or {}).get("stage") == "boot":
+            # Readiness is stage=boot AND phase=ready, as the real api decides it (pod.go preparePodEvent):
+            # other boot events — e.g. the MISC-209 stream_reopen report — are telemetry, not readiness.
+            event = frame.get("event") or {}
+            if kind == "event" and event.get("stage") == "boot" and event.get("phase") == "ready":
                 self._handle_ready(ws, frame)
             elif kind == "job_ack":
                 self._handle_job_ack(ws, frame)

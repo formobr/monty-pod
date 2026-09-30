@@ -343,7 +343,9 @@ def test_mid_window_disconnect_replays_only_unacked_frames_with_the_same_ids(
 
     assert len(connections) == 2
     assert [seq for _, seq in connections[0]] == [1, 2, 3, 4]
-    assert connections[1] == connections[0][2:], "ACKed prefix must not cross the reconnect again"
+    # MISC-209: the reconnect leads with its own fresh-seq stream_reopen report, then the replay.
+    assert connections[1][0][1] == 5
+    assert connections[1][1:] == connections[0][2:], "ACKed prefix must not cross the reconnect again"
 
 
 def test_reconnect_replays_worker_capacity_bootstrap(tmp_path: Path) -> None:
@@ -1344,7 +1346,9 @@ def test_reconnect_bootstrap_ready_precedes_a_replayed_job_ack(
 
     assert connections[0] and connections[0][0]["event"]["phase"] == "warm"
     assert connections[1], "the pod must reconnect"
-    first = connections[1][0]
+    # MISC-209: the reconnect's stream_reopen report leads; readiness is the first frame after it.
+    assert connections[1][0]["event"].get("phase") == "stream_reopen"
+    first = connections[1][1]
     assert first["type"] == "event" and first["event"].get("phase") == "capacity", (
         "a replayed job_ack must never precede the reconnect's bootstrap-ready")
     assert any(f["type"] == "job_ack" for f in connections[1])
