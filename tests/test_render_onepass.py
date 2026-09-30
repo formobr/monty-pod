@@ -92,6 +92,20 @@ def _prepared(spec: RenderSpec, **kw) -> op.Prepared:
     return op.Prepared(**base)
 
 
+def _write_caption_font(root: Path) -> None:
+    """captions.build_ass measures every style with PIL (the safe-width shrink, MISC-167), so the
+    `caption_font` input the tests resolve under `root` must be a real TTF, not an absent file."""
+    import glob
+    found = glob.glob("/usr/share/fonts/**/*.ttf", recursive=True)
+    if found and not (root / "caption_font").exists():
+        shutil.copyfile(found[0], root / "caption_font")
+
+
+@pytest.fixture(autouse=True)
+def _caption_font_is_a_real_ttf(tmp_path: Path) -> None:
+    _write_caption_font(tmp_path)
+
+
 def _paths(spec: RenderSpec, root: Path) -> dict[str, Path]:
     return {i.id: root / i.id.replace("/", "__") for i in spec.inputs}
 
@@ -976,6 +990,7 @@ def _stub_prepare_passes(monkeypatch, tmp_path):
     # H1: _check_inputs now probes the base timeline segment too — stub it same as any other pre-pass.
     monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
     (tmp_path / "base").write_bytes(b"x")
+    _write_caption_font(tmp_path)
     bed = tmp_path / "music_bed.flac"
     monkeypatch.setattr(render, "_prerender_bed", lambda *_a, **_kw: bed)
     monkeypatch.setattr(mograph, "_render_layers", lambda *_a, **_kw: list(LAYERS))
