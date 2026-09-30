@@ -17,6 +17,7 @@
 # `-base`, NOT `-runtime`: -runtime adds 2.06 GB of cuda-libraries (cublas/cufft/cusolver/cusparse/nccl)
 # that NOTHING here links — torch ships its own copies in site-packages/nvidia/*, and the ffmpeg GPU path is
 # Vulkan/libplacebo + NVENC, which come from the driver the container runtime injects.
+# The image must ship libEGL (libegl1 -> libglvnd) for that injected Vulkan ICD to load at all.
 FROM nvidia/cuda:12.8.1-base-ubuntu22.04 AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -33,9 +34,11 @@ ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
 # and the job ships a black card instead — a failure nothing errors on. ~2 MB on top of the cairo/pango
 # libraries the bundled browser uses. ------------------------------------------------------------------
 # libvulkan1 is the Vulkan loader ffmpeg libplacebo dlopen's; vulkan-tools supplies vulkaninfo diagnostics.
+# libegl1: the injected NVIDIA ICD resolves libEGL.so.1 internally; without it vkCreateInstance silently
+# fails (ERROR_INCOMPATIBLE_DRIVER) — see docs/research/pod-image-headless-vulkan-libegl.md.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common curl xz-utils ca-certificates gnupg \
-        fonts-dejavu-core fontconfig librsvg2-bin libvulkan1 vulkan-tools \
+        fonts-dejavu-core fontconfig libegl1 librsvg2-bin libvulkan1 vulkan-tools \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3.11-distutils \
