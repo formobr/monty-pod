@@ -216,10 +216,11 @@ def test_ready_is_sent_synchronously_only_after_a_successful_probe(monkeypatch):
     cp = _OrderedCP()
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: timeline.append("boot"))
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: timeline.append("nvenc_probe"))
+    monkeypatch.setattr(agent_main, "_free_vram_or_refuse", lambda _cp: timeline.append("free_vram"))
     monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: timeline.append("nvdec_probe"))
     monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: timeline.append("vulkan"))
     agent_main._capability_preflight(cp)
-    assert timeline == ["boot", "nvenc_probe", "nvdec_probe", "vulkan", "ready"]
+    assert timeline == ["boot", "nvenc_probe", "free_vram", "nvdec_probe", "vulkan", "ready"]
     assert cp.events == [{
         "stage": "boot", "status": "step", "phase": "ready",
         "step": "capability preflight passed",

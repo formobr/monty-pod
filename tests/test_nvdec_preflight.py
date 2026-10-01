@@ -145,7 +145,8 @@ def test_nvdec_probe_runs_after_nvenc_in_capability_preflight(monkeypatch):
     cp = _CP()
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: timeline.append("nvenc"))
+    monkeypatch.setattr(agent_main, "_free_vram_or_refuse", lambda _cp: timeline.append("free_vram"))
     monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: timeline.append("nvdec"))
     monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: timeline.append("vulkan"))
     agent_main._capability_preflight(cp)
-    assert timeline == ["nvenc", "nvdec", "vulkan"]
+    assert timeline == ["nvenc", "free_vram", "nvdec", "vulkan"]

@@ -86,9 +86,13 @@ def _log(msg: str) -> None:
 
 
 def _free_vram_mb() -> float | None:
-    """Free VRAM on the card the towers will run on, or None if this machine cannot say."""
-    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                       capture_output=True, text=True)
+    """Free VRAM on the card the towers will run on, or None if this machine cannot say. Bounded: main's boot
+    preflight reads it before the pod reports ready, and a hung nvidia-smi must not hang the boot."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
     if r.returncode != 0:
         return None
     vals = [float(ln.strip()) for ln in r.stdout.splitlines() if ln.strip().replace(".", "", 1).isdigit()]

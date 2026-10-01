@@ -331,6 +331,65 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     sys.exit(3)
 
 
+BOOT_FREE_VRAM_WHY = """
+A RENTED CARD CAN ARRIVE ALREADY FULL, AND THE MARKETPLACE CANNOT TELL US BEFOREHAND.
+
+clore's marketplace API exposes only INSTALLED VRAM (specs.gpuram), never current usage nor the host's
+background job (that is owner-only server_config); its own renter troubleshooting says to check nvidia-smi for
+other processes. Server 96828 (RTX 5060 Ti 16 GB) had ~14 GiB held by foreign processes on 4 rents, and our
+warm-up OOM'd («15.48 GiB total, 19 MiB free») only AFTER the pod had reported ready and taken work.
+
+THE FLOOR IS DERIVED, NOT GUESSED: the heaviest single infer kind's measured residency
+(infer_lanes.KIND_VRAM_MIB — clip_rank = _VRAM_WEIGHTS_MB 2322 + _VRAM_PER_LANE_MB 414 = 2736 MiB, above align's
+1500) plus the same _VRAM_RESERVE_MB 512 every lane budget keeps = 3248 MiB. Below that not even one kind can
+load, so the pod refuses before ready. Above it the lane sizing (narrow card -> kinds serialise) takes over.
+An UNREADABLE card is not refused here: no reading is not evidence of a foreign tenant, and the NVENC probe
+has already proven the GPU answers.
+"""
+
+BOOT_VRAM_REFUSAL_EXIT = 6   # distinct from 3 (codec refusal), 4 (transport), 5 (infra fault)
+
+
+def boot_vram_floor_mib() -> float:
+    """Free MiB the card must report at boot: heaviest single infer kind + reserve (BOOT_FREE_VRAM_WHY)."""
+    from .infer_lanes import KIND_VRAM_MIB, RESERVE_MIB
+    return max(KIND_VRAM_MIB.values()) + RESERVE_MIB
+
+
+def _free_vram_or_refuse(cp: "ControlPlane", *, free_probe: Any = None, total_probe: Any = None) -> None:
+    """Refuse a card whose VRAM is already taken by processes that are not ours, BEFORE ready (BOOT_FREE_VRAM_WHY)."""
+    from .infer_cliprank import _free_vram_mb, vram_total_mb
+    try:
+        free = (free_probe or _free_vram_mb)()
+    except Exception as e:  # noqa: BLE001 — a reader fault is "no reading", never a refusal
+        _log(f"free-VRAM probe failed ({safe_error(e)}) — cannot prove the card is occupied, proceeding")
+        return
+    floor = boot_vram_floor_mib()
+    if free is None:
+        _log(f"free-VRAM unreadable — cannot prove the card is occupied, proceeding (floor={floor:.0f} MiB)")
+        return
+    try:
+        total = (total_probe or vram_total_mb)()
+    except Exception:  # noqa: BLE001 — total only decorates the verdict
+        total = None
+    total_s = f"{total:.0f}" if total is not None else "unknown"
+    if free >= floor:
+        _log(f"free VRAM OK — free={free:.0f} total={total_s} floor={floor:.0f} MiB")
+        return
+    msg = (f"gpu_vram_occupied: free={free:.0f} total={total_s} floor={floor:.0f} — REFUSING work: "
+           f"foreign processes hold this card's VRAM")
+    _log(msg)
+    try:
+        cp.send_event(
+            {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
+            wait=True,
+        )
+    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
+        _log(f"VRAM refusal delivery failed: {safe_error(e)}")
+    _mark_stopped()
+    sys.exit(BOOT_VRAM_REFUSAL_EXIT)
+
+
 def _ffmpeg_version_head(edge_lines: int = 2) -> str:
     """The banner's own git-describe + build-config lines, so a probe verdict names its exact binary."""
     import subprocess
@@ -1015,9 +1074,10 @@ def _report_boot(cp: ControlPlane) -> None:
 
 
 def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, Any] | None = None) -> None:
-    """Report the boot, prove the encoder, then make readiness an ACKed admission barrier."""
+    """Report the boot, prove the encoder and a card not already full, then make readiness an ACKed admission barrier."""
     _report_boot(cp)
     _nvenc_or_refuse(cp)
+    _free_vram_or_refuse(cp)
     _nvdec_or_refuse(cp)
     if capacity is not None:
         capacity["vulkan"] = _vulkan_preflight(cp, capacity=capacity)
