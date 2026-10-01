@@ -148,6 +148,79 @@ _store = requests.Session()
 for _scheme in ("http://", "https://"):
     _store.mount(_scheme, HTTPAdapter(pool_connections=_store_pool(), pool_maxsize=_store_pool(),
                                       pool_block=False))
+
+# A PUT's per-attempt deadline is sized to the OBJECT and to the uplink it actually shares, not a flat 30 s:
+# measured 2026-10-01, three concurrent previews spent 680/811/460 s in `put` (155-320 s alone) because every
+# object under 30 MiB got the same 30 s read window, timed out on a shared uplink and was re-sent from byte 0.
+# Floor arithmetic: one stream measures ~25 MB/s (see `_XFER_DEADLINE_S`); the pod may run `_store_pool()`
+# PUTs at once on that same uplink, so the worst honest per-PUT rate is 25 MB/s / that width — e.g. 64
+# transfers -> ~0.39 MB/s, so a 40 MiB object gets ~117 s instead of 40 s. Pessimistic on purpose: the
+# deadline only ever SHORTENS from it when a measured rate says the uplink really is faster.
+_MEASURED_STREAM_BYTES_PER_S = 25e6
+_PUT_FLOOR_BYTES_PER_S = _MEASURED_STREAM_BYTES_PER_S / _store_pool()
+# Connect + TLS + the store's own answer after the last byte; matches the 10 s connect leg in STORE_POOL_WHY.
+_PUT_CONNECT_MARGIN_S = 10.0
+# A measured rate is a sample, not a promise: the deadline assumes half of it before it cuts a transfer off.
+_PUT_RATE_SLACK = 2.0
+# EWMA weight of the newest aggregate-throughput sample.
+_PUT_RATE_ALPHA = 0.3
+
+
+class _PutRate:
+    """The pod's AGGREGATE PUT throughput (EWMA over completed attempts) and how many PUTs share it now.
+    Per-PUT rate = aggregate / in-flight. Best-effort: a stopwatch can never fail a transfer."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._in_flight = 0
+            self._aggregate: float | None = None
+
+    def begin(self) -> None:
+        with self._lock:
+            self._in_flight += 1
+
+    def end(self, size: int | None = None, seconds: float = 0.0) -> None:
+        with self._lock:
+            sharing = max(1, self._in_flight)
+            self._in_flight = max(0, self._in_flight - 1)
+            if size and seconds > 0:
+                sample = size / seconds * sharing
+                prev = self._aggregate
+                self._aggregate = sample if prev is None else prev + _PUT_RATE_ALPHA * (sample - prev)
+
+    def per_put(self) -> float:
+        """Measured bytes/s ONE more concurrent PUT may count on, 0.0 while nothing has been measured."""
+        with self._lock:
+            if not self._aggregate:
+                return 0.0
+            return self._aggregate / max(1, self._in_flight) / _PUT_RATE_SLACK
+
+
+put_rate = _PutRate()
+
+
+def _put_deadline_s(size: int) -> float:
+    """connect margin + size / max(floor, measured per-PUT rate); never stricter than the old `_TIMEOUT`."""
+    rate = max(_PUT_FLOOR_BYTES_PER_S, put_rate.per_put())
+    return max(float(_TIMEOUT), _PUT_CONNECT_MARGIN_S + size / rate)
+
+
+class PutRejected(requests.HTTPError):
+    """The store ANSWERED a PUT with a 4xx (not 408/429): an expired/invalid presign or a malformed request
+    fails identically on every re-send, so it is raised at once — no retry, no sleep."""
+
+
+def _put_rejected(exc: requests.RequestException) -> PutRejected | None:
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if isinstance(exc, requests.HTTPError) and isinstance(status, int) and 400 <= status < 500 \
+            and status not in (408, 429):
+        return PutRejected(f"upload rejected: HTTP {status} (not retryable)", response=resp)
+    return None
 def _log(msg: str) -> None:
     print(f"[podagent] {safe_text(msg)}", file=sys.stderr, flush=True)
 
@@ -377,8 +450,8 @@ class _DeadlineBody:
     """A file read as chunks under the same wall-clock deadline. `__len__` keeps requests on Content-Length —
     a presigned PUT is signed for a plain body, not for chunked transfer-encoding."""
 
-    def __init__(self, fh: Any, size: int) -> None:
-        self._fh, self._size = fh, size
+    def __init__(self, fh: Any, size: int, deadline_s: float = _XFER_DEADLINE_S) -> None:
+        self._fh, self._size, self._deadline_s = fh, size, deadline_s
 
     def __len__(self) -> int:
         return self._size
@@ -393,9 +466,9 @@ class _DeadlineBody:
             yield chunk
             sent += len(chunk)
             elapsed = time.monotonic() - t0
-            if elapsed > _XFER_DEADLINE_S:
+            if elapsed > self._deadline_s:
                 raise TransferTimeout(
-                    f"upload stalled: aborted after {elapsed:.1f}s (deadline {_XFER_DEADLINE_S:.0f}s) with "
+                    f"upload stalled: aborted after {elapsed:.1f}s (deadline {self._deadline_s:.0f}s) with "
                     f"{sent} of {self._size} bytes sent")
 
 
@@ -827,6 +900,8 @@ def _upload_content_type(src: Path) -> str:
 
 def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
     """Presigned PUT ← file, streamed, 3 attempts. A file:// url copies to local disk (local backend).
+    Each attempt's deadline scales with the object and the shared uplink (`_put_deadline_s`); a 4xx answer
+    other than 408/429 is `PutRejected` after ONE attempt — 5xx, timeouts and connection errors retry.
 
     A retry re-sends the object FROM BYTE 0 — a presigned PUT is one signed request and has no resume. The
     real fix is presigned MULTIPART (the brain mints an uploadId plus per-part urls), which makes a reset
@@ -849,27 +924,39 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
             resent += size
             _log(f"upload retry {attempt + 1}/{_XFER_ATTEMPTS} for {src.name}: re-sending all {size} bytes "
                  f"from 0 ({resent} bytes re-sent so far, no resume on a presigned PUT)")
+        deadline = _put_deadline_s(size)
         t_attempt = time.monotonic()
         t_attempt_ns = time.monotonic_ns()
         try:
-            with src.open("rb") as f:
-                r = _store.put(
-                    put_url, data=_DeadlineBody(f, size),
-                    headers={"Content-Type": content_type, "Content-Length": str(size)},
-                    timeout=max(_TIMEOUT, size // (1 << 20)),
-                )
-            r.raise_for_status()
+            put_rate.begin()
+            try:
+                with src.open("rb") as f:
+                    # (connect, read): the read leg bounds every socket op, the body's wall the whole attempt
+                    # — both sized to this object (`_put_deadline_s`); the wall keeps the old 300 s drip bound.
+                    r = _store.put(
+                        put_url, data=_DeadlineBody(f, size, max(_XFER_DEADLINE_S, deadline)),
+                        headers={"Content-Type": content_type, "Content-Length": str(size)},
+                        timeout=(_PUT_CONNECT_MARGIN_S, deadline),
+                    )
+                r.raise_for_status()
+            except BaseException:
+                put_rate.end()
+                raise
+            put_rate.end(size, time.monotonic() - t_attempt)
             put_trace.add(
                 attempt=attempt + 1, start_mono_ns=t_attempt_ns,
                 end_mono_ns=time.monotonic_ns(), outcome="ok")
             return
-        except requests.RequestException:
+        except requests.RequestException as e:
             wire_end_ns = time.monotonic_ns()
-            if attempt + 1 == _XFER_ATTEMPTS:
+            rejected = _put_rejected(e)
+            if rejected is not None or attempt + 1 == _XFER_ATTEMPTS:
                 retry.add(time.monotonic() - t_attempt)
                 put_trace.add(
                     attempt=attempt + 1, start_mono_ns=t_attempt_ns,
                     end_mono_ns=wire_end_ns, retry_end_mono_ns=time.monotonic_ns(), outcome="error")
+                if rejected is not None:
+                    raise rejected from e
                 raise
             time.sleep(2**attempt)
             retry.add(time.monotonic() - t_attempt)
