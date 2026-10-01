@@ -13,6 +13,7 @@ image, or waits for publication. GHCR verification is an anonymous bounded read.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -139,6 +140,16 @@ class Registry:
         self.timeout = timeout
 
     def _json(self, url: str, *, headers: dict[str, str] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
+        raw, response_headers = self._read(url, headers=headers)
+        return parse_registry_json(raw), response_headers
+
+    def _by_digest(self, url: str, digest: str, *,
+                   headers: dict[str, str]) -> tuple[dict[str, Any], dict[str, str]]:
+        """Content-addressed read: the body MUST hash to the digest it was asked for, or it is refused."""
+        raw, response_headers = self._read(url, headers=headers)
+        return verify_content_digest(raw, digest), response_headers
+
+    def _read(self, url: str, *, headers: dict[str, str] | None = None) -> tuple[str, dict[str, str]]:
         # TRK-79: `verify`/`pin` runs this from the engine's own image-boot proof, which the landing/ship
         # threaded proof pool (`proof_units.py`'s `run_units`, `ThreadPoolExecutor`) calls from a WORKER
         # THREAD. `multiprocessing`'s fork context only clones the calling thread, so a lock any sibling
@@ -170,9 +181,9 @@ class Registry:
                     f"GHCR read worker printed a malformed result ({type(exc).__name__})") from exc
             if not payload.get("ok"):
                 raise ReleaseError(f"GHCR read failed ({payload.get('error', 'unknown')})")
-            body = json.loads(payload["body"])
+            body = payload["body"]
             response_headers = payload["headers"]
-            if not isinstance(body, dict) or not isinstance(response_headers, dict):
+            if not isinstance(body, str) or not isinstance(response_headers, dict):
                 raise ReleaseError("GHCR returned a malformed JSON response")
             return body, {str(key): str(value) for key, value in response_headers.items()}
         except ReleaseError:
@@ -196,15 +207,36 @@ class Registry:
         headers = {"Authorization": f"Bearer {token}", "Accept": ACCEPT}
         root, root_headers = self._json(
             f"https://ghcr.io/v2/formobr/monty-pod/manifests/{image_sha}", headers=headers)
-        digest, manifest = select_amd64_manifest(root, root_headers, lambda ref: self._json(
-            f"https://ghcr.io/v2/formobr/monty-pod/manifests/{ref}", headers=headers))
+        digest, manifest = select_amd64_manifest(root, root_headers, lambda ref: self._by_digest(
+            f"https://ghcr.io/v2/formobr/monty-pod/manifests/{ref}", ref, headers=headers))
         config_ref = (manifest.get("config") or {}).get("digest")
         if not isinstance(config_ref, str) or not DIGEST_RE.fullmatch(config_ref):
             raise ReleaseError("linux/amd64 manifest has no valid config digest")
-        config, _ = self._json(
-            f"https://ghcr.io/v2/formobr/monty-pod/blobs/{config_ref}", headers=headers)
+        config, _ = self._by_digest(
+            f"https://ghcr.io/v2/formobr/monty-pod/blobs/{config_ref}", config_ref, headers=headers)
         revision, config_tag = verify_config_identity(config, tag=image_sha, commit=commit)
         return ImageReceipt(image_sha, commit, digest, revision, config_tag)
+
+
+def parse_registry_json(raw: str) -> dict[str, Any]:
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        raise ReleaseError(f"GHCR read failed ({type(exc).__name__})") from exc
+    if not isinstance(body, dict):
+        raise ReleaseError("GHCR returned a malformed JSON response")
+    return body
+
+
+def verify_content_digest(raw: str, digest: str) -> dict[str, Any]:
+    """MISC-12: a body fetched BY DIGEST is only trusted once its own sha256 equals that digest — a
+    registry, proxy or cache answering with other bytes is refused here, before anything is parsed."""
+    if not DIGEST_RE.fullmatch(digest):
+        raise ReleaseError("requested content digest is not a valid sha256 digest")
+    actual = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if actual != digest:
+        raise ReleaseError(f"registry content digest mismatch: requested {digest}, body hashes to {actual}")
+    return parse_registry_json(raw)
 
 
 def select_amd64_manifest(root: dict[str, Any], headers: dict[str, str],

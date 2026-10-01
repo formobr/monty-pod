@@ -23,6 +23,11 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # MISC-12: two pushes to main must never build and publish at once over the one shared `:buildcache`
+    # tag. One publish per ref at a time; a new publish waits behind the running one and never cancels it.
+    concurrency:
+      group: image-publish-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
