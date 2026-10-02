@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -58,6 +60,26 @@ environment whole, so a second budget nobody assigns would only ever be its defa
 THE POD STILL LEARNS NOTHING. "Same artifact, newer run" is read off the key's own shape — basename under a
 different directory — never off a slug, a job id or anything else that would make this box know what it holds.
 """
+
+ACCOUNT_WHY = """
+THE PRUNER READS A LEDGER, NOT THE DISK. `prune` runs after every fetch and every PUT, and it used to walk the
+whole cache twice to decide whether anything was over the cap. With 23,914 entries / 10.6 GB that walk measured
+1.75 s, and one smoke envelope did 187 cache operations — 327 s of pure scanning (v0.20.153: fetch_broll
+46 s -> 381 s while the bytes moved FELL). A long-lived pod's cache only grows, so the cost only grows.
+
+So the account is kept in memory: ONE scan seeds it (lazily, on first use), every insert/evict on this process
+re-reads that ONE slot from disk and updates it, and `prune` compares the running total to the cap — O(1) when
+under it, oldest-first off an insertion-ordered index when over it. The index is the eviction order; the disk
+is still the truth for the slot being evicted, re-checked under its object lock as before.
+
+What the account cannot see is a change nobody on this process made (an operator `rm`, a disk swap). A
+RECONCILE re-walks the disk every `RECONCILE_OPS` operations or `RECONCILE_S` seconds, whichever comes first,
+on a background thread so no fetch waits on it; changes made while it walks win over what it saw.
+"""
+# 1.75 s per walk at 24k entries: once per 10 min or per 2000 ops is < 0.3 % of a busy pod's wall clock and
+# bounds how long an external delete can keep the account pessimistic.
+RECONCILE_S = 600.0
+RECONCILE_OPS = 2000
 
 _lock = threading.Lock()
 _locks: dict[str, threading.Lock] = {}
@@ -146,6 +168,159 @@ def _copy_or_reflink(src: Path, dst: Path) -> None:
             os.fsync(target.fileno())
 
 
+class _Account:
+    """Running (bytes, retained) per COMPLETE slot of one cache root, oldest first (ACCOUNT_WHY)."""
+
+    def __init__(self, base: Path):
+        self.root = base
+        self.rows: OrderedDict[str, tuple[int, bool]] = OrderedDict()
+        self.total = 0
+        self.held = 0
+        self.ops = 0
+        self.scanned_at = 0.0
+        self.reconciling = False
+        self.touched: set[str] = set()
+
+    def _drop(self, name: str) -> None:
+        row = self.rows.pop(name, None)
+        if row is not None:
+            self.total -= row[0]
+            if row[1]:
+                self.held -= row[0]
+
+    def put(self, name: str, row: tuple[int, bool] | None) -> None:
+        self._drop(name)
+        if row is not None:
+            self.rows[name] = row      # newest last: insertion order IS the eviction order
+            self.total += row[0]
+            if row[1]:
+                self.held += row[0]
+        if self.reconciling:
+            self.touched.add(name)
+
+    def load(self, scanned: list[tuple[float, str, int, bool]]) -> None:
+        """Replace the account with a fresh walk, keeping whatever changed WHILE it walked."""
+        live = {n: self.rows.get(n) for n in self.touched}
+        self.rows.clear()
+        self.total = self.held = 0
+        for _mtime, name, size, retained in sorted(scanned):
+            if name not in live:
+                self.put(name, (size, retained))
+        for name, row in live.items():
+            if row is not None:
+                self.put(name, row)
+        self.touched.clear()
+        self.reconciling = False
+        self.ops = 0
+        self.scanned_at = time.monotonic()
+
+
+_account_lock = threading.Lock()
+_account: _Account | None = None
+_scan_lock = threading.Lock()          # one walk at a time: a second one would only repeat the first
+# Visible cost (the span): walks taken, prune calls, their summed/max seconds, evictions.
+_stats = {"scans": 0, "prunes": 0, "prune_s": 0.0, "prune_max_s": 0.0, "evicted": 0}
+
+
+def stats() -> dict[str, float]:
+    with _account_lock:
+        return dict(_stats)
+
+
+def _read_slot(slot: Path) -> tuple[int, bool] | None:
+    """One slot's account row straight off the disk: None unless it is COMPLETE."""
+    try:
+        if not (slot / DONE).exists():
+            return None
+        st = (slot / "payload").stat()
+    except OSError:
+        return None
+    return st.st_size, (slot / RETAINED).exists()
+
+
+def _scan(base: Path) -> list[tuple[float, str, int, bool]]:
+    """THE full walk — (mtime, slot name, bytes, retained) per complete slot. Seed and reconcile only."""
+    out: list[tuple[float, str, int, bool]] = []
+    for slot in base.glob("*"):
+        payload = slot / "payload"
+        if not (slot / DONE).exists():
+            continue
+        try:
+            st = payload.stat()
+        except OSError:
+            continue
+        if not payload.is_file():
+            continue
+        out.append((st.st_mtime, slot.name, st.st_size, (slot / RETAINED).exists()))
+    with _account_lock:
+        _stats["scans"] += 1
+    return out
+
+
+def _ledger() -> _Account:
+    """The account for the CURRENT root, seeded by one walk the first time it is asked for."""
+    global _account
+    base = root()
+    acct = _account
+    if acct is not None and acct.root == base:
+        return acct
+    with _scan_lock:
+        acct = _account
+        if acct is not None and acct.root == base:
+            return acct
+        fresh = _Account(base)
+        fresh.load(_scan(base))
+        with _account_lock:
+            _account = fresh
+        return fresh
+
+
+def _note(slot: Path) -> None:
+    """Re-read ONE slot into the account after this process changed it — never a walk."""
+    acct = _ledger()
+    if slot.parent != acct.root:
+        return
+    row = _read_slot(slot)
+    with _account_lock:
+        acct.put(slot.name, row)
+
+
+def reconcile() -> None:
+    """Re-sync the account with the disk, absorbing changes this process did not make (ACCOUNT_WHY)."""
+    acct = _ledger()
+    with _scan_lock:
+        with _account_lock:
+            acct.reconciling = True
+            acct.touched.clear()
+        scanned = _scan(acct.root)
+        with _account_lock:
+            acct.load(scanned)
+
+
+def _reconcile_if_due(acct: _Account) -> None:
+    with _account_lock:
+        acct.ops += 1
+        due = acct.ops >= RECONCILE_OPS or time.monotonic() - acct.scanned_at >= RECONCILE_S
+        if not due or acct.reconciling:
+            return
+        acct.reconciling = True      # single flight: claims the slot before the thread exists
+        acct.touched.clear()
+
+    def _run():
+        try:
+            with _scan_lock:
+                scanned = _scan(acct.root)
+                with _account_lock:
+                    acct.load(scanned)
+        except Exception:
+            with _account_lock:
+                acct.reconciling = False
+                acct.ops = 0
+                acct.scanned_at = time.monotonic()
+
+    threading.Thread(target=_run, name="inputcache-reconcile", daemon=True).start()
+
+
 def _invalidate_locked(slot: Path, log=None) -> None:
     """Remove any COMPLETE value after a newer PUT landed but could not be adopted.
 
@@ -161,6 +336,7 @@ def _invalidate_locked(slot: Path, log=None) -> None:
     except OSError as exc:
         if log:
             log(f"[input-cache] stale slot invalidation failed ({type(exc).__name__})")
+    _note(slot)
 
 
 def upload_and_adopt(url: str, src: Path, upload, log=None) -> None:
@@ -213,6 +389,7 @@ def upload_and_adopt(url: str, src: Path, upload, log=None) -> None:
                 (slot / RETAINED).unlink(missing_ok=True)
                 snapshot.replace(payload)
                 sentinel.write_text(_sentinel_body(payload.stat().st_size, before), encoding="utf-8")
+                _note(slot)
             except Exception as exc:  # cache maintenance cannot reverse a successful durable PUT
                 _invalidate_locked(slot, log=log)
                 if log:
@@ -265,7 +442,11 @@ def _read_marker(slot: Path) -> dict[str, str] | None:
 def _retained_rows() -> list[tuple[int, Path, dict[str, str]]]:
     """(bytes, slot, marker) for every COMPLETE retained entry. Never a pruning candidate; always counted."""
     rows: list[tuple[int, Path, dict[str, str]]] = []
-    for slot in root().glob("*"):
+    acct = _ledger()
+    with _account_lock:
+        names = [name for name, (_size, retained) in acct.rows.items() if retained]
+    for name in names:                   # the account's retained slots, never a walk of the whole cache
+        slot = acct.root / name
         payload = slot / "payload"
         if not (slot / DONE).exists() or not payload.is_file() or not (slot / RETAINED).exists():
             continue
@@ -311,6 +492,7 @@ def _release_slot(slot: Path, why: str, log=None) -> int:
     except OSError:
         return 0
     finally:
+        _note(slot)
         lock.release()
     if log:
         log(f"[input-cache] released retained {slot.name} ({size / 1e6:.0f} MB) — {why}")
@@ -399,6 +581,7 @@ def adopt_local(url: str, src: Path, *, holder: str, log=None) -> Path:
                 marker.write_text(json.dumps({"holder": holder, "key": key}, sort_keys=True),
                                   encoding="utf-8")
                 sentinel.write_text(_sentinel_body(payload.stat().st_size, digest), encoding="utf-8")
+                _note(slot)
             except Exception as exc:
                 _invalidate_locked(slot, log=log)
                 raise RetentionUnavailable(
@@ -443,24 +626,6 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _entries() -> list[tuple[float, int, Path]]:
-    """(mtime, bytes, slot) for every EVICTABLE entry — a half-written one is nobody's to evict, and neither
-    is a RETAINED one: nothing uploaded it, so eviction is deletion, not a re-download (RETENTION_WHY)."""
-    out: list[tuple[float, int, Path]] = []
-    for slot in root().glob("*"):
-        payload = slot / "payload"
-        if not (slot / DONE).exists() or not payload.is_file():
-            continue
-        if (slot / RETAINED).exists():
-            continue
-        try:
-            st = payload.stat()
-        except OSError:
-            continue
-        out.append((st.st_mtime, st.st_size, slot))
-    return out
-
-
 def prune(keep_bytes: int | None = None, log=None) -> int:
     """Evict oldest-first until the cache fits. A pod's disk is smaller than the media it sees in a shift,
     so an unbounded cache trades one bug for a fuller one.
@@ -469,42 +634,86 @@ def prune(keep_bytes: int | None = None, log=None) -> int:
     bug: an all-retained cache summed to ZERO, compared clean against the cap and freed nothing while the
     disk filled. Counting them means retention squeezes the ordinary cache, which is the pressure that
     SHOULD arrive first — a re-download is what a cache is for.
+
+    The totals come from the in-memory account, never a walk (ACCOUNT_WHY): under the cap this is O(1).
     """
-    import shutil
+    t0 = time.perf_counter()
     cap = keep_bytes if keep_bytes is not None else int(
         float(os.environ.get(MAX_GB_ENV) or MAX_GB_DEFAULT) * 1e9)
-    entries = sorted(_entries())
-    held = sum(size for size, _slot, _m in _retained_rows())
-    total = sum(size for _m, size, _s in entries) + held
-    if log and held and total > cap:
+    acct = _ledger()
+    try:
+        return _evict(acct, cap, log)
+    finally:
+        _reconcile_if_due(acct)
+        took = time.perf_counter() - t0
+        with _account_lock:
+            _stats["prunes"] += 1
+            _stats["prune_s"] += took
+            _stats["prune_max_s"] = max(_stats["prune_max_s"], took)
+        if log and took >= 0.25:
+            log(f"[input-cache] prune took {took:.2f} s ({len(acct.rows)} entries, "
+                f"{acct.total / 1e9:.2f} GB accounted)")
+
+
+def _oldest_batch(acct: _Account, cap: int, tried: set[str]) -> list[tuple[str, int]]:
+    """Just enough of the oldest evictable rows to cover the excess — never a copy of the whole index.
+    Caller holds `_account_lock`."""
+    excess = acct.total - cap
+    batch: list[tuple[str, int]] = []
+    for name, (size, retained) in acct.rows.items():
+        if excess <= 0:
+            break
+        if retained or name in tried:
+            continue
+        batch.append((name, size))
+        excess -= size
+    return batch
+
+
+def _evict(acct: _Account, cap: int, log) -> int:
+    with _account_lock:
+        if acct.total <= cap:
+            return 0
+        held = acct.held
+    if log and held:
         log(f"[input-cache] {held / 1e9:.2f} GB retained (unevictable) of a {cap / 1e9:.2f} GB cap — "
             f"evicting cached objects against it")
+    import shutil
     freed = 0
-    for _mtime, size, slot in entries:
-        if total <= cap:
-            break
-        slot_lock = _slot_lock(slot)
-        if not slot_lock.acquire(blocking=False):
-            continue
-        try:
-            # Re-check under the same per-object lock used by get/upload_and_adopt: an entry may have been
-            # replaced since `_entries`, and an incomplete transfer is never ours to evict.
-            payload = slot / "payload"
-            if not (slot / DONE).exists() or not payload.is_file():
+    tried: set[str] = set()
+    while True:
+        # Oldest first: the account's insertion order, taken in batches so no lock is held across disk work.
+        with _account_lock:
+            batch = _oldest_batch(acct, cap, tried)
+        if not batch:
+            return freed
+        for name, size in batch:
+            tried.add(name)
+            slot = acct.root / name
+            slot_lock = _slot_lock(slot)
+            if not slot_lock.acquire(blocking=False):
                 continue
-            if (slot / RETAINED).exists():
-                continue      # adopted between _entries and here: its only copy is not ours to delete
-            actual = payload.stat().st_size
-            shutil.rmtree(slot, ignore_errors=True)
-            total -= actual
-            freed += actual
-        except OSError:
-            continue
-        finally:
-            slot_lock.release()
-        if log:
-            log(f"[input-cache] evicted {slot.name} ({size / 1e6:.0f} MB)")
-    return freed
+            try:
+                # Re-check under the same per-object lock used by get/upload_and_adopt: the account may be
+                # stale (an external delete, a replace since the batch), and an incomplete transfer is never
+                # ours to evict.
+                row = _read_slot(slot)
+                if row is None or row[1]:
+                    # gone, half-written, or adopted as retained meanwhile: correct the account, delete nothing
+                    with _account_lock:
+                        acct.put(name, row)
+                    continue
+                shutil.rmtree(slot, ignore_errors=True)
+                with _account_lock:
+                    acct.put(name, _read_slot(slot))
+                    _stats["evicted"] += 1
+                freed += row[0]
+            except OSError:
+                continue
+            finally:
+                slot_lock.release()
+            if log:
+                log(f"[input-cache] evicted {name} ({size / 1e6:.0f} MB)")
 
 
 def get(url: str, download, *, lease: Path, log=None) -> Path | None:
@@ -552,6 +761,7 @@ def get(url: str, download, *, lease: Path, log=None) -> Path | None:
                         log(f"[input-cache] healing {key}: sentinel recorded {recorded!r}, payload is "
                             f"{actual} bytes — re-downloading")
                     shutil.rmtree(slot, ignore_errors=True)
+                    _note(slot)
                     hit = False
         if not hit:
             slot.mkdir(parents=True, exist_ok=True)
@@ -567,6 +777,7 @@ def get(url: str, download, *, lease: Path, log=None) -> Path | None:
                 if not ok:
                     tmp.unlink(missing_ok=True)
             sentinel.write_text(_sentinel_body(size), encoding="utf-8")
+            _note(slot)
             if log:
                 log(f"[input-cache] stored {key} ({payload.stat().st_size / 1e6:.0f} MB)")
         elif log:
