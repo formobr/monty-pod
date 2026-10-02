@@ -12,6 +12,7 @@ from podagent.infer_lanes import KIND_VRAM_MIB, RESERVE_MIB
 @pytest.fixture(autouse=True)
 def _isolated_live_mark(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
+    monkeypatch.delenv("MONTY_INFER_KINDS", raising=False)   # every kind served: the fleet floor
 
 
 class _CP:

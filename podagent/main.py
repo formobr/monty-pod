@@ -350,21 +350,46 @@ has already proven the GPU answers.
 BOOT_VRAM_REFUSAL_EXIT = 6   # distinct from 3 (codec refusal), 4 (transport), 5 (infra fault)
 
 
-def boot_vram_floor_mib() -> float:
-    """Free MiB the card must report at boot: heaviest single infer kind + reserve (BOOT_FREE_VRAM_WHY)."""
-    from .infer_lanes import KIND_VRAM_MIB, RESERVE_MIB
-    return max(KIND_VRAM_MIB.values()) + RESERVE_MIB
+def boot_vram_floor_mib(kinds: "frozenset[str] | set[str] | None" = None) -> float | None:
+    """Free MiB the card must report at boot: heaviest SERVED infer kind + reserve (BOOT_FREE_VRAM_WHY,
+    infer_lanes.SERVED_INFER_KINDS_WHY); None when no served kind holds VRAM. `kinds` None = every kind."""
+    from .infer_lanes import KIND_VRAM_MIB, vram_floor_mib
+    return vram_floor_mib(frozenset(KIND_VRAM_MIB) if kinds is None else kinds)
+
+
+def _served_kinds_or_refuse(cp: "ControlPlane") -> frozenset[str]:
+    """The infer kinds this pod serves (MONTY_INFER_KINDS); an unknown name refuses boot by name."""
+    from .infer_lanes import SERVED_INFER_KINDS_ENV, served_kinds
+    try:
+        return served_kinds(os.environ.get(SERVED_INFER_KINDS_ENV))
+    except ValueError as e:
+        msg = f"REFUSING work: {safe_error(e)}"
+        _log(msg)
+        try:
+            cp.send_event(
+                {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
+                wait=True,
+            )
+        except Exception as send_e:  # noqa: BLE001 — the boot verdict stands even if its report cannot land
+            _log(f"infer-kinds refusal delivery failed: {safe_error(send_e)}")
+        _mark_stopped()
+        sys.exit(BOOT_VRAM_REFUSAL_EXIT)
 
 
 def _free_vram_or_refuse(cp: "ControlPlane", *, free_probe: Any = None, total_probe: Any = None) -> None:
     """Refuse a card whose VRAM is already taken by processes that are not ours, BEFORE ready (BOOT_FREE_VRAM_WHY)."""
     from .infer_cliprank import _free_vram_mb, vram_total_mb
+    served = _served_kinds_or_refuse(cp)
+    floor = boot_vram_floor_mib(served)
+    _log(f"serving infer kinds {','.join(sorted(served)) or '(none)'} — boot VRAM floor "
+         f"{'none (no served kind holds VRAM)' if floor is None else f'{floor:.0f} MiB'}")
+    if floor is None:
+        return
     try:
         free = (free_probe or _free_vram_mb)()
     except Exception as e:  # noqa: BLE001 — a reader fault is "no reading", never a refusal
         _log(f"free-VRAM probe failed ({safe_error(e)}) — cannot prove the card is occupied, proceeding")
         return
-    floor = boot_vram_floor_mib()
     if free is None:
         _log(f"free-VRAM unreadable — cannot prove the card is occupied, proceeding (floor={floor:.0f} MiB)")
         return
@@ -690,6 +715,7 @@ def _run_infer(
     rank_parallel: int = 1,
     rank_slots: threading.BoundedSemaphore | None = None,
     one_kind_resident: bool = False,
+    served: "frozenset[str] | None" = None,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag.
 
@@ -730,6 +756,10 @@ def _run_infer(
     work_started = time.monotonic()
     try:
         req = InferRequest.model_validate(raw)
+        if served is not None:
+            # Never a lazy load of a kind this pod was not given (infer_lanes.SERVED_INFER_KINDS_WHY).
+            from .infer_lanes import refuse_unserved
+            refuse_unserved(req.kind, served)
         if one_kind_resident:
             # A cached service holds its weights on the card forever, so on a card too small for both kinds
             # the idle one must go before this load — the kinds are already serialised onto one lane.
@@ -1322,12 +1352,16 @@ def main() -> None:
     # which is exactly the signal.
     for _sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(_sig, _stop_and_exit)
+    served = _served_kinds_or_refuse(cp)
     _log_gpu_status()
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
     from .infer_lanes import card_holds_both_kinds
     rank_width = lane_width()
-    kinds_coexist, residency_why = card_holds_both_kinds()
+    if {"align", "clip_rank"} <= served:
+        kinds_coexist, residency_why = card_holds_both_kinds()
+    else:
+        kinds_coexist, residency_why = True, "this pod serves at most one weight-holding kind"
     _log(f"infer kinds {'run in parallel' if kinds_coexist else 'take turns on one lane'}: {residency_why}")
     capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width(),
                                 vram_total_mb=vram_total_mb(),
@@ -1368,7 +1402,8 @@ def main() -> None:
             if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
                               yunet_path, not mine, corr_id=pod_job.corr_id,
                               session_id=pod_job.session_id, rank_parallel=rank_width,
-                              rank_slots=rank_slots, one_kind_resident=not kinds_coexist) and mine:
+                              rank_slots=rank_slots, one_kind_resident=not kinds_coexist,
+                              served=served) and mine:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None

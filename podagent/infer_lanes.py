@@ -75,3 +75,49 @@ def release_other_kinds(kind: str, caches: Mapping[str, dict[Any, Any]]) -> list
     if freed:
         gc.collect()                # the service graph has cycles; the tensors outlive the dict without this
     return freed
+
+
+SERVED_INFER_KINDS_WHY = """
+A POD SERVES THE INFER KINDS IT IS GIVEN, AND SIZES ITS CARD FOR THOSE ALONE.
+
+The engine release smoke replays align / clip_rank outputs from a model-output cassette whenever a model's
+passport is unchanged, so those kinds never reach the pod — yet the boot floor demanded the heaviest kind's
+residency regardless, and a laptop whose desktop holds 2.5 GB of a 6 GB card refused (free=3236 < 3248) with
+no model ever going to load. MONTY_INFER_KINDS (comma list; unset = every kind, the fleet default) is the set
+this pod serves: the boot floor is the heaviest SERVED kind + reserve, none at all when no served kind holds
+VRAM, and a request for any other kind is refused by name — never loaded lazily, never a silent fallback. An
+unknown name refuses boot: a typo must not quietly shrink what the pod serves.
+"""
+
+SERVED_INFER_KINDS_ENV = "MONTY_INFER_KINDS"
+
+
+class UnservedInferKind(RuntimeError):
+    """An infer request for a kind this pod was not given (SERVED_INFER_KINDS_WHY)."""
+
+
+def served_kinds(raw: str | None) -> frozenset[str]:
+    """Parse MONTY_INFER_KINDS; None = every kind. Raises ValueError naming any unknown kind."""
+    if raw is None:
+        return frozenset(KIND_VRAM_MIB)
+    kinds = [k.strip() for k in raw.split(",") if k.strip()]
+    unknown = sorted(set(kinds) - set(KIND_VRAM_MIB))
+    if unknown:
+        raise ValueError(f"{SERVED_INFER_KINDS_ENV} names unknown infer kind(s) {', '.join(unknown)} "
+                         f"(known: {', '.join(sorted(KIND_VRAM_MIB))})")
+    return frozenset(kinds)
+
+
+def vram_floor_mib(kinds: frozenset[str] | set[str]) -> float | None:
+    """Free MiB a card must report to load the heaviest served kind + reserve; None when no served kind holds
+    VRAM (face_probe-only or nothing)."""
+    heaviest = max((KIND_VRAM_MIB[k] for k in kinds), default=0.0)
+    return heaviest + RESERVE_MIB if heaviest > 0 else None
+
+
+def refuse_unserved(kind: str, kinds: frozenset[str] | set[str]) -> None:
+    """Raise before any fetch or load when `kind` is not one this pod serves."""
+    if kind not in kinds:
+        raise UnservedInferKind(
+            f"infer kind {kind!r} is not served by this pod: {SERVED_INFER_KINDS_ENV}="
+            f"{','.join(sorted(kinds)) or '(empty)'}")
