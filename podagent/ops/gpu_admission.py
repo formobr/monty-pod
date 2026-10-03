@@ -34,12 +34,15 @@ and lights never take admission, so the two locks cannot cycle.
 A SELF-SIZING HANDLER RESERVES THE WHOLE BUDGET. Today's heavy handlers (cut_apply.max_sessions and
 kin) still size their NVENC fan-out from their OWN free-VRAM read, not from a reservation the ledger hands
 them; a flat one-session reservation would admit two of them side by side, each sizing for the whole card —
-exactly the joint OOM this module exists to stop. So admission() — the runner's door — books the full budget,
-keeping one-at-a-time for them, and reserve(op, need_mib) with the one-session default is the door for a
-handler that sizes from its own reservation. Heavies overlap only once their handlers do that (Q-20/Q-22).
+exactly the joint OOM this module exists to stop. So admission() with no need — the runner's door today —
+books the full budget, keeping one-at-a-time for them; admission(op, need_mib=...) (and reserve(op, need_mib)
+with the one-session default) is the door for a handler that sizes from its own reservation. Such heavies
+OVERLAP while their reservations fit the budget: two 960 MiB sessions run side by side on a 4 GiB card, and a
+large need waits only until exactly its MiB are free, not until the card is empty (Q-20).
 
-Waiters are admitted strictly in arrival order: the head is admitted when its need fits in what the live
-reservations leave, and nobody behind it jumps ahead — a large need parked behind small ones is not starved.
+Waiters are admitted strictly in arrival order (no overtaking): admit = head of the queue AND reserved + need
+<= budget. The head lets NOBODY past until it fits itself, even a small need that would fit right now — a
+stream of small requests must never starve a large cut.apply parked ahead of them.
 
 The wait is bounded (repo law: a wait with no deadline is a swallowed error; registered box-side as
 deadline.yaml `gpu_heavy_admission_park`) and spends part of the op envelope the box already grants a
@@ -165,8 +168,10 @@ def release(token: object) -> None:
 
 
 @contextmanager
-def admission(op_name: str, deadline_s: float = HEAVY_WAIT_DEADLINE_S) -> Iterator[None]:
-    """reserve() the WHOLE budget for a self-sizing handler, release() it on any exit (GPU_ADMISSION_WHY)."""
+def admission(op_name: str, deadline_s: float = HEAVY_WAIT_DEADLINE_S,
+              need_mib: float | None = None) -> Iterator[None]:
+    """reserve() `need_mib` — the WHOLE budget when None, for a self-sizing handler — and release() it on any
+    exit; heavies with explicit needs overlap while they fit (GPU_ADMISSION_WHY)."""
     me = threading.get_ident()
     with _cond:
         if me in _holders:
@@ -174,7 +179,7 @@ def admission(op_name: str, deadline_s: float = HEAVY_WAIT_DEADLINE_S) -> Iterat
             raise GpuAdmissionRefused(
                 f"op {op_name!r} refused GPU admission: this thread already holds it "
                 f"(queue depth {len(_queue)}, waited 0.0s)")
-    token = reserve(op_name, budget_mib(), deadline_s)
+    token = reserve(op_name, budget_mib() if need_mib is None else need_mib, deadline_s)
     with _cond:
         _holders.add(me)
     try:

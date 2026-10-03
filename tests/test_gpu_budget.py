@@ -219,3 +219,97 @@ def test_the_budget_probe_runs_outside_the_ledger_lock(monkeypatch):
         holder.join(timeout=2)
         reader.join(timeout=2)
     assert ga.budget_mib() == 4000.0 - 512.0
+
+
+def _hold_admission(op: str, need: float, entered: threading.Event, leave: threading.Event,
+                    order: list[str] | None = None) -> threading.Thread:
+    def _run() -> None:
+        with ga.admission(op, deadline_s=5.0, need_mib=need):
+            if order is not None:
+                order.append(op)
+            entered.set()
+            assert leave.wait(timeout=5)
+
+    t = threading.Thread(target=_run)
+    t.start()
+    return t
+
+
+def test_small_heavy_ops_overlap_and_a_large_one_is_never_overtaken(monkeypatch):
+    """NEGATIVE: a one-at-a-time gate would park the second small heavy op; a large need that waited for the
+    card to EMPTY (not for exactly its MiB) would stay parked after the first release; a gate that let any
+    fitting waiter in would let the stream of small ops behind the large cut.apply overtake — and starve — it."""
+    # Two one-session heavies on a 4 GiB budget run side by side.
+    _measured(monkeypatch, 4096.0 + 512.0)
+    leave = threading.Event()
+    a_in, b_in = threading.Event(), threading.Event()
+    small = [_hold_admission("media.normalize", SESSION, a_in, leave),
+             _hold_admission("camera.apply", SESSION, b_in, leave)]
+    assert a_in.wait(timeout=1) and b_in.wait(timeout=1), "two small heavies must overlap inside the budget"
+    assert ga.reserved_mib() == 2 * SESSION and list(ga._queue) == []
+    leave.set()
+    for t in small:
+        t.join(timeout=2)
+    assert ga.reserved_mib() == 0.0
+
+    # An 8 GiB need on a 10 GiB budget waits for exactly enough, and nobody behind it gets past.
+    _measured(monkeypatch, 10240.0 + 512.0)
+    held = [ga.reserve("media.cut_proxy", 1024.0, deadline_s=1.0) for _ in range(3)]  # 3072 of 10240 MiB
+    order: list[str] = []
+    large_in, large_leave = threading.Event(), threading.Event()
+    large = _hold_admission("cut.apply", 8192.0, large_in, large_leave, order)
+    _spin_until(lambda: len(ga._queue) == 1)
+    stream_leave = threading.Event()
+    stream_in = [threading.Event() for _ in range(3)]
+    stream = []
+    for i, ev in enumerate(stream_in):
+        # each small need fits in the 7168 MiB left right now — only strict FIFO keeps it parked
+        stream.append(_hold_admission(f"small-{i}", SESSION, ev, stream_leave, order))
+        _spin_until(lambda n=i: len(ga._queue) == n + 2)
+    time.sleep(0.05)
+    assert order == [] and ga.reserved_mib() == 3072.0, "a small waiter overtook the large head"
+
+    ga.release(held.pop())  # 2048 + 8192 == budget: exactly enough, two reservations still live
+    assert large_in.wait(timeout=1), "the large need must be admitted once exactly its MiB are free"
+    assert ga.reserved_mib() == 10240.0 and len(ga._queue) == 3
+    time.sleep(0.05)
+    assert order == ["cut.apply"], "the stream must still wait behind a full budget"
+
+    large_leave.set()
+    large.join(timeout=2)
+    assert all(ev.wait(timeout=1) for ev in stream_in)
+    assert order == ["cut.apply", "small-0", "small-1", "small-2"], order
+    assert ga.reserved_mib() == 2048.0 + 3 * SESSION
+    stream_leave.set()
+    for t in stream:
+        t.join(timeout=2)
+    for token in held:
+        ga.release(token)
+    assert ga.reserved_mib() == 0.0 and list(ga._queue) == []
+
+
+def test_reentry_with_an_explicit_need_still_refuses(monkeypatch):
+    """NEGATIVE: with room left in the budget, a re-entering thread would be admitted a second reservation
+    instead of refused — a heavy op invoking a heavy op on its own thread must stay a loud refusal."""
+    _measured(monkeypatch, 4096.0 + 512.0)
+    with ga.admission("cut.apply", deadline_s=1.0, need_mib=SESSION):
+        with pytest.raises(ga.GpuAdmissionRefused, match="already holds"):
+            with ga.admission("media.normalize", deadline_s=1.0, need_mib=SESSION):
+                pytest.fail("re-entry must refuse")
+        assert ga.reserved_mib() == SESSION and list(ga._queue) == []
+    assert ga.reserved_mib() == 0.0
+
+
+def test_an_unreadable_card_admits_one_explicit_need_at_a_time(monkeypatch):
+    """NEGATIVE: overlap must come only from a MEASURED budget — on an unreadable card two one-session needs
+    must not run side by side."""
+    _measured(monkeypatch, None)
+    leave, entered = threading.Event(), threading.Event()
+    holder = _hold_admission("cut.apply", SESSION, entered, leave)
+    assert entered.wait(timeout=1)
+    with pytest.raises(ga.GpuAdmissionTimeout):
+        with ga.admission("media.normalize", deadline_s=0.05, need_mib=SESSION):
+            pytest.fail("a second heavy op must not run beside the first on an unreadable card")
+    leave.set()
+    holder.join(timeout=2)
+    assert ga.reserved_mib() == 0.0
