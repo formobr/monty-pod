@@ -1,6 +1,8 @@
 """podagent/ops/dry.py — contour-dry stand-in handler, reached via `runner.py`'s dry-vs-pack seam when
 `ARM_ENV` is armed. Mocks what is EXPENSIVE or EXTERNAL only; cheap read-only measurement ops resolve
-straight through to the pack's own handler (see `_CLASSIFICATION`)."""
+straight through to the pack's own handler (see `_CLASSIFICATION`). media.tag is REAL here too: a `-c copy`
+remux whose output IS the master stamp_deliverables re-checks, so a stub would overwrite a bt709-tagged
+master with an untagged placeholder and get it refused off-contract."""
 from __future__ import annotations
 
 import hashlib
@@ -18,7 +20,8 @@ from . import pack, registry
 ARM_ENV = "MONTY_OPS_CONTOUR_DRY"
 
 # Mirrored byte-for-byte at scripts/plan_match.py::CONTOUR_DRY_CLAIMS — MISC-62 lock 4 refuses a receipt
-# whose tuple has moved on only one side.
+# whose tuple has moved on only one side. A real media.tag (see `_CLASSIFICATION`) leaves every claim true:
+# it re-muxes the master's own streams, so no pixel is rendered and no encoder runs.
 CONTOUR_DRY_CLAIMS: dict[str, str] = {
     "taps": "plan-derived, not measured", "pixels": "not rendered", "vram": "not exercised",
     "nvenc": "not exercised", "weights": "cache presence only", "graph": "really built",
@@ -40,6 +43,8 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     "measure.master": (REAL, "loudnorm analysis (loudness/true-peak/LRA) + ffprobe colour/bitrate"),
     "measure.silence": (REAL, "silencedetect spans + RMS envelope — ffmpeg reads only"),
     "measure.source": (REAL, "ffprobe-class ingest numbers (dims, rotation, codec, pix_fmt, ...)"),
+    # a stub replaced the dry master with an untagged 64x64 black file; the real op is a stream copy.
+    "media.tag": (REAL, "deliverable metadata remux — `-c copy`, no encode; keeps the master's colour tags"),
     "media.range_frames": (REAL, "Range-only frame reader — decode-only sampling, no full encode"),
     # a stubbed probe reports fake capability facts, defeating the whole op (TRK-108).
     "probe.ffmpeg_caps": (REAL, "ffmpeg encode/decode candidates + nvidia-smi read against the bound fixture"),
@@ -62,7 +67,6 @@ _CLASSIFICATION: dict[str, tuple[str, str]] = {
     "media.scale": (STUB, "video downscale + re-encode"),
     "media.sheet": (STUB, "contact-sheet composite + image encode"),
     "media.still": (STUB, "vector rasterise + contain composite + image encode"),
-    "media.tag": (STUB, "container remux, not a measurement"),
     "mograph.render": (STUB, "headless-Chrome Remotion render (browser-heavy)"),
     "motion.kenburns": (STUB, "Ken-Burns bake, video encode"),
     "opener.build": (STUB, "cold-open assembly + composite + encode (browser-class)"),
