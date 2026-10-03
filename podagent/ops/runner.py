@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 from ..artifact import log
 from ..cp import download, put_trace, retry, upload
 from ..identity import worker_identity
+from ..infer_cliprank import _free_vram_mb
 from ..sanitize import safe_error
 from . import dry, gpu_admission, inputcache, pack, registry, resultcache
 
@@ -124,6 +125,70 @@ def _run_heartbeat(live: Any, t0: float, stop: threading.Event, tick: float) -> 
     it is reporting on — a leaked heartbeat would itself become a second silent thing to explain."""
     while not stop.wait(tick):
         live("run_progress", timings={"elapsed_s": round(time.monotonic() - t0, 3)})
+
+
+VRAM_LEG_WHY: Final[str] = """
+THE M4 VRAM BUDGET NEEDS WHAT EACH HEAVY OP ACTUALLY COSTS ON THE CARD, and only this box can see the card.
+
+Every heavy op (gpu_admission.HEAVY_GPU_OPS) books three additive keys into its `timing.legs`:
+  · `vram_free_before_mib` — free VRAM the moment exclusive GPU admission is GRANTED. Not before the park:
+                             a parked heavy is by definition waiting on another heavy that still holds the
+                             card, so a pre-park read would book THAT op's footprint as this one's baseline.
+  · `vram_free_after_mib`  — free VRAM once the handler has returned.
+  · `vram_peak_used_mib`   — before minus the LOWEST free reading sampled while the handler ran (clamped at
+                             0). Sampled every _VRAM_SAMPLE_S, so a spike shorter than that can be missed: it
+                             is a floor on the true peak, never an invented one (main.CAPACITY_VRAM_WHY).
+                             Card-wide: a clip_rank lane allocating beside the heavy op lands in it too.
+
+One reader, the one the pod already has: infer_cliprank._free_vram_mb (nvidia-smi memory.free, bounded).
+Every read happens on a daemon sampler thread, never on the step's own thread, so the measurement adds no
+wait to admission, the handler or the put. An unreadable card (None, a raise, a hung nvidia-smi still in
+flight when the terminal is built) means the three keys are simply ABSENT and the op ran exactly as before —
+the same "a stopwatch may not break the work it times" rule as the handler legs (STEP_TIMING_WHY).
+"""
+
+_VRAM_SAMPLE_S: Final[float] = 1.0
+# how long the terminal waits for an after-read still in flight — only ever paid when nvidia-smi is hung
+_VRAM_SETTLE_S: Final[float] = 0.2
+_read_vram_free_mib = _free_vram_mb
+
+
+class _VramWatch:
+    """Samples free VRAM beside one heavy handler call (VRAM_LEG_WHY). `stop()` never blocks; `legs()`
+    returns {} unless every read it needs landed."""
+
+    def __init__(self, name: str) -> None:
+        self._stop = threading.Event()
+        self._result: dict[str, float] = {}
+        self._thread = threading.Thread(target=self._sample, daemon=True, name=f"vram-{name}"[:63])
+        self._thread.start()
+
+    def _sample(self) -> None:
+        try:
+            before = _read_vram_free_mib()
+            if before is None:
+                return
+            lowest = before
+            while not self._stop.wait(_VRAM_SAMPLE_S):
+                now = _read_vram_free_mib()
+                if now is None:
+                    return
+                lowest = min(lowest, now)
+            after = _read_vram_free_mib()
+            if after is None:
+                return
+            lowest = min(lowest, after)
+            self._result = {"vram_free_before_mib": float(before), "vram_free_after_mib": float(after),
+                            "vram_peak_used_mib": max(0.0, float(before) - float(lowest))}
+        except Exception as e:  # noqa: BLE001 — announced; a VRAM reading may not break the op it measures
+            log(f"ops: vram reader failed ({type(e).__name__}: {e}) — heavy op booked without vram legs")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def legs(self) -> dict[str, float]:
+        self._thread.join(timeout=_VRAM_SETTLE_S)
+        return dict(self._result)
 
 
 # ── how wide the chain runs ──────────────────────────────────────────────────────────────────────
@@ -612,6 +677,8 @@ class StepTiming:
     # ports this step kept on THIS worker instead of uploading (RETAIN_WHY) — the terminal names the
     # holder off these, because a reader on another worker can only be warned by a name it can bind
     retained_ports: list[str] = field(default_factory=list)
+    # heavy ops only: harvested into `legs` when the terminal is built, never waited on earlier (VRAM_LEG_WHY)
+    vram: _VramWatch | None = None
 
     @property
     def seconds(self) -> float:
@@ -626,6 +693,7 @@ class StepTiming:
         performance contract at the top of this file being kept. Dropping it would make "free" and "never
         measured" the same reading, which is the class of error this whole change exists to remove."""
         legs = {**{k: round(v, 3) for k, v in self.legs.items()},
+                **{k: round(v, 3) for k, v in (self.vram.legs() if self.vram is not None else {}).items()},
                 "slot_wait": round(self.slot_wait_s, 3), "bind": round(self.bind_s, 3),
                 "run": round(self.run_s, 3), "put": round(self.put_s, 3),
                 "put_wait": round(self.put_wait_s, 3), "put_retry": round(self.put_retry_s, 3)}
@@ -1159,6 +1227,7 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
                 live("heavy_slot_wait_ended",
                      timings={"heavy_slot_wait_s": time.monotonic() - slot_ready},
                      worker=worker_identity())
+                timing.vram = _VramWatch(str(step.id))
             with handler_slots(op):
                 timing.slot_wait_s = time.monotonic() - slot_ready
                 timing.intervals["slot_wait"] = {
@@ -1187,8 +1256,12 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
                     if isinstance(handler_result.get("value"), dict):
                         timing.instrument = handler_result["value"]
                 finally:
+                    if timing.vram is not None:
+                        timing.vram.stop()
                     heartbeat_stop.set()  # SET before waiting: a single tick left in flight is fine, a leaked thread is not
     except BaseException as exc:
+        if timing.vram is not None:
+            timing.vram.stop()  # a step-slot wait that raised never reached the handler's `finally`
         # If the durable `step_started` append itself failed, do not try another append and mask the transport
         # refusal; work has not started, and main must stop before paid work can go silent.
         if run_announced:
