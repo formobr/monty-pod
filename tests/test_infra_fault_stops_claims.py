@@ -217,7 +217,7 @@ def test_the_real_gpu_admission_timeout_reaches_the_fence(tmp_path, monkeypatch)
     monkeypatch.setattr(runner.gpu_admission, "admission", lambda name: real(name, deadline_s=0.01))
     gpu_admission._reset_for_tests()
     with gpu_admission._cond:
-        gpu_admission._busy = True            # another heavy op holds the card past the deadline
+        gpu_admission._live[object()] = gpu_admission.budget_mib()   # another heavy op holds the whole budget
     coordinator = agent_main.RestartCoordinator()
     events: list[dict] = []
     token = runner.infra_fault_sink.set(coordinator.report_infra_fault)

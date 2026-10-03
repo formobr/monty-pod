@@ -95,7 +95,7 @@ def test_deadline_times_out_and_the_queue_recovers_for_a_fresh_waiter():
 
     holder = threading.Thread(target=_hold)
     holder.start()
-    _spin_until(lambda: gpu_admission._busy)
+    _spin_until(lambda: bool(gpu_admission._live))
 
     with pytest.raises(gpu_admission.GpuAdmissionTimeout, match="cut.apply"):
         with gpu_admission.admission("cut.apply", deadline_s=0.05):
@@ -124,7 +124,7 @@ def test_bounded_fifo_refuses_once_the_parked_depth_is_reached(monkeypatch):
 
     holder = threading.Thread(target=_hold)
     holder.start()
-    _spin_until(lambda: gpu_admission._busy)
+    _spin_until(lambda: bool(gpu_admission._live))
 
     release_parked = threading.Event()
 
@@ -170,7 +170,7 @@ def test_heavy_op_takes_step_slot_only_after_admission_and_emits_wire_legal_even
     monkeypatch.setattr(runner.registry, "assert_pod_safe", lambda *a, **k: None)
 
     def _handler(*, params, inputs, outputs):
-        assert gpu_admission._busy, "the heavy handler must run INSIDE admission"
+        assert gpu_admission._live, "the heavy handler must run INSIDE admission"
         outputs["dst"].write_bytes(b"cut")
         outputs["durs"].write_text("[]")
 
@@ -244,4 +244,4 @@ def test_cancellation_during_wait_leaves_queue_and_busy_consistent():
     assert holder_exc, "the holder's own exception must have propagated through admission"
 
     assert list(gpu_admission._queue) == [], "a token from either unwind path must not linger"
-    assert gpu_admission._busy is False, "the holder's failure must still have cleared busy"
+    assert gpu_admission._live == {}, "the holder's failure must still have released its reservation"
