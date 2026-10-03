@@ -147,6 +147,19 @@ flight when the terminal is built) means the three keys are simply ABSENT and th
 the same "a stopwatch may not break the work it times" rule as the handler legs (STEP_TIMING_WHY).
 """
 
+HEAVY_PARK_WHY: Final[str] = """
+A HEAVY OP WAITING FOR VRAM IS A PARK, AND A PARK IS ITS OWN LEG — never folded into slot_wait.
+
+slot_ready is stamped before admission, so the old slot_wait (step-slot acquire minus slot_ready) CONTAINED
+the whole park; a reader adding a park leg beside it would count the same seconds twice. The runner
+therefore books `heavy_park` = admission granted − slot_ready and `slot_wait` = the remainder (the step-slot
+acquire after admission), so slot_wait + heavy_park + bind + run + put is the step wall, exactly once.
+
+A park that actually waits is announced as a `heavy_park` event (timings: position, ahead, admitted,
+budget_mib, request_mib, deadline_s) the moment it parks — the deadline is the one gpu_admission priced
+ONCE at entry (GPU_ADMISSION_WHY), so the event says how long this op may sit before it fails loud.
+"""
+
 _VRAM_SAMPLE_S: Final[float] = 1.0
 # how long the terminal waits for an after-read still in flight — only ever paid when nvidia-smi is hung
 _VRAM_SETTLE_S: Final[float] = 0.2
@@ -658,6 +671,8 @@ class StepTiming:
     step_id: str
     op: str
     slot_wait_s: float = 0.0
+    # heavy ops only: the VRAM park, a leg BESIDE slot_wait and subtracted from it, never inside (HEAVY_PARK_WHY)
+    heavy_park_s: float = 0.0
     bind_s: float = 0.0
     run_s: float = 0.0
     put_s: float = 0.0
@@ -682,7 +697,7 @@ class StepTiming:
 
     @property
     def seconds(self) -> float:
-        return round(self.slot_wait_s + self.bind_s + self.run_s + self.put_s, 3)
+        return round(self.slot_wait_s + self.heavy_park_s + self.bind_s + self.run_s + self.put_s, 3)
 
     def wire(self) -> dict[str, Any]:
         """The shape that crosses the seam. `legs` merges the runner's four with the handler's, and the
@@ -697,6 +712,8 @@ class StepTiming:
                 "slot_wait": round(self.slot_wait_s, 3), "bind": round(self.bind_s, 3),
                 "run": round(self.run_s, 3), "put": round(self.put_s, 3),
                 "put_wait": round(self.put_wait_s, 3), "put_retry": round(self.put_retry_s, 3)}
+        if "heavy_park" in self.intervals:  # heavy ops only; a light op's legs keep their old shape
+            legs["heavy_park"] = round(self.heavy_park_s, 3)
         out: dict[str, Any] = {
             "id": self.step_id,
             "op": self.op,
@@ -1210,6 +1227,13 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
         live("heavy_slot_wait_started", timings={"bind_s": timing.bind_s}, worker=worker_identity())
     slot_ready = time.monotonic()
     slot_start_ns = time.monotonic_ns()
+    park_end_ns = slot_start_ns
+
+    def _on_park(*, position: int, ahead: int, admitted: int, budget_mib: float, need_mib: float,
+                 deadline_s: float) -> None:
+        live("heavy_park", timings={
+            "position": position, "ahead": ahead, "admitted": admitted, "budget_mib": budget_mib,
+            "request_mib": need_mib, "deadline_s": deadline_s}, worker=worker_identity())
     # THE handler call. `LocalBackend` makes this exact call in-process on the origin machine; here the
     # pod makes it. ONE handler, two transports — parity is structural, not tested into existence. Note
     # what the handler is NOT given: no URL, no credential, no control-plane handle. It sees typed params
@@ -1221,18 +1245,24 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
     try:
         # heavy: park holding NOTHING → admission → an ordinary step slot IN ADDITION (fixed lock order,
         # lights never take admission → no cycle); the step slot prices the running heavy's CPU/RAM
-        with (gpu_admission.admission(op.op) if heavy else _null_permit()):
+        with (gpu_admission.admission(op.op, on_park=_on_park) if heavy else _null_permit()):
             if heavy:
                 # measured BEFORE the step-slot acquire, so GPU contention stays attributable
+                park_end_ns = time.monotonic_ns()
+                timing.heavy_park_s = (park_end_ns - slot_start_ns) / 1e9
+                timing.intervals["heavy_park"] = {"start_mono_ns": slot_start_ns, "end_mono_ns": park_end_ns}
                 live("heavy_slot_wait_ended",
-                     timings={"heavy_slot_wait_s": time.monotonic() - slot_ready},
+                     timings={"heavy_slot_wait_s": timing.heavy_park_s},
                      worker=worker_identity())
                 timing.vram = _VramWatch(str(step.id))
             with handler_slots(op):
-                timing.slot_wait_s = time.monotonic() - slot_ready
+                # the park is its own leg, SUBTRACTED from slot_wait, never inside it (HEAVY_PARK_WHY)
+                slot_end_ns = time.monotonic_ns()
+                timing.slot_wait_s = (slot_end_ns - slot_start_ns) / 1e9 - timing.heavy_park_s
                 timing.intervals["slot_wait"] = {
-                    "start_mono_ns": slot_start_ns, "end_mono_ns": time.monotonic_ns()}
-                live("run_started", timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s})
+                    "start_mono_ns": park_end_ns if heavy else slot_start_ns, "end_mono_ns": slot_end_ns}
+                live("run_started", timings={"bind_s": timing.bind_s, "slot_wait_s": timing.slot_wait_s,
+                                             **({"heavy_park_s": timing.heavy_park_s} if heavy else {})})
                 run_announced = True
                 t0 = time.monotonic()
                 run_start_ns = time.monotonic_ns()
@@ -1390,7 +1420,8 @@ def _timeline_spans(
         "seek_decode": "compute", "encode": "compute",
     }
     phase_lanes = {
-        "bind": "transport", "slot_wait": "scheduler", "run": "compute", "put": "transport"}
+        "bind": "transport", "heavy_park": "scheduler", "slot_wait": "scheduler", "run": "compute",
+        "put": "transport"}
     for step in steps:
         sid, op = str(step["id"]), str(step["op"])
         for leg, interval in step["intervals"].items():

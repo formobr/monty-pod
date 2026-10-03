@@ -214,7 +214,7 @@ def test_the_real_gpu_admission_timeout_reaches_the_fence(tmp_path, monkeypatch)
     monkeypatch.setattr(runner.registry, "validate_params", lambda *a, **k: None)
     monkeypatch.setattr(runner.pack, "resolve", lambda h: (lambda **kw: None))
     real = gpu_admission.admission
-    monkeypatch.setattr(runner.gpu_admission, "admission", lambda name: real(name, deadline_s=0.01))
+    monkeypatch.setattr(runner.gpu_admission, "admission", lambda name, **kw: real(name, **{**kw, "deadline_s": 0.01}))
     gpu_admission._reset_for_tests()
     with gpu_admission._cond:
         gpu_admission._live[object()] = gpu_admission.budget_mib()   # another heavy op holds the whole budget

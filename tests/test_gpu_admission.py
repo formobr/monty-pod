@@ -156,9 +156,9 @@ def test_heavy_op_takes_step_slot_only_after_admission_and_emits_wire_legal_even
     order: list[str] = []
     real_admission = gpu_admission.admission
 
-    def _recording_admission(op_name, deadline_s=gpu_admission.HEAVY_WAIT_DEADLINE_S):
+    def _recording_admission(op_name, **kw):
         order.append("admission")
-        return real_admission(op_name, deadline_s)
+        return real_admission(op_name, **kw)
 
     def _recording_handler_slots(op):
         order.append(f"step_slot:{op.op}")

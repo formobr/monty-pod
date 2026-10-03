@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator
 
 from ..infer_cliprank import _VRAM_RESERVE_MB, _free_vram_mb
 
@@ -45,11 +45,18 @@ Waiters are admitted strictly in arrival order (no overtaking): admit = head of 
 stream of small requests must never starve a large cut.apply parked ahead of them.
 
 The wait is bounded (repo law: a wait with no deadline is a swallowed error; registered box-side as
-deadline.yaml `gpu_heavy_admission_park`) and spends part of the op envelope the box already grants a
-claimed heavy op — media.normalize/camera.apply carry 140 s table budgets, cut.apply/media.cut_proxy ride
-the wider unmeasured window — never a second, uncoordinated clock. A waiter behind a heavy that runs
-longer than this deadline fails LOUD by design: on this card that is the box over-driving one pod, and a
-silent multi-minute park would just move the same failure past the point where anyone can read it.
+deadline.yaml `gpu_heavy_admission_park`) by a deadline computed ONCE, at entry, from the queue policy:
+(requests parked ahead + reservations admitted) × HEAVY_OP_CEILING_S, the per-op ceiling the box already
+sanctions for every heavy op, capped by HEAVY_PARK_CEILING_S. Each op ahead of this one may legitimately
+run its whole sanctioned ceiling, so a flat deadline (the old 90 s) timed out the THIRD of three
+preview-equivalent heavies that were each well inside their own budget. Computed once is the point: a
+deadline re-derived while waiting would stretch every time the queue changed, i.e. never be a deadline.
+A waiter that still has not fit when it expires fails LOUD, naming its position and its request in MiB:
+on this card that is the box over-driving one pod, and a silent multi-minute park would just move the same
+failure past the point where anyone can read it.
+
+A park is VISIBLE: a waiter that cannot be admitted on arrival calls the caller's `on_park` hook (the
+runner emits a `heavy_park` event: position, budget, request, deadline) BEFORE it waits, outside the lock.
 
 The queue is bounded to mirror OPS_MAX_CHAINS=8: one heavy op per chain in flight is a reasonable park; a
 ninth waiter means the box over-drove this pod and must hear that now, as a refusal, not a growing queue.
@@ -58,7 +65,13 @@ ninth waiter means the box over-drove this pod and must hear that now, as a refu
 # Ops whose handler saturates the GPU (GPU_ADMISSION_WHY).
 HEAVY_GPU_OPS = frozenset({"cut.apply", "media.normalize", "camera.apply", "media.cut_proxy"})
 
-HEAVY_WAIT_DEADLINE_S = 90.0   # part of the box's own op envelope, never a second clock (GPU_ADMISSION_WHY)
+# The sanctioned per-op ceiling of every heavy op: the box's _OP_BUDGET_S rows for the four heavies sit AT the
+# measured cap, video-editor scripts/op_backend.py:437-444 (_MEASURED_CEILING_S 200.0 − overhead = 140.0 s).
+# The park deadline is priced in units of it (GPU_ADMISSION_WHY); deadline.yaml cites the cap below.
+HEAVY_OP_CEILING_S = 140.0
+# Cap on any one park: four whole heavy ceilings, inside the box's widest op window (scripts/op_backend.py
+# _OPS_MAX_BUDGET_S = 600.0) — a park past that would outlive every envelope the box can grant the op.
+HEAVY_PARK_CEILING_S = 4 * HEAVY_OP_CEILING_S
 MAX_PARKED = 8                 # mirrors OPS_MAX_CHAINS (GPU_ADMISSION_WHY)
 
 
@@ -119,10 +132,17 @@ def reserved_mib() -> float:
         return sum(_live.values())
 
 
-def reserve(op_name: str, need_mib: float = NVENC_SESSION_MIB,
-            deadline_s: float = HEAVY_WAIT_DEADLINE_S) -> object:
+def park_deadline_s(ahead: int, admitted: int) -> float:
+    """The park deadline, priced ONCE at entry from the queue policy (GPU_ADMISSION_WHY)."""
+    return min(max(ahead + admitted, 1) * HEAVY_OP_CEILING_S, HEAVY_PARK_CEILING_S)
+
+
+def reserve(op_name: str, need_mib: float = NVENC_SESSION_MIB, deadline_s: float | None = None,
+            on_park: Callable[..., None] | None = None) -> object:
     """Park in FIFO order until this waiter leads the queue and `need_mib` fits in what the live reservations
-    leave of the budget; return the token release() takes. Refuses or times out, never parks unbounded."""
+    leave of the budget; return the token release() takes. Refuses or times out, never parks unbounded.
+    `deadline_s` None prices the deadline at entry (park_deadline_s); a waiter that must park first calls
+    `on_park(position=, ahead=, admitted=, budget_mib=, need_mib=, deadline_s=)` outside the lock."""
     budget = budget_mib()
     started = time.monotonic()
     with _cond:
@@ -134,30 +154,46 @@ def reserve(op_name: str, need_mib: float = NVENC_SESSION_MIB,
             raise GpuAdmissionRefused(
                 f"op {op_name!r} refused GPU admission: {len(_queue)} heavy op(s) already parked "
                 f"(MAX_PARKED={MAX_PARKED}, waited 0.0s)")
+        ahead, admitted = len(_queue), len(_live)
+        position = ahead + 1  # 1-based place in the park queue at entry
+        if deadline_s is None:
+            deadline_s = park_deadline_s(ahead, admitted)
         token = object()
         _queue.append(token)
         deadline = started + deadline_s
-        try:
-            while not (_queue[0] is token and sum(_live.values()) + need_mib <= budget):
+        parks = not _admissible(token, need_mib, budget)
+    try:
+        if parks and on_park is not None:
+            on_park(position=position, ahead=ahead, admitted=admitted, budget_mib=budget,
+                    need_mib=need_mib, deadline_s=deadline_s)
+        with _cond:
+            while not _admissible(token, need_mib, budget):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise GpuAdmissionTimeout(
                         f"op {op_name!r} timed out waiting for GPU admission after {deadline_s:.1f}s "
-                        f"(need {need_mib:.0f} MiB, {sum(_live.values()):.0f}/{budget:.0f} MiB reserved, "
-                        f"queue depth {len(_queue) - 1}, waited {time.monotonic() - started:.1f}s)")
+                        f"at park position {position} (request {need_mib:.0f} MiB, "
+                        f"{sum(_live.values()):.0f}/{budget:.0f} MiB reserved, {ahead} ahead + "
+                        f"{admitted} admitted at entry, waited {time.monotonic() - started:.1f}s)")
                 _cond.wait(timeout=remaining)
-        except BaseException:
-            # any unwind before admitting must drop the token and let the next head re-check the budget
+            _queue.popleft()
+            _live[token] = need_mib
+            _cond.notify_all()  # the new head may fit in what is left
+            return token
+    except BaseException:
+        # any unwind before admitting must drop the token and let the next head re-check the budget
+        with _cond:
             try:
                 _queue.remove(token)
             except ValueError:
                 pass
             _cond.notify_all()
-            raise
-        _queue.popleft()
-        _live[token] = need_mib
-        _cond.notify_all()  # the new head may fit in what is left
-        return token
+        raise
+
+
+def _admissible(token: object, need_mib: float, budget: float) -> bool:
+    """Caller holds _cond: head of the queue AND the need fits beside the live reservations."""
+    return _queue[0] is token and sum(_live.values()) + need_mib <= budget
 
 
 def release(token: object) -> None:
@@ -168,8 +204,8 @@ def release(token: object) -> None:
 
 
 @contextmanager
-def admission(op_name: str, deadline_s: float = HEAVY_WAIT_DEADLINE_S,
-              need_mib: float | None = None) -> Iterator[None]:
+def admission(op_name: str, deadline_s: float | None = None, need_mib: float | None = None,
+              on_park: Callable[..., None] | None = None) -> Iterator[None]:
     """reserve() `need_mib` — the WHOLE budget when None, for a self-sizing handler — and release() it on any
     exit; heavies with explicit needs overlap while they fit (GPU_ADMISSION_WHY)."""
     me = threading.get_ident()
@@ -179,7 +215,7 @@ def admission(op_name: str, deadline_s: float = HEAVY_WAIT_DEADLINE_S,
             raise GpuAdmissionRefused(
                 f"op {op_name!r} refused GPU admission: this thread already holds it "
                 f"(queue depth {len(_queue)}, waited 0.0s)")
-    token = reserve(op_name, budget_mib() if need_mib is None else need_mib, deadline_s)
+    token = reserve(op_name, budget_mib() if need_mib is None else need_mib, deadline_s, on_park)
     with _cond:
         _holders.add(me)
     try:
