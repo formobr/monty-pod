@@ -873,6 +873,7 @@ def build_receipt(p: Prepared, graph: str, cmd: list[str], wall_s: float) -> dic
         "overlays": {"broll": _broll_rows(spec, graph)},
         "logo": _logo_row(spec, p.duration, pads),
         "taps": [read_framemd5(pad, p.tap_md5[pad], expected[pad]) for pad in pads],
+        "audio_mix": _render.audio_mix_facts(p.audio, graph),
         "wall": round(wall_s, 3),
     }
     if _contour_dry_armed():

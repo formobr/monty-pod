@@ -620,6 +620,23 @@ def _audio_mix_chains(a: _AudioMix) -> list[str]:
     return chains
 
 
+def audio_mix_facts(a: _AudioMix | None, graph: str) -> dict:
+    """The receipt's `audio_mix` row (engine `plan_match.ReceiptAudioMix`): what the mix in `graph` — the
+    filtergraph that actually ran — really wired, read off the input pads `_audio_mix_chains` emits (input
+    pads `[N:a]` survive `render_onepass.rewire` verbatim; only internal labels are suffixed).
+
+    music_bed: the bed input feeds a chain of the graph. bed_lufs: the bed's normalisation TARGET
+    (`_MUSIC_LUFS`, what `_prerender_bed`'s loudnorm aims at), not a measurement — None with no bed.
+    sfx_mixed: the SFX entries whose delayed input chain is in the graph."""
+    chains = graph.split(";")
+    bed = (a is not None and a.bed_idx is not None
+           and any(c.startswith(f"[{a.bed_idx}:a]") for c in chains))
+    sfx = 0 if a is None else sum(
+        1 for sidx, at, _g in a.sfx
+        if any(c.startswith(f"[{sidx}:a]adelay={int(round(at * 1000))}:all=1,") for c in chains))
+    return {"music_bed": bed, "bed_lufs": _MUSIC_LUFS if bed else None, "sfx_mixed": sfx}
+
+
 def build_filtergraph(spec: RenderSpec, gpu: bool, audio: _AudioMix | None = None,
                       terminal_bt709: bool = True, taps: bool = False) -> str:
     """Pure: the -filter_complex string trimming, speed-adjusting, motion-treating and concatenating
