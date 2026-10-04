@@ -11,8 +11,10 @@ Design rules baked into these macros (they are load-bearing, not style):
   * Per-frame zoom/pan uses `zoompan`, NEVER `crop` — crop freezes w/h at frame 0.
   * Any `zoompan` that moves x/y renders at SS=2 then scales down, or it jitters from integer
     truncation.
-  * Every accent is gated to its window (`enable=between(t,…)` or a sliced+concat span) so the rest
-    of the clip is untouched — an accent is an INSTANT, not a wash.
+  * Every accent is gated to its window (`enable=between(N,…)` over the output frame index N, or a
+    sliced+concat span) so the rest of the clip is untouched — an accent is an INSTANT, not a wash.
+  * Every window is an integer FRAME range on the output grid (frames.py): the accent's centre frame
+    is rounded ONCE and the span is counted in frames, never a formatted float second.
 
 These builders are MIRRORED by the planner (scripts/fx.py + scripts/transitions.py). The mirror is
 not decorative: the planner-side copies drive local sample renders and the CLI. Both sides are held
@@ -26,6 +28,8 @@ import random
 import re
 import subprocess
 from typing import NamedTuple
+
+from . import frames as _frames
 
 SS = 2  # supersample factor for any zoompan x/y move
 _PI = 3.14159265358979
@@ -62,6 +66,12 @@ def lp_kenburns(z: str, x: str, y: str, out_w: int, out_h: int) -> str:
             f":upscaler=spline36:downscaler=spline36")
 
 
+def _centred(at: float, n: int, fps: float) -> tuple[int, int]:
+    """[a, a+n): an n-frame window centred on the frame nearest `at`, clamped at frame 0."""
+    a = max(0, _frames.frame_at(at, fps) - n // 2)
+    return a, a + n
+
+
 # --- camera_shake -------------------------------------------------------------
 
 def camera_shake_filter(at: float, *, intensity: float = 0.6, frames: int = 9, fps: float = 30.0,
@@ -70,11 +80,8 @@ def camera_shake_filter(at: float, *, intensity: float = 0.6, frames: int = 9, f
     settles clean. intensity 0..1 -> amplitude 0.4%..2.5% of the dimension. Premium ONLY because it is
     SHORT and DECAYS; rendered at SS=2 so the sub-pixel offset stays smooth."""
     intensity = _clamp01(intensity)
-    f = float(fps)
     n = max(1, frames)
-    fdur = 1.0 / f
-    t0 = max(0.0, at - (n * fdur) / 2.0)
-    t1 = t0 + n * fdur
+    a, b = _centred(at, n, fps)
     amp_frac = 0.004 + 0.021 * intensity
     zoom = 1.0 + amp_frac * 2.2          # crop-in headroom so the jitter never bares an edge
     env = f"(1-on/{n})"
@@ -85,14 +92,14 @@ def camera_shake_filter(at: float, *, intensity: float = 0.6, frames: int = 9, f
     sw, sh = w * SS, h * SS
     move = (f"hwupload,{lp_kenburns(f'{zoom:.4f}', x, y, sw, sh)},hwdownload,format=yuv420p"
             if gpu else
-            f"zoompan=z='{zoom:.4f}':x='{x}':y='{y}':d=1:s={sw}x{sh}:fps={f:.4f}")
+            f"zoompan=z='{zoom:.4f}':x='{x}':y='{y}':d=1:s={sw}x{sh}:fps={_frames.rate(fps)}")
     return (
         f"[0:v]split=2[base][sh];"
-        f"[sh]trim=start={t0:.4f}:end={t1:.4f},setpts=PTS-STARTPTS,"
+        f"[sh]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,"
         f"scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
         f"{move},"
-        f"scale={w}:{h},setpts=PTS-STARTPTS+{t0:.4f}/TB[shx];"
-        f"[base][shx]overlay=enable='between(t,{t0:.4f},{t1:.4f})'[vout]"
+        f"scale={w}:{h},setpts=PTS-STARTPTS+{_frames.pts_at(a, fps)}[shx];"
+        f"[base][shx]overlay=enable='{_frames.between(a, b, fps)}'[vout]"
     )
 
 
@@ -103,18 +110,14 @@ def grain_filter(at: float, *, intensity: float = 0.7, frames: int = 24, fps: fl
     """Brief film-GRAIN burst on `at` — analog texture as an ACCENT, not a whole-video wash.
     intensity 0..1 -> luma-noise sigma 10..40, gated by overlay so the rest stays clean."""
     intensity = _clamp01(intensity)
-    f = float(fps)
-    fdur = 1.0 / f
-    n = max(1, frames)
-    t0 = max(0.0, at - (n * fdur) / 2.0)
-    t1 = t0 + n * fdur
+    a, b = _centred(at, max(1, frames), fps)
     strength = 10 + round(30 * intensity)
     return (
         f"[0:v]split=2[base][gr];"
-        f"[gr]trim=start={t0:.4f}:end={t1:.4f},setpts=PTS-STARTPTS,"
+        f"[gr]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,"
         f"noise=c0s={strength}:c0f=t,eq=contrast={1.0 + 0.06 * intensity:.3f},"
-        f"setpts=PTS-STARTPTS+{t0:.4f}/TB[grx];"
-        f"[base][grx]overlay=enable='between(t,{t0:.4f},{t1:.4f})'[vout]"
+        f"setpts=PTS-STARTPTS+{_frames.pts_at(a, fps)}[grx];"
+        f"[base][grx]overlay=enable='{_frames.between(a, b, fps)}'[vout]"
     )
 
 
@@ -127,16 +130,11 @@ def zoom_punch_filter(at: float, *, intensity: float = 0.6, frames_in: int = 4,
     eased settle back, with motion blur on the fast leg. intensity 0..1 -> peak +6%..+22%."""
     intensity = _clamp01(intensity)
     peak = 1.06 + 0.16 * intensity
-    f = float(fps)
-    t_in = max(1, frames_in) / f
-    t_hold = max(0, frames_hold) / f
-    t_out = max(1, frames_out) / f
-    t0 = max(0.0, at - t_in)
-    t_peak1 = at + t_hold
-    t_end = t_peak1 + t_out
     n_in = max(1, frames_in)
     n_hold = max(0, frames_hold)
     n_out = max(1, frames_out)
+    c = _frames.frame_at(at, fps)
+    a, b = max(0, c - n_in), c + n_hold + n_out
     z = (
         f"if(lt(on,{n_in}),"
         f"1+({peak - 1:.4f})*(on/{n_in}),"
@@ -149,15 +147,15 @@ def zoom_punch_filter(at: float, *, intensity: float = 0.6, frames_in: int = 4,
     cxe, cye = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     move = (f"hwupload,{lp_kenburns(z, cxe, cye, w, h)},hwdownload,format=yuv420p"
             if gpu else
-            f"zoompan=z='{z}':d=1:s={w}x{h}:fps={f:.4f}:x='{cxe}':y='{cye}'")
+            f"zoompan=z='{z}':d=1:s={w}x{h}:fps={_frames.rate(fps)}:x='{cxe}':y='{cye}'")
     return (
         f"[0:v]split=3[pre][mid][post];"
-        f"[pre]trim=end={t0:.4f},setpts=PTS-STARTPTS[a];"
-        f"[mid]trim=start={t0:.4f}:end={t_end:.4f},setpts=PTS-STARTPTS,"
+        f"[pre]trim=end_frame={a},setpts=PTS-STARTPTS[a];"
+        f"[mid]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,"
         f"{move},"
         f"tmix=frames={blur}:weights='{' '.join(['1'] * blur)}',"
         f"setpts=PTS-STARTPTS[b];"
-        f"[post]trim=start={t_end:.4f},setpts=PTS-STARTPTS[c];"
+        f"[post]trim=start_frame={b},setpts=PTS-STARTPTS[c];"
         f"[a][b][c]concat=n=3:v=1:a=0[vout]"
     )
 
@@ -217,22 +215,20 @@ def glitch_filter(at: float, *, intensity: float = 0.5, frames: int = 7, fps: fl
     steps = _glitch_steps(intensity, seed)
     n = min(max(1, frames), len(steps))
     steps = steps[:n]
-    t0 = max(0.0, at - (n * fdur) / 2.0)
-    t1 = t0 + n * fdur
+    a, b = _centred(at, n, fps)
     nstr = round(14 + 34 * intensity)
     contrast = 1.0 + 0.25 * intensity
 
     parts = ["[0:v]split=2[base][gl]"]
-    parts.append(f"[gl]trim=start={t0:.4f}:end={t1:.4f},setpts=PTS-STARTPTS,"
+    parts.append(f"[gl]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,"
                  f"split={n}{''.join(f'[s{i}]' for i in range(n))}")
     glabels = []
     for i, (rh, bh, rv, mono) in enumerate(steps):
-        a0, a1 = i * fdur, (i + 1) * fdur
         glabels.append(f"[g{i}]")
         ns = nstr + round(mono * 45)
         sat = round(max(0.0, 1.0 - mono), 3)
         parts.append(
-            f"[s{i}]trim=start={a0:.4f}:end={a1:.4f},setpts=PTS-STARTPTS,"
+            f"[s{i}]trim=start_frame={i}:end_frame={i + 1},setpts=PTS-STARTPTS,"
             f"rgbashift=rh={rh}:bh={bh}:rv={rv}:bv={-rv}:edge=wrap,"
             f"noise=alls={ns}:allf=t,"
             f"eq=contrast={contrast:.3f}:saturation={sat:.3f}[g{i}]"
@@ -241,8 +237,8 @@ def glitch_filter(at: float, *, intensity: float = 0.5, frames: int = 7, fps: fl
     parts.append(f"{''.join(glabels)}concat=n={n}:v=1:a=0[gcat]")
     parts.append(f"[gcat]split=2[rc0][rc1];[rc0][rc1]vstack=inputs=2,"
                  f"crop={w}:{h}:0:y='{roll}',"
-                 f"setpts=PTS-STARTPTS+{t0:.4f}/TB[gx]")
-    parts.append(f"[base][gx]overlay=enable='between(t,{t0:.4f},{t1:.4f})'[vout]")
+                 f"setpts=PTS-STARTPTS+{_frames.pts_at(a, fps)}[gx]")
+    parts.append(f"[base][gx]overlay=enable='{_frames.between(a, b, fps)}'[vout]")
     return ";".join(parts)
 
 
@@ -253,18 +249,15 @@ def rgb_split_filter(at: float, *, intensity: float = 0.55, frames: int = 5, fps
     """Clean chromatic-aberration split on `at` — R/B tear apart then snap back, NO noise/roll/mono
     (that is `glitch`). intensity 0..1 -> peak split +-3..21 px."""
     intensity = _clamp01(intensity)
-    f = float(fps)
-    fdur = 1.0 / f
     n = max(1, frames)
     seed = int(round(at * 1000)) & 0xFFFFFFFF
     rng = random.Random(seed)
     amp = 3 + round(18 * intensity)
     env = ([1.0, 0.72, 0.46, 0.24, 0.10] + [0.05] * n)[:n]
-    t0 = max(0.0, at - (n * fdur) / 2.0)
-    t1 = t0 + n * fdur
+    a, b = _centred(at, n, fps)
     sat = 1.0 + 0.30 * intensity
     parts = ["[0:v]split=2[base][rs]"]
-    parts.append(f"[rs]trim=start={t0:.4f}:end={t1:.4f},setpts=PTS-STARTPTS,"
+    parts.append(f"[rs]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,"
                  f"split={n}{''.join(f'[p{i}]' for i in range(n))}")
     labels = []
     for i, e in enumerate(env):
@@ -272,14 +265,13 @@ def rgb_split_filter(at: float, *, intensity: float = 0.55, frames: int = 5, fps
         rh = round(amp * je)
         bh = round(-amp * je)
         rv = round(amp * je * 0.35)
-        a0, a1 = i * fdur, (i + 1) * fdur
         labels.append(f"[r{i}]")
-        parts.append(f"[p{i}]trim=start={a0:.4f}:end={a1:.4f},setpts=PTS-STARTPTS,"
+        parts.append(f"[p{i}]trim=start_frame={i}:end_frame={i + 1},setpts=PTS-STARTPTS,"
                      f"rgbashift=rh={rh}:bh={bh}:rv={rv}:bv={-rv}:edge=smear,"
                      f"eq=saturation={sat:.3f}[r{i}]")
     parts.append(f"{''.join(labels)}concat=n={n}:v=1:a=0,"
-                 f"setpts=PTS-STARTPTS+{t0:.4f}/TB[rsx]")
-    parts.append(f"[base][rsx]overlay=enable='between(t,{t0:.4f},{t1:.4f})'[vout]")
+                 f"setpts=PTS-STARTPTS+{_frames.pts_at(a, fps)}[rsx]")
+    parts.append(f"[base][rsx]overlay=enable='{_frames.between(a, b, fps)}'[vout]")
     return ";".join(parts)
 
 
@@ -291,11 +283,10 @@ def zoom_blur_filter(at: float, *, intensity: float = 0.6, frames_in: int = 4, f
     OUT. Bigger and blurrier than zoom_punch. intensity 0..1 -> peak +10%..+40%."""
     intensity = _clamp01(intensity)
     peak = 1.10 + 0.30 * intensity
-    f = float(fps)
     n_in = max(1, frames_in)
     n_out = max(1, frames_out)
-    t0 = max(0.0, at - n_in / f)
-    t_end = at + n_out / f
+    c = _frames.frame_at(at, fps)
+    a, b = max(0, c - n_in), c + n_out
     z = (
         f"if(lt(on,{n_in}),1+({peak - 1:.4f})*pow(on/{n_in},2),"
         f"if(lt(on,{n_in + n_out}),{peak:.4f}-({peak - 1:.4f})*pow((on-{n_in})/{n_out},1.6),1))"
@@ -304,15 +295,15 @@ def zoom_blur_filter(at: float, *, intensity: float = 0.6, frames_in: int = 4, f
     cxe, cye = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     move = (f"hwupload,{lp_kenburns(z, cxe, cye, w, h)},hwdownload,format=yuv420p"
             if gpu else
-            f"zoompan=z='{z}':d=1:s={w}x{h}:fps={f:.4f}:x='{cxe}':y='{cye}'")
+            f"zoompan=z='{z}':d=1:s={w}x{h}:fps={_frames.rate(fps)}:x='{cxe}':y='{cye}'")
     return (
         f"[0:v]split=3[pre][mid][post];"
-        f"[pre]trim=end={t0:.4f},setpts=PTS-STARTPTS[a];"
-        f"[mid]trim=start={t0:.4f}:end={t_end:.4f},setpts=PTS-STARTPTS,"
+        f"[pre]trim=end_frame={a},setpts=PTS-STARTPTS[a];"
+        f"[mid]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,"
         f"{move},"
         f"tmix=frames={blur}:weights='{' '.join(['1'] * blur)}',"
         f"setpts=PTS-STARTPTS[b];"
-        f"[post]trim=start={t_end:.4f},setpts=PTS-STARTPTS[c];"
+        f"[post]trim=start_frame={b},setpts=PTS-STARTPTS[c];"
         f"[a][b][c]concat=n=3:v=1:a=0[vout]"
     )
 
@@ -324,20 +315,16 @@ def pixelate_filter(at: float, *, intensity: float = 0.6, frames: int = 10, fps:
     """Brief MOSAIC on `at` — the frame drops to blocks then snaps back (censorship / redacted /
     low-res meaning, distinct from glitch's signal failure). intensity 0..1 -> block ~8..36 px."""
     intensity = _clamp01(intensity)
-    f = float(fps)
-    fdur = 1.0 / f
-    n = max(1, frames)
-    t0 = max(0.0, at - (n * fdur) / 2.0)
-    t1 = t0 + n * fdur
+    a, b = _centred(at, max(1, frames), fps)
     block = 8 + round(28 * intensity)
     dw = max(2, round(w / block))
     dh = max(2, round(h / block))
     return (
         f"[0:v]split=2[base][px];"
-        f"[px]trim=start={t0:.4f}:end={t1:.4f},setpts=PTS-STARTPTS,"
+        f"[px]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,"
         f"scale={dw}:{dh}:flags=neighbor,scale={w}:{h}:flags=neighbor,"
-        f"setpts=PTS-STARTPTS+{t0:.4f}/TB[pxx];"
-        f"[base][pxx]overlay=enable='between(t,{t0:.4f},{t1:.4f})'[vout]"
+        f"setpts=PTS-STARTPTS+{_frames.pts_at(a, fps)}[pxx];"
+        f"[base][pxx]overlay=enable='{_frames.between(a, b, fps)}'[vout]"
     )
 
 
@@ -417,42 +404,51 @@ def add_filmburn(parts: list, prev: str, burn_idx: int, boundaries: list, flares
         f"[bc][bm]alphamerge,format=yuva420p,split={k}{labels}"
     )
     flares = flares or [lead]
-    dur = lead + post
-    fin, fout = 0.14, 0.20
+    # The burn stream is conformed to the output grid (fps= above), so its own frame index is a frame
+    # count too: the window, the clip offset and both fades are frame numbers, never float seconds.
+    n_in, n_out = _frames.frame_at(0.14, fps), _frames.frame_at(0.20, fps)
     for j, t in enumerate(boundaries):
-        st = max(0.0, t - lead)
-        win = round(max(0.0, flares[j % len(flares)] - lead + flare_lead), 2)
+        a, b = _frames.frame_range(max(0.0, t - lead), t + post, fps)
+        span = b - a
+        src = _frames.frame_at(max(0.0, flares[j % len(flares)] - lead + flare_lead), fps)
         parts.append(
-            f"[bn{j}]trim=start={win:.2f}:duration={dur:.3f},setpts=PTS-STARTPTS,"
-            f"fade=t=in:st=0:d={fin:.3f}:alpha=1,"
-            f"fade=t=out:st={dur - fout:.3f}:d={fout:.3f}:alpha=1,"
-            f"setpts=PTS-STARTPTS+{st:.3f}/TB[bs{j}]"
+            f"[bn{j}]trim=start_frame={src}:end_frame={src + span},setpts=PTS-STARTPTS,"
+            f"fade=t=in:s=0:n={n_in}:alpha=1,"
+            f"fade=t=out:s={max(0, span - n_out)}:n={n_out}:alpha=1,"
+            f"setpts=PTS-STARTPTS+{_frames.pts_at(a, fps)}[bs{j}]"
         )
         out = f"[g{j}]"
-        parts.append(f"{prev}[bs{j}]overlay=enable='between(t,{st:.3f},{t + post:.3f})'{out}")
+        parts.append(f"{prev}[bs{j}]overlay=enable='{_frames.between(a, b, fps)}'{out}")
         prev = out
     return parts, prev
 
 
-def _pw_linear(T: float, pts: list) -> str:
-    """Piecewise-linear ffmpeg expression for the held frame slip."""
+def _pw_linear(T: float, pts: list, fps: float | str = FPS) -> str:
+    """Piecewise-linear ffmpeg expression for the held frame slip, in output frames N: each leg is
+    the half-open frame range [a, b) of its two knots, so adjacent legs never both fire on a shared
+    knot frame; a leg shorter than one frame is a step and emits nothing."""
     segs = []
     for (ta, va), (tb, vb) in zip(pts, pts[1:], strict=False):
-        a, b = T + ta, T + tb
+        a, b = _frames.frame_at(T + ta, fps), _frames.frame_at(T + tb, fps)
+        if b <= a:
+            continue
         segs.append(
-            f"between(t,{a:.3f},{b:.3f})*({va:.0f}+({vb - va:.0f})*(t-{a:.3f})/{b - a:.5f})"
+            f"{_frames.between(a, b, fps)}*({va:.0f}+({vb - va:.0f})*({_frames.index(fps)}-{a})/{b - a})"
         )
-    return "+".join(segs)
+    return "+".join(segs) or "0"
 
 
 def add_offset_jump(parts: list, prev: str, boundaries: list, lead: float = 0.42, seed: int = 42,
-                    *, w: int = W, h: int = H):
-    """Apply the deterministic wraparound frame jump before the burn overlay."""
+                    *, w: int = W, h: int = H, fps: float | str = FPS, slips: list | None = None):
+    """Apply the deterministic wraparound frame jump before the burn overlay. `slips[j]` (aligned with
+    `boundaries`) is the engine's precomputed [(t_rel, dy_px)] for that burn and is rendered verbatim;
+    a None entry (or no `slips`) falls back to this function's own seeded draw. The rng is drawn for
+    EVERY burn either way, so a fallback burn's slip never depends on its neighbours carrying one."""
     if not boundaries:
         return parts, prev
     rng = random.Random(seed)
     exprs = []
-    for T in boundaries:
+    for j, T in enumerate(boundaries):
         pts = [(-lead, 0.0)]
         cur = -lead
         sign = rng.choice([1, -1])
@@ -471,7 +467,8 @@ def add_offset_jump(parts: list, prev: str, boundaries: list, lead: float = 0.42
         pts.append((round(settle, 3), 0.0))
         if settle < 0.0:
             pts.append((0.0, 0.0))
-        exprs.append(_pw_linear(T, pts))
+        given = slips[j] if slips is not None else None
+        exprs.append(_pw_linear(T, [tuple(p) for p in given] if given is not None else pts, fps))
     jy = "+".join(f"({e})" for e in exprs)
     parts.append(f"{prev}split=2[jc0][jc1];[jc0][jc1]vstack=inputs=2[jstk]")
     parts.append(f"[jstk]crop={w}:{h}:0:y='mod(({jy})+{100 * h},{h})'[vout]")
@@ -483,6 +480,7 @@ class FilmBurnPlan(NamedTuple):
     burn: str
     opacity: float
     boundaries: list[float]
+    slips: list  # aligned with boundaries: each burn's spec `slip`, or None (add_offset_jump draws it)
 
 
 def film_burn_plan(accents) -> FilmBurnPlan:
@@ -497,13 +495,15 @@ def film_burn_plan(accents) -> FilmBurnPlan:
     intensities = {float(a.intensity) for a in burns}
     if len(intensities) != 1:
         raise RuntimeError("all film_burn accents must share one intensity")
-    boundaries = sorted(float(a.at) for a in burns)
+    ordered = sorted(burns, key=lambda a: float(a.at))
+    boundaries = [float(a.at) for a in ordered]
     if len(boundaries) > MAX_FILM_BURN_BOUNDARIES:
         raise RuntimeError(
             f"film_burn boundary count {len(boundaries)} exceeds cap {MAX_FILM_BURN_BOUNDARIES}; "
             "registry law: film burns are a RARE accent, 2-3/video"
         )
-    return FilmBurnPlan(singles, next(iter(burn_ids)), intensities.pop(), boundaries)
+    return FilmBurnPlan(singles, next(iter(burn_ids)), intensities.pop(), boundaries,
+                        [getattr(a, "slip", None) for a in ordered])
 
 
 # --- chaining -----------------------------------------------------------------

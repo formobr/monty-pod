@@ -839,6 +839,24 @@
         "clicks": {
           "type": "string",
           "minLength": 1
+        },
+        "slip": {
+          "description": "film_burn only: the engine's precomputed frame slip (video-editor scripts/burn_slip.keyframes) as [[t_rel, dy_px], …] relative to `at`, dy in px of the 1920 reference height; rendered piecewise-linear, zero outside [first, last], wrapped. Absent → the pod draws the same keyframes itself (seeded).",
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "items": false,
+            "minItems": 2
+          }
         }
       },
       "allOf": [
@@ -870,6 +888,11 @@
                 {
                   "required": [
                     "clicks"
+                  ]
+                },
+                {
+                  "required": [
+                    "slip"
                   ]
                 }
               ]

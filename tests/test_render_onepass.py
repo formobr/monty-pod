@@ -279,26 +279,31 @@ _COMPOSITE_NO_MUSIC = [
 def _pixelate(base: str, out: str) -> list[str]:
     return [
         '[%s]split=2[base_a0__acc][px_a0__acc]' % base,
-        '[px_a0__acc]trim=start=2.8333:end=3.1667,setpts=PTS-STARTPTS,scale=49:87:flags=neighbor,'
-        'scale=1080:1920:flags=neighbor,setpts=PTS-STARTPTS+2.8333/TB[pxx_a0__acc]',
-        "[base_a0__acc][pxx_a0__acc]overlay=enable='between(t,2.8333,3.1667)'[%s]" % out,
+        '[px_a0__acc]trim=start_frame=85:end_frame=95,setpts=PTS-STARTPTS,scale=49:87:flags=neighbor,'
+        'scale=1080:1920:flags=neighbor,setpts=PTS-STARTPTS+85/30/TB[pxx_a0__acc]',
+        "[base_a0__acc][pxx_a0__acc]overlay=enable='between(round(t*30),85,94)'[%s]" % out,
     ]
 
 
 _ACCENT = _pixelate("vtail", "vaccents")
 
 # add_offset_jump is seeded (seed=42): the slip expression below is a deterministic function of the
-# two boundaries alone, so the literal pins it the same way every other golden line is pinned.
+# two boundaries alone, so the literal pins it the same way every other golden line is pinned. Every leg is
+# a half-open output-FRAME range; a ramp shorter than one frame at 30 fps is a step and emits nothing.
 _JUMP_CROP = (
-    "[jstk__acc]crop=1080:1920:0:y='mod(((between(t,3.080,3.095)*(0+(107)*(t-3.080)/0.01500)"
-    "+between(t,3.095,3.162)*(107+(0)*(t-3.095)/0.06700)+between(t,3.162,3.169)*(107+(-248)*(t-3.162)/0.00700)"
-    "+between(t,3.169,3.271)*(-141+(0)*(t-3.169)/0.10200)+between(t,3.271,3.284)*(-141+(244)*(t-3.271)/0.01300)"
-    "+between(t,3.284,3.336)*(103+(0)*(t-3.284)/0.05200)+between(t,3.336,3.371)*(103+(-103)*(t-3.336)/0.03500)"
-    "+between(t,3.371,3.500)*(0+(0)*(t-3.371)/0.12900))+(between(t,6.580,6.595)*(0+(131)*(t-6.580)/0.01500)"
-    "+between(t,6.595,6.694)*(131+(0)*(t-6.595)/0.09900)+between(t,6.694,6.705)*(131+(-300)*(t-6.694)/0.01100)"
-    "+between(t,6.705,6.775)*(-169+(0)*(t-6.705)/0.07000)+between(t,6.775,6.790)*(-169+(300)*(t-6.775)/0.01500)"
-    "+between(t,6.790,6.851)*(131+(0)*(t-6.790)/0.06100)+between(t,6.851,6.886)*(131+(-131)*(t-6.851)/0.03500)"
-    "+between(t,6.886,7.000)*(0+(0)*(t-6.886)/0.11400)))+192000,1920)'[vout__acc]"
+    "[jstk__acc]crop=1080:1920:0:y='mod(((between(round(t*30),92,92)*(0+(107)*(round(t*30)-92)/1)"
+    "+between(round(t*30),93,94)*(107+(0)*(round(t*30)-93)/2)"
+    "+between(round(t*30),95,97)*(-141+(0)*(round(t*30)-95)/3)"
+    "+between(round(t*30),98,98)*(-141+(244)*(round(t*30)-98)/1)"
+    "+between(round(t*30),99,99)*(103+(0)*(round(t*30)-99)/1)"
+    "+between(round(t*30),100,100)*(103+(-103)*(round(t*30)-100)/1)"
+    "+between(round(t*30),101,104)*(0+(0)*(round(t*30)-101)/4))+(between(round(t*30),197,197)*(0+(131)*(round(t*30)-197)/1)"
+    "+between(round(t*30),198,200)*(131+(0)*(round(t*30)-198)/3)"
+    "+between(round(t*30),201,202)*(-169+(0)*(round(t*30)-201)/2)"
+    "+between(round(t*30),203,203)*(-169+(300)*(round(t*30)-203)/1)"
+    "+between(round(t*30),204,205)*(131+(0)*(round(t*30)-204)/2)"
+    "+between(round(t*30),206,206)*(131+(-131)*(round(t*30)-206)/1)"
+    "+between(round(t*30),207,209)*(0+(0)*(round(t*30)-207)/3)))+192000,1920)'[vout__acc]"
 )
 
 
@@ -311,18 +316,18 @@ def _burn_chains(idx: int, base: str) -> list[str]:
         'crop=1080:1920,fps=30,format=gbrp,split=2[bc__acc][bl__acc]' % idx,
         "[bl__acc]format=gray,curves=all='0/0.05 0.12/0.5 1/0.8',colorchannelmixer=aa=0.6[bm__acc]",
         '[bc__acc][bm__acc]alphamerge,format=yuva420p,split=2[bn0__acc][bn1__acc]',
-        '[bn0__acc]trim=start=0.06:duration=0.640,setpts=PTS-STARTPTS,fade=t=in:st=0:d=0.140:alpha=1,'
-        'fade=t=out:st=0.440:d=0.200:alpha=1,setpts=PTS-STARTPTS+3.080/TB[bs0__acc]',
-        "[vout__acc][bs0__acc]overlay=enable='between(t,3.080,3.720)'[g0__acc]",
-        '[bn1__acc]trim=start=0.06:duration=0.640,setpts=PTS-STARTPTS,fade=t=in:st=0:d=0.140:alpha=1,'
-        'fade=t=out:st=0.440:d=0.200:alpha=1,setpts=PTS-STARTPTS+6.580/TB[bs1__acc]',
-        "[g0__acc][bs1__acc]overlay=enable='between(t,6.580,7.220)'[vaccents]",
+        '[bn0__acc]trim=start_frame=2:end_frame=22,setpts=PTS-STARTPTS,fade=t=in:s=0:n=4:alpha=1,'
+        'fade=t=out:s=14:n=6:alpha=1,setpts=PTS-STARTPTS+92/30/TB[bs0__acc]',
+        "[vout__acc][bs0__acc]overlay=enable='between(round(t*30),92,111)'[g0__acc]",
+        '[bn1__acc]trim=start_frame=2:end_frame=22,setpts=PTS-STARTPTS,fade=t=in:s=0:n=4:alpha=1,'
+        'fade=t=out:s=14:n=6:alpha=1,setpts=PTS-STARTPTS+197/30/TB[bs1__acc]',
+        "[g0__acc][bs1__acc]overlay=enable='between(round(t*30),197,216)'[vaccents]",
     ]
 
 
 def _mograph_chains(idx: int) -> list[str]:
-    return ['[%d:v]setpts=PTS-STARTPTS+2.0/TB[o0__mog]' % idx,
-            "[vcomposite][o0__mog]overlay=enable='between(t,2.0,5.0)':eof_action=pass[vmograph]"]
+    return ['[%d:v]setpts=PTS-STARTPTS+60/30/TB[o0__mog]' % idx,
+            "[vcomposite][o0__mog]overlay=enable='between(round(t*30),60,149)':eof_action=pass[vmograph]"]
 
 
 def _fork(src: str) -> list[str]:
@@ -333,7 +338,7 @@ def _fork(src: str) -> list[str]:
 
 def _logo(idx: int, base: str) -> list[str]:
     return ['[%d:v]format=rgba,colorchannelmixer=aa=0.55,scale=150:-1:flags=lanczos[lg__lgo]' % idx,
-            "[%s][lg__lgo]overlay=W-w-40:40:enable='lt(t,10.000)'[vlogo]" % base]
+            "[%s][lg__lgo]overlay=W-w-40:40:enable='lt(round(t*30),300)'[vlogo]" % base]
 
 
 def _watermark(sting: int, idle: int, base: str, base_a: str = "atail") -> list[str]:
@@ -342,8 +347,8 @@ def _watermark(sting: int, idle: int, base: str, base_a: str = "atail") -> list[
         '[%d:v]pad=1200:600:0:(oh-ih)/2:color=black@0,fps=30,setpts=PTS-STARTPTS[d__wmk]' % idle,
         '[i__wmk][d__wmk]concat=n=2:v=1:a=0[wm0__wmk]',
         '[wm0__wmk]scale=422:-1[wm__wmk]',
-        '[wm__wmk]setpts=PTS+2.5/TB[wmd__wmk]',
-        "[%s][wmd__wmk]overlay=(W-w)/2:H-h-60:enable='gte(t,2.5)':shortest=1:format=auto[vwatermark]" % base,
+        '[wm__wmk]setpts=PTS+75/30/TB[wmd__wmk]',
+        "[%s][wmd__wmk]overlay=(W-w)/2:H-h-60:enable='gte(round(t*30),75)':shortest=1:format=auto[vwatermark]" % base,
         '[%d:a]aresample=48000,volume=0.4,adelay=2500|2500[chm__wmk]' % sting,
         '[%s][chm__wmk]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[awatermark]' % base_a,
     ]
@@ -538,8 +543,8 @@ def test_reuse_mograph_builder(monkeypatch) -> None:
     monkeypatch.setattr(mograph, "overlay_filtergraph", spy)
     graph, _cmd = op.assemble(_prepared(_spec()))
     assert spy.calls[0][0][0] == list(LAYERS)
-    assert spy.calls[0][1] == {"base": "vcomposite", "layers_v": ["2:v"]}
-    real, last = mograph.overlay_filtergraph.real(list(LAYERS), base="vcomposite", layers_v=["2:v"])
+    assert spy.calls[0][1] == {"fps": 30.0, "base": "vcomposite", "layers_v": ["2:v"]}
+    real, last = mograph.overlay_filtergraph.real(list(LAYERS), fps=30.0, base="vcomposite", layers_v=["2:v"])
     assert _sub(graph, op.rewire(real, "mog", {"vcomposite": "vcomposite", "2:v": "2:v",
                                                last: "vmograph"}))
 
@@ -562,8 +567,8 @@ def test_reuse_logo_builder(monkeypatch) -> None:
     graph, _cmd = op.assemble(_prepared(_spec()))
     assert spy.calls[0][0][:4] == ("tr", 150, 0.55, 40)
     assert spy.calls[0][0][4] == pytest.approx(DUR)
-    assert spy.calls[0][1] == {"base_v": "vaccents", "logo_v": "3:v", "out_v": "vlogo"}
-    real = finalize.body_logo_filter.real("tr", 150, 0.55, 40, DUR, base_v="vaccents",
+    assert spy.calls[0][1] == {"fps": "30", "base_v": "vaccents", "logo_v": "3:v", "out_v": "vlogo"}
+    real = finalize.body_logo_filter.real("tr", 150, 0.55, 40, DUR, fps="30", base_v="vaccents",
                                           logo_v="3:v", out_v="vlogo")
     assert _sub(graph, op.rewire(real, "lgo", {"vaccents": "vaccents", "3:v": "3:v",
                                                "vlogo": "vlogo"}))
@@ -811,7 +816,7 @@ def test_one_duration_computed_once_reaches_all_three_places(segments, want, mon
     for opts, _dst in outs:
         assert opts.count("-t") == 1
         assert float(opts[opts.index("-t") + 1]) == pytest.approx(want)
-    assert f"enable='lt(t,{want:.3f})'" in graph
+    assert f"enable='lt(round(t*30),{round(want * 30)})'" in graph  # the body's end as an output frame (fps 30)
     assert f"apad=whole_dur={render._num(want)}" in graph
 
 
@@ -819,8 +824,8 @@ def test_the_logo_runs_to_the_end_of_the_body() -> None:
     spec = _spec()
     assert spec.overlays.finalize.logo.cover_hold == 0.6
     graph, _cmd = op.assemble(_prepared(spec))
-    assert "enable='lt(t,10.000)'" in graph
-    assert "9.400" not in graph
+    assert "enable='lt(round(t*30),300)'" in graph   # 10.0 s at 30 fps
+    assert "lt(round(t*30),282)" not in graph        # 9.4 s: the cover_hold tail is not reserved
 
 
 def test_the_t_bound_survives_a_missing_watermark() -> None:
@@ -1607,8 +1612,8 @@ def test_the_tap_forks_the_planned_chain_at_its_end() -> None:
     spec = _tap_spec(logo=False)
     kb = render._kenburns("in", 0.12, 0.08, 90, 320, 240, 30.0)
     chains = render.build_filtergraph(spec, gpu=False, taps=True).split(";")
-    assert (f"[3:v]trim=start=0:duration=3,setpts=PTS-STARTPTS,fps=30,{kb},"
-            "setpts=PTS-STARTPTS+12.000/TB,split=2[b0][b0t]") in chains
+    assert (f"[3:v]trim=start=0,setpts=PTS-STARTPTS,fps=30,trim=end_frame=90,{kb},"
+            "setpts=PTS-STARTPTS+360/30/TB,split=2[b0][b0t]") in chains
     assert "[b0t]scale=96:96:flags=neighbor,format=gray[vtap0]" in chains
     assert render.build_filtergraph(spec, gpu=False) == render.build_filtergraph(
         spec, gpu=False, taps=False), "taps must be OFF by default — an old engine's spec is untouched"
@@ -1821,10 +1826,10 @@ def test_run_encode_writes_one_receipt_of_the_encode_that_ran(monkeypatch, tmp_p
     assert (receipt["schema"], receipt["job_id"], receipt["mode"]) == (op.RECEIPT_SCHEMA, "j-tap", "final")
     assert receipt["overlays"]["broll"][0] == {
         "clip": "broll/0.jpg", "input_index": 3, "start": 12.0, "end": 15.0,
-        "enable": "between(t,12.000,15.000)", "chain_label": "b0__cmp", "tap_pad": "vtap0"}
+        "enable": "between(round(t*30),360,449)", "chain_label": "b0__cmp", "tap_pad": "vtap0"}
     assert [r["clip"] for r in receipt["overlays"]["broll"]] == ["broll/0.jpg", "broll/1.jpg"]
     assert receipt["logo"] == {"input_id": "brand/logo.png",
-                               "enable": f"lt(t,{p.duration:.3f})", "tap": "vtaplogo"}
+                               "enable": f"lt(round(t*30),{round(p.duration * 30)})", "tap": "vtaplogo"}
     assert [t["pad"] for t in receipt["taps"]] == ["vtap0", "vtap1", "vtaplogo"]
     assert [(t["frames_delivered"], t["frames_expected"]) for t in receipt["taps"]] == [
         (90, 90), (90, 90), (1, 1)]
@@ -1877,7 +1882,7 @@ def test_a_planned_cutaways_own_overlay_clause_must_carry_its_own_window() -> No
     """LOW-4 fold: a [b0] label sitting elsewhere in the graph (not consumed by ITS overlay) must not
     let the row pass — the match is pinned to the clause that actually rides [b0] into `overlay=`."""
     spec = _tap_spec(clips=1, logo=False)
-    decoy = "[x][b0]someotherfilter=enable='between(t,12.000,15.000)'[y]"
+    decoy = "[x][b0]someotherfilter=enable='between(round(t*30),360,449)'[y]"
     rows = op._broll_rows(spec, decoy)
     assert rows[0]["chain_label"] is None and rows[0]["error"]
 

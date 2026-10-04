@@ -11,6 +11,7 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
+from . import frames as _frames
 from .ops.dry import armed as _contour_dry_armed
 from .sanitize import safe_error
 
@@ -169,9 +170,10 @@ def _terminal_bt709(fc: str, out_v: str) -> str:
 # --- 1. persistent body logo --------------------------------------------------
 
 def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_end: float, *,
-                     base_v: str = "0:v", logo_v: str = "1:v", out_v: str = "vout",
+                     fps: float | str, base_v: str = "0:v", logo_v: str = "1:v", out_v: str = "vout",
                      tap_v: str | None = None) -> str:
-    """Persistent corner logo over the BODY only (t < body_end); the cover end-card carries its own.
+    """Persistent corner logo over the BODY only (output frames before body_end's frame); the cover
+    end-card carries its own.
     `tap_v` forks the prepared logo frame to a framemd5 pad — the overlay's own input, so a logo that
     delivered nothing reads 0 there instead of hiding behind a master that looks fine."""
     # The three labels are parameters for the same reason watermark_filter's are: in a merged graph
@@ -180,7 +182,7 @@ def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_
     y = f"H-h-{margin}" if corner in ("bl", "br") else f"{margin}"
     prep = f"[{logo_v}]format=rgba,colorchannelmixer=aa={opacity},scale={width}:-1:flags=lanczos"
     head = f"{prep}[lg];" if tap_v is None else f"{prep},split=2[lg][lgt];[lgt]{TAP_SCALE}[{tap_v}];"
-    return head + f"[{base_v}][lg]overlay={x}:{y}:enable='lt(t,{body_end:.3f})'[{out_v}]"
+    return head + f"[{base_v}][lg]overlay={x}:{y}:enable='lt({_frames.index(fps)},{_frames.frame_at(body_end, fps)})'[{out_v}]"
 
 
 # --- 2. animated watermark ----------------------------------------------------
@@ -198,8 +200,10 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
          "[i][d]concat=n=2:v=1:a=0[wm0];"
          f"[wm0]scale={width}:-1[wm]")
     if delay > 0:
-        f += f";[wm]setpts=PTS+{delay}/TB[wmd]"
-        f += f";[{base_v}][wmd]overlay={overlay_xy}:enable='gte(t,{delay})':shortest=1:format=auto[{out_v}]"
+        # The video entry is a grid frame (frames.py), not a float second; the chime stays in ms.
+        d = _frames.frame_at(delay, grid)
+        f += f";[wm]setpts=PTS+{_frames.pts_at(d, grid)}[wmd]"
+        f += f";[{base_v}][wmd]overlay={overlay_xy}:enable='gte({_frames.index(grid)},{d})':shortest=1:format=auto[{out_v}]"
     else:
         f += f";[{base_v}][wm]overlay={overlay_xy}:shortest=1:format=auto[{out_v}]"
     ret_a: str | None = None

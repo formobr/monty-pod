@@ -35,12 +35,13 @@ def test_hardcut_broll_overlays_and_covers():
     # base lands in [vbase], the cutaway overlay produces [vout]
     assert "[vbase][aout]" in g
     assert "[vout]" in g
-    # trim [in,in+dur], Ken Burns move (scale-2x cover → zoompan), seat at start
-    assert "trim=start=0.3:duration=2.4" in g
+    # source from `in`, cut to exactly dur*fps grid frames, Ken Burns move (scale-2x cover → zoompan), seat at
+    # the start FRAME — 23.75 s at 30 fps is 712.5, which rounds once to 713 (frames.frame_at)
+    assert "trim=start=0.3,setpts=PTS-STARTPTS,fps=30,trim=end_frame=72," in g
     assert "scale=2160:3840:force_original_aspect_ratio=increase:flags=lanczos,crop=2160:3840" in g
     assert "zoompan=z='(1.0+(0.12" in g            # 'in' preset zooms 1.0→1.0+amount (cutaway is NOT frozen)
     assert ":d=1:s=1080x1920:fps=30" in g          # zoompan emits canvas-size frames
-    assert "setpts=PTS-STARTPTS+23.750/TB" in g
+    assert "setpts=PTS-STARTPTS+713/30/TB" in g
 
 
 def test_broll_kenburns_preset_direction():
@@ -52,8 +53,8 @@ def test_broll_kenburns_preset_direction():
     g2 = render.build_filtergraph(_spec(clip2), gpu=False)
     assert "zoompan=z='(1.08+(0.0" in g2           # pan: constant 1+pan_zoom (0.08)
     assert "(iw-iw/zoom)*(0.15+(0.7" in g2         # x pans 0.15→0.85
-    # hard cut → plain overlay gated to the clip's span, base passes on eof
-    assert "overlay=enable='between(t,23.750,26.150)':eof_action=pass" in g
+    # hard cut → plain overlay gated to the clip's frame range [713,785), base passes on eof
+    assert "overlay=enable='between(round(t*30),713,784)':eof_action=pass" in g
 
 
 def test_no_broll_keeps_vout_directly():
@@ -74,7 +75,10 @@ def test_slide_transition_rides_overlay_xy():
     # entry window rides an eased overlay x offset; 'left' enters from the right edge (W-W*e)
     assert "overlay=x='" in g
     assert "W-W*" in g
-    assert "between(t,23.7500,24.1000)" in g  # [start, start+dur]
+    # [start, start+0.35s) from its two endpoints: frame_at(23.75)=713, frame_at(24.10)=723 → 10 frames
+    # (not 713 + a separately rounded round(0.35*30)=11, which would end a frame past 24.10's frame)
+    assert "if(between(round(t*30),713,722)," in g
+    assert "clip((round(t*30)-713)/10,0,1)" in g
 
 
 def test_push_return_uses_end_window():
@@ -82,7 +86,7 @@ def test_push_return_uses_end_window():
     clip["transition_out"] = {"kind": "push", "edge": "return", "direction": "up", "dur": 0.4}
     g = render.build_filtergraph(_spec(clip), gpu=False)
     assert "H-H*" in g  # 'up' moves on y
-    assert "between(t,25.7500,26.1500)" in g  # [end-dur, end], end=26.15
+    assert "if(between(round(t*30),773,784)," in g  # [end-12, end) frames, end=785
 
 
 def test_dissolve_is_alpha_fade_not_overlay_move():
@@ -90,7 +94,7 @@ def test_dissolve_is_alpha_fade_not_overlay_move():
     clip["transition_in"] = {"kind": "dissolve", "edge": "entry", "dur": 0.5}
     g = render.build_filtergraph(_spec(clip), gpu=False)
     assert "format=yuva420p" in g
-    assert "fade=t=in:st=23.750:d=0.500:alpha=1" in g
+    assert "fade=t=in:s=0:n=15:alpha=1" in g  # the cutaway's own first 15 frames
     assert "overlay=enable=" in g  # no x/y move for a dissolve
 
 

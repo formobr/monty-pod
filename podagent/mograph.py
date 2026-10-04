@@ -1,7 +1,7 @@
 """Mograph overlays on the pod: render motion_plan.sections via the (brand-agnostic) Remotion bundle the
 job delivers — brand crosses through inputProps, role fonts + section media are staged into the bundle
 public/. Each section packs to a transparent qtrle layer, overlaid onto the base gated to its
-[start,start+dur] window. The bundle is a per-job input cached by content hash, not image ballast: see
+[start,start+dur) output-frame range. The bundle is a per-job input cached by content hash, not image ballast: see
 bundle.py."""
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import subprocess
 import sys
 from collections import namedtuple
 from pathlib import Path
+
+from . import frames as _frames
 
 FPS = 30
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
@@ -316,8 +318,9 @@ def _esc(expr: str) -> str:
     return expr.replace(",", "\\,")
 
 
-def mark_glass_filters(i: int, src: str, backing: dict, start: float, end: float) -> tuple[list[str], str]:
-    """Blur+darken ONLY the mark's own box, following it, gated to [start+from, end].
+def mark_glass_filters(i: int, src: str, backing: dict, start: float, end: float,
+                       fps: float) -> tuple[list[str], str]:
+    """Blur+darken ONLY the mark's own box, following it, gated to the frame range [start+from, end).
 
     Blur the whole frame once (gated to the window, so it costs nothing outside it), CROP the mark's moving box
     out of the blurred copy, and overlay that one box back onto the sharp frame at the same moving position.
@@ -332,8 +335,7 @@ def mark_glass_filters(i: int, src: str, backing: dict, start: float, end: float
     if not kfs:
         return [], src
     bw, bh = kfs[0].rect[2], kfs[0].rect[3]
-    on = float(start) + float(backing.get("from") or 0.0)
-    win = f"between(t,{on},{end})"
+    win = _frames.between(*_frames.frame_range(float(start) + float(backing.get("from") or 0.0), end, fps), fps)
     # crop's box is in SOURCE pixels (in_w/in_h); overlay's in main-frame pixels (W/H). Same numbers, two
     # vocabularies — anim_expr takes the dimension expr, so each gets its own rather than a string rewrite.
     cx = _esc(f"clip({anim_expr(kfs, 0, 'linear', 'in_w')},0,in_w-out_w)")
@@ -352,39 +354,42 @@ def mark_glass_filters(i: int, src: str, backing: dict, start: float, end: float
 # knowledge of the frame behind it). The keys are the parity contract: the engine's gate demands they equal
 # the player's table and the planner's vocabulary, so no treatment can be one-sided. Declared after the
 # builder so the table holds the function object, not a name.
-_MARK_BACKING = {"glass": lambda i, src, b, s, e: mark_glass_filters(i, src, b, s, e),
+_MARK_BACKING = {"glass": lambda i, src, b, s, e, fps: mark_glass_filters(i, src, b, s, e, fps),
                  "shadow": None}
 
 
-def overlay_filtergraph(layers: list[dict], *, base: str = "0:v",
+def overlay_filtergraph(layers: list[dict], *, fps: float, base: str = "0:v",
                         layers_v: list[str] | None = None) -> tuple[str, str]:
     """Pure: (-filter_complex string, final video label) compositing alpha layers onto [base]. Each layer is
-    shifted to its start and gated to [start,start+dur]; a glass layer blurs+darkens the frame behind it; a
-    head_below layer slides the base head down first, so the layer's picture rides over the cleared top band."""
+    seated on its start frame and gated to the output-frame range [start, start+dur) (frames.py — the same
+    rounding a cutaway's window gets); a glass layer blurs+darkens the frame behind it; a head_below layer
+    slides the base head down first, so the layer's picture rides over the cleared top band."""
     # base/layers_v exist so a MERGED graph can hand real pad names: the defaults are this pass's own
     # -i order, which stops being 0/1/2… the moment the composite's inputs sit in front of the layers.
     filters, src = [], base
     for i, lay in enumerate(layers):
         s, e = lay["start"], lay["start"] + lay["dur"]
+        a, b = _frames.frame_range(s, e, fps)
+        win, seat = _frames.between(a, b, fps), _frames.pts_at(a, fps)
         idx = layers_v[i] if layers_v is not None else f"{i + 1}:v"
         if lay.get("glass"):
             # frosted-glass takeover: blur+darken the frame behind the card, gated to its window (parity with engine _composite).
-            filters.append(f"[{src}]gblur=sigma=22:enable='between(t,{s},{e})',"
-                           f"eq=brightness=-0.05:enable='between(t,{s},{e})'[g{i}]")
+            filters.append(f"[{src}]gblur=sigma=22:enable='{win}',"
+                           f"eq=brightness=-0.05:enable='{win}'[g{i}]")
             src = f"g{i}"
         backing = lay.get("backing") or None
         if backing and _MARK_BACKING.get(str(backing.get("treatment"))) is not None:
-            add, src = _MARK_BACKING[str(backing["treatment"])](i, src, backing, s, e)
+            add, src = _MARK_BACKING[str(backing["treatment"])](i, src, backing, s, e, fps)
             filters += add
         if lay.get("head_below"):
             # slide a copy of the base head DOWN over its window; the layer (SplitScreen alpha, overlaid next)
             # then covers the cleared top band. Mirrors MontagePreview / the retired engine _composite.
             yexpr = _hb_settle_y_expr(s, e)
             filters.append(f"[{src}]split[ha{i}][hb{i}];"
-                           f"[hb{i}]trim=start={s}:end={e},setpts=PTS-STARTPTS+{s}/TB[hw{i}];"
-                           f"[ha{i}][hw{i}]overlay=y='{yexpr}':enable='between(t,{s},{e})':eof_action=pass[hbv{i}]")
+                           f"[hb{i}]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS+{seat}[hw{i}];"
+                           f"[ha{i}][hw{i}]overlay=y='{yexpr}':enable='{win}':eof_action=pass[hbv{i}]")
             src = f"hbv{i}"
-        filters.append(f"[{idx}]setpts=PTS-STARTPTS+{s}/TB[o{i}];"
-                       f"[{src}][o{i}]overlay=enable='between(t,{s},{e})':eof_action=pass[v{i}]")
+        filters.append(f"[{idx}]setpts=PTS-STARTPTS+{seat}[o{i}];"
+                       f"[{src}][o{i}]overlay=enable='{win}':eof_action=pass[v{i}]")
         src = f"v{i}"
     return ";".join(filters), src

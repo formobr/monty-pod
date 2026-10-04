@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from . import finalize as _finalize
+from . import frames as _frames
 from .cp import ControlPlane, download, upload
 from .sanitize import safe_error
 from .models import MotionKeyframe, RenderSpec, SpecBrollClip, SpecTransition
@@ -281,16 +282,36 @@ def input_ids(spec: RenderSpec) -> list[str]:
 
 
 # b-roll cutaway overlay (final): transition exprs are single-quoted so commas stay literal, not separators.
+# Every cutaway window is the output-frame range [a, b) of frames.frame_range — the graph, the receipt row
+# and the tap's planned count all read it from broll_window, so none of them can round on its own.
 
-def _broll_slide_xy(clip: SpecBrollClip, start: float, end: float) -> tuple[str, str] | None:
+def broll_window(clip: SpecBrollClip, fps: float) -> tuple[int, int]:
+    """The cutaway's [start, start+dur) as output frame indices [a, b)."""
+    if clip.dur is None:
+        raise ValueError(f"final broll clip {clip.clip!r} has no resolved dur")
+    return _frames.frame_range(clip.start, clip.start + clip.dur, fps)
+
+
+def seam_window(clip: SpecBrollClip, tr: SpecTransition, phase: str, fps: float) -> tuple[int, int]:
+    """A seam's output-frame range [lo, hi) from the frame_range of its OWN two endpoints — entry
+    [start, start+dur), return [end-dur, end) — never from a rounded duration, so a seam ends on the
+    same frame as every other element ending at that time."""
+    assert clip.dur is not None
+    if phase == "entry":
+        return _frames.frame_range(clip.start, clip.start + tr.dur, fps)
+    end = clip.start + clip.dur
+    return _frames.frame_range(max(0.0, end - tr.dur), end, fps)
+
+
+def _broll_slide_xy(clip: SpecBrollClip, fps: float) -> tuple[str, str] | None:
     """(x_expr, y_expr) overlay offsets for a slide_wipe/push at this cutaway's entry/return seam, or
-    None when it hard-cuts (seated at 0,0). Dissolve is NOT here — it's an alpha fade on the clip."""
-    def _sel(tr: "SpecTransition | None", phase: str) -> "tuple[float, float, str, str] | None":
+    None when it hard-cuts (seated at 0,0). Dissolve is NOT here — it's an alpha fade on the clip.
+    Progress runs on the output frame index N (frames.index) over the seam's own frame range."""
+    def _sel(tr: "SpecTransition | None", phase: str) -> "tuple[int, int, str, str] | None":
         if tr is None or tr.kind not in ("slide_wipe", "push") or tr.direction is None:
             return None
-        dur = min(tr.dur, end - start)
-        t0 = start if phase == "entry" else end - dur
-        p = f"clip((t-{t0:.4f})/{dur:.4f},0,1)"
+        lo, hi = seam_window(clip, tr, phase, fps)
+        p = f"clip(({_frames.index(fps)}-{lo})/{hi - lo},0,1)"
         e = f"(pow({p},3)*({p}*({p}*6-15)+10))"  # smootherstep 0→1
         if phase == "return":
             e = f"(1-{e})"
@@ -303,7 +324,6 @@ def _broll_slide_xy(clip: SpecBrollClip, start: float, end: float) -> tuple[str,
             x, y = "0", f"H-H*{e}"
         else:  # down
             x, y = "0", f"-H+H*{e}"
-        lo, hi = (start, start + dur) if phase == "entry" else (end - dur, end)
         return (lo, hi, x, y)
 
     pieces = [s for s in (_sel(clip.transition_in, "entry"),
@@ -314,28 +334,31 @@ def _broll_slide_xy(clip: SpecBrollClip, start: float, end: float) -> tuple[str,
     def _expr(component: int) -> str:
         expr = "0"  # outside every window → seated
         for lo, hi, x, y in pieces:
-            expr = f"if(between(t,{lo:.4f},{hi:.4f}),{(x, y)[component]},{expr})"
+            expr = f"if({_frames.between(lo, hi, fps)},{(x, y)[component]},{expr})"
         return expr
 
     return _expr(0), _expr(1)
 
 
-def _broll_dissolve_frag(clip: SpecBrollClip, start: float, end: float) -> str:
+def _broll_dissolve_frag(clip: SpecBrollClip, a: int, b: int, fps: float) -> str:
     """Alpha-crossfade fragment spliced into a cutaway's source chain for a `dissolve` seam; '' if none.
-    alpha=1 ramps opacity (needs yuva420p) so the host shows through — a naплыв, not a luma fade."""
+    alpha=1 ramps opacity (needs yuva420p) so the host shows through — a naплыв, not a luma fade.
+    fade counts the cutaway's OWN frames (0 = its first): each ramp is its seam_window shifted by a and
+    clipped to the cutaway's [0, b-a), so it ends where the seam's endpoint frame says."""
     ti, to = clip.transition_in, clip.transition_out
     di = ti if (ti and ti.kind == "dissolve") else None
     do = to if (to and to.kind == "dissolve") else None
     if not di and not do:
         return ""
-    span = max(end - start, 1e-3)
     frag = ",format=yuva420p"
     if di:
-        d = min(di.dur, span)
-        frag += f",fade=t=in:st={start:.3f}:d={d:.3f}:alpha=1"
+        n = min(seam_window(clip, di, "entry", fps)[1], b) - a
+        if n > 0:
+            frag += f",fade=t=in:s=0:n={n}:alpha=1"
     if do:
-        d = min(do.dur, span)
-        frag += f",fade=t=out:st={end - d:.3f}:d={d:.3f}:alpha=1"
+        s = max(seam_window(clip, do, "return", fps)[0], a) - a
+        if b - a - s > 0:
+            frag += f",fade=t=out:s={s}:n={b - a - s}:alpha=1"
     return frag
 
 
@@ -385,8 +408,9 @@ def broll_tap_pads(spec: RenderSpec) -> list[str]:
 def _broll_chains(spec: RenderSpec, idx: dict[str, int], base_label: str,
                   taps: bool = False) -> list[str]:
     """Overlay every resolved cutaway onto [base_label] → [vout]: Ken Burns move (scale-2x→zoompan per the
-    clip's preset/amount), trim [in,in+dur], seat at `start`, ride authored slide/push (overlay x/y) or
-    dissolve (alpha fade). Audio untouched. `taps` forks each cutaway to its own framemd5 pad."""
+    clip's preset/amount), source from `in` cut to exactly b-a grid frames, seat on output frame a, gate to
+    [a, b), ride authored slide/push (overlay x/y) or dissolve (alpha fade). Audio untouched. `taps` forks
+    each cutaway to its own framemd5 pad."""
     assert spec.overlays is not None and spec.overlays.broll_final is not None
     clips = spec.overlays.broll_final.broll
     w, h = spec.timeline.width, spec.timeline.height
@@ -395,27 +419,25 @@ def _broll_chains(spec: RenderSpec, idx: dict[str, int], base_label: str,
     prev = f"[{base_label}]"
     last = len(clips) - 1
     for i, c in enumerate(clips):
-        if c.dur is None:
-            raise ValueError(f"final broll clip {c.clip!r} has no resolved dur")
-        start, end = c.start, c.start + c.dur
-        frag = _broll_dissolve_frag(c, start, end)
+        a, b = broll_window(c, fps)
+        frag = _broll_dissolve_frag(c, a, b, fps)
         j = idx[c.clip]
-        kb = _kenburns(c.preset, c.amount if c.amount is not None else 0.12, 0.08,
-                       max(1, round(c.dur * fps)), w, h, fps)
+        kb = _kenburns(c.preset, c.amount if c.amount is not None else 0.12, 0.08, b - a, w, h, fps)
         # The fork sits at the END of the chain: a tap taken any earlier would count frames the overlay
         # never saw, which is the whole question the receipt exists to answer.
         tail = f",split=2[b{i}][b{i}t]" if taps else f"[b{i}]"
         chains.append(
-            f"[{j}:v]trim=start={_num(c.in_ or 0.0)}:duration={_num(c.dur)},setpts=PTS-STARTPTS,"
-            f"fps={_num(fps)},{kb},setpts=PTS-STARTPTS+{start:.3f}/TB{frag}{tail}"
+            f"[{j}:v]trim=start={_num(c.in_ or 0.0)},setpts=PTS-STARTPTS,"
+            f"fps={_num(fps)},trim=end_frame={b - a},{kb},setpts=PTS-STARTPTS+{_frames.pts_at(a, fps)}"
+            f"{frag}{tail}"
         )
         if taps:
             chains.append(f"[b{i}t]{_finalize.TAP_SCALE}[vtap{i}]")
-        xy = _broll_slide_xy(c, start, end)
+        xy = _broll_slide_xy(c, fps)
         over = f"overlay=x='{xy[0]}':y='{xy[1]}':" if xy else "overlay="
         out_label = "vout" if i == last else f"o{i}"
         chains.append(
-            f"{prev}[b{i}]{over}enable='between(t,{start:.3f},{end:.3f})':eof_action=pass[{out_label}]"
+            f"{prev}[b{i}]{over}enable='{_frames.between(a, b, fps)}':eof_action=pass[{out_label}]"
         )
         prev = f"[o{i}]"
     return chains

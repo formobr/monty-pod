@@ -6,7 +6,6 @@ from __future__ import annotations
 import concurrent.futures as cf
 import hashlib
 import json
-import math
 import os
 import re
 import subprocess
@@ -20,6 +19,7 @@ from typing import NamedTuple
 from . import __version__
 from . import accents as _accents
 from . import finalize as _finalize
+from . import frames as _frames
 from . import mograph as _mograph
 from . import render as _render
 from .cp import upload
@@ -265,9 +265,10 @@ def tap_frames_expected(spec: RenderSpec) -> dict[str, int]:
         for i, c in enumerate(ov.broll_final.broll):
             if c.dur is None:
                 raise RuntimeError(f"final broll clip {c.clip!r} has no resolved dur")
-            # ceil, not round: trim=duration=dur is a half-open [0,dur) window, so a dur landing
-            # mid-frame (n/fps < dur <= (n+1)/fps) still delivers n+1 frames.
-            expected[f"vtap{i}"] = max(1, math.ceil(round(c.dur * fps, 6)))
+            # The cutaway chain cuts to exactly b-a grid frames (render.broll_window), so the plan
+            # counts the very same frame range the graph was built from.
+            a, b = _render.broll_window(c, fps)
+            expected[f"vtap{i}"] = max(1, b - a)
     if ov is not None and ov.finalize is not None and ov.finalize.logo is not None:
         expected[V_TAP_LOGO] = 1
     return expected
@@ -563,7 +564,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
 
     if p.layers:
         layers_v = [f"{inputs.add(Path(lay['mov']))}:v" for lay in p.layers]
-        frag, last = _mograph.overlay_filtergraph(list(p.layers), base=vlink, layers_v=layers_v)
+        frag, last = _mograph.overlay_filtergraph(list(p.layers), fps=fps, base=vlink, layers_v=layers_v)
         chains.append(rewire(frag, "mog", {vlink: vlink, **{lv: lv for lv in layers_v}, last: V_MOGRAPH}))
         vlink = V_MOGRAPH
 
@@ -604,7 +605,8 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
                 prefix, terminal = fc.rsplit("[vout]", 1)
                 parts = [prefix + "[preburn]" + terminal]
                 prev = "[preburn]"
-            parts, prev = _accents.add_offset_jump(parts, prev, plan.boundaries, w=w, h=h)
+            parts, prev = _accents.add_offset_jump(parts, prev, plan.boundaries, w=w, h=h, fps=grid,
+                                                  slips=plan.slips)
             parts, prev = _accents.add_filmburn(parts, prev, burn, plan.boundaries, list(p.flares),
                                                 opacity=plan.opacity, w=w, h=h, fps=grid)
             chains.append(rewire(";".join(parts), "acc",
@@ -621,7 +623,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         # body_end is the WHOLE body: cover_hold reserves the welded end-card's tail, and preflight
         # refuses a cover here, so there is no tail to reserve.
         tapped = {"tap_v": V_TAP_LOGO} if V_TAP_LOGO in pads else {}
-        frag = _finalize.body_logo_filter(lg.corner, lg.width, lg.opacity, lg.margin, p.duration,
+        frag = _finalize.body_logo_filter(lg.corner, lg.width, lg.opacity, lg.margin, p.duration, fps=grid,
                                           base_v=vlink, logo_v=logo_v, out_v=V_LOGO, **tapped)
         subst = {vlink: vlink, logo_v: logo_v, V_LOGO: V_LOGO}
         if tapped:
@@ -814,7 +816,8 @@ def _broll_rows(spec: RenderSpec, graph: str) -> list[dict]:
     rows: list[dict] = []
     for i, c in enumerate(ov.broll_final.broll):
         start, end = c.start, c.start + (c.dur or 0.0)
-        enable = f"between(t,{start:.3f},{end:.3f})"
+        a, b = _frames.frame_range(start, end, spec.timeline.fps)  # == render.broll_window once dur is set
+        enable = _frames.between(a, b, spec.timeline.fps)
         # rewire namespaces a builder's internal pads, so [b{i}] must be read as MERGED, and the match
         # is bound to ONE overlay clause (not the graph at large) so a swapped chain cannot pass.
         found = re.search(rf"\[(b{i}(?:__[A-Za-z0-9_]+)?)\]overlay=[^;]*?enable='{re.escape(enable)}'",
@@ -823,8 +826,8 @@ def _broll_rows(spec: RenderSpec, graph: str) -> list[dict]:
               "end": round(end, 3), "enable": enable, "tap_pad": f"vtap{i}"}
         if found is None:
             row["chain_label"] = None
-            row["error"] = (f"planned cutaway {c.clip!r} has no chain [b{i}] enabled over "
-                            f"[{start:.3f},{end:.3f}) in the filtergraph this encode ran")
+            row["error"] = (f"planned cutaway {c.clip!r} has no chain [b{i}] enabled over frames "
+                            f"[{a},{b}) in the filtergraph this encode ran")
         else:
             row["chain_label"] = found.group(1)
         rows.append(row)
@@ -836,7 +839,8 @@ def _logo_row(spec: RenderSpec, body_end: float, pads: list[str]) -> dict | None
     fin = ov.finalize if ov is not None else None
     if fin is None or fin.logo is None:
         return None
-    return {"input_id": fin.logo.asset, "enable": f"lt(t,{body_end:.3f})",
+    grid = _finalize.declared_grid(spec.timeline.fps)
+    return {"input_id": fin.logo.asset, "enable": f"lt({_frames.index(grid)},{_frames.frame_at(body_end, grid)})",
             "tap": V_TAP_LOGO if V_TAP_LOGO in pads else None}
 
 

@@ -253,6 +253,9 @@ class SpecAccent(BaseModel):
     intensity: float = Field(ge=0, le=1)
     burn: str | None = Field(default=None, min_length=1)
     clicks: str | None = Field(default=None, min_length=1)
+    # film_burn only: the engine's precomputed frame slip as [(t_rel, dy_px)] around `at` (video-editor
+    # scripts/burn_slip.keyframes, the SAME list the preview plays). Absent → add_offset_jump draws it itself.
+    slip: list[tuple[float, float]] | None = Field(default=None, min_length=2)
 
     @model_validator(mode="after")
     def _film_burn_needs_both(self) -> "SpecAccent":
@@ -270,6 +273,8 @@ class SpecAccent(BaseModel):
                 raise ValueError("film_burn accent requires both burn and clicks input ids")
         elif burn_set or clicks_set:
             raise ValueError(f"{self.kind} accent must not carry burn/clicks (film_burn only)")
+        if self.slip is not None and self.kind != "film_burn":
+            raise ValueError(f"{self.kind} accent must not carry slip (film_burn only)")
         return self
 
 
