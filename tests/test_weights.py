@@ -74,7 +74,7 @@ def _ref(payload: bytes, **over) -> WeightsRef:
 # --- the fetch ---------------------------------------------------------------------------------
 
 def test_a_hub_shaped_tar_resolves_to_the_snapshot_dir(served):
-    """The seeded tars (scripts/render/upload_models.py) are HF-hub shaped, so the returned path must be the
+    """The seeded tars (the engine's model uploader) are HF-hub shaped, so the returned path must be the
     snapshot dir from_pretrained can actually read — not the tar root."""
     hub = "models--acme--m"
     payload = _tar_bytes({f"{hub}/refs/main": "abc123",

@@ -7,15 +7,15 @@ import pytest
 
 from podagent import cp
 
-# The real shape both in-repo presigners emit — Go's r2.go:70,76,133,211,228 and Python's
-# store_s3.py:127,149,256 — never an invented spelling (docs/TESTING.md §3b.3).
+# The real shape both in-repo presigners emit — the engine's Go presigner and its Python
+# S3-store module — never an invented spelling (docs/TESTING.md §3b.3).
 PRESIGNED = ("https://acct.r2.cloudflarestorage.com/bucket/work/fleet/s/cut.mp4"
              "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
              "&X-Amz-Credential=AKIAEXAMPLE%2F20260829%2Fauto%2Fs3%2Faws4_request"
              "&X-Amz-Date=20260829T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host"
              "&X-Amz-Signature=0a79a76965ec9f93e27e38d15ddf76978aae86c8450da425ebffe684e062bbc0")
-# The local contour's own MinIO (dev/localpod/.env.example:14) — plain http on loopback, a real
-# production path per decisions.yaml `one-local-mode-and-it-is-production`.
+# The local contour's own MinIO (the local contour's env example) — plain http on loopback, a real
+# production path per the engine's decision `one-local-mode-and-it-is-production`.
 MINIO_LOCAL = ("http://127.0.0.1:9000/monty/work/fleet/s/cut.mp4"
                "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
                "&X-Amz-Credential=minioadmin%2F20260829%2Fauto%2Fs3%2Faws4_request"

@@ -90,7 +90,7 @@ def test_the_clamp_is_a_closed_enum():
 def test_an_unknown_param_is_refused_whole_which_is_why_the_engine_gates():
     """THE ASYMMETRY, stated where it is enforced: this is what an image PREDATING `height_mode` does with a
     payload carrying it. Additive is free only in the pod→engine direction, so the engine withholds the
-    field below its minimum pin (op_chains.OPS_MIN_IMAGE)."""
+    field below its minimum pin (the engine's own op-chains minimum-image pin)."""
     pytest.importorskip("jsonschema")
     with pytest.raises(registry.OpError, match="invalid params"):
         registry.validate_params("media.scale", {**_SCALE, "no_upscale": True})

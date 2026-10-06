@@ -8,7 +8,7 @@ from pydantic import ConfigDict, Field, model_validator
 
 _MISSING = object()
 WIRE_BUNDLE_FORMAT: Final = 1
-WIRE_BUNDLE_SHA256: Final = '1ef4b5ac334541841d658ae28376648d163bb85e1a082445b201ae78c71ac883'
+WIRE_BUNDLE_SHA256: Final = '93b56ccb265620f300c7873807655e37358bf4d0a481b2ebb10388efc0b14933'
 WIRE_CONTRACT_VERSION: Final = 14
 
 

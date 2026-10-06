@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "Deterministic for a fixed ffmpeg build: the trim+concat filtergraph is a pure function of the removed spans (and the source's own duration), and libx264 at a pinned preset/crf over identical input bytes emits identical output bytes. tests/test_op_edit_splice.py runs the handler twice on one clip and sha256-compares the bytes, and pins the filtergraph string, so a drift shows as a hash/argv diff rather than as mystery-different pixels. WHICH spans to remove is the FE's editorial decision and arrives as params (data); the overlay-timeline remap around it is arithmetic that stays on the brain — only this splice crosses."
+    "note": "Deterministic for a fixed ffmpeg build: the trim+concat filtergraph is a pure function of the removed spans (and the source's own duration), and libx264 at a pinned preset/crf over identical input bytes emits identical output bytes. the engine's parity test for this op runs the handler twice on one clip and sha256-compares the bytes, and pins the filtergraph string, so a drift shows as a hash/argv diff rather than as mystery-different pixels. WHICH spans to remove is the FE's editorial decision and arrives as params (data); the overlay-timeline remap around it is arithmetic that stays on the brain — only this splice crosses."
   },
   "inputs": [
     {"id": "src", "kind": "video"}

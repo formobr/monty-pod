@@ -38,8 +38,8 @@ BOLD_SIZE = 80      # "bold" look: same ≤2-line block/wrap as phrase, heavier 
 _REF_H = 1920
 _SAFE_BOTTOM = 1565
 
-# safe-zone sides: the SAME box the browser preview wraps to — engine scripts/safezone.py:23-24
-# (`_LEFT, _RIGHT = 112, 951` on 1080×1920, brand safe box in brand_tokens.py). Scales with width.
+# safe-zone sides: the SAME box the browser preview wraps to — the engine's safe-zone box
+# (`_LEFT, _RIGHT = 112, 951` on 1080×1920, brand safe box in the engine's brand tokens module). Scales with width.
 _REF_W = 1080
 _SAFE_LEFT = 112
 _SAFE_RIGHT = 951

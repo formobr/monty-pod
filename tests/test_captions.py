@@ -62,7 +62,7 @@ def test_colours_are_required_arguments() -> None:
 
 
 def test_no_colour_literal_survives_in_the_module() -> None:
-    """NEGATIVE — the file itself must hold no `#rrggbb`. The engine gate (tests/test_brand_literals.py)
+    """NEGATIVE — the file itself must hold no `#rrggbb`. The engine gate (its own brand-literals test)
     proves it is not THIS brand's colour; this proves it is not ANY colour, defaults included."""
     src = Path(captions.__file__).read_text(encoding="utf-8")
     code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
@@ -142,7 +142,7 @@ def test_bold_size_sits_between_phrase_and_title() -> None:
 
 def test_the_three_legacy_styles_keep_their_own_size_and_stay_not_bold() -> None:
     """NEGATIVE — proves the `bold` addition did not leak BOLD_SIZE/Bold:1 into phrase/phrase_jump (byte-exact
-    pin for oneword lives in tests/test_captions_ass_golden.py; this covers the two _build_ass_phrase callers
+    pin for oneword lives in this module's own captions-ASS golden test; this covers the two _build_ass_phrase callers
     the golden test does not hash)."""
     font = _real_font()
     kw = dict(font=font, w=1080, h=1920, fg=_FG, accent=_ACCENT, center_y=0.76)
@@ -157,7 +157,7 @@ def test_the_three_legacy_styles_keep_their_own_size_and_stay_not_bold() -> None
 # ── safe width: the same side box as the browser preview ─────────────────────────────────────────────
 
 def test_side_limits_are_the_engine_safe_box() -> None:
-    """Twin parity (like _SAFE_BOTTOM): engine scripts/safezone.py:23-24 `_LEFT, _RIGHT = 112, 951`."""
+    """Twin parity (like _SAFE_BOTTOM): the engine's safe-zone box `_LEFT, _RIGHT = 112, 951`."""
     assert (captions._REF_W, captions._SAFE_LEFT, captions._SAFE_RIGHT) == (1080, 112, 951)
     assert captions._safe_maxw(1080) == 839
     assert captions._safe_maxw(2160) == 1678                    # scales with the frame width

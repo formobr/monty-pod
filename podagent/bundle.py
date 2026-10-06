@@ -47,7 +47,7 @@ def ensure(ref: BundleRef) -> Path:
     if missing:
         raise RuntimeError(
             f"remotion bundle {ref.sha256[:12]} is not a Remotion project — missing {', '.join(missing)} "
-            f"under {root}. Rebuild it with scripts/render/build_remotion_bundle.py.")
+            f"under {root}. Rebuild it with the engine's Remotion bundle builder.")
     return root
 
 

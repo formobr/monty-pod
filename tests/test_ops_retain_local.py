@@ -399,7 +399,7 @@ def test_there_is_no_override_knob_for_the_worker_name(monkeypatch):
 def test_the_terminal_names_the_holder_exactly_when_a_step_retained(tmp_path, wired):
     """The consumer half's premise: the box learns WHERE the bytes stayed only from the terminal. A retain
     whose terminal stays silent is a master nobody can bind — the engine refuses the whole preview cut on it
-    (op_chains.require_retained_worker), so this seam is load-bearing on every preview."""
+    (the engine's own op-chains retained-worker check), so this seam is load-bearing on every preview."""
     _puts, _gets = wired
     kept = OpChain(job_id="j", pack=_PACK, steps=[_cut_step(retain=True)]).steps[0]
     sink_kept: list[runner.StepTiming] = []

@@ -1,5 +1,5 @@
 """A pod whose ffmpeg cannot decode via cuda hwaccel silently falls back to software (0.73x-realtime
-incident, docs/research/nvdec-normalize-config.md) even though its NVENC probe passed — NVENC and NVDEC are
+incident, the engine's own nvdec-normalize research note) even though its NVENC probe passed — NVENC and NVDEC are
 separate silicon. This probe forces the failure loud at boot, before the pod claims anything."""
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ def test_a_dead_encoder_leg_also_refuses_before_ever_trying_to_decode(monkeypatc
 
 def test_the_probe_exercises_the_hwdownload_filter_we_rely_on_for_a_loud_failure(monkeypatch):
     """Without `hwdownload` after `-hwaccel_output_format cuda`, a missing NVDEC decodes in software with
-    rc 0 (docs/research/nvdec-normalize-config.md) and this whole probe would silently pass everywhere."""
+    rc 0 (the engine's own nvdec-normalize research note) and this whole probe would silently pass everywhere."""
     seen, fake = _fake_run()
     monkeypatch.setattr(subprocess, "run", fake)
     agent_main._nvdec_or_refuse(_CP())

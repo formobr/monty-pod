@@ -52,7 +52,7 @@ _OPS_MAX_CHAINS_ENV = "OPS_MAX_CHAINS"
 _OPS_MAX_CHAINS_DEFAULT = 8
 _OPS_CLAIM_MAX = 4
 
-# Twin of podagent.render.VULKAN_PROBE and scripts/montyops/camera_apply.py.VULKAN_PROBE; pin all three
+# Twin of podagent.render.VULKAN_PROBE and the engine's camera.apply op VULKAN_PROBE; pin all three
 # copies in the superproject parity test.
 # NVENC min frame dimension on newer GPUs exceeds 32; a tiny probe frame false-fails the whole GPU.
 VULKAN_PROBE = (
@@ -98,7 +98,7 @@ free VRAM — nvidia-smi, never a second device-reading tool.
 VRAM_PEAK_USED_MB IS DELIBERATELY ABSENT. nvidia-smi's memory.used is an instantaneous snapshot — "allocated
 by active contexts" right now — and this whole declaration runs ONCE, at boot, before any model has loaded.
 Publishing that snapshot under a name that promises a peak would be the exact "0.0 reads like somebody
-looked" failure rent_receipt.py exists to catch: a genuine peak needs a source that TRACKS one over the pod's
+looked" failure the engine's rent-receipt check exists to catch: a genuine peak needs a source that TRACKS one over the pod's
 life, and nvidia-smi has no such query. So: a real total, and a named absence rather than a mislabeled instant.
 """
 
@@ -224,7 +224,7 @@ def _env_or_exit(name: str) -> str:
 
 
 def _refuse_dry_off_local_contour() -> None:
-    """Twin of `prod_contour.is_production()`, on the pod's own visible fact: a rented pod's image always
+    """Twin of the engine's own production-contour check, on the pod's own visible fact: a rented pod's image always
     bakes `POD_IMAGE_TAG` (registry.image_tag()); the local worktree process never does."""
     from .ops.dry import ARM_ENV, armed
     from .ops.registry import image_tag
@@ -243,7 +243,7 @@ def _llm_correlation(corr_id: str | None):
     """Delegate one product corr to the keyless control-plane LLM proxy.
 
     The pod's ``JOB_TOKEN`` authenticates the physical worker, not a tenant.  The API therefore requires
-    the claimed corr on worker LLM requests.  Keep the binding in ``scripts.llm``'s ContextVar so concurrent
+    the claimed corr on worker LLM requests.  Keep the binding in the engine LLM client's ContextVar so concurrent
     chains cannot race through a process-wide ``MONTY_CORR_ID`` environment variable.  The import is lazy:
     the public pod image may run an ops pack with no engine LLM module at all.
     """
@@ -334,7 +334,7 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
 BOOT_FREE_VRAM_WHY = """
 A RENTED CARD CAN ARRIVE ALREADY FULL, AND THE MARKETPLACE CANNOT TELL US BEFOREHAND.
 
-clore's marketplace API exposes only INSTALLED VRAM (specs.gpuram), never current usage nor the host's
+The provider's marketplace API exposes only INSTALLED VRAM (specs.gpuram), never current usage nor the host's
 background job (that is owner-only server_config); its own renter troubleshooting says to check nvidia-smi for
 other processes. Server 96828 (RTX 5060 Ti 16 GB) had ~14 GiB held by foreign processes on 4 rents, and our
 warm-up OOM'd («15.48 GiB total, 19 MiB free») only AFTER the pod had reported ready and taken work.
@@ -434,7 +434,7 @@ def _ffmpeg_version_head(edge_lines: int = 2) -> str:
 
 def _nvdec_or_refuse(cp: "ControlPlane") -> None:
     """A passing NVENC probe does not prove NVDEC — separate silicon behind the same driver, and the
-    0.73x-realtime incident host silently software-decoded the whole run despite it (nvdec-normalize-config.md)."""
+    0.73x-realtime incident host silently software-decoded the whole run despite it (the engine's NVDEC normalize research note)."""
     import subprocess
     import tempfile
     with tempfile.TemporaryDirectory(prefix="podagent-nvdec-") as tmp:
@@ -445,7 +445,7 @@ def _nvdec_or_refuse(cp: "ControlPlane") -> None:
         # `hwdownload` requires a HARDWARE frame; unlike bare `-hwaccel cuda` it cannot fall back to software.
         # MISC-188 EXEMPTION: `probe_mp4` is a single 1-frame 256x256 synthetic clip this same function just
         # encoded — no frame-threading DPB pressure, nowhere near NVDEC's 32-surface pool, so no `-threads`
-        # pin (tests/test_nvdec_decode_threads.py).
+        # pin (the engine's NVDEC decode-threads test).
         decode = ["ffmpeg", "-v", "error", "-init_hw_device", "cuda=gpu", "-hwaccel", "cuda",
                   "-hwaccel_output_format", "cuda", "-i", probe_mp4,
                   "-vf", "hwdownload,format=nv12", "-f", "null", "-"]
@@ -524,7 +524,7 @@ def _nvidia_ldconfig_names(ldconfig_out: str) -> list[str]:
 
 
 def _icd_dir_listing(path: str) -> str:
-    """"<dir>: a.json" / ": empty" / ": absent" — an unreadable directory is a NAMED absence, never silently
+    """"<dir>: <names>" / ": empty" / ": absent" — an unreadable directory is a NAMED absence, never silently
     the same fact as an empty one."""
     try:
         entries = sorted(entry.name for entry in Path(path).iterdir())
@@ -572,7 +572,7 @@ def _nvidia_driver_version() -> str:
 def _run_vulkan_probe() -> tuple[bool, str, bytes]:
     """One VULKAN_PROBE run under whatever VK_ICD_FILENAMES is currently set. raw_stderr stays UNTRUNCATED —
     bounding only ever happens on the wire, never on what reaches the pod's own stderr log."""
-    # Twin of podagent.render.VULKAN_PROBE and scripts/montyops/camera_apply.py.VULKAN_PROBE.
+    # Twin of podagent.render.VULKAN_PROBE and the engine's camera.apply op VULKAN_PROBE.
     import subprocess
     try:
         r = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=120)
@@ -677,7 +677,7 @@ def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None,
     forever; the ONLY door this loop itself walks out of early is a DEFINITIVE identity verdict on the
     ready frame itself (this worker's own identity will never validate), which still exits honestly at 4,
     same as every other transport-unhealthy give-up. A pod that can never confirm readiness at all is
-    someone else's job to end — the pool's own `unready_claimed` rotation (deadline.yaml
+    someone else's job to end — the pool's own `unready_claimed` rotation (the engine's deadline table
     `pod_readiness_round` / `pool_unready_claimed`), never this loop giving up on itself.
     """
     event: dict[str, Any] = {
@@ -939,7 +939,7 @@ def _infra_fault_reporter(cp: ControlPlane, coordinator: "RestartCoordinator") -
 
 def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str,
              coordinator: "RestartCoordinator | None" = None) -> None:
-    """Run an op chain. Dispatch is a registry LOOKUP, never a per-op branch (tests/test_ops_dispatch_is_a_lookup.py).
+    """Run an op chain. Dispatch is a registry LOOKUP, never a per-op branch (the engine's own dispatch-is-a-lookup test).
     A RESTART_REQUIRED return means the pack generation flipped; coordinator hears about it, no terminal is built."""
     from .ops.runner import RESTART_REQUIRED, infra_fault_sink, run_chain
 
@@ -1171,7 +1171,7 @@ def _guarded(fn: Any, cp: ControlPlane, meta: dict[str, str | None] | None = Non
                      "error": safe_error(e)})
 
 
-# DERIVED: above the largest known single-arm budget (montyops/patience.py ARM_S, cut_apply.py
+# DERIVED: above the largest known single-arm budget (the op pack's patience ARM_S, cut.apply's
 # CUT_APPLY_SEG_S — both 900s), capped at the brain's own "ops" patience (pod_lane.DEFAULT_WORK_BUDGET_S=1800s).
 _RESTART_DRAIN_S_ENV = "POD_RESTART_DRAIN_S"
 _RESTART_DRAIN_S_DEFAULT = 1800.0

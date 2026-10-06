@@ -1,7 +1,7 @@
 # contracts — the render seam
 
 The pod is a dumb executor on rented GPUs. Everything that crosses this seam is **data, never
-code**: the planning side decides, writes a `spec.json`, the pod applies it. This directory is the
+code**: the planning side decides, writes a spec (`spec.schema.json`), the pod applies it. This directory is the
 SSOT for that seam — JSON Schema (draft 2020-12) + golden examples + a `validate.py` tripwire.
 Consumers on both sides mirror these schemas and re-run the same goldens against their mirrors.
 

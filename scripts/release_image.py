@@ -7,6 +7,10 @@ its embedded identity, and the engine pins without writes. ``pin`` performs the
 same source/artifact proof independently of old engine pins, updates the clean
 engine checkout, then proves the resulting pins.
 
+Where the pins live inside the engine checkout, and how its pin doc is regenerated, is the ENGINE's to
+say: the caller passes ``--pin-file``, ``--doc-file`` (both relative to ``--engine-dir``) and, for ``pin``,
+``--doc-regen`` (a shell-quoted command run in ``--engine-dir``). This public repo never spells them.
+
 Neither mode creates or pushes git tags or commits, dispatches CI, builds an
 image, or waits for publication. GHCR verification is an anonymous bounded read.
 """
@@ -15,8 +19,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -151,13 +155,13 @@ class Registry:
 
     def _read(self, url: str, *, headers: dict[str, str] | None = None) -> tuple[str, dict[str, str]]:
         # TRK-79: `verify`/`pin` runs this from the engine's own image-boot proof, which the landing/ship
-        # threaded proof pool (`proof_units.py`'s `run_units`, `ThreadPoolExecutor`) calls from a WORKER
+        # threaded proof pool (the engine's own `run_units`, `ThreadPoolExecutor`) calls from a WORKER
         # THREAD. `multiprocessing`'s fork context only clones the calling thread, so a lock any sibling
         # thread held is frozen mid-state in the child, and the child can die with no result for reasons
         # that have nothing to do with the read itself (measured: the same read passed 71s earlier on
         # v0.20.70) — and `spawn`/`forkserver` need the target to be importable BY NAME from a fresh
-        # interpreter, which this module is not when `_boot_probe_registry_module` (release_all.py) or
-        # this test file load it via `importlib.util.spec_from_file_location`. A genuine `subprocess` —
+        # interpreter, which this module is not when `_boot_probe_registry_module` (the engine's release
+        # driver) or this test file load it via `importlib.util.spec_from_file_location`. A genuine `subprocess` —
         # re-invoking THIS FILE by its own resolved path, which is correct however this module was loaded
         # — has neither problem: no inherited threads/locks, and no by-name import at all.
         try:
@@ -309,8 +313,29 @@ def inspect_source_artifact(image_sha: str, commands: Commands, registry: Regist
     return registry.inspect(commit, commit)
 
 
-def engine_pin_values(engine: Path) -> tuple[str, str]:
-    text = (engine / "scripts" / "broker" / "pod_image.py").read_text(encoding="utf-8")
+@dataclass(frozen=True)
+class EngineLayout:
+    """Where, inside the engine checkout, the image pin and its generated doc live, and the command that
+    regenerates that doc. The ENGINE owns its own layout: this public tool never spells it — the caller hands
+    it in (`--pin-file`, `--doc-file`, `--doc-regen`) at release time."""
+    pin_file: Path
+    doc_file: Path
+    doc_regen: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for what, rel in (("--pin-file", self.pin_file), ("--doc-file", self.doc_file)):
+            if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+                raise ReleaseError(f"{what} must be a path inside the engine checkout, relative to it")
+
+    def pin(self, engine: Path) -> Path:
+        return engine / self.pin_file
+
+    def doc(self, engine: Path) -> Path:
+        return engine / self.doc_file
+
+
+def engine_pin_values(engine: Path, layout: EngineLayout) -> tuple[str, str]:
+    text = layout.pin(engine).read_text(encoding="utf-8")
     image = re.findall(r'^POD_AGENT_IMAGE\s*=\s*"([^"]+)"$', text, re.MULTILINE)
     digest = re.findall(r'^POD_AGENT_AMD64_DIGEST\s*=\s*"([^"]+)"$', text, re.MULTILINE)
     if len(image) != 1 or len(digest) != 1:
@@ -318,8 +343,8 @@ def engine_pin_values(engine: Path) -> tuple[str, str]:
     return image[0], digest[0]
 
 
-def verify_engine(engine: Path, receipt: ImageReceipt, commands: Commands) -> None:
-    image, digest = engine_pin_values(engine)
+def verify_engine(engine: Path, layout: EngineLayout, receipt: ImageReceipt, commands: Commands) -> None:
+    image, digest = engine_pin_values(engine, layout)
     if image != f"{IMAGE_REPO}:{receipt.tag}" or digest != receipt.amd64_digest:
         raise ReleaseError("engine image SHA tag/digest do not equal the verified GHCR receipt")
     submodule_sha = require_full_sha(
@@ -327,9 +352,9 @@ def verify_engine(engine: Path, receipt: ImageReceipt, commands: Commands) -> No
         "engine pod-agent gitlink")
     if submodule_sha != receipt.commit:
         raise ReleaseError("engine pod-agent gitlink does not equal the image source commit")
-    doc = (engine / "docs" / "gen" / "POD_IMAGE.md").read_text(encoding="utf-8")
+    doc = layout.doc(engine).read_text(encoding="utf-8")
     if image not in doc or digest not in doc:
-        raise ReleaseError("generated POD_IMAGE doc does not quote the exact SHA tag and amd64 digest")
+        raise ReleaseError("generated pin doc does not quote the exact SHA tag and amd64 digest")
 
 
 def replace_once(text: str, pattern: str, replacement: str, what: str) -> str:
@@ -339,11 +364,11 @@ def replace_once(text: str, pattern: str, replacement: str, what: str) -> str:
     return updated
 
 
-def update_engine(engine: Path, receipt: ImageReceipt, commands: Commands) -> None:
+def update_engine(engine: Path, layout: EngineLayout, receipt: ImageReceipt, commands: Commands) -> None:
     """Update exact local pin paths, rolling every one back on any refusal."""
     require_clean(engine, commands, "engine")
-    pin_file = engine / "scripts" / "broker" / "pod_image.py"
-    doc_file = engine / "docs" / "gen" / "POD_IMAGE.md"
+    pin_file = layout.pin(engine)
+    doc_file = layout.doc(engine)
     old_pin = pin_file.read_text(encoding="utf-8")
     old_doc = doc_file.read_text(encoding="utf-8")
     old_submodule = commands.out(["git", "rev-parse", "HEAD"], cwd=engine / "pod-agent")
@@ -361,15 +386,18 @@ def update_engine(engine: Path, receipt: ImageReceipt, commands: Commands) -> No
         updated = replace_once(updated, r'^POD_AGENT_AMD64_DIGEST\s*=\s*"[^"]+"$',
                                f'POD_AGENT_AMD64_DIGEST = "{receipt.amd64_digest}"', "digest")
         pin_file.write_text(updated, encoding="utf-8")
-        python = engine / ".venv" / "bin" / "python"
-        if not python.is_file():
-            raise ReleaseError("engine .venv Python is missing; generated doc cannot be proven")
-        env = dict(os.environ, PYTHONPATH=str(engine / "scripts"))
-        result = subprocess.run([str(python), "-m", "gen", "--write", "--only", "doc:pod_image"],
-                                cwd=engine, env=env, capture_output=True, text=True, timeout=60)
+        argv = list(layout.doc_regen)
+        if not argv:
+            raise ReleaseError("no --doc-regen command; generated doc cannot be proven")
+        if "/" in argv[0] and not Path(argv[0]).is_absolute():
+            # a relative program (an engine-local interpreter) is the ENGINE's, resolved inside its checkout
+            argv[0] = str(engine / argv[0])
+            if not Path(argv[0]).is_file():
+                raise ReleaseError("--doc-regen program is missing in the engine; generated doc cannot be proven")
+        result = subprocess.run(argv, cwd=engine, capture_output=True, text=True, timeout=60)
         if result.returncode:
-            raise ReleaseError("engine POD_IMAGE generator failed")
-        verify_engine(engine, receipt, commands)
+            raise ReleaseError("engine pin-doc generator failed")
+        verify_engine(engine, layout, receipt, commands)
     except Exception as exc:
         rollback_errors: list[str] = []
         try:
@@ -390,16 +418,18 @@ def update_engine(engine: Path, receipt: ImageReceipt, commands: Commands) -> No
         raise
 
 
-def pin(image_sha: str, engine: Path, commands: Commands, registry: Registry) -> ImageReceipt:
+def pin(image_sha: str, engine: Path, layout: EngineLayout, commands: Commands,
+        registry: Registry) -> ImageReceipt:
     receipt = inspect_source_artifact(image_sha, commands, registry)
-    update_engine(engine, receipt, commands)
+    update_engine(engine, layout, receipt, commands)
     print(f"[image] PINNED sha={image_sha} amd64={receipt.amd64_digest}")
     return receipt
 
 
-def verify(image_sha: str, engine: Path, commands: Commands, registry: Registry) -> ImageReceipt:
+def verify(image_sha: str, engine: Path, layout: EngineLayout, commands: Commands,
+           registry: Registry) -> ImageReceipt:
     receipt = inspect_source_artifact(image_sha, commands, registry)
-    verify_engine(engine, receipt, commands)
+    verify_engine(engine, layout, receipt, commands)
     print(f"[image] PASS sha={image_sha} amd64={receipt.amd64_digest}")
     return receipt
 
@@ -415,12 +445,20 @@ def main(argv: list[str] | None = None) -> int:
         cmd = sub.add_parser(name)
         cmd.add_argument("sha")
         cmd.add_argument("--engine-dir", type=Path, required=True)
+        # The engine's own layout, supplied by the engine's caller: this public repo never spells it.
+        cmd.add_argument("--pin-file", type=Path, required=True,
+                         help="the engine's image-pin module, relative to --engine-dir")
+        cmd.add_argument("--doc-file", type=Path, required=True,
+                         help="the engine's generated pin doc, relative to --engine-dir")
+        cmd.add_argument("--doc-regen", required=name == "pin", default="",
+                         help="command (shell-quoted) that regenerates --doc-file, run in --engine-dir")
     args = parser.parse_args(argv)
     try:
+        layout = EngineLayout(args.pin_file, args.doc_file, tuple(shlex.split(args.doc_regen)))
         if args.command == "pin":
-            pin(args.sha, args.engine_dir.resolve(), Commands(), Registry())
+            pin(args.sha, args.engine_dir.resolve(), layout, Commands(), Registry())
         else:
-            verify(args.sha, args.engine_dir.resolve(), Commands(), Registry())
+            verify(args.sha, args.engine_dir.resolve(), layout, Commands(), Registry())
         return 0
     except ReleaseError as exc:
         print(f"[image] REFUSE: {exc}", file=sys.stderr)

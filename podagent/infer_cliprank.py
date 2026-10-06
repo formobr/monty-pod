@@ -30,7 +30,7 @@ _MISS = -1.0   # unreadable image, or an embed-only group where a score has noth
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
 
 # Chunk the image tower so ONE lane's VRAM is a known number, not a function of a beat's candidate count —
-# the cap engine vram_budget.SIGLIP_TILE_BATCH declares and this arm had dropped (per-image embeds are same).
+# the cap the engine's own VRAM budget module declares and this arm had dropped (per-image embeds are same).
 TILE_BATCH = 12
 
 LANE_SIZING_WHY = """
@@ -50,7 +50,7 @@ already learned. The towers are VRAM-bound and keep their own narrow lane.
 THE LANE WIDTH IS DERIVED FROM THE CARD THIS AGENT BOOTED ON, NEVER FROM A CONSTANT. The weights load ONCE
 and every lane shares them (main.py caches the service by weights hash), so they are a fixed toll, not a
 per-lane cost; what a lane costs is one capped forward's activations. Both numbers are measured on an RTX
-2060 with nvidia-smi and declared in the engine's vram_budget.py: 2322 MiB for the fp16 weights + CUDA
+2060 with nvidia-smi and declared in the engine's VRAM budget module: 2322 MiB for the fp16 weights + CUDA
 context, then 2736 MiB at 12 tiles, 3144 at 24, 3782 at 48 — ~34 MiB per tile, so one TILE_BATCH chunk is
 2736 − 2322 = 414 MiB. The dev 2060 (3254 MiB free under a desktop) therefore gets exactly 1 lane, which is
 the truth about that card and not a regression.

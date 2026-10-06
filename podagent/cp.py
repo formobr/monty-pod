@@ -399,7 +399,7 @@ def assert_fetchable(url: str) -> str:
         f"transport would fetch whatever a third party's search response happened to contain.")
 
 
-# Mirrors scripts/montyops/media_fetch.py:303-321: allow_redirects=False, bounded hops, urljoin.
+# Mirrors the engine's media.fetch op redirect handling: allow_redirects=False, bounded hops, urljoin.
 _MAX_REDIRECT_HOPS = 10
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 

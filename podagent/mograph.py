@@ -22,8 +22,8 @@ _STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/
 
 # HEAD BELOW (any media riding over a slid-down head): the live head slides DOWN so its face clears the top-band
 # picture/video, reversing at the beat end. Closed form of MontagePreview.headSettle (GLIDE spring) → master == preview.
-# Bound COPIES of the SSOT in remotion/src/MontagePreview.tsx (HB_DROP_FRAC / HEAD_SETTLE_SEC) — the pod
-# renders ffmpeg, not TS. The engine's tests/test_head_settle_ssot.py text-reads this file and reddens on drift.
+# Bound COPIES of the SSOT in the engine's MontagePreview component (HB_DROP_FRAC / HEAD_SETTLE_SEC) — the pod
+# renders ffmpeg, not TS. The engine's own head-settle SSOT test text-reads this file and reddens on drift.
 HB_DROP_FRAC = 0.33          # frame-fraction the face travels down → seats at 0.75
 HEAD_SETTLE_SEC = 0.4        # settle window at beat start; reversed at beat end
 # CRITICALLY damped {mass:0.9, stiffness:140, damping:2√(km)}: S(τ)=1-e^(-ω0τ)(1+ω0τ). The underdamped GLIDE
@@ -62,7 +62,7 @@ def remotion_dir(ref, tmp: Path) -> Path:
     The bundle is not baked into the image (504 MB most jobs never touch) — it arrives per job as a
     presigned tar, is cached by content hash, and each job renders out of its own workspace over that
     cache (bundle.workspace explains why the copy is not optional). MONTY_REMOTION_DIR still overrides
-    with a local tree so `worker.py --local` runs against the repo's own remotion/ unchanged.
+    with a local tree so the engine's own worker CLI run locally runs against its own Remotion tree unchanged.
     """
     if d := os.environ.get("MONTY_REMOTION_DIR"):
         cand = Path(d)
@@ -90,7 +90,7 @@ def _stage_dest(rd: Path, iid: str) -> Path:
         raise StagedInputNotAllowed(
             f"REFUSED staged input id {iid!r}: a staged input id must name a RELATIVE path under the "
             f"staging root — no absolute component, no `..` segment. A legitimate id looks like "
-            f"mograph/public/_photo/x.jpg (scripts/final_dispatch.py's _ship_public mints these).")
+            f"mograph/public/_photo/x.jpg (the engine's final dispatch mints these).")
     dest = rd / rel
     rd_real, dest_real = rd.resolve(), dest.resolve()
     if dest_real != rd_real and not dest_real.is_relative_to(rd_real):

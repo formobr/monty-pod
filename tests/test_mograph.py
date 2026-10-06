@@ -53,7 +53,7 @@ def test_stage_public_copies_by_prefix(tmp_path: Path) -> None:
 # ── H6/F8: a staged input id must not escape the job's own render workspace ────────────────────────
 
 def test_stage_public_regression_floor_matches_final_dispatch_shape(tmp_path: Path) -> None:
-    """The exact id shape scripts/final_dispatch.py._ship_public mints (`f"mograph/public/{dest}"` where
+    """The exact id shape the engine's final dispatch mints (`f"mograph/public/{dest}"` where
     `dest = f"_photo/{p.name}"`, :433,470,484) must still stage exactly where it did before the guard."""
     rd = tmp_path / "remotion"
     (rd / "public").mkdir(parents=True)

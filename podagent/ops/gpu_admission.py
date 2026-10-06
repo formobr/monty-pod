@@ -44,8 +44,8 @@ Waiters are admitted strictly in arrival order (no overtaking): admit = head of 
 <= budget. The head lets NOBODY past until it fits itself, even a small need that would fit right now — a
 stream of small requests must never starve a large cut.apply parked ahead of them.
 
-The wait is bounded (repo law: a wait with no deadline is a swallowed error; registered box-side as
-deadline.yaml `gpu_heavy_admission_park`) by a deadline computed ONCE, at entry, from the queue policy:
+The wait is bounded (repo law: a wait with no deadline is a swallowed error; registered box-side in
+the engine's deadline table as `gpu_heavy_admission_park`) by a deadline computed ONCE, at entry, from the queue policy:
 (requests parked ahead + reservations admitted) × HEAVY_OP_CEILING_S, the per-op ceiling the box already
 sanctions for every heavy op, capped by HEAVY_PARK_CEILING_S. Each op ahead of this one may legitimately
 run its whole sanctioned ceiling, so a flat deadline (the old 90 s) timed out the THIRD of three
@@ -66,17 +66,17 @@ ninth waiter means the box over-drove this pod and must hear that now, as a refu
 HEAVY_GPU_OPS = frozenset({"cut.apply", "media.normalize", "camera.apply", "media.cut_proxy"})
 
 # The sanctioned per-op ceiling of every heavy op: the box's _OP_BUDGET_S rows for the four heavies sit AT the
-# measured cap, video-editor scripts/op_backend.py:437-444 (_MEASURED_CEILING_S 200.0 − overhead = 140.0 s).
-# The park deadline is priced in units of it (GPU_ADMISSION_WHY); deadline.yaml cites the cap below.
+# measured cap, the engine's op backend (_MEASURED_CEILING_S 200.0 − overhead = 140.0 s).
+# The park deadline is priced in units of it (GPU_ADMISSION_WHY); the engine's deadline table cites the cap below.
 HEAVY_OP_CEILING_S = 140.0
-# Cap on any one park: four whole heavy ceilings, inside the box's widest op window (scripts/op_backend.py
+# Cap on any one park: four whole heavy ceilings, inside the box's widest op window (the engine's op backend
 # _OPS_MAX_BUDGET_S = 600.0) — a park past that would outlive every envelope the box can grant the op.
 HEAVY_PARK_CEILING_S = 4 * HEAVY_OP_CEILING_S
 MAX_PARKED = 8                 # mirrors OPS_MAX_CHAINS (GPU_ADMISSION_WHY)
 
 
 # Free VRAM one 1080p NVDEC+NVENC session needs — the default heavy-op reservation. The engine's own
-# measurement: video-editor scripts/montyops/cut_apply.py `_VRAM_PER_SESSION_MB` (NVENC_SIZING_WHY there).
+# measurement: the engine's cut.apply op `_VRAM_PER_SESSION_MB` (NVENC_SIZING_WHY there).
 NVENC_SESSION_MIB = 960.0
 
 

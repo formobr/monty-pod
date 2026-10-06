@@ -1,6 +1,6 @@
 """Headless NVIDIA Vulkan needs libEGL in the IMAGE, not just the loader.
 
-The container toolkit injects the NVIDIA Vulkan ICD (libGLX_nvidia + nvidia_icd.json), but that ICD resolves
+The container toolkit injects the NVIDIA Vulkan ICD (libGLX_nvidia + its ICD manifest), but that ICD resolves
 libEGL.so.1 internally and silently fails vkCreateInstance (ERROR_INCOMPATIBLE_DRIVER) when the image has
 none — so libplacebo cannot create a Vulkan device and every camera.apply pass fails on a pod. Static check
 of the Dockerfile; no docker build here. See docs/research/pod-image-headless-vulkan-libegl.md.

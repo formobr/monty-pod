@@ -10,7 +10,7 @@
     "op": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$",
-      "description": "Registry key, `domain.verb`. Also the join key into docs/CAPABILITY_REGISTRY.md (`executor.op`)."
+      "description": "Registry key, `domain.verb`. Also the join key into the engine's capability registry doc (`executor.op`)."
     },
     "version": {
       "type": "integer",
@@ -93,7 +93,7 @@
         "durable": {
           "type": "boolean",
           "default": false,
-          "description": "Output only. True = must materialise to R2 (a deliverable, or something a LATER JOB reads). False = intra-job intermediate; it stays on the pod's local disk and the next op in the chain reads the path directly. THIS FLAG IS THE R2 BUDGET: docs/RENDER_FLEET_AND_4MIN_BUDGET.md measured ~10 min of a ~25 min pod run as per-stage R2 transport, so defaulting to false is what keeps op granularity from multiplying that."
+          "description": "Output only. True = must materialise to R2 (a deliverable, or something a LATER JOB reads). False = intra-job intermediate; it stays on the pod's local disk and the next op in the chain reads the path directly. THIS FLAG IS THE R2 BUDGET: the engine's render-fleet budget doc measured ~10 min of a ~25 min pod run as per-stage R2 transport, so defaulting to false is what keeps op granularity from multiplying that."
         }
       }
     }

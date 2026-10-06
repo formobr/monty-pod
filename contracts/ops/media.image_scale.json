@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "Deterministic for a fixed ffmpeg build: one decode, one bicubic scale, one still-image encode at a pinned quality over identical input bytes emits identical output bytes. tests/test_op_media_image_scale.py asserts the argv is a pure function of (params, paths) so a drift shows as an argv diff rather than as mystery-different pixels. WHY A SECOND OP and not a `kind: image` on media.scale: an op input has ONE kind, and media.scale's argv is video by construction (encoder profile, yuv420p, faststart, audio) — a still needs none of it and must keep its own container. The pre-existing box-side resize (preview_proxy.proxy_img) is the same ffmpeg spelling; this is that resize where the bytes actually are (STILL_SEAM_GAP)."
+    "note": "Deterministic for a fixed ffmpeg build: one decode, one bicubic scale, one still-image encode at a pinned quality over identical input bytes emits identical output bytes. the engine's parity test for this op asserts the argv is a pure function of (params, paths) so a drift shows as an argv diff rather than as mystery-different pixels. WHY A SECOND OP and not a `kind: image` on media.scale: an op input has ONE kind, and media.scale's argv is video by construction (encoder profile, yuv420p, faststart, audio) — a still needs none of it and must keep its own container. The pre-existing box-side resize (the engine's own preview-proxy resizer) is the same ffmpeg spelling; this is that resize where the bytes actually are (STILL_SEAM_GAP)."
   },
   "inputs": [
     {"id": "src", "kind": "image"}

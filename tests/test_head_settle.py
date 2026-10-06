@@ -1,19 +1,16 @@
 """GATE: the pod's head-below slide IS the engine's — same numbers, critical damping, rest is the cap.
 This tier renders the MASTER, so an overshoot kept here after the engine dropped it (fbr ff22e5e4) ships in
-the delivered cut while the approved preview no longer has it; the owner TSX is absent in a bare pod checkout."""
+the delivered cut while the approved preview no longer has it. The parity check against the engine's own
+preview constants is the engine's to run (it holds both trees); this public repo pins the literals alone."""
 from __future__ import annotations
 
 import math
-import re
-from pathlib import Path
 
 import pytest
 
 from podagent import mograph
 
 BEAT = (2.0, 6.0)
-# <engine>/pod-agent/tests/ → <engine>/: present only when the pod is checked out as the engine's submodule
-OWNER = Path(__file__).resolve().parents[2] / "remotion" / "src" / "MontagePreview.tsx"
 
 
 def _curve(step: float = 0.01):
@@ -27,20 +24,6 @@ def test_the_constants_are_the_engine_values() -> None:
     assert mograph.HB_DROP_FRAC == 0.33
     assert mograph.HEAD_SETTLE_SEC == 0.4
     assert mograph._HB_W0 == (140 / 0.9) ** 0.5
-
-
-@pytest.mark.skipif(not OWNER.is_file(), reason="engine tree not around this submodule checkout")
-def test_the_constants_still_equal_the_declared_owner() -> None:
-    src = OWNER.read_text(encoding="utf-8")
-
-    def ts_const(name: str) -> float:
-        m = re.search(rf"^export const {name} = ([0-9.]+);", src, re.M)
-        assert m, f"{name} is no longer an exported literal in MontagePreview.tsx — the SSOT moved"
-        return float(m.group(1))
-
-    assert mograph.HB_DROP_FRAC == ts_const("HB_DROP_FRAC")
-    assert mograph.HEAD_SETTLE_SEC == ts_const("HEAD_SETTLE_SEC")
-    assert "2 * Math.sqrt(140 * 0.9)" in src, "the owner's glide is not critically damped"
 
 
 def test_the_head_settle_never_overshoots_its_rest() -> None:

@@ -32,10 +32,10 @@ def _tar(files: dict[str, bytes]) -> bytes:
 
 _PROJECT = {
     "render_batch.mjs": b"// batch renderer\n",
-    "src/index.ts": b"registerRoot(Root)\n",
-    "src/tokens.ts": b"export const T = 1\n",
+    "src/entry.mjs": b"registerRoot(Root)\n",
+    "src/tokens.mjs": b"export const T = 1\n",
     "package.json": b'{"name":"remotion"}\n',
-    "node_modules/remotion/index.js": b"module.exports = {}\n",
+    "node_modules/remotion/index.cjs": b"module.exports = {}\n",
 }
 
 
@@ -116,13 +116,13 @@ def test_changed_bundle_is_never_served_from_the_old_entry(serve):
     serve["install"](first)
     a = bundle.ensure(_ref(first))
 
-    second = _tar({**_PROJECT, "src/tokens.ts": b"export const T = 2\n"})
+    second = _tar({**_PROJECT, "src/tokens.mjs": b"export const T = 2\n"})
     serve["install"](second)
     b = bundle.ensure(_ref(second))
 
     assert a != b
-    assert (b / "src/tokens.ts").read_bytes() == b"export const T = 2\n"
-    assert (a / "src/tokens.ts").read_bytes() == b"export const T = 1\n"
+    assert (b / "src/tokens.mjs").read_bytes() == b"export const T = 2\n"
+    assert (a / "src/tokens.mjs").read_bytes() == b"export const T = 1\n"
 
 
 def test_warm_cache_does_not_refetch(serve):
@@ -152,8 +152,8 @@ def test_workspace_staging_cannot_touch_the_cache(serve, tmp_path):
 
     ws = bundle.workspace(root, tmp_path / "job1")
     (ws / "public" / "brand.woff2").write_bytes(b"a job asset")
-    (ws / "src" / "index.bespoke.Bespoke-dead.tsx").write_bytes(b"per-job entry")
-    (ws / "src" / "tokens.ts").write_bytes(b"export const T = 999\n")   # overwrite an EXISTING file
+    (ws / "src" / "job_entry.mjs").write_bytes(b"per-job entry")
+    (ws / "src" / "tokens.mjs").write_bytes(b"export const T = 999\n")   # overwrite an EXISTING file
 
     after = {p.relative_to(root): p.read_bytes()
              for p in root.rglob("*") if p.is_file() and not p.is_symlink()}

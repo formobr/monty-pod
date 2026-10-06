@@ -246,7 +246,7 @@ def test_cold_infer_exposes_weights_fetch_and_model_load_boundaries(monkeypatch,
     cp = _CP()
     agent_main._run_infer(
         raw, cp, {}, {}, {}, tmp_path / "yunet", False,
-        corr_id="work/result.json", session_id="s")
+        corr_id="work/result", session_id="s")
     phases = [e["phase"] for e in cp.events if e.get("phase", "").startswith(
         ("weights_fetch", "model_load"))]
     assert phases == [

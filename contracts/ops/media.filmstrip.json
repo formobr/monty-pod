@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "One ffmpeg invocation whose argv is a pure function of (params, measured duration), decoding the same input bytes on a pinned build — the same condition media.scale states. tests/test_op_media_filmstrip.py asserts the argv directly, so a tuning drift shows as an argv diff instead of as a different picture in front of a judge. No `flags=` is set on the scaler ON PURPOSE: the strip is read by a vision model, and its pixels must not change on the day the work moved off the box. FAILURE: `strip` is OPTIONAL — a frame that will not render leaves no file rather than raising, because one chain carries a whole batch and a raising handler would let one unreadable clip kill every sibling. A malformed PARAM still raises, in milliseconds."
+    "note": "One ffmpeg invocation whose argv is a pure function of (params, measured duration), decoding the same input bytes on a pinned build — the same condition media.scale states. the engine's parity test for this op asserts the argv directly, so a tuning drift shows as an argv diff instead of as a different picture in front of a judge. No `flags=` is set on the scaler ON PURPOSE: the strip is read by a vision model, and its pixels must not change on the day the work moved off the box. FAILURE: `strip` is OPTIONAL — a frame that will not render leaves no file rather than raising, because one chain carries a whole batch and a raising handler would let one unreadable clip kill every sibling. A malformed PARAM still raises, in milliseconds."
   },
   "inputs": [
     {"id": "src", "kind": "video"}

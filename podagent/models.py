@@ -139,7 +139,7 @@ class SpecCaptions(BaseModel):
     hot: list[float] = Field(default_factory=list)
     words: list[SpecCaptionWord] = Field(default_factory=list)
     font: str | None = None
-    # mirrors scripts/spec_models.py — the pod's libass burn does not consume it (no Remotion Captions path
+    # mirrors the engine's spec models — the pod's libass burn does not consume it (no Remotion Captions path
     # here), but extra="forbid" means the field must exist or a spec that carries it fails validation.
     maxSeconds: float | None = Field(default=None, gt=0)
 
@@ -180,7 +180,7 @@ class SpecMotionPlan(BaseModel):
         if self.sections and self.bundle is None:
             raise ValueError(
                 "motion_plan.sections requires motion_plan.bundle — the pod bakes no Remotion bundle, so "
-                "sections without one cannot render (see docs/POD_RUNBOOK.md)")
+                "sections without one cannot render (see the engine's pod runbook)")
         return self
 
 
@@ -253,8 +253,8 @@ class SpecAccent(BaseModel):
     intensity: float = Field(ge=0, le=1)
     burn: str | None = Field(default=None, min_length=1)
     clicks: str | None = Field(default=None, min_length=1)
-    # film_burn only: the engine's precomputed frame slip as [(t_rel, dy_px)] around `at` (video-editor
-    # scripts/burn_slip.keyframes, the SAME list the preview plays). Absent → add_offset_jump draws it itself.
+    # film_burn only: the engine's precomputed frame slip as [(t_rel, dy_px)] around `at` (the engine's
+    # burn-slip keyframes, the SAME list the preview plays). Absent → add_offset_jump draws it itself.
     slip: list[tuple[float, float]] | None = Field(default=None, min_length=2)
 
     @model_validator(mode="after")
@@ -281,8 +281,8 @@ class SpecAccent(BaseModel):
 class SpecOpener(BaseModel):
     """The pre-rendered cold-open clip and its film-burn junction assets, welded onto the front of the
     body (single-pass prep — E-W1; the pod does not execute it until render_onepass lands, W2). `cold`
-    is an inputs[].id (mirrors stitch_coldopen.py's own `cold` arg). `burn`/`clicks` are a PAIR — set
-    both (the film-burn junction, mirrors stitch_coldopen.py's own `must_exist=True` on both) or neither
+    is an inputs[].id (mirrors the engine's cold-open stitcher's own `cold` arg). `burn`/`clicks` are a PAIR — set
+    both (the film-burn junction, mirrors the engine's cold-open stitcher's own `must_exist=True` on both) or neither
     (a hard-cut concat) — same style as the accent's two-input kind: plain strings, absence (never an
     explicit null) means "not carried". `cold_trim` shortens the cold-open's tail (seconds); `gain` is
     the junction click's linear level."""
@@ -696,11 +696,11 @@ class OpBinding(BaseModel):
     anywhere else. Both fields are optional and absent on every envelope that predates them, which is why
     `contracts/VERSION` does not move.
 
-    `from_step` is the whole point. docs/RENDER_FLEET_AND_4MIN_BUDGET.md measured a pipeline that runs
+    `from_step` is the whole point. the engine's render-fleet budget doc measured a pipeline that runs
     ~9 min locally taking ~25 min split onto a pod, of which ~10 min was sequential per-stage R2 transport.
     Op granularity is FINER than stage granularity, so a design that gave every op its own round trip
     would multiply that regression rather than fix it. Here the unit that crosses R2 is the JOB; inside a
-    job, adjacent ops hand off via shared local disk exactly as docs/TRANSPORT_ARCHITECTURE.md requires
+    job, adjacent ops hand off via shared local disk exactly as the engine's transport architecture doc requires
     ("when two adjacent stages share ONE box in ONE job they hand off via shared local disk — that is the
     correct place to cut R2, and only there").
     """

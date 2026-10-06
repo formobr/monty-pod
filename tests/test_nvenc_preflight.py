@@ -251,7 +251,7 @@ def _sleep_n_times_then_stop(n: int, sleeps: list[float]):
 
 
 def test_an_ambiguous_readiness_ack_backs_off_and_keeps_retrying_never_exits(monkeypatch):
-    """TRK-105/PLAN.md §2: `_report_ready` must never raise or exit out of a mere ambiguous ACK — it backs
+    """TRK-105, the engine's queue plan §2: `_report_ready` must never raise or exit out of a mere ambiguous ACK — it backs
     off and retries the SAME durable frame in bounded rounds forever; only the pool's own `unready_claimed`
     rotation (out of this slice's scope) ever ends a pod stuck here."""
     cp = _CP(accept=False)
@@ -298,7 +298,7 @@ def test_main_never_reaches_dispatch_while_readiness_stays_ambiguous(monkeypatch
 
 
 def test_readiness_identity_rejection_exits_4_not_a_crash(monkeypatch):
-    """PLAN.md §2: the ONE readiness outcome that still ends the process — a DEFINITIVE verdict on the
+    """The engine's queue plan §2: the ONE readiness outcome that still ends the process — a DEFINITIVE verdict on the
     worker's OWN identity, not a mere ambiguity — exits honestly at 4, the same code every other
     transport-unhealthy give-up uses, instead of an uncaught crash."""
     cp = _CP(identity_reject=True)

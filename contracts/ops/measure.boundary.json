@@ -7,7 +7,7 @@
   "parity": {
     "mode": "numeric",
     "tol": 0.5,
-    "note": "The heuristics are ffmpeg-decoded audio RMS/click ratios and a downscaled frame-diff — deterministic for identical input bytes on a pinned build, with sub-dB jitter across ffmpeg minors, so numeric(0.5). No THRESHOLD crosses: the op returns raw per-join numbers and boundary_qc.py applies CLICK_RATIO_MIN / RMS_JUMP_DB / FRAME_JUMP on the brain to turn them into flags. WHICH joins to inspect is discovered on the brain (cut segments + b-roll plan) and arrives as data."
+    "note": "The heuristics are ffmpeg-decoded audio RMS/click ratios and a downscaled frame-diff — deterministic for identical input bytes on a pinned build, with sub-dB jitter across ffmpeg minors, so numeric(0.5). No THRESHOLD crosses: the op returns raw per-join numbers and the engine's boundary-QC module applies CLICK_RATIO_MIN / RMS_JUMP_DB / FRAME_JUMP on the brain to turn them into flags. WHICH joins to inspect is discovered on the brain (cut segments + b-roll plan) and arrives as data."
   },
   "inputs": [
     {"id": "master", "kind": "video"}

@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "perceptual",
-    "note": "TWO paths with different honest answers, and the mode is the weaker of them. The ffmpeg SKELETON — Ken-Burns zoompan, the solid backplate, the teaser concat, the drawtext title, the two-up stack, the composite overlay and both audio mixes — is argv-identical to the code it was moved from and encodes with libx264 at a fixed crf, so on one host it is REPRODUCIBLE: run the old path and this op over the same inputs and the mp4s hash the same (pinned as argv in tests/test_op_opener_build.py, measured as bytes in its docstring). The moment a comp renders, headless Chrome is in the picture and bit_exact would be a lie for the same reason mograph.render says so — rasterisation is not reproducible across GPU/driver/font-hinting. What IS exact either way: canvas, fps, frame count and the overlay's placement on the base timeline, because those are what the weld downstream depends on. FAILURE: a comp that will not render degrades to drawtext and the clip still ships; a MISSING Remotion toolchain raises, because an opener in ffmpeg's default font renders, plays, looks deliberate and would ship unnoticed."
+    "note": "TWO paths with different honest answers, and the mode is the weaker of them. The ffmpeg SKELETON — Ken-Burns zoompan, the solid backplate, the teaser concat, the drawtext title, the two-up stack, the composite overlay and both audio mixes — is argv-identical to the code it was moved from and encodes with libx264 at a fixed crf, so on one host it is REPRODUCIBLE: run the old path and this op over the same inputs and the mp4s hash the same (pinned as argv in the engine's parity test for this op, measured as bytes in its docstring). The moment a comp renders, headless Chrome is in the picture and bit_exact would be a lie for the same reason mograph.render says so — rasterisation is not reproducible across GPU/driver/font-hinting. What IS exact either way: canvas, fps, frame count and the overlay's placement on the base timeline, because those are what the weld downstream depends on. FAILURE: a comp that will not render degrades to drawtext and the clip still ships; a MISSING Remotion toolchain raises, because an opener in ffmpeg's default font renders, plays, looks deliberate and would ship unnoticed."
   },
   "inputs": [
     {"id": "img0", "kind": "image", "optional": true},
@@ -33,7 +33,7 @@
     "properties": {
       "format": {
         "enum": ["question", "contrast", "teaser", "before_after"],
-        "description": "Which shape stages the hook. The Director CHOSE it (hook_seed.json); by the time it arrives it is layout, not judgement."
+        "description": "Which shape stages the hook. The Director CHOSE it (its hook seed); by the time it arrives it is layout, not judgement."
       },
       "dur": {"type": "number", "minimum": 0.2, "maximum": 30, "description": "Clip length in seconds, decided per format on the brain."},
       "w": {"type": "integer", "minimum": 16, "maximum": 8192},
@@ -86,7 +86,7 @@
       "audio": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Every sound, already CHOSEN: which file, how loud, and at what second. add_whoosh.plan_cues made the kind->file decision on the brain with the sfx registry in hand; nothing here resolves an intent.",
+        "description": "Every sound, already CHOSEN: which file, how loud, and at what second. the engine's SFX cue planner made the kind->file decision on the brain with the sfx registry in hand; nothing here resolves an intent.",
         "properties": {
           "beds": {"type": "array", "items": {
             "type": "object", "additionalProperties": false, "required": ["port", "volume"],

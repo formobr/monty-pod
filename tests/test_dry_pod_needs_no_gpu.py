@@ -3,7 +3,7 @@ a card that cannot hold its render ops (main.DRY_POD_NO_GPU_WHY, ops/dry.py DRY_
 infer_lanes.RENDER_HEADROOM_WHY).
 
 The engine gates are VENDORED here as rules (no engine import — this repo ships without it), each citing the
-video-editor source it mirrors, so a dry output is judged by the check it actually meets in a release replay."""
+engine source it mirrors, so a dry output is judged by the check it actually meets in a release replay."""
 from __future__ import annotations
 
 import json
@@ -53,7 +53,7 @@ class _CP:
 
 # ── vendored engine gates ─────────────────────────────────────────────────────────────────────────────────
 
-# video-editor scripts/check_master.py::gate — TARGET_LUFS (brand audio.master_lufs, cryptomonkeys -14), TOL,
+# the engine's master check — TARGET_LUFS (brand audio.master_lufs, -14 for the brand), TOL,
 # TP_CLIP, SILENT_LUFS, WANT_COLOR are its constants; the audio branch is the MISC-239 «silent audio» refusal.
 _TARGET_LUFS, _TOL, _TP_CLIP, _SILENT_LUFS, _WANT_COLOR, _WANT_SR = -14.0, 3.0, 0.0, -40.0, "bt709", 48000
 
@@ -106,8 +106,8 @@ def _master_contract_issues(path: Path, *, target: float, w: int, h: int, fps: s
 
 
 def _still_gate_issues(meta: dict, dst: Path, *, vector: bool) -> list[str]:
-    """video-editor scripts/fetch_photo.py fetch_still :1648 (finished|plated AND bytes), cmd_get_photo :1897
-    (a vector not plated is refused), mark_backing.treatment_for / _mark_rect (dark, bbox, mark_w/mark_h), and
+    """the engine's photo fetcher (finished|plated AND bytes), and its get-photo command
+    (a vector not plated is refused), the engine's own mark-backing treatment check (dark, bbox, mark_w/mark_h), and
     the real montyops.media_still.run sidecar shape."""
     issues: list[str] = []
     real_keys = {"width", "height", "vector", "alpha", "plated", "finished", "rasterizer", "width_requested",
@@ -119,17 +119,17 @@ def _still_gate_issues(meta: dict, dst: Path, *, vector: bool) -> list[str]:
     if vector and not meta.get("plated"):
         issues.append("cmd_get_photo: a VECTOR no host could rasterise")
     if not isinstance(meta.get("dark"), bool):
-        issues.append("mark_backing.treatment_for: no `dark` verdict")
+        issues.append("the engine's mark-backing treatment check: no `dark` verdict")
     bbox = meta.get("bbox") or []
     if len(bbox) != 4 or not all(0.0 <= v <= 1.0 for v in bbox) or not (meta.get("mark_w") and meta.get("mark_h")):
-        issues.append(f"mark_backing._mark_rect: unusable bbox={bbox} mark={meta.get('mark_w')}x{meta.get('mark_h')}")
+        issues.append(f"the engine's mark-backing rect check: unusable bbox={bbox} mark={meta.get('mark_w')}x{meta.get('mark_h')}")
     if meta.get("vector") is not vector:
         issues.append("probe: vector verdict wrong")
     return issues
 
 
 def _range_receipt_issues(doc: dict) -> list[str]:
-    """video-editor scripts/montyops/media_range.py RangeTransportReceipt._closed (+ field bounds) and
+    """the engine op's range transport receipt (closed shape + field bounds) and
     acceptance_snapshot.RangeSampleCounts.strict for one sample."""
     issues: list[str] = []
     if doc.get("status") not in ("ok", "whole_read"):
@@ -179,7 +179,7 @@ def test_a_dry_pod_boots_without_a_gpu_and_its_fakes_pass_the_engine_gates(monke
     assert "gpu=not probed (contour-dry" in boot["step"]
     assert ready["phase"] == "ready" and ready["step"] == agent_main.DRY_PREFLIGHT_STEP
     assert "no NVENC/NVDEC/Vulkan probe, no VRAM floor" in ready["step"]
-    # not probed is not the `vulkan=false` defect the pool evicts on (video-editor scripts/pod_boot_defect.py)
+    # not probed is not the `vulkan=false` defect the pool evicts on (the engine's pod boot-defect check)
     assert ready["capacity"]["vulkan"] is None and ready["capacity"]["vulkan"] is not False
     assert ready["capacity"]["gpu_preflight"] == "skipped_contour_dry"
     assert [e for e in cp.events if e.get("status") == "error"] == []

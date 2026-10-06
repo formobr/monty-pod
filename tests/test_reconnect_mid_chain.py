@@ -2,7 +2,7 @@
 
 The fake api below is built on `_server`/`_ack` (tests/test_cp_retry.py:81-121) and `valid_wire`
 (wire_fixtures.py) and implements EXACTLY the facts the api repo's own tests pin (S1, api branch
-trk105-api-facts, cmd/api/pod_stream_test.go):
+trk105-api-facts, the api's pod-stream test):
 
   (a) TestFleetDuplicateReadyFromOldStreamOpensAdmissionUnderThatStream
   (b) TestFleetReplayIsStampedWithAdmissionStream (+ a job_ack under an unrelated stream gets 409)
@@ -81,7 +81,7 @@ class _FakeFleetApi:
 
     - A fresh ready ACKs 202 and opens admission under ITS OWN carried stream_id (b: "the reconnect's own
       admission stream, not the stream the job was originally sent under") — this pod never replays an
-      inherited ready (PLAN.md §1: dropped at load), so the duplicate-ready-reopens-an-OLD-stream case (a)
+      inherited ready (the engine's queue plan §1: dropped at load), so the duplicate-ready-reopens-an-OLD-stream case (a)
       is the api's own behaviour, not something this pod's tests need to drive.
     - job_ack whose corr is in `reassigned` always gets 403 "job_ack corr is not owned by this worker" (d).
     - job_ack under a stream_id that is NOT the live admission stream: accepted if a durable receipt was
@@ -110,7 +110,7 @@ class _FakeFleetApi:
             except Exception:
                 return
             kind = frame.get("type")
-            # Readiness is stage=boot AND phase=ready, as the real api decides it (pod.go preparePodEvent):
+            # Readiness is stage=boot AND phase=ready, as the real api decides it (the api's preparePodEvent):
             # other boot events — e.g. the MISC-209 stream_reopen report — are telemetry, not readiness.
             event = frame.get("event") or {}
             if kind == "event" and event.get("stage") == "boot" and event.get("phase") == "ready":
@@ -179,8 +179,8 @@ def _poll_with_retry(cp: ControlPlane, *, attempts: int = 40) -> dict[str, Any] 
 
 def _seed_inherited_state(path: Path, *, job_acks: list[tuple[str, str, int]]) -> None:
     """Durable state exactly as a crashed prior incarnation would leave it: each (corr, old_stream, seq)
-    names a job durably received AND durably job_ack'd (never confirmed) — mirrors the crashloop PLAN.md
-    §0 diagnoses (a stuck agent's unconfirmed job_ack outlives it)."""
+    names a job durably received AND durably job_ack'd (never confirmed) — mirrors the crashloop the engine's
+    queue plan §0 diagnoses (a stuck agent's unconfirmed job_ack outlives it)."""
     first = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
     try:
         for corr, old_stream, seq in job_acks:
@@ -292,7 +292,7 @@ def test_a_403_not_owned_job_ack_removes_the_unclaimed_job_from_the_inbox(
 
 
 def test_an_unmatched_403_keeps_the_latch(tmp_path: Path) -> None:
-    """PLAN.md §1: a 403 whose text names no verdict in the table keeps today's fail-closed latch."""
+    """The engine's queue plan §1: a 403 whose text names no verdict in the table keeps today's fail-closed latch."""
     def handler(ws: Any) -> None:
         frame = json.loads(ws.recv())
         ws.send(_ack(frame, status=403, error="a brand new refusal this table has never seen"))

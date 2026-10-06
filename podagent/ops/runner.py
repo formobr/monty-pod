@@ -59,7 +59,7 @@ process died look byte-for-byte identical to the box for the whole handler call.
 A heartbeat beside the call (never inside it — the handler thread is not touched, exactly as
 `patience._narrate` beats beside a subprocess rather than polling it) turns that identical shape into two
 different ones: a live handler ticks, a dead one does not. It does not change what the box DOES about a slow
-op — `op_backend.py`'s budget and retry policy are unchanged — it only removes the false choice between
+op — the engine's op backend budget and retry policy are unchanged — it only removes the false choice between
 "assume dead" and "wait blind" that a pod which is neither erroring nor finishing forced on every reader of
 this incident.
 """
@@ -69,7 +69,7 @@ INFRA_FAULT_WHY = """
 TRK-123: a pod whose op ends in an INFRASTRUCTURE-class run_error stops claiming at once and says so.
 
 The control plane's pool condemns a worker on the first infrastructure-class `run_error` it classifies (engine
-scripts/broker/pod_pool_service.classify_infra_error over registry/pod_defect_classes.yaml), but until that
+the engine pool's infra-error classifier over its own pod-defect class registry), but until that
 fence lands this process kept claiming, and the next job went onto the same broken card. So the pod decides
 the SAME question on the SAME text at run_error time: a match emits one `infra_fault` event (class in
 `timings.error_class`, the open dict the pool already honours by name) and trips the process-wide sink main
@@ -78,14 +78,14 @@ is classified too: `GpuAdmissionTimeout` (the registry's `gpu_admission_timeout`
 own gpu_admission.py) is raised by the admission wait, before any run_started, so it never reaches run_error.
 The pod does not idle after a fault either way: main drains in-flight work and exits (code 5).
 
-The patterns are the pool's own, not a pod invention — copied from registry/pod_defect_classes.yaml `classes:`
+The patterns are the pool's own, not a pod invention — copied from the engine's pod-defect class registry `classes:`
 (engine a5350d3a8). Encoder errors and CUDA OOM sit under that file's `not_infrastructure:` (MISC-209, owner
 2026-09-30: an encoder error is OUR argv/driver parameters, never the rented card; an OOM is job-caused), so
 they never classify here either. Fencing on a text the pool does not condemn would leave a pod alive,
 unfenced and never claiming — the very latch MISC-200 forbids. Change these rows only with the registry.
 """
 
-# registry/pod_defect_classes.yaml `classes:` — (name, patterns). `GpuAdmissionTimeout` is this package's own
+# the engine's pod-defect class registry `classes:` — (name, patterns). `GpuAdmissionTimeout` is this package's own
 # class (podagent/ops/gpu_admission.py); the second is the boot capability verdict's defect name.
 _INFRA_CLASSES: Final = (
     ("gpu_admission_timeout", (re.compile(r"\bGpuAdmissionTimeout\b"),)),
@@ -811,7 +811,7 @@ def _upload_with_affinity(url: str, path: Path) -> None:
 PUT_FANOUT_WHY = """
 A STEP'S OUTPUTS ARE INDEPENDENT OBJECTS AND WERE SENT ONE AFTER ANOTHER THROUGH ONE PERMIT.
 
-`media.sheet` declares two durable outputs (the contact sheet and the `.cells.json` sidecar that says which
+`media.sheet` declares two durable outputs (the contact sheet and the cells sidecar that says which
 cells drew); `media.range_filmstrip` declares two (the strip and its transport receipt). The put phase held
 ONE `transport_slots()` permit and walked them serially, so a two-output step paid two full store latencies
 end to end while the transport budget — `TRANSFERS_PER_STEP` times the step cap, twenty on a five-step rent
@@ -1580,7 +1580,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
                 timings={"phase_s": round(time.monotonic() - started, 3)},
             )
 
-    # FIRST LINE: the chain-pool-to-worker admission edge op_backend.READINESS_WHY reads.
+    # FIRST LINE: the chain-pool-to-worker admission edge the engine's own op-backend readiness check reads.
     _event(status="step", op="ops", phase="chain_admitted")
 
     # The clock the box cannot read, started BEFORE preflight/pack fetch on purpose (STEP_TIMING_WHY).
@@ -1734,7 +1734,7 @@ def run_chain(chain: Any, cp: Any, corr_id: str | None = None,
             "timeline": terminal_timeline,
             # additive, like chain_s: an older control plane drops the key with a 202. Without it the box
             # KNOWS a retain happened but not WHERE — and the engine refuses the cut rather than letting
-            # five later readers 404 (op_chains.require_retained_worker).
+            # five later readers 404 (the engine's own op-chains retained-worker check).
             **({"retained_on": held} if (held := terminal_retained_on(timings)) else {}),
             **({"session_id": session_id} if session_id is not None else {}),
         })

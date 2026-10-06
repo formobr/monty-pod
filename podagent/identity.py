@@ -2,7 +2,7 @@
 
 THE NAME MUST BE THE CONTROL PLANE'S, NOT ONE THIS BOX INVENTS. The API fences a targeted delivery by
 comparing the envelope's `target_worker_id` against the claims of the bearer that claimed it
-(`decoded.TargetWorkerID != claims.JobID` in api/cmd/api/pod_stream.go), and the corr→owner index it writes
+(`decoded.TargetWorkerID != claims.JobID` in the api's pod-stream handler), and the corr→owner index it writes
 carries that same string. So the worker's identity IS its JOB_TOKEN's `jid` claim, and reading it here is the
 only way a refusal on this side can name the same worker the brain does. A hostname would be a second
 vocabulary: every cross-worker check would either always match or never, and both are silent wrongness.
@@ -12,7 +12,7 @@ process lying to itself about that gains nothing. The token stays unprinted: onl
 returned, never the bearer.
 
 AND THERE IS NO OVERRIDE KNOB. The first draft had a `POD_WORKER_ID` escape hatch; the pod-orphan gate
-(`tests/test_knob_registry.py`) refused it, correctly — the box writes the pod's environment WHOLE, so a knob
+(the engine's knob-registry test) refused it, correctly — the box writes the pod's environment WHOLE, so a knob
 nothing in the seam assigns can only ever be its default, and a switch nobody can throw is worse than none
 here: it would look like a way to repair a mis-routed retention while doing nothing. The bearer already names
 this worker, and if it does not, the answer is local-only and says so.

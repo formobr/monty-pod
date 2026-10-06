@@ -1,5 +1,5 @@
 """MISC-239: the final receipt says what audio the graph that ran actually mixed — the engine's
-final_dispatch.audio_qc compares the planned music/SFX against this row (plan_match.ReceiptAudioMix)."""
+own final-dispatch audio QC compares the planned music/SFX against this row (plan_match.ReceiptAudioMix)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,7 +10,7 @@ from podagent import render, render_onepass as op
 from podagent.models import RenderSpec
 
 SHA = "0" * 64
-# engine contract, video-editor scripts/plan_match.py class ReceiptAudioMix — the field names exactly
+# engine contract, its plan-match ReceiptAudioMix class — the field names exactly
 ENGINE_FIELDS = {"music_bed": bool, "bed_lufs": (float, type(None)), "sfx_mixed": int}
 
 

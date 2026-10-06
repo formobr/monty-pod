@@ -20,6 +20,8 @@ SPEC.loader.exec_module(release)
 OLD_SHA = "a" * 40
 NEW_SHA = "b" * 40
 DIGEST = "sha256:" + "d" * 64
+# A neutral engine layout: the real one is the engine's to supply at release time, never spelled here.
+LAYOUT = release.EngineLayout(Path("pins") / "image_pin", Path("pins") / "image_doc", ("regen-doc", "--write"))
 
 
 def _receipt(sha: str = NEW_SHA, digest: str = DIGEST):
@@ -28,18 +30,16 @@ def _receipt(sha: str = NEW_SHA, digest: str = DIGEST):
 
 def _engine(tmp_path: Path, *, sha: str = OLD_SHA, digest: str | None = None) -> Path:
     engine = tmp_path / "engine"
-    (engine / "scripts/broker").mkdir(parents=True)
-    (engine / "docs/gen").mkdir(parents=True)
+    LAYOUT.pin(engine).parent.mkdir(parents=True)
+    LAYOUT.doc(engine).parent.mkdir(parents=True, exist_ok=True)
     (engine / "pod-agent").mkdir()
-    (engine / ".venv/bin").mkdir(parents=True)
-    (engine / ".venv/bin/python").touch()
     image = f"{release.IMAGE_REPO}:{sha}"
     pin_digest = digest or "sha256:" + "c" * 64
-    (engine / "scripts/broker/pod_image.py").write_text(
+    LAYOUT.pin(engine).write_text(
         f'POD_AGENT_IMAGE = "{image}"\nPOD_AGENT_AMD64_DIGEST = "{pin_digest}"\n',
         encoding="utf-8",
     )
-    (engine / "docs/gen/POD_IMAGE.md").write_text(
+    (LAYOUT.doc(engine)).write_text(
         f"{image}\n{pin_digest}\n", encoding="utf-8")
     return engine
 
@@ -194,11 +194,11 @@ def test_engine_verifier_requires_sha_digest_gitlink_and_generated_doc(tmp_path)
     engine = _engine(tmp_path, sha=NEW_SHA, digest=DIGEST)
     commands = FakeCommands(engine=engine)
     commands.current_engine_sha = NEW_SHA
-    release.verify_engine(engine, _receipt(), commands)
-    (engine / "docs/gen/POD_IMAGE.md").write_text(
+    release.verify_engine(engine, LAYOUT, _receipt(), commands)
+    (LAYOUT.doc(engine)).write_text(
         f"{release.IMAGE_REPO}:{NEW_SHA}\n", encoding="utf-8")
     with pytest.raises(release.ReleaseError, match="generated"):
-        release.verify_engine(engine, _receipt(), commands)
+        release.verify_engine(engine, LAYOUT, _receipt(), commands)
 
 
 def test_verify_is_read_only_and_requires_existing_engine_equality(monkeypatch, tmp_path):
@@ -207,8 +207,8 @@ def test_verify_is_read_only_and_requires_existing_engine_equality(monkeypatch, 
     commands.current_engine_sha = NEW_SHA
     monkeypatch.setattr(release, "REPO", tmp_path / "pod")
     before = {path: path.read_bytes() for path in (
-        engine / "scripts/broker/pod_image.py", engine / "docs/gen/POD_IMAGE.md")}
-    assert release.verify(NEW_SHA, engine, commands, GoodRegistry()) == _receipt()
+        LAYOUT.pin(engine), LAYOUT.doc(engine))}
+    assert release.verify(NEW_SHA, engine, LAYOUT, commands, GoodRegistry()) == _receipt()
     assert {path: path.read_bytes() for path in before} == before
     assert not any(call[1:2] in (("push",), ("tag",)) or call[:2] == ("gh", "run")
                    for call in commands.calls)
@@ -220,21 +220,21 @@ def test_pin_proves_artifact_before_replacing_an_old_engine_pin(monkeypatch, tmp
     monkeypatch.setattr(release, "REPO", tmp_path / "pod")
 
     def still_old():
-        image, digest = release.engine_pin_values(engine)
+        image, digest = release.engine_pin_values(engine, LAYOUT)
         assert image.endswith(OLD_SHA) and digest.endswith("c" * 64)
         assert commands.current_engine_sha == OLD_SHA
 
     def generate(argv, **_kwargs):
-        assert argv[-2:] == ["--only", "doc:pod_image"]
-        image, digest = release.engine_pin_values(engine)
-        (engine / "docs/gen/POD_IMAGE.md").write_text(f"{image}\n{digest}\n", encoding="utf-8")
+        assert argv == list(LAYOUT.doc_regen)
+        image, digest = release.engine_pin_values(engine, LAYOUT)
+        (LAYOUT.doc(engine)).write_text(f"{image}\n{digest}\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(release.subprocess, "run", generate)
-    assert release.pin(NEW_SHA, engine, commands, GoodRegistry(before=still_old)) == _receipt()
-    assert release.engine_pin_values(engine) == (f"{release.IMAGE_REPO}:{NEW_SHA}", DIGEST)
+    assert release.pin(NEW_SHA, engine, LAYOUT, commands, GoodRegistry(before=still_old)) == _receipt()
+    assert release.engine_pin_values(engine, LAYOUT) == (f"{release.IMAGE_REPO}:{NEW_SHA}", DIGEST)
     assert commands.current_engine_sha == NEW_SHA
-    assert NEW_SHA in (engine / "docs/gen/POD_IMAGE.md").read_text(encoding="utf-8")
+    assert NEW_SHA in (LAYOUT.doc(engine)).read_text(encoding="utf-8")
     assert not any(call[1:2] in (("push",), ("tag",)) or call[:2] == ("gh", "run")
                    for call in commands.calls)
     assert commands.calls.count(("git", "fetch", "--quiet", "origin", "main")) == 1
@@ -251,17 +251,17 @@ def test_pin_copies_a_missing_commit_from_the_verified_local_source_without_a_se
     monkeypatch.setattr(release, "REPO", source)
 
     def generate(argv, **_kwargs):
-        image, digest = release.engine_pin_values(engine)
-        (engine / "docs/gen/POD_IMAGE.md").write_text(f"{image}\n{digest}\n", encoding="utf-8")
+        image, digest = release.engine_pin_values(engine, LAYOUT)
+        (LAYOUT.doc(engine)).write_text(f"{image}\n{digest}\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(release.subprocess, "run", generate)
-    assert release.pin(NEW_SHA, engine, commands, GoodRegistry()) == _receipt()
+    assert release.pin(NEW_SHA, engine, LAYOUT, commands, GoodRegistry()) == _receipt()
     network = [call for call in commands.calls if call == ("git", "fetch", "--quiet", "origin", "main")]
     local = [call for call in commands.calls
              if call == ("git", "fetch", "--quiet", str(source), "HEAD")]
     assert len(network) == 1 and len(local) == 1
-    assert release.engine_pin_values(engine) == (f"{release.IMAGE_REPO}:{NEW_SHA}", DIGEST)
+    assert release.engine_pin_values(engine, LAYOUT) == (f"{release.IMAGE_REPO}:{NEW_SHA}", DIGEST)
 
 
 @pytest.mark.parametrize("failure", ["missing", "wrong-platform", "ambiguous-platform"])
@@ -269,7 +269,7 @@ def test_registry_refusal_leaves_every_pin_path_unchanged(monkeypatch, tmp_path,
     engine = _engine(tmp_path)
     commands = FakeCommands(engine=engine)
     monkeypatch.setattr(release, "REPO", tmp_path / "pod")
-    paths = (engine / "scripts/broker/pod_image.py", engine / "docs/gen/POD_IMAGE.md")
+    paths = (LAYOUT.pin(engine), LAYOUT.doc(engine))
     before = {path: path.read_bytes() for path in paths}
 
     class RefusingRegistry:
@@ -284,7 +284,7 @@ def test_registry_refusal_leaves_every_pin_path_unchanged(monkeypatch, tmp_path,
             raise AssertionError("unreachable")
 
     with pytest.raises(release.ReleaseError):
-        release.pin(NEW_SHA, engine, commands, RefusingRegistry())
+        release.pin(NEW_SHA, engine, LAYOUT, commands, RefusingRegistry())
     assert {path: path.read_bytes() for path in paths} == before
     assert commands.current_engine_sha == OLD_SHA
 
@@ -292,13 +292,13 @@ def test_registry_refusal_leaves_every_pin_path_unchanged(monkeypatch, tmp_path,
 def test_update_rolls_back_files_and_submodule_on_generator_failure(monkeypatch, tmp_path):
     engine = _engine(tmp_path)
     commands = FakeCommands(engine=engine)
-    pin_file = engine / "scripts/broker/pod_image.py"
-    doc_file = engine / "docs/gen/POD_IMAGE.md"
+    pin_file = LAYOUT.pin(engine)
+    doc_file = LAYOUT.doc(engine)
     before = (pin_file.read_bytes(), doc_file.read_bytes())
     monkeypatch.setattr(release.subprocess, "run", lambda argv, **_kwargs:
                         subprocess.CompletedProcess(argv, 1, "", ""))
     with pytest.raises(release.ReleaseError, match="generator failed"):
-        release.update_engine(engine, _receipt(), commands)
+        release.update_engine(engine, LAYOUT, _receipt(), commands)
     assert (pin_file.read_bytes(), doc_file.read_bytes()) == before
     assert commands.current_engine_sha == OLD_SHA
 
@@ -328,3 +328,45 @@ def test_cli_and_module_have_no_release_build_or_ci_wait_path():
     assert "git\", \"push" not in source
     assert "git\", \"tag" not in source
     assert "gh\", \"run" not in source
+
+
+def test_the_engine_layout_is_the_callers_to_supply_and_stays_inside_the_engine(tmp_path, capsys):
+    # the CLI refuses to guess where the engine keeps its pins: every location is a required argument
+    for verb in ("pin", "verify"):
+        with pytest.raises(SystemExit):
+            release.main([verb, NEW_SHA, "--engine-dir", str(tmp_path)])
+        assert "--pin-file" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        release.main(["pin", NEW_SHA, "--engine-dir", str(tmp_path), "--pin-file", "a", "--doc-file", "b"])
+    assert "--doc-regen" in capsys.readouterr().err
+    for bad in (Path("/abs/pin"), Path("..") / "outside", Path("pins") / ".." / ".." / "outside"):
+        with pytest.raises(release.ReleaseError, match="inside the engine"):
+            release.EngineLayout(bad, Path("doc"))
+        with pytest.raises(release.ReleaseError, match="inside the engine"):
+            release.EngineLayout(Path("pin"), bad)
+
+
+def test_a_relative_regen_program_resolves_inside_the_engine_and_must_exist(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    commands = FakeCommands(engine=engine)
+    layout = release.EngineLayout(LAYOUT.pin_file, LAYOUT.doc_file, ("bin/regen", "--write"))
+    seen: list[list[str]] = []
+    monkeypatch.setattr(release.subprocess, "run", lambda argv, **kw: seen.append(argv))
+    before = (LAYOUT.pin(engine).read_bytes(), LAYOUT.doc(engine).read_bytes())
+    with pytest.raises(release.ReleaseError, match="program is missing"):
+        release.update_engine(engine, layout, _receipt(), commands)
+    assert seen == [] and (LAYOUT.pin(engine).read_bytes(), LAYOUT.doc(engine).read_bytes()) == before
+    assert commands.current_engine_sha == OLD_SHA
+
+    (engine / "bin").mkdir()
+    (engine / "bin/regen").touch()
+
+    def generate(argv, **kwargs):
+        assert argv == [str(engine / "bin/regen"), "--write"] and kwargs["cwd"] == engine
+        image, digest = release.engine_pin_values(engine, layout)
+        LAYOUT.doc(engine).write_text(f"{image}\n{digest}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(release.subprocess, "run", generate)
+    release.update_engine(engine, layout, _receipt(), commands)
+    assert release.engine_pin_values(engine, layout) == (f"{release.IMAGE_REPO}:{NEW_SHA}", DIGEST)

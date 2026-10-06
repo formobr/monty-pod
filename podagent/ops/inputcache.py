@@ -22,7 +22,7 @@ DONE = ".complete"
 RETAINED = ".retained"
 # Share of the ONE cap (MAX_GB_ENV) retention may hold. A module constant, not an env read: the box writes
 # the pod's environment whole, so a second budget nobody assigns could only ever be its default — the exact
-# shape `tests/test_knob_registry.py` exists to refuse. Half leaves the ordinary cache half its working set.
+# shape the engine's own knob-registry test exists to refuse. Half leaves the ordinary cache half its working set.
 RETAINED_SHARE = 0.5
 
 RETENTION_WHY = """

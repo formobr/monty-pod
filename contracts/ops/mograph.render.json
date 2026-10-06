@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "perceptual",
-    "note": "Headless Chrome rasterisation is not byte-reproducible across GPU/driver/font-hinting, so bit_exact would be a lie. What IS guaranteed: frame COUNT, canvas size, fps and alpha channel are exact (asserted in tests/test_op_mograph_render.py), because those are the properties the downstream overlay filtergraph depends on — a drifted frame count desynchronises every later beat, a drifted subpixel does not. This is the honest mode for anything that goes through a rasteriser."
+    "note": "Headless Chrome rasterisation is not byte-reproducible across GPU/driver/font-hinting, so bit_exact would be a lie. What IS guaranteed: frame COUNT, canvas size, fps and alpha channel are exact (asserted in the engine's parity test for this op), because those are the properties the downstream overlay filtergraph depends on — a drifted frame count desynchronises every later beat, a drifted subpixel does not. This is the honest mode for anything that goes through a rasteriser."
   },
   "inputs": [
     {"id": "bundle", "kind": "dir", "optional": true},

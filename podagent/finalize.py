@@ -19,7 +19,7 @@ from .sanitize import safe_error
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
 _BT709_SET_PARAMS = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
 # TERMINAL encode (watermark pass): master rung, capped at the h1080-class ceiling — a pinned mirror of
-# registry/encode.yaml `master` (no registry/ on this package). NVENC cq 19 ~= x264 crf 21 (Codex condition).
+# the engine's encode registry `master` (no registry/ on this package). NVENC cq 19 ~= x264 crf 21 (Codex condition).
 _FINAL_GPU = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-cq", "19",
               "-rc", "vbr", "-b:v", "0", "-maxrate", "12M", "-bufsize", "24M",
               "-pix_fmt", "yuv420p", *_BT709]
@@ -57,7 +57,7 @@ def _run(cmd: list[str], what: str, *, timeout_s: int | None = None,
         raise RuntimeError(f"{what} ffmpeg timed out after {timeout_s}s") from exc
 
 
-_PROBE_TIMEOUT_S = 20  # header-only ffprobe; matches the engine's own precedent (scripts/tag_music.py:_duration)
+_PROBE_TIMEOUT_S = 20  # header-only ffprobe; matches the engine's own precedent (its music tagger's duration probe)
 
 
 def _probe(path: Path) -> tuple[int, int, float, int, int, float]:

@@ -4,6 +4,7 @@ nothing here asserts on a rendered frame (that harness is a later wave)."""
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
 import json
 import re
 import shutil
@@ -394,13 +395,13 @@ def _no_chime(d):
 
 
 def _add_film_burn(d):
-    d["inputs"] += [{"id": "fx/burn.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b"},
-                    {"id": "fx/clicks.wav", "kind": "audio", "sha256": SHA, "url": "https://x/c"}]
+    d["inputs"] += [{"id": "brand/film_burn.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b"},
+                    {"id": "brand/film_burn_clicks.wav", "kind": "audio", "sha256": SHA, "url": "https://x/c"}]
     d["overlays"]["finalize"]["accents"] += [
-        {"kind": "film_burn", "at": 3.5, "intensity": 0.6, "burn": "fx/burn.mp4",
-         "clicks": "fx/clicks.wav"},
-        {"kind": "film_burn", "at": 7.0, "intensity": 0.6, "burn": "fx/burn.mp4",
-         "clicks": "fx/clicks.wav"},
+        {"kind": "film_burn", "at": 3.5, "intensity": 0.6, "burn": "brand/film_burn.mp4",
+         "clicks": "brand/film_burn_clicks.wav"},
+        {"kind": "film_burn", "at": 7.0, "intensity": 0.6, "burn": "brand/film_burn.mp4",
+         "clicks": "brand/film_burn_clicks.wav"},
     ]
 
 
@@ -489,7 +490,7 @@ def test_golden_film_burn_with_singles() -> None:
         + _logo(4, "vaccents") + _watermark(5, 6, "vlogo") + _bt709_stamp("vwatermark"))
     assert_connected(graph, _MASTER_MAPS + _REF_MAPS)
     ins, _outs = _argv(cmd)
-    assert ins[3] == (("-stream_loop", "-1"), "/w/fx/burn.mp4")
+    assert ins[3] == (("-stream_loop", "-1"), "/w/brand/film_burn.mp4")
 
 
 def test_golden_film_burn_only() -> None:
@@ -646,7 +647,7 @@ def test_master_clause_declares_the_measured_grid() -> None:
 
 
 def test_presync_clause_shares_the_masters_grid() -> None:
-    """A ref on a different grid from the master makes check_sync.py's frame-index comparison
+    """A ref on a different grid from the master makes the engine's sync check's frame-index comparison
     meaningless — it must declare cfr and the master's own -ar too."""
     _ins, outs = _argv(op.assemble(_prepared(_spec()))[1])
     (master_opts, _m), (ref_opts, _r) = outs
@@ -1028,7 +1029,7 @@ def test_prepare_leaves_the_base_bare_when_no_mograph_layer_survived(monkeypatch
 def test_prepare_detects_flares_under_the_prepare_phase(monkeypatch, tmp_path) -> None:
     """The flare decode is the ONE film_burn I/O — it rides prepare's arm pool so assemble stays pure."""
     spec = _spec(_add_film_burn)
-    (tmp_path / "fx__burn.mp4").write_bytes(b"x")
+    (tmp_path / "brand__film_burn.mp4").write_bytes(b"x")
     monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
     _stub_prepare_passes(monkeypatch, tmp_path)
     calls: list[str] = []
@@ -1043,15 +1044,15 @@ def test_prepare_detects_flares_under_the_prepare_phase(monkeypatch, tmp_path) -
 
     p = op.prepare(spec, _paths(spec, tmp_path), tmp_path, False, phase=rec)
     assert p.flares == (0.3, 1.7)
-    assert calls == ["fx__burn.mp4"]
+    assert calls == ["brand__film_burn.mp4"]
     assert "prepare" in ops
 
 
 def test_prepare_refuses_a_malformed_burn_set_before_the_flare_decode(monkeypatch, tmp_path) -> None:
     def two_ids(d):
         _add_film_burn(d)
-        d["inputs"].append({"id": "fx/burn2.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b2"})
-        d["overlays"]["finalize"]["accents"][-1]["burn"] = "fx/burn2.mp4"
+        d["inputs"].append({"id": "brand/film_burn2.mp4", "kind": "video", "sha256": SHA, "url": "https://x/b2"})
+        d["overlays"]["finalize"]["accents"][-1]["burn"] = "brand/film_burn2.mp4"
     spec = _spec(two_ids)
     _stub_prepare_passes(monkeypatch, tmp_path)
     monkeypatch.setattr(accents, "detect_flares",
@@ -1063,7 +1064,7 @@ def test_prepare_refuses_a_malformed_burn_set_before_the_flare_decode(monkeypatc
 def test_an_unresolved_burn_input_refuses_before_any_pass(monkeypatch, tmp_path) -> None:
     spec = _spec(_add_film_burn)
     paths = _paths(spec, tmp_path)
-    del paths["fx/burn.mp4"]
+    del paths["brand/film_burn.mp4"]
     monkeypatch.setattr(accents, "detect_flares",
                         lambda _p: pytest.fail("the flare decode ran on an unresolved input"))
     with pytest.raises(RuntimeError, match="is not resolved"):
@@ -1211,7 +1212,7 @@ def test_the_multipass_builders_no_longer_exist() -> None:
                       (finalize, "apply_watermark"), (finalize, "finalize"),
                       (render, "_burn_captions"), (mograph, "_overlay"), (mograph, "composite")):
         assert not hasattr(mod, name), f"{mod.__name__}.{name} should have been deleted"
-    assert not (Path(__file__).resolve().parents[1] / "podagent" / "cover.py").exists()
+    assert importlib.util.find_spec("podagent.cover") is None, "the deleted cover module must not exist"
 
 
 def test_one_video_encode_the_loudnorm_still_runs_and_both_outputs_ship(monkeypatch, tmp_path) -> None:
@@ -1285,7 +1286,7 @@ def test_a_film_burn_door_run_never_reaches_the_multipass_burn(monkeypatch, tmp_
     """_door forbids finalize.apply_accents, so a burn spec passing through IS the proof the one-pass
     graph composited the burn itself; the flare decode rides prepare's arm pool before ffmpeg."""
     monkeypatch.setattr(accents, "detect_flares", lambda _p: [0.3])
-    (tmp_path / "fx__burn.mp4").write_bytes(b"x")
+    (tmp_path / "brand__film_burn.mp4").write_bytes(b"x")
     monkeypatch.setattr(finalize, "_has_video", lambda _p: True)
     ops: list[str] = []
 

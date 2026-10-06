@@ -87,7 +87,7 @@ def resolve(handler: str) -> Callable[..., Any]:
     except ImportError as e:
         raise PackError(
             f"handler module {mod_name!r} is not in the ops pack ({e}). Either the pack predates this op "
-            f"or the pack was built without it — check scripts/build_ops_pack.py output.") from e
+            f"or the pack was built without it — check the engine's ops-pack build output.") from e
     fn = getattr(mod, fn_name, None)
     if not callable(fn):
         raise PackError(f"{mod_name}:{fn_name} is not callable")

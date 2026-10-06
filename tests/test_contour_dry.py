@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -16,14 +17,18 @@ from podagent import main as podagent_main
 from podagent.ops import dry, pack, registry
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
-# parents[1] (this repo), never parents[2] (an enclosing engine checkout) — monty-pod ships no fixture.
-FIXTURE = Path(__file__).resolve().parents[1] / "dev/localpod/fixtures/contour-smoke.mp4"
+# monty-pod ships no smoke-test video of its own; where the caller keeps one — an engine checkout's dev
+# fixture, or anything else local — is the caller's to say, never this repo's to spell.
+_FIXTURE_ENV = "MONTY_CONTOUR_FIXTURE"
+FIXTURE = Path(os.environ[_FIXTURE_ENV]) if os.environ.get(_FIXTURE_ENV) else None
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 _HAS_FFPROBE = shutil.which("ffprobe") is not None
 _NEEDS_FFMPEG = pytest.mark.skipif(
     not (_HAS_FFMPEG and _HAS_FFPROBE), reason="ffmpeg/ffprobe not on this runner")
-_NEEDS_FIXTURE = pytest.mark.skipif(not FIXTURE.exists(), reason="contour-smoke.mp4 not shipped here")
+_NEEDS_FIXTURE = pytest.mark.skipif(
+    FIXTURE is None or not FIXTURE.exists(),
+    reason=f"set {_FIXTURE_ENV} to a local smoke-test video to run this")
 
 _ALL_OP_NAMES = sorted(p.stem for p in CONTRACTS.glob("ops/*.json"))
 _STUB_OP_NAMES = sorted(n for n in _ALL_OP_NAMES if dry._CLASSIFICATION[n][0] == dry.STUB)
@@ -40,25 +45,25 @@ _JSON_STUB_PARAMS: dict[str, dict] = {
                                "width": 64, "height": 96, "fit": "cover",
                                "max_origin_bytes": 16 * 1024 * 1024},
 }
-# op -> (field it cannot derive, engine reader file:line that needs it). Empty since media.still measures its
+# op -> (field it cannot derive, engine reader that needs it). Empty since media.still measures its
 # bound placeholder (dry.DRY_STILL_WHY); the mechanism stays for the next underivable field.
 _UNDERIVABLE_JSON_FIELD: dict[str, tuple[str, str]] = {}
-# (op, field, engine reader file:line) for every STUB op's JSON output this dry tier must satisfy.
+# (op, field, engine reader role) for every STUB op's JSON output this dry tier must satisfy.
 _ENGINE_READER_ROSTER: list[tuple[str, str, str]] = [
-    ("cut.apply", "rdurs", "scripts/apply_edl.py:306"),
-    ("media.sheet", "cells", "scripts/broll_resolve.py:3107"),
-    ("media.sheet", "width", "scripts/broll_resolve.py:3108"),
-    ("media.sheet", "height", "scripts/broll_resolve.py:3109"),
-    ("media.sheet", "drawn", "scripts/broll_resolve.py:3111"),
-    ("media.image_tile", "cells", "scripts/broll_resolve.py:3107"),
-    ("media.image_tile", "width", "scripts/broll_resolve.py:3108"),
-    ("media.image_tile", "height", "scripts/broll_resolve.py:3109"),
-    ("media.image_tile", "drawn", "scripts/broll_resolve.py:3111"),
-    ("media.still", "dark", "scripts/broll_resolve.py:2231"),
-    ("media.range_filmstrip", "status", "scripts/run_ledger.py:2366"),
-    ("media.range_filmstrip", "origin_bytes", "scripts/run_ledger.py:2371"),
-    ("media.range_filmstrip", "byte_cap", "scripts/run_ledger.py:2373"),
-    ("media.range_filmstrip", "outputs_present", "scripts/run_ledger.py:2379"),
+    ("cut.apply", "rdurs", "engine EDL step"),
+    ("media.sheet", "cells", "engine b-roll resolver"),
+    ("media.sheet", "width", "engine b-roll resolver"),
+    ("media.sheet", "height", "engine b-roll resolver"),
+    ("media.sheet", "drawn", "engine b-roll resolver"),
+    ("media.image_tile", "cells", "engine b-roll resolver"),
+    ("media.image_tile", "width", "engine b-roll resolver"),
+    ("media.image_tile", "height", "engine b-roll resolver"),
+    ("media.image_tile", "drawn", "engine b-roll resolver"),
+    ("media.still", "dark", "engine b-roll resolver"),
+    ("media.range_filmstrip", "status", "engine run ledger"),
+    ("media.range_filmstrip", "origin_bytes", "engine run ledger"),
+    ("media.range_filmstrip", "byte_cap", "engine run ledger"),
+    ("media.range_filmstrip", "outputs_present", "engine run ledger"),
 ]
 
 _JSON_STUB_OP_NAMES = sorted({op for op, _, _ in _ENGINE_READER_ROSTER})
@@ -129,13 +134,13 @@ def test_every_stubbed_op_yields_its_declared_outputs_in_dry_mode(tmp_path, op_n
 
 
 def test_cut_apply_stub_derives_rdurs_from_keep_spans(tmp_path):
-    """MISC-62: apply_edl.py:306 read `["rdurs"]` off a placeholder that never had it. The synthesized
+    """MISC-62: the engine's EDL step read `["rdurs"]` off a placeholder that never had it. The synthesized
     durations must exist, one per keep span, and sum to the planned (params-only) duration within 1 ms."""
     keep = [[0.0, 1.234], [5.0, 7.89], [10.0, 10.5]]
     planned = sum(e - s for s, e in keep)
     outputs = _run_stub(tmp_path, "cut.apply", params={"keep": keep, "fps_grid": 30.0}, only={"durs"})
     doc = json.loads(outputs["durs"].read_text())
-    assert len(doc["rdurs"]) == len(keep), "scripts/project.py:66 requires len(rdurs) == len(keep)"
+    assert len(doc["rdurs"]) == len(keep), "the engine's EDL step requires len(rdurs) == len(keep)"
     assert abs(sum(doc["rdurs"]) - planned) < 1e-3, "sum(rdurs) must match the planned duration within 1ms"
 
 
@@ -148,7 +153,7 @@ def test_cut_apply_stub_folds_speed_into_rdurs(tmp_path):
 
 
 def test_media_sheet_stub_meta_matches_the_readers_own_validation(tmp_path):
-    """Replays the exact shape/value checks scripts/broll_resolve.py:3105-3114 runs on this sidecar."""
+    """Replays the exact shape/value checks the engine's b-roll resolver runs on this sidecar."""
     params = _JSON_STUB_PARAMS["media.sheet"]
     n = len(params["captions"])
     outputs = _run_stub(tmp_path, "media.sheet", params=params,
@@ -164,7 +169,7 @@ def test_media_sheet_stub_meta_matches_the_readers_own_validation(tmp_path):
 
 
 def test_media_image_tile_stub_meta_matches_the_readers_own_validation(tmp_path):
-    """TRK-90: an empty `drawn` made scripts/broll_resolve.py:2381-2386 drop every photo-lane candidate
+    """TRK-90: an empty `drawn` made the engine's b-roll resolver drop every photo-lane candidate
     ("preview did not render") whenever the LLM picked asset auto/photo under the dry tier — the stub must
     report every requested cell as drawn, like a real fetch+composite would for cells it actually placed."""
     params = _JSON_STUB_PARAMS["media.image_tile"]
@@ -181,7 +186,7 @@ def test_media_image_tile_stub_meta_matches_the_readers_own_validation(tmp_path)
 @pytest.mark.parametrize("op_name,field,_reader", _ENGINE_READER_ROSTER)
 def test_engine_reader_roster_lands_or_refuses_by_name(tmp_path, op_name, field, _reader):
     """One row per (op, field, reader-file:line). A reader added without a stub field reds HERE by name,
-    not three layers down at a KeyError the way MISC-62's apply_edl.py:306 did."""
+    not three layers down at a KeyError the way MISC-62's EDL-step read did."""
     json_port = _json_port_id(op_name)
     if op_name in _UNDERIVABLE_JSON_FIELD:
         with pytest.raises(dry.DryStubUnderivedField) as ei:

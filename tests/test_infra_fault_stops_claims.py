@@ -67,7 +67,7 @@ def test_an_infra_class_run_error_stops_claiming_and_reports_it(tmp_path, monkey
     monkeypatch.setattr(agent_main.time, "sleep", lambda _s: None)
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
 
-    # An infrastructure class the pool condemns on (registry/pod_defect_classes.yaml `classes:`).
+    # An infrastructure class the pool condemns on (the engine's pod-defect class registry `classes:`).
     events, coordinator = _run_failing(
         tmp_path, monkeypatch, gpu_admission.GpuAdmissionTimeout("op 'x' timed out waiting for GPU admission"),
         "infra")

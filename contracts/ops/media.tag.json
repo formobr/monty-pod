@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "`-c copy` — the elementary streams are re-muxed, never re-encoded, so the video bitstream is byte-identical on either transport (tests/test_deliverable_metadata_parity.py md5s the copied video stream before and after). The argv is a pure function of (paths, tags) and is pinned string-equal to the origin's own copy, so the two lanes cannot drift into different tags."
+    "note": "`-c copy` — the elementary streams are re-muxed, never re-encoded, so the video bitstream is byte-identical on either transport (the engine's deliverable-metadata parity test md5s the copied video stream before and after). The argv is a pure function of (paths, tags) and is pinned string-equal to the origin's own copy, so the two lanes cannot drift into different tags."
   },
   "inputs": [
     {"id": "src", "kind": "video"}

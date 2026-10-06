@@ -266,7 +266,7 @@ def test_out_of_order_acks_are_not_settled_ahead_of_the_durable_head(
 
 def test_later_window_4xx_latches_admission_before_its_predecessors_settle(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """PLAN.md §1: only a worker-identity ("closes_admission") verdict needs this early reader-side latch
+    """The engine's queue plan §1: only a worker-identity ("closes_admission") verdict needs this early reader-side latch
     at all — a boot/ready frame's 422 is exactly that class, unlike an ordinary one-job frame's 422/403
     (which dead-letters but leaves admission open, tested elsewhere)."""
     verdict_sent = threading.Event()
@@ -634,7 +634,7 @@ def test_unknown_or_malformed_ack_never_retires_a_frame(
 
 
 def test_4xx_is_durably_dead_lettered_and_fails_the_caller(tmp_path: Path) -> None:
-    """PLAN.md §1: a result's 422 names ONE correlation only — dead-letter that frame and fail its own
+    """The engine's queue plan §1: a result's 422 names ONE correlation only — dead-letter that frame and fail its own
     caller, but job admission stays open for every other correlation (a result/job_ack frame is never the
     boot/ready class that would close it)."""
     path = tmp_path / "outbox.json"
@@ -678,7 +678,7 @@ def test_async_4xx_dead_letters_without_accumulating_an_outcome(tmp_path: Path) 
 
 def test_job_ack_409_texts_are_one_frame_verdicts_admission_stays_open(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """PLAN.md §1: pod_stream_test.go's TestFleetReplayIsStampedWithAdmissionStream/
+    """The engine's queue plan §1: the api's pod-stream test's TestFleetReplayIsStampedWithAdmissionStream/
     TestPodFrameRefusalTextsArePinned pin these exact 409 prefixes as per-DELIVERY verdicts — the api's own
     replay (or this pod's dedup re-ack) is what eventually lands the job, so THIS job_ack frame alone
     dead-letters while every other correlation's admission stays open. This supersedes codex#25's old
@@ -709,7 +709,7 @@ def test_job_ack_409_texts_are_one_frame_verdicts_admission_stays_open(
 
 
 def test_unmatched_409_keeps_todays_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """codex#25: a 409 whose text names no verdict in PLAN.md §1's table is still a transport race — retry
+    """codex#25: a 409 whose text names no verdict in the engine's queue plan §1 table is still a transport race — retry
     it like a 5xx, never dead-letter on an unrecognised reason."""
     monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
     path = tmp_path / "outbox.json"
@@ -733,7 +733,7 @@ def test_unmatched_409_keeps_todays_retry(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_403_is_durably_dead_lettered_and_admission_stays_open(tmp_path: Path) -> None:
-    """codex#20 + PLAN.md §1: Go's 403 'unknown or expired fleet corr_id' is a permanent verdict on ONE
+    """codex#20 + the engine's queue plan §1: Go's 403 'unknown or expired fleet corr_id' is a permanent verdict on ONE
     correlation — the attribution row is gone, so retrying the identical frame can never make it valid.
     Dead-letter it and fail its own caller, but — unlike codex#20's original blanket close — every OTHER
     correlation's job admission stays open, since nothing about the WORKER's own identity is in question."""
@@ -778,7 +778,7 @@ def test_403_dead_letters_on_first_verdict_without_retrying(
 
 
 def test_identity_wrong_403_still_closes_admission(tmp_path: Path) -> None:
-    """PLAN.md §1: unlike a one-frame 403, a WORKER-identity verdict (here, a boot/ready-class frame) still
+    """The engine's queue plan §1: unlike a one-frame 403, a WORKER-identity verdict (here, a boot/ready-class frame) still
     fails closed — nothing about this worker will ever validate, so no other correlation may claim either."""
     path = tmp_path / "outbox.json"
 
@@ -972,7 +972,7 @@ def test_inbox_replays_after_receive_before_run_crash(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "outbox.json"
     first = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
-    first._accept_job(_job("work/infer/result.json"))
+    first._accept_job(_job("work/infer/result"))
     first.close()
 
     second = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
@@ -982,7 +982,7 @@ def test_inbox_replays_after_receive_before_run_crash(
     with second._work:
         second._outbox.clear()
         second._admission_error = None
-    assert second.claim(0.2)["corr_id"] == "work/infer/result.json"
+    assert second.claim(0.2)["corr_id"] == "work/infer/result"
     second.close()
 
 
@@ -1033,7 +1033,7 @@ def test_valid_infer_golden_crosses_real_event_stream_with_one_result_identity(
 
     req = json.loads(
         (Path(__file__).parents[1] / "contracts/examples/infer_request.face_probe.json").read_text())
-    corr = "work/session/result.json"
+    corr = "work/session/result"
     yunet = tmp_path / "yunet.onnx"
 
     class _Probe:
@@ -1065,7 +1065,7 @@ def test_valid_infer_golden_crosses_real_event_stream_with_one_result_identity(
 def test_result_append_and_inbox_retirement_are_one_durable_transition(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "outbox.json"
-    corr = "work/infer/result.json"
+    corr = "work/infer/result"
     stream = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
     stream._accept_job(_job(corr))
     monkeypatch.setattr(stream, "_ensure_open", lambda: True)
@@ -1080,7 +1080,7 @@ def test_result_append_and_inbox_retirement_are_one_durable_transition(
 def test_result_append_failure_rolls_back_seq_waiter_and_inbox(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "outbox.json"
-    corr = "work/infer/result.json"
+    corr = "work/infer/result"
     stream = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
     stream._accept_job(_job(corr))
     monkeypatch.setattr(stream, "_ensure_open", lambda: True)
@@ -1101,7 +1101,7 @@ def test_result_append_failure_rolls_back_seq_waiter_and_inbox(
 
 def test_replayed_job_before_pending_result_ack_does_not_reconnect_livelock_or_rerun(
         tmp_path: Path) -> None:
-    corr = "work/infer/result.json"
+    corr = "work/infer/result"
     seen: list[str] = []
 
     def handler(ws: Any) -> None:
@@ -1179,7 +1179,7 @@ def test_waited_terminal_sync_is_in_timeline_context_before_result_build(tmp_pat
 
 
 def test_job_replay_has_one_work_item_two_exact_receipts_and_no_secret_timeline(tmp_path: Path) -> None:
-    corr = "work/infer/result.json"
+    corr = "work/infer/result"
     receipts: list[dict[str, Any]] = []
 
     def handler(ws: Any) -> None:

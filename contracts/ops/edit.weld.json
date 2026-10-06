@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "perceptual",
-    "note": "The weld FILTERGRAPH — the film-burn overlay, the old-film frame-jerk offset expression and the two-click audio delay — is a pure function of params, pinned byte-identical in tests/test_op_edit_weld.py, so the transition the viewer sees is exact. The terminal ENCODE defaults to h264_nvenc (not byte-reproducible across GPU/driver) and degrades to libx264 on a box without NVENC, so bit_exact would be a lie; perceptual is the honest mode for anything whose final encode is NVENC. The flare detection is a deterministic probe of the burn clip, not a decision."
+    "note": "The weld FILTERGRAPH — the film-burn overlay, the old-film frame-jerk offset expression and the two-click audio delay — is a pure function of params, pinned byte-identical in the engine's parity test for this op, so the transition the viewer sees is exact. The terminal ENCODE defaults to h264_nvenc (not byte-reproducible across GPU/driver) and degrades to libx264 on a box without NVENC, so bit_exact would be a lie; perceptual is the honest mode for anything whose final encode is NVENC. The flare detection is a deterministic probe of the burn clip, not a decision."
   },
   "inputs": [
     {"id": "cold", "kind": "video"},
@@ -24,11 +24,11 @@
     "properties": {
       "master_lufs": {
         "type": "number",
-        "description": "Integrated loudness (LUFS) the cold-open is matched to — the DELIVERY target the brand declares (brand.yaml audio.master_lufs). Required, never defaulted: a keyless pod holds no brand profile, and a guessed level welds the seam at a loudness that jumps against the master."
+        "description": "Integrated loudness (LUFS) the cold-open is matched to — the DELIVERY target the brand declares (the brand profile's audio.master_lufs). Required, never defaulted: a keyless pod holds no brand profile, and a guessed level welds the seam at a loudness that jumps against the master."
       },
       "master_tp": {
         "type": "number",
-        "description": "True-peak ceiling (dB) for that match — brand.yaml audio.master_tp. Required for the same reason as master_lufs."
+        "description": "True-peak ceiling (dB) for that match — the brand profile's audio.master_tp. Required for the same reason as master_lufs."
       },
       "cold_trim": {
         "type": "number",

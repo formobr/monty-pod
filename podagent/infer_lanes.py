@@ -17,9 +17,9 @@ card both fit with ~10 GB to spare and this module changes nothing. On a small c
 measured here, clip_rank asked for 20 MiB with 167 MiB free while the process still held 2.89 GiB of align.
 
 THE DECISION IS DERIVED, exactly as the clip_rank lane width already is (infer_cliprank.LANE_SIZING_WHY): the
-per-kind residency is measured with nvidia-smi and matches the engine's vram_budget.GpuResidents figure for
+per-kind residency is measured with nvidia-smi and matches the engine's own VRAM-budget residency figure for
 figure — align 1500 MiB (1.2 GB fp32 checkpoint + a 20 s window's emissions + the CUDA context, seen at 1.44
-GiB in the OOM report, = vram_budget.GPU.ctc_align), clip_rank the fp16 towers plus ONE capped forward (the
+GiB in the OOM report, = the engine's VRAM-budget align figure), clip_rank the fp16 towers plus ONE capped forward (the
 two numbers the lane width is already sized from), face_probe's yunet ONNX no card tenant at all — and a card
 that cannot hold both kinds runs them one at a time with the idle kind's weights dropped. Never the CPU:
 ranking or aligning there moves the work across the placement axis the ruling forbids.
@@ -39,7 +39,7 @@ RESERVE_MIB = _VRAM_RESERVE_MB
 
 def coresident_mib() -> float:
     """Free MiB a card must report for both weight-holding kinds to be resident together (4748 here; the
-    engine's vram_budget.concurrent_mib() reads 4752 off its own rounding of the same measurements)."""
+    engine's own VRAM-budget concurrent-residency figure reads 4752 off its own rounding of the same measurements)."""
     return KIND_VRAM_MIB["align"] + KIND_VRAM_MIB["clip_rank"] + RESERVE_MIB
 
 
@@ -115,8 +115,8 @@ A CARD THAT PASSED THE FLOOR MUST STILL BE ABLE TO ENCODE.
 The floor used to count only the heaviest infer kind + reserve (clip_rank 2736 + 512 = 3248 MiB), yet every full
 pod also serves render ops — and camera.apply on a 6 GB card that cleared 3248 died mid-job on its NVENC open:
 «CreateInputBuffer failed: out of memory». So a pod that serves render ops adds the render headroom: ONE 1080p
-NVDEC+NVENC session, the engine's measured `_VRAM_PER_SESSION_MB` 960 MiB (video-editor
-scripts/montyops/cut_apply.py, NVENC_SIZING_WHY there; mirrored as gpu_admission.NVENC_SESSION_MIB, the unit the
+NVDEC+NVENC session, the engine's measured `_VRAM_PER_SESSION_MB` 960 MiB (the engine's
+cut.apply op, NVENC_SIZING_WHY there; mirrored as gpu_admission.NVENC_SESSION_MIB, the unit the
 pod's own heavy-op ledger reserves). One session is the largest working set any render op is GUARANTEED: the
 heavies (cut.apply, camera.apply, media.normalize, media.cut_proxy) size their fan-out from what is free and run
 one at a time under the whole-budget admission (gpu_admission.GPU_ADMISSION_WHY), so the floor that lets ONE of

@@ -16,9 +16,9 @@ Design rules baked into these macros (they are load-bearing, not style):
   * Every window is an integer FRAME range on the output grid (frames.py): the accent's centre frame
     is rounded ONCE and the span is counted in frames, never a formatted float second.
 
-These builders are MIRRORED by the planner (scripts/fx.py + scripts/transitions.py). The mirror is
+These builders are MIRRORED by the planner (its fx and transition builders). The mirror is
 not decorative: the planner-side copies drive local sample renders and the CLI. Both sides are held
-byte-identical by a string-identity test over a parameter grid (tests/test_finalize_parity.py in the
+byte-identical by a string-identity test over a parameter grid (the engine's finalize-parity test in the
 engine repo) — a drift in either copy fails that test rather than silently shipping two different
 masters from the two transports.
 """

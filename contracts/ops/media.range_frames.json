@@ -6,7 +6,7 @@
   "judgement": false,
   "parity": {
     "mode": "bit_exact",
-    "note": "The decoder receives the origin's original compressed bytes and media.frames' exact one-pass implementation. tests/test_op_media_range.py compares every landed PNG against media.frames over the full local object. If the exact one-pass cannot answer every position, the arm fails closed: the historical N-process fallback could outlive the receipt deadline, and approximate pixels are forbidden. The required closed receipt proves origin_bytes < object_bytes and counts whole origin attempts. Range refusal never falls back to a whole GET. Positions and cell geometry are identical to media.frames and carry no rule for choosing one frame over another."
+    "note": "The decoder receives the origin's original compressed bytes and media.frames' exact one-pass implementation. the engine's parity test for this op compares every landed PNG against media.frames over the full local object. If the exact one-pass cannot answer every position, the arm fails closed: the historical N-process fallback could outlive the receipt deadline, and approximate pixels are forbidden. The required closed receipt proves origin_bytes < object_bytes and counts whole origin attempts. Range refusal never falls back to a whole GET. Positions and cell geometry are identical to media.frames and carry no rule for choosing one frame over another."
   },
   "inputs": [],
   "outputs": [

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-# The agent's own suite runs with `cd pod-agent`; the engine's one door (scripts/test.sh) runs from the
+# The agent's own suite runs with `cd pod-agent`; the engine's one test door runs from the
 # superproject. Spelled here so this file is runnable from either, exactly as the engine-side tests that
 # reach into the submodule already do.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -163,7 +163,7 @@ def _handler_writing(required: str, payload: bytes = b"y" * 4096, hold_s: float 
 
 def test_the_terminal_carries_one_timing_per_step(monkeypatch, wired, tmp_path, op):
     """THE DELIVERABLE. Without this the box's `steps` list names WHICH steps ran and nothing about what
-    they cost, and `docs/gen/SEAM_ATLAS.md` records that Go drops even that.
+    they cost, and the engine's own generated seam-atlas doc records that Go drops even that.
 
     NEGATIVE: drop the `timings=` key from the terminal event and the box is back to one number per chain."""
     src, required = wired
@@ -213,7 +213,7 @@ def test_a_handler_that_returns_none_carries_no_instrument_key(monkeypatch, wire
 
 
 def test_chain_admitted_fires_exactly_once_at_admission(monkeypatch, wired, op):
-    """The box's READINESS phase (op_backend.READINESS_WHY) reads this frame as the chain-pool-to-worker
+    """The box's READINESS phase (the engine's own op-backend readiness check) reads this frame as the chain-pool-to-worker
     admission edge. NEGATIVE: a duplicate or a frame that moved past preflight would mis-time that edge."""
     src, required = wired
     monkeypatch.setattr(runner.pack, "resolve", lambda h: _handler_writing(required))

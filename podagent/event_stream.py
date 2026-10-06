@@ -60,8 +60,8 @@ _DEFAULT_OUTBOX = "/var/cache/monty/pod-stream/outbox.json"
 _STATE_VERSION = 3
 _ADMISSION_WAKE = object()
 _CLAIM_INTERRUPT = object()   # interrupt_claim(): the claim in progress returns None so its caller re-checks
-# The verdict table (PLAN.md §1), matched by (frame kind, status, exact/prefix error text) against the
-# literal texts pod_stream_test.go's TestPodFrameRefusalTextsArePinned pins on the real api. A "one_frame"
+# The verdict table (the engine's queue plan §1), matched by (frame kind, status, exact/prefix error text) against the
+# literal texts the api's own pod-stream test TestPodFrameRefusalTextsArePinned pins on the real api. A "one_frame"
 # verdict is permanent for THIS correlation only — dead-letter it, keep job admission open for every other
 # correlation. A "closes_admission" verdict means the WORKER's own identity is wrong — nothing about this
 # pod will ever validate, so admission closes like every other permanent content verdict.
@@ -78,7 +78,7 @@ _ONE_FRAME_PREFIXES = (
     "pod delivery identity conflict: ",
     "job_ack arrived before readiness: ",
 )
-# Named for the drift test (tests/test_pod_stream_contract_drift.py) and for readers of this table; an
+# Named for the drift test (the engine's stream-contract drift test) and for readers of this table; an
 # UNMATCHED 403/422 text also closes admission (today's fail-closed latch), so this set does not narrow
 # `_classify_verdict`'s 403 branch — it documents which texts are KNOWN to mean a worker-identity verdict.
 _CLOSES_ADMISSION_EXACT_TEXTS = frozenset({

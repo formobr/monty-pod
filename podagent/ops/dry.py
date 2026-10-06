@@ -19,7 +19,7 @@ from . import pack, registry
 
 ARM_ENV = "MONTY_OPS_CONTOUR_DRY"
 
-# Mirrored byte-for-byte at scripts/plan_match.py::CONTOUR_DRY_CLAIMS — MISC-62 lock 4 refuses a receipt
+# Mirrored byte-for-byte by the engine's plan-match CONTOUR_DRY_CLAIMS — MISC-62 lock 4 refuses a receipt
 # whose tuple has moved on only one side. A real media.tag (see `_CLASSIFICATION`) leaves every claim true:
 # it re-muxes the master's own streams, so no pixel is rendered and no encoder runs.
 CONTOUR_DRY_CLAIMS: dict[str, str] = {
@@ -126,7 +126,7 @@ _IMAGE_EXTS = _RASTER_IMAGE_EXTS | _VECTOR_IMAGE_EXTS
 DRY_AUDIO_WHY = """
 A DRY FAKE IS NEVER SILENT: THE ENGINE'S MASTER CONTRACT REFUSES A FINAL WITHOUT SOUND.
 
-video-editor scripts/check_master.py::gate refuses («OFF-CONTRACT … silent audio: loudness measured as -inf»)
+the engine's master check refuses («OFF-CONTRACT … silent audio: loudness measured as -inf»)
 any master whose audio stream measures no programme, or under SILENT_LUFS -40, or outside target ± TOL 3 LU.
 anullsrc is bit-exact silence, so every dry master failed the REAL gate. The stand-in is a 997 Hz sine on both
 channels at 48 kHz (check_master WANT_SAMPLE_RATE) with peak amplitude 10^(L/20): BS.1770 K-weighting is ~0 dB
@@ -252,7 +252,7 @@ _IMAGE_SYNTH: dict[str, Callable[..., None]] = {"media.range_filmstrip": _write_
 
 
 # A field neither params nor bound inputs can honestly produce is refused BY NAME, never guessed
-# (MISC-62: cut.apply's placeholder durs.rdurs was exactly that guess — scripts/apply_edl.py:306).
+# (MISC-62: cut.apply's placeholder durs.rdurs was exactly that guess — the engine's EDL step).
 class DryStubUnderivedField(RuntimeError):
     def __init__(self, op_name: str, field: str, *, why: str) -> None:
         self.op_name, self.field = op_name, field
@@ -262,14 +262,14 @@ class DryStubUnderivedField(RuntimeError):
 
 
 def _synth_cut_apply_durs(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
-    # rdurs read at scripts/apply_edl.py:306/260 and scripts/project.py:66 (needs len == len(keep)).
+    # rdurs read by the engine's EDL step and its project loader (needs len == len(keep)).
     speed = float(params.get("speed", 1.0)) or 1.0
     return {"rdurs": [(float(e) - float(s)) / speed for s, e in params["keep"]]}
 
 
 def _synth_media_sheet_meta(params: dict[str, Any], inputs: dict[str, Path]) -> dict[str, Any]:
-    # {cells,drawn,width,height} read at scripts/broll_resolve.py:3105-3114; width/height replay the pure
-    # canvas_size() at scripts/montyops/media_sheet.py:150-158; drawn mirrors its own input-presence check.
+    # {cells,drawn,width,height} read by the engine's b-roll resolver; width/height replay the pure
+    # canvas_size() of the engine's media.sheet op; drawn mirrors its own input-presence check.
     n = len(params.get("captions") or [])
     cols = max(1, min(int(params["cols"]), n)) if n else 1
     rows = (n + cols - 1) // cols if n else 1
@@ -281,9 +281,9 @@ def _synth_media_sheet_meta(params: dict[str, Any], inputs: dict[str, Path]) -> 
 
 
 def _synth_media_image_tile_meta(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
-    # Same shape read at scripts/broll_resolve.py:3104-3114; fused sheet call is cols=len(urls) one row
-    # (scripts/montyops/media_image_tile.py:70-73). `drawn` reports every requested cell as drawn — no GET
-    # runs under a stub, but broll_resolve.py:2381-2386 drops a candidate whose cell is missing from `drawn`
+    # Same shape read by the engine's b-roll resolver; fused sheet call is cols=len(urls) one row
+    # (the engine's media.image_tile op). `drawn` reports every requested cell as drawn — no GET
+    # runs under a stub, but the engine's b-roll resolver drops a candidate whose cell is missing from `drawn`
     # ("preview did not render"), so an honest empty list makes every photo-lane candidate under dry fail at
     # fetch_broll, not just skip the fetch, whenever the LLM picked asset auto/photo (TRK-90/MISC-189).
     n = len(params["urls"])
@@ -291,7 +291,7 @@ def _synth_media_image_tile_meta(params: dict[str, Any], _inputs: dict[str, Path
 
 
 def _synth_range_filmstrip_receipt(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
-    # Shape read back by scripts/fetch_broll.py:1537 and validated by montyops.media_range.RangeTransportReceipt
+    # Shape read back by the engine's b-roll fetcher and validated by the op pack's range transport receipt
     # (+ run_ledger.RANK_TRANSPORT_FIELDS' strict fold). The strip DID land, so the receipt is green: a "failed"
     # receipt with outputs_present=1 made every dry b-roll candidate a transport failure the real gate counts.
     # Nothing was read from any origin (origin/proven bytes 0, no requests — CONTOUR_DRY_CLAIMS); the dry
@@ -369,11 +369,11 @@ def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inp
 DRY_STILL_WHY = """
 media.still's sidecar is a MEASUREMENT of pixels, so the dry stand-in measures pixels — the placeholder ones.
 
-The engine reads `dark` (scripts/mark_backing.py::treatment_for, glass vs shadow), `bbox`/`mark_w`/`mark_h`
-(mark_backing._mark_rect), `width`/`height` (scripts/fetch_photo.py:1908), `plated`/`finished`/`rasterizer`
-(fetch_photo.py:1648, :1897-1902, :1952) — the old stub refused with DryStubUnderivedField, so the dry photo and
+The engine reads `dark` (its mark-backing treatment, glass vs shadow), `bbox`/`mark_w`/`mark_h`
+(the mark rect), `width`/`height` (its photo fetcher), `plated`/`finished`/`rasterizer`
+(the engine's photo fetcher) — the old stub refused with DryStubUnderivedField, so the dry photo and
 logo lanes died at the first still. Here the bound `src` (the media.fetch placeholder) is read with the REAL
-op's own rules, vendored verbatim from video-editor scripts/montyops/media_still.py (is_dark_image: alpha-
+op's own rules, vendored verbatim from the engine's media.still op (is_dark_image: alpha-
 weighted mean luminance of a 48x48 RGBA resize < 110; has_alpha: mode carries alpha and min alpha of a 64x64
 resize < 250; mark_probe: alpha bbox at >= 24 as canvas fractions; probe: 0x0 for a vector); a vector is
 "rasterised" to a solid placeholder at `width` (rasterizer `contour-dry-stub`), and the plate is a solid

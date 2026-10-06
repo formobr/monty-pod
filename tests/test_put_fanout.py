@@ -20,7 +20,7 @@ _LATENCY = 0.25          # one mock store round trip; a handful still finish the
 
 def _sheet_step(sid="sheet"):
     """`media.sheet` as the rank wave submits it: two INDEPENDENT durable outputs, the contact sheet and
-    the `.cells.json` sidecar that says which cells drew."""
+    the cells sidecar that says which cells drew."""
     return {"id": sid, "op": "media.sheet", "needs": [],
             "params": {"cols": 1, "cell_w": 16, "cell_h": 16, "gap": 0, "head": 0,
                        "caption_h": 0, "plate": True, "bg": [18, 18, 18], "captions": [[]]},

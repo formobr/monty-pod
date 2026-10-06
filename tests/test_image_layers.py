@@ -105,13 +105,13 @@ def test_ffmpeg_is_pinned_and_not_the_rolling_master():
 
 def test_ffmpeg_is_not_the_build_whose_acrossfade_drops_the_first_input():
     """NEGATIVE: n7.1.5-16-g9a4bb2c579's acrossfade silently discards most of the first operand on a
-    long+short join — exactly cut_audio.py's left-folded shape — and shipped for months because host
-    ffmpeg (a different, correct build) always passed local repro. See docs/POD_RUNBOOK.md."""
+    long+short join — exactly the engine's cut.audio op's left-folded shape — and shipped for months because host
+    ffmpeg (a different, correct build) always passed local repro. See the engine's pod runbook."""
     text = "\n".join(ln for ln in DOCKERFILE.read_text().splitlines() if not ln.strip().startswith("#"))
     assert "n7.1.5-16-g9a4bb2c579" not in text, (
         "this exact BtbN build's acrossfade drops the first operand on a long/short join")
     asset = re.search(r"ARG FFMPEG_ASSET=(\S+)", text)
     assert asset.group(1) == "ffmpeg-n6.1.3-linux64-gpl-6.1.tar.xz", (
         f"FFMPEG_ASSET moved to {asset.group(1)!r} — re-run the acrossfade isolation (long+short join, "
-        "3x) against the built image before repinning, and update scripts/broker/pod_ffmpeg_pin.py "
+        "3x) against the built image before repinning, and update the engine's ffmpeg pin "
         "(engine repo) to match")

@@ -1,5 +1,5 @@
 """pod-agent/tests/test_contour_dry_matrix.py — MISC-62: the pod-side half of the dry stub x engine reader
-matrix; mirrors tests/test_dry_stub_reader_matrix.py with an independent params roster (lock 4). Pod-only:
+matrix; mirrors the engine's own dry-stub-reader matrix test with an independent params roster (lock 4). Pod-only:
 no engine-module import, no engine-source read — those value-semantics checks live in the engine's file."""
 from __future__ import annotations
 
@@ -13,8 +13,6 @@ import pytest
 from podagent.ops import dry, pack, registry
 
 REPO = Path(__file__).resolve().parents[1]
-# monty-pod ships no media fixture; tests that bind one skip via `_NEEDS_FIXTURE` rather than assume it.
-FIXTURE = REPO / "dev/localpod/fixtures/contour-smoke.mp4"
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 _HAS_FFPROBE = shutil.which("ffprobe") is not None
@@ -55,7 +53,10 @@ def _produce(tmp_path: Path, op_name: str, *, only: set[str] | None = None):
         name = f"{op_name.replace('.', '_')}_{port.id}"
         outputs[port.id] = ([tmp_path / f"{name}_{i}{ext}" for i in range(2)] if port.many
                              else tmp_path / f"{name}{ext}")
-    inputs: dict[str, Path] = {p.id: FIXTURE for p in op.inputs if p.kind == "video"}
+    # a STUB handler never opens its bound input — it synthesizes the output's shape, not its content —
+    # so this needs only a syntactically valid video Path, never a real decodable file.
+    stub_input = tmp_path / "stub_input.mp4"
+    inputs: dict[str, Path] = {p.id: stub_input for p in op.inputs if p.kind == "video"}
     if op_name in _BOUND_IMAGE_OPS:
         for p in op.inputs:
             if p.kind == "image":
@@ -121,7 +122,7 @@ def test_dry_stub_output_x_engine_reader_matrix(tmp_path):
 
 
 def test_cut_apply_stub_durs_matches_contract_shape(tmp_path):
-    # No engine-source read here (unlike apply_edl.py:306) — that proof lives in the engine's own matrix.
+    # No engine-source read here (unlike the EDL-step reader) — that proof lives in the engine's own matrix.
     keep = _JSON_PARAMS["cut.apply"]["keep"]
     outputs = _produce(tmp_path, "cut.apply", only={"durs"})
     doc = json.loads(outputs["durs"].read_text(encoding="utf-8"))

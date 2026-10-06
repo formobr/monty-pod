@@ -32,7 +32,7 @@ from .render import body_duration
 from .sanitize import safe_text
 
 # The sync guard matches frames by argmin|ref-master| over GRAYSCALE at exactly this size
-# (scripts/check_sync.py all_frames), so the reference is scaled and greyed INSIDE the graph: a
+# (the engine's sync check, all frames), so the reference is scaled and greyed INSIDE the graph: a
 # compression delta between rungs would otherwise land straight in the frame match.
 _REF_W, _REF_H = 80, 142
 # libx264 at both rungs on purpose: h264_nvenc has a minimum encode width an 80-px frame is under,
@@ -574,7 +574,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         chains.append(f"[{vlink}]subtitles={p.ass}:fontsdir={p.font_dir}[{V_CAPTIONS}]")
         vlink = V_CAPTIONS
 
-    # The reference is built only when the spec DECLARES somewhere to put it (final_spec.py:172-174
+    # The reference is built only when the spec DECLARES somewhere to put it (the engine's final-spec builder
     # declares it with the tail and not otherwise); an undeclared one is a second full-body encode
     # thrown away. A filter link is single-use, so the fork is explicit, and it sits BEFORE the
     # accents — they are the very thing able to slide picture against sound.
@@ -673,7 +673,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
             "-ar", "48000", *_MASTER_AUDIO,
             "-movflags", "+faststart", "-t", t, str(p.master_out)]
     if wants_ref:
-        # check_sync.py all_frames matches ref against master by frame INDEX, so a different grid here
+        # the engine's sync check all_frames matches ref against master by frame INDEX, so a different grid here
         # compares different instants — the ref carries the master's OWN -r, never its own.
         cmd += ["-map", f"[{V_PRESYNC}]", "-map", f"[{aref}]",
                 "-r", grid, "-fps_mode", "cfr",

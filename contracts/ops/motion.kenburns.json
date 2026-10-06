@@ -67,7 +67,7 @@
       },
       "encode_profile": {
         "enum": ["preview", "final"],
-        "description": "Named quality tier, NOT encoder flags — same SSOT pattern as scripts/render_profile.py. The intermediate cq/preset ladder is tuning and stays in the handler."
+        "description": "Named quality tier, NOT encoder flags — same SSOT pattern as the engine's render-profile table. The intermediate cq/preset ladder is tuning and stays in the handler."
       }
     }
   },

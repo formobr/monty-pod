@@ -4,9 +4,9 @@ plane checks before dispatch, so a payload the schema admits is one the pod admi
 widen this schema for the fold's param shape (top-level `geom`, keyframes carrying z/head_x/eye_y/interp or
 t/bump, no top-level `interp`) — every post-fold camera.apply call died with `'interp' is a required
 property` before this fix. These tests are pure contract-level checks (no engine import); the cross-boundary
-check that `scripts.op_chains.camera_params`'s REAL output validates is
-tests/test_camera_path_smoothness.py::test_camera_apply_validate_params_accepts_the_real_fold_trajectory
-(engine side, since it needs head_trajectory to build a real trajectory.json).
+check that the engine's camera-params builder's REAL output validates is
+the engine's own camera-path smoothness test's test_camera_apply_validate_params_accepts_the_real_fold_trajectory
+(engine side, since it needs head_trajectory to build a real persisted trajectory).
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _zoom(keyframes=None, **overrides):
 
 
 def test_the_legacy_rect_shape_still_validates():
-    """A trajectory.json persisted before MISC-141 (no `geom`, one top-level `interp`, keyframes carry
+    """A trajectory persisted before MISC-141 (no `geom`, one top-level `interp`, keyframes carry
     `t`/`rect`) validates unchanged — the fold's oneOf must not narrow the pre-fold shape."""
     registry.validate_params("camera.apply", _legacy())
 

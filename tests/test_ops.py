@@ -113,7 +113,7 @@ def test_judgement_op_is_refused_on_the_pod(tmp_path, monkeypatch):
     d.mkdir()
     decl = json.loads((CONTRACTS / "ops" / "media.scale.json").read_text())
     decl.update({"op": "cut.decide", "judgement": True})
-    (d / "cut.decide.json").write_text(json.dumps(decl))
+    (d / f"{decl['op']}.json").write_text(json.dumps(decl))
     monkeypatch.setattr(registry, "OPS_DIR", d)
     registry.all_ops.cache_clear()
     with pytest.raises(registry.OpError, match="judgement"):
@@ -128,7 +128,7 @@ def test_key_needing_op_is_refused_on_the_pod(tmp_path, monkeypatch):
     d.mkdir()
     decl = json.loads((CONTRACTS / "ops" / "mograph.render.json").read_text())
     decl.update({"op": "llm.author", "needs": ["llm", "keys"]})
-    (d / "llm.author.json").write_text(json.dumps(decl))
+    (d / f"{decl['op']}.json").write_text(json.dumps(decl))
     monkeypatch.setattr(registry, "OPS_DIR", d)
     registry.all_ops.cache_clear()
     with pytest.raises(registry.OpError, match="KEYLESS"):
@@ -206,7 +206,7 @@ def _make_pack(tmp_path: Path, body: str) -> tuple[object, Path]:
     src = tmp_path / "montyops"
     src.mkdir(parents=True, exist_ok=True)
     (src / "__init__.py").write_text("")
-    (src / "demo.py").write_text(body)
+    (src / "runner.py").write_text(body)
     tar = tmp_path / "pack.tar"
     with tarfile.open(tar, "w") as tf:
         tf.add(src, arcname="montyops")
@@ -235,7 +235,7 @@ def test_pack_activates_and_resolves_a_handler(tmp_path, monkeypatch):
     ref, _ = _make_pack(tmp_path, "def run(*, params, inputs, outputs):\n    return params\n")
     monkeypatch.setenv(pack.PACK_CACHE_ENV, str(tmp_path / "cache"))
     pack.activate(ref)
-    fn = pack.resolve("montyops.demo:run")
+    fn = pack.resolve("montyops.runner:run")
     assert fn(params={"k": 1}, inputs={}, outputs={}) == {"k": 1}
     pack.reset_for_tests()
 
