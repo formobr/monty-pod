@@ -40,10 +40,9 @@ _JSON_STUB_PARAMS: dict[str, dict] = {
                                "width": 64, "height": 96, "fit": "cover",
                                "max_origin_bytes": 16 * 1024 * 1024},
 }
-# op -> (field it cannot derive, engine reader file:line that needs it)
-_UNDERIVABLE_JSON_FIELD: dict[str, tuple[str, str]] = {
-    "media.still": ("dark", "scripts/broll_resolve.py:2231"),
-}
+# op -> (field it cannot derive, engine reader file:line that needs it). Empty since media.still measures its
+# bound placeholder (dry.DRY_STILL_WHY); the mechanism stays for the next underivable field.
+_UNDERIVABLE_JSON_FIELD: dict[str, tuple[str, str]] = {}
 # (op, field, engine reader file:line) for every STUB op's JSON output this dry tier must satisfy.
 _ENGINE_READER_ROSTER: list[tuple[str, str, str]] = [
     ("cut.apply", "rdurs", "scripts/apply_edl.py:306"),
@@ -65,10 +64,21 @@ _ENGINE_READER_ROSTER: list[tuple[str, str, str]] = [
 _JSON_STUB_OP_NAMES = sorted({op for op, _, _ in _ENGINE_READER_ROSTER})
 
 
+def _bound_inputs(tmp_path: Path, op_name: str) -> dict:
+    """media.still's stub measures its bound src — the placeholder the dry media.fetch stub really writes."""
+    if op_name != "media.still":
+        return {}
+    src = tmp_path / "fetched_src.png"
+    dry._write_image(src, op_name="media.fetch")
+    return {"src": src}
+
+
 def _run_stub(tmp_path: Path, op_name: str, *, params: dict | None = None, inputs: dict | None = None,
               only: set[str] | None = None):
     op = registry.get(op_name)
     fn = dry.resolve(op)
+    if inputs is None:
+        inputs = _bound_inputs(tmp_path, op_name)
     outputs = {}
     for port in op.outputs:
         if only is not None and port.id not in only:
@@ -111,7 +121,7 @@ def test_every_stubbed_op_yields_its_declared_outputs_in_dry_mode(tmp_path, op_n
             outputs[port.id] = [tmp_path / f"{port.id}_{i}{ext}" for i in range(2)]
         else:
             outputs[port.id] = tmp_path / f"{port.id}{ext}"
-    fn(params=_JSON_STUB_PARAMS.get(op_name, {}), inputs={}, outputs=outputs)
+    fn(params=_JSON_STUB_PARAMS.get(op_name, {}), inputs=_bound_inputs(tmp_path, op_name), outputs=outputs)
     for port in op.outputs:
         paths = outputs[port.id] if port.many else [outputs[port.id]]
         for path in paths:
@@ -178,17 +188,11 @@ def test_engine_reader_roster_lands_or_refuses_by_name(tmp_path, op_name, field,
             _run_stub(tmp_path, op_name, only={json_port})
         assert ei.value.op_name == op_name
         return
-    outputs = _run_stub(tmp_path, op_name, params=_JSON_STUB_PARAMS.get(op_name, {}), only={json_port})
+    # media.still measures the mark only when it finishes `dst` (the real op's own rule), so bind every port
+    only = None if op_name == "media.still" else {json_port}
+    outputs = _run_stub(tmp_path, op_name, params=_JSON_STUB_PARAMS.get(op_name, {}), only=only)
     doc = json.loads(outputs[json_port].read_text())
     assert field in doc, f"{op_name}: {_reader} reads {field!r}, which the dry synth never produced"
-
-
-def test_underivable_json_field_refuses_by_name(tmp_path):
-    for op_name, (field, _reader) in _UNDERIVABLE_JSON_FIELD.items():
-        with pytest.raises(dry.DryStubUnderivedField) as ei:
-            _run_stub(tmp_path, op_name, only={_json_port_id(op_name)})
-        assert ei.value.op_name == op_name
-        assert ei.value.field == field
 
 
 def _fake_pack_tar(tmp_path: Path, module_name: str, body: str) -> object:
@@ -514,8 +518,10 @@ def test_range_filmstrip_stub_receipt_never_claims_bytes_it_did_not_read(tmp_pat
     outputs = _run_stub(tmp_path, "media.range_filmstrip",
                         params=_JSON_STUB_PARAMS["media.range_filmstrip"])
     doc = json.loads(outputs["receipt"].read_text())
-    assert doc["object_bytes"] is None and doc["status"] != "ok", "a stub may not fabricate a green receipt"
-    assert doc["origin_bytes"] == doc["range_requests"] == doc["whole_attempts"] == 0
+    # green because the strip landed (MISC-262), yet no origin byte is claimed read
+    assert doc["status"] == "ok" and doc["reason"] == ""
+    assert doc["object_bytes"] == doc["byte_cap"] == _JSON_STUB_PARAMS["media.range_filmstrip"]["max_origin_bytes"]
+    assert doc["origin_bytes"] == doc["proven_bytes"] == doc["range_requests"] == doc["whole_attempts"] == 0
     assert doc["outputs_present"] == doc["outputs_expected"] == 1, "the placeholder strip really landed"
     assert outputs["strip"].stat().st_size > 0
 

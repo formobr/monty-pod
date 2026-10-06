@@ -19,6 +19,7 @@ _RANK_REQ = {"infer_version": 6, "job_id": "j", "kind": "clip_rank", "model": "s
 @pytest.fixture(autouse=True)
 def _isolated_live_mark(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
+    monkeypatch.delenv("MONTY_OPS_CONTOUR_DRY", raising=False)   # a FULL pod; the dry pod has its own test
 
 
 class _CP:
@@ -55,15 +56,20 @@ def _boot(monkeypatch, *, env: str | None, free: float) -> tuple[_CP, list[str]]
 
 
 def test_a_pod_serves_and_sizes_only_its_given_infer_kinds(monkeypatch, tmp_path):
-    # the floor follows the served set
-    assert agent_main.boot_vram_floor_mib({"clip_rank", "align"}) == 3248.0
-    assert agent_main.boot_vram_floor_mib({"align"}) == 2012.0
-    assert agent_main.boot_vram_floor_mib({"face_probe"}) is None
-    assert agent_main.boot_vram_floor_mib(set()) is None
+    # the floor follows the served set, plus one NVENC session for the render ops every full pod serves
+    # (infer_lanes.RENDER_HEADROOM_WHY)
+    assert agent_main.boot_vram_floor_mib({"clip_rank", "align"}) == 4208.0
+    assert agent_main.boot_vram_floor_mib({"align"}) == 2972.0
+    assert agent_main.boot_vram_floor_mib({"face_probe"}) == 1472.0
+    assert agent_main.boot_vram_floor_mib(set()) == 1472.0
+    assert agent_main.boot_vram_floor_mib({"clip_rank", "align"}, render=False) == 3248.0
+    assert agent_main.boot_vram_floor_mib({"align"}, render=False) == 2012.0
+    assert agent_main.boot_vram_floor_mib({"face_probe"}, render=False) is None
+    assert agent_main.boot_vram_floor_mib(set(), render=False) is None
 
-    # unset env = every kind, today's floor
+    # unset env = every kind, the fleet floor
     assert lanes.served_kinds(None) == frozenset({"align", "clip_rank", "face_probe"})
-    assert agent_main.boot_vram_floor_mib() == 3248.0
+    assert agent_main.boot_vram_floor_mib() == 4208.0
     with pytest.raises(SystemExit) as exc:
         _boot(monkeypatch, env=None, free=3236.0)          # the 2026-10-02 laptop, all kinds
     assert exc.value.code == agent_main.BOOT_VRAM_REFUSAL_EXIT
@@ -72,10 +78,13 @@ def test_a_pod_serves_and_sizes_only_its_given_infer_kinds(monkeypatch, tmp_path
     _, timeline = _boot(monkeypatch, env="align", free=3236.0)
     assert timeline[-1] == "ready"
 
-    # no GPU kind served: a card with 100 MiB free boots
+    # no GPU kind served: the card still needs its render headroom — 1500 MiB free boots, 100 MiB refuses
     for env in ("face_probe", ""):
-        cp, timeline = _boot(monkeypatch, env=env, free=100.0)
+        cp, timeline = _boot(monkeypatch, env=env, free=1500.0)
         assert timeline[-1] == "ready" and cp.events == []
+        with pytest.raises(SystemExit) as exc:
+            _boot(monkeypatch, env=env, free=100.0)
+        assert exc.value.code == agent_main.BOOT_VRAM_REFUSAL_EXIT
 
     # an unknown kind refuses boot by name, before ready
     with pytest.raises(SystemExit) as exc:

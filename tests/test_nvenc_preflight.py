@@ -285,6 +285,9 @@ def test_main_never_reaches_dispatch_while_readiness_stays_ambiguous(monkeypatch
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
+    # the boot VRAM floor reads the LIVE card — a desktop holding it must not decide a readiness test
+    monkeypatch.setattr(agent_main, "_free_vram_or_refuse", lambda _cp: None)
+    monkeypatch.delenv("MONTY_OPS_CONTOUR_DRY", raising=False)
     monkeypatch.setattr(agent_main, "_dispatch_loop", _dispatch)
     monkeypatch.setattr(agent_main.time, "sleep", _sleep_n_times_then_stop(2, sleeps))
 
@@ -308,6 +311,9 @@ def test_readiness_identity_rejection_exits_4_not_a_crash(monkeypatch):
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
+    # the boot VRAM floor reads the LIVE card — a desktop holding it must not decide a readiness test
+    monkeypatch.setattr(agent_main, "_free_vram_or_refuse", lambda _cp: None)
+    monkeypatch.delenv("MONTY_OPS_CONTOUR_DRY", raising=False)
 
     with pytest.raises(SystemExit) as e:
         agent_main.main()

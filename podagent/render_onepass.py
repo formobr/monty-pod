@@ -25,7 +25,9 @@ from . import render as _render
 from .cp import upload
 from .models import SPEC_VERSION, RenderSpec
 from .ops.dry import CONTOUR_DRY_CLAIMS as _CONTOUR_DRY_CLAIMS
+from .ops.dry import DRY_TONE_LUFS as _DRY_TONE_LUFS
 from .ops.dry import armed as _contour_dry_armed
+from .ops.dry import dry_tone_lavfi as _dry_tone_lavfi
 from .render import body_duration
 from .sanitize import safe_text
 
@@ -944,15 +946,18 @@ def _ffmpeg_failure_message(returncode: int, stderr: bytes | str | None) -> str:
     return prefix + cleaned
 
 
-def _dry_lavfi(dst: Path, *, w: int, h: int, dur: float, grid: str, with_audio: bool) -> None:
+def _dry_lavfi(dst: Path, *, w: int, h: int, dur: float, grid: str, with_audio: bool,
+               lufs: float = _DRY_TONE_LUFS) -> None:
+    # Audio is the never-silent stand-in at the contract's loudness (ops/dry.py DRY_AUDIO_WHY): anullsrc made
+    # every dry master «OFF-CONTRACT … silent audio: loudness -inf» at the engine's check_master gate.
     src = ["-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={grid}:d={dur:.3f}"]
     maps = ["-map", "0:v"]
     if with_audio:
-        src += ["-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo:d={dur:.3f}"]
+        src += ["-f", "lavfi", "-i", _dry_tone_lavfi(lufs=lufs, dur=dur)]
         maps += ["-map", "1:a"]
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *src, *maps,
-           "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "ultrafast", *_finalize._BT709,
-           *(["-c:a", "aac"] if with_audio else []), str(dst)]
+           "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+           *_finalize._BT709, *(["-c:a", "aac", "-b:a", "128k"] if with_audio else []), str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_ENCODE_FLOOR_S)
 
 
@@ -963,15 +968,24 @@ def _dry_framemd5(dst: Path, n_frames: int) -> None:
     dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def dry_master_lufs(spec: RenderSpec) -> float:
+    """The integrated loudness the dry master is written at: the spec's own delivery loudnorm target when
+    it declares one (the level check_master gates against), else the brand default ops/dry.DRY_TONE_LUFS."""
+    fin = spec.overlays.finalize if spec.overlays is not None else None
+    ln = fin.loudnorm if fin is not None else None
+    return float(ln.i) if ln is not None else _DRY_TONE_LUFS
+
+
 def _run_dry(p: Prepared, cmd: list[str]) -> None:
     """Contour-dry stand-in for the ONE real filtergraph subprocess: every declared output this argv would
     have written (master, presync, every framemd5 tap) lands via a cheap lavfi source at the PLAN's own
     duration/size/fps instead — `assemble`'s real graph/argv is judged by `build_receipt`, never this."""
     grid = _finalize.declared_grid(p.spec.timeline.fps)
     w, h = p.spec.timeline.width, p.spec.timeline.height
-    _dry_lavfi(p.master_out, w=w, h=h, dur=p.duration, grid=grid, with_audio=True)
+    lufs = dry_master_lufs(p.spec)
+    _dry_lavfi(p.master_out, w=w, h=h, dur=p.duration, grid=grid, with_audio=True, lufs=lufs)
     if str(p.presync_out) in cmd:
-        _dry_lavfi(p.presync_out, w=_REF_W, h=_REF_H, dur=p.duration, grid=grid, with_audio=True)
+        _dry_lavfi(p.presync_out, w=_REF_W, h=_REF_H, dur=p.duration, grid=grid, with_audio=True, lufs=lufs)
     expected = tap_frames_expected(p.spec)
     for pad, path in p.tap_md5.items():
         _dry_framemd5(path, expected.get(pad, 0))

@@ -5,6 +5,7 @@ import gc
 from typing import Any, Callable, Mapping
 
 from .infer_cliprank import _VRAM_PER_LANE_MB, _VRAM_RESERVE_MB, _VRAM_WEIGHTS_MB, _free_vram_mb
+from .ops.gpu_admission import NVENC_SESSION_MIB
 
 INFER_KIND_RESIDENCY_WHY = """
 TWO INFER KINDS, ONE CARD, AND NOTHING DECIDED WHETHER IT HOLDS BOTH.
@@ -108,11 +109,31 @@ def served_kinds(raw: str | None) -> frozenset[str]:
     return frozenset(kinds)
 
 
-def vram_floor_mib(kinds: frozenset[str] | set[str]) -> float | None:
-    """Free MiB a card must report to load the heaviest served kind + reserve; None when no served kind holds
-    VRAM (face_probe-only or nothing)."""
+RENDER_HEADROOM_WHY = """
+A CARD THAT PASSED THE FLOOR MUST STILL BE ABLE TO ENCODE.
+
+The floor used to count only the heaviest infer kind + reserve (clip_rank 2736 + 512 = 3248 MiB), yet every full
+pod also serves render ops — and camera.apply on a 6 GB card that cleared 3248 died mid-job on its NVENC open:
+«CreateInputBuffer failed: out of memory». So a pod that serves render ops adds the render headroom: ONE 1080p
+NVDEC+NVENC session, the engine's measured `_VRAM_PER_SESSION_MB` 960 MiB (video-editor
+scripts/montyops/cut_apply.py, NVENC_SIZING_WHY there; mirrored as gpu_admission.NVENC_SESSION_MIB, the unit the
+pod's own heavy-op ledger reserves). One session is the largest working set any render op is GUARANTEED: the
+heavies (cut.apply, camera.apply, media.normalize, media.cut_proxy) size their fan-out from what is free and run
+one at a time under the whole-budget admission (gpu_admission.GPU_ADMISSION_WHY), so the floor that lets ONE of
+them start is the one that matters — a wider fan-out is their own sizing, never a boot promise. The headroom is
+ADDED to the infer kind's residency, because the heavy lane (align) and a render op are dispatched side by side.
+Full floor with every kind: 2736 + 960 + 512 = 4208 MiB. A contour-dry pod renders nothing and keeps no floor.
+"""
+
+RENDER_HEADROOM_MIB = NVENC_SESSION_MIB
+
+
+def vram_floor_mib(kinds: frozenset[str] | set[str], *, render: bool = False) -> float | None:
+    """Free MiB a card must report to load the heaviest served kind (+ one NVENC session when the pod serves
+    render ops, RENDER_HEADROOM_WHY) + reserve; None when nothing served holds VRAM."""
     heaviest = max((KIND_VRAM_MIB[k] for k in kinds), default=0.0)
-    return heaviest + RESERVE_MIB if heaviest > 0 else None
+    need = heaviest + (RENDER_HEADROOM_MIB if render else 0.0)
+    return need + RESERVE_MIB if need > 0 else None
 
 
 def refuse_unserved(kind: str, kinds: frozenset[str] | set[str]) -> None:

@@ -312,8 +312,8 @@ def apply_loudnorm(fin, src: Path, out: Path) -> Path:
     if ln is None:
         return src
     if _contour_dry_armed():
-        # A synthetic dry master is bit-exact silence; loudnorm's own measure refuses non-finite LUFS
-        # (master_af above), so this copies the declared output instead of running a measure doomed to raise.
+        # A synthetic dry master is already written AT this loudnorm target (render_onepass.dry_master_lufs,
+        # ops/dry.py DRY_AUDIO_WHY), so the two-pass measure has nothing to move: copy the declared output.
         shutil.copyfile(src, out)
         return out
     aim = round(ln.tp - TP_HEADROOM_DB, 2)

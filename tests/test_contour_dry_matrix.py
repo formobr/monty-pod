@@ -39,7 +39,9 @@ _JSON_PARAMS = {
                                "max_origin_bytes": 1024 * 1024},
 }
 _EXTRA_PARAMS = {"media.cut_proxy": {"max_h": 360}}
-_UNDERIVABLE = {"media.still"}
+_UNDERIVABLE: set[str] = set()   # media.still now measures its bound placeholder (dry.DRY_STILL_WHY)
+# Ops whose stub reads its bound IMAGE input; bound to the placeholder the dry media.fetch stub really writes.
+_BOUND_IMAGE_OPS = {"media.still"}
 
 
 def _produce(tmp_path: Path, op_name: str, *, only: set[str] | None = None):
@@ -53,7 +55,12 @@ def _produce(tmp_path: Path, op_name: str, *, only: set[str] | None = None):
         name = f"{op_name.replace('.', '_')}_{port.id}"
         outputs[port.id] = ([tmp_path / f"{name}_{i}{ext}" for i in range(2)] if port.many
                              else tmp_path / f"{name}{ext}")
-    inputs = {p.id: FIXTURE for p in op.inputs if p.kind == "video"}
+    inputs: dict[str, Path] = {p.id: FIXTURE for p in op.inputs if p.kind == "video"}
+    if op_name in _BOUND_IMAGE_OPS:
+        for p in op.inputs:
+            if p.kind == "image":
+                inputs[p.id] = tmp_path / f"{p.id}_fetched.png"
+                dry._write_image(inputs[p.id], op_name="media.fetch")
     params = {**_JSON_PARAMS.get(op_name, {}), **_EXTRA_PARAMS.get(op_name, {})}
     try:
         fn(params=params, inputs=inputs, outputs=outputs)

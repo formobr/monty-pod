@@ -341,8 +341,10 @@ warm-up OOM'd («15.48 GiB total, 19 MiB free») only AFTER the pod had reported
 
 THE FLOOR IS DERIVED, NOT GUESSED: the heaviest single infer kind's measured residency
 (infer_lanes.KIND_VRAM_MIB — clip_rank = _VRAM_WEIGHTS_MB 2322 + _VRAM_PER_LANE_MB 414 = 2736 MiB, above align's
-1500) plus the same _VRAM_RESERVE_MB 512 every lane budget keeps = 3248 MiB. Below that not even one kind can
-load, so the pod refuses before ready. Above it the lane sizing (narrow card -> kinds serialise) takes over.
+1500) plus one 1080p NVDEC+NVENC session for the render ops every full pod serves (960 MiB, measured;
+infer_lanes.RENDER_HEADROOM_WHY) plus the same _VRAM_RESERVE_MB 512 every lane budget keeps = 4208 MiB. Below
+that a kind and a render op cannot both start, so the pod refuses before ready instead of mid-job. Above it the
+lane sizing (narrow card -> kinds serialise) takes over.
 An UNREADABLE card is not refused here: no reading is not evidence of a foreign tenant, and the NVENC probe
 has already proven the GPU answers.
 """
@@ -350,11 +352,12 @@ has already proven the GPU answers.
 BOOT_VRAM_REFUSAL_EXIT = 6   # distinct from 3 (codec refusal), 4 (transport), 5 (infra fault)
 
 
-def boot_vram_floor_mib(kinds: "frozenset[str] | set[str] | None" = None) -> float | None:
-    """Free MiB the card must report at boot: heaviest SERVED infer kind + reserve (BOOT_FREE_VRAM_WHY,
-    infer_lanes.SERVED_INFER_KINDS_WHY); None when no served kind holds VRAM. `kinds` None = every kind."""
+def boot_vram_floor_mib(kinds: "frozenset[str] | set[str] | None" = None, *, render: bool = True) -> float | None:
+    """Free MiB the card must report at boot: heaviest SERVED infer kind + one NVENC session when the pod serves
+    render ops + reserve (BOOT_FREE_VRAM_WHY, infer_lanes.SERVED_INFER_KINDS_WHY / RENDER_HEADROOM_WHY); None
+    when nothing served holds VRAM. `kinds` None = every kind; every full pod serves render ops."""
     from .infer_lanes import KIND_VRAM_MIB, vram_floor_mib
-    return vram_floor_mib(frozenset(KIND_VRAM_MIB) if kinds is None else kinds)
+    return vram_floor_mib(frozenset(KIND_VRAM_MIB) if kinds is None else kinds, render=render)
 
 
 def _served_kinds_or_refuse(cp: "ControlPlane") -> frozenset[str]:
@@ -379,10 +382,12 @@ def _served_kinds_or_refuse(cp: "ControlPlane") -> frozenset[str]:
 def _free_vram_or_refuse(cp: "ControlPlane", *, free_probe: Any = None, total_probe: Any = None) -> None:
     """Refuse a card whose VRAM is already taken by processes that are not ours, BEFORE ready (BOOT_FREE_VRAM_WHY)."""
     from .infer_cliprank import _free_vram_mb, vram_total_mb
+    from .infer_lanes import RENDER_HEADROOM_MIB
     served = _served_kinds_or_refuse(cp)
     floor = boot_vram_floor_mib(served)
-    _log(f"serving infer kinds {','.join(sorted(served)) or '(none)'} — boot VRAM floor "
-         f"{'none (no served kind holds VRAM)' if floor is None else f'{floor:.0f} MiB'}")
+    _log(f"serving infer kinds {','.join(sorted(served)) or '(none)'} + render ops — boot VRAM floor "
+         f"{'none (nothing served holds VRAM)' if floor is None else f'{floor:.0f} MiB'} "
+         f"(incl. {RENDER_HEADROOM_MIB:.0f} MiB render headroom, one NVENC session)")
     if floor is None:
         return
     try:
@@ -665,7 +670,8 @@ def _vulkaninfo_summary() -> str:
     return f"vulkaninfo: {line}"
 
 
-def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None) -> None:
+def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None,
+                  step: str = "capability preflight passed") -> None:
     """Open admission only once the capability verdict is durably acknowledged — but never by ending the
     process on a mere ambiguity (TRK-105). A stuck ACK backs off and keeps retrying in bounded rounds
     forever; the ONLY door this loop itself walks out of early is a DEFINITIVE identity verdict on the
@@ -678,7 +684,7 @@ def _report_ready(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None)
         "stage": "boot",
         "status": "step",
         "phase": "ready",
-        "step": "capability preflight passed",
+        "step": step,
     }
     if capacity is not None:
         event["capacity"] = dict(capacity)
@@ -1085,6 +1091,27 @@ def _stop_and_exit(signum: int, _frame: Any) -> None:
     sys.exit(128 + int(signum))
 
 
+DRY_POD_NO_GPU_WHY = """
+A DRY POD DOES NO GPU WORK, SO IT ASKS NOTHING OF THE CARD.
+
+Owner 2026-10-06: the release check must be fast, must not render for real and must not occupy the owner's
+laptop GPU. A contour-dry pod (MONTY_OPS_CONTOUR_DRY, the local release replay) renders through lavfi/libx264
+stand-ins (ops/dry.py, render_onepass._run_dry), serves only face_probe (CPU ONNX) and replays clip_rank — yet
+it still opened an NVENC session, an NVDEC decode and a Vulkan device before ready, so every release needed a
+working encoder on the owner's card. Dry is no GPU work BY DEFINITION: the NVENC/NVDEC/Vulkan probes, the torch
+device read and the boot VRAM floor are all skipped, and the boot beacon and the ready frame say so (capacity
+`vulkan` is null — not probed, which is not the `vulkan=false` boot defect the pool evicts on).
+"""
+
+DRY_PREFLIGHT_STEP = ("capability preflight skipped: contour-dry pod does no GPU work — no NVENC/NVDEC/Vulkan "
+                      "probe, no VRAM floor (DRY_POD_NO_GPU_WHY)")
+
+
+def _dry_pod() -> bool:
+    from .ops.dry import armed
+    return armed()
+
+
 def _report_boot(cp: ControlPlane) -> None:
     """One event before the first poll. A keyless pod that cannot reach the CP has NO other voice: the box
     boots, bills and stays silent, which reads exactly like a dead host. This beacon turns that into a
@@ -1092,11 +1119,14 @@ def _report_boot(cp: ControlPlane) -> None:
 
     It also carries the PREVIOUS incarnation's post-mortem, because a second boot on one rent is the only
     place a crash that ran no handler can still be described (POST_MORTEM_WHY)."""
-    try:
-        import torch
-        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no-cuda"
-    except Exception:  # noqa: BLE001 — the beacon must never be what kills a boot
-        gpu = "no-torch"
+    if _dry_pod():
+        gpu = "not probed (contour-dry: no GPU work)"
+    else:
+        try:
+            import torch
+            gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no-cuda"
+        except Exception:  # noqa: BLE001 — the beacon must never be what kills a boot
+            gpu = "no-torch"
     post = _post_mortem()
     _mark_alive()
     cp.note({"stage": "boot", "status": "step", "phase": "started",
@@ -1104,8 +1134,16 @@ def _report_boot(cp: ControlPlane) -> None:
 
 
 def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, Any] | None = None) -> None:
-    """Report the boot, prove the encoder and a card not already full, then make readiness an ACKed admission barrier."""
+    """Report the boot, prove the encoder and a card not already full, then make readiness an ACKed admission barrier.
+    A contour-dry pod proves nothing of the card: it does no GPU work (DRY_POD_NO_GPU_WHY)."""
     _report_boot(cp)
+    if _dry_pod():
+        _log(DRY_PREFLIGHT_STEP)
+        if capacity is not None:
+            capacity["vulkan"] = None
+            capacity["gpu_preflight"] = "skipped_contour_dry"
+        _report_ready(cp, capacity=capacity, step=DRY_PREFLIGHT_STEP)
+        return
     _nvenc_or_refuse(cp)
     _free_vram_or_refuse(cp)
     _nvdec_or_refuse(cp)
@@ -1353,7 +1391,8 @@ def main() -> None:
     for _sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(_sig, _stop_and_exit)
     served = _served_kinds_or_refuse(cp)
-    _log_gpu_status()
+    if not _dry_pod():
+        _log_gpu_status()
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
     from .infer_lanes import card_holds_both_kinds

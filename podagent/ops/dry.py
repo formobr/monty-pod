@@ -107,12 +107,12 @@ class DryStubUnsupportedOutput(RuntimeError):
 _AUDIO_EXT_ARGS: dict[str, list[str]] = {
     ".mp3": ["-c:a", "libmp3lame", "-q:a", "5"],
     ".wav": ["-c:a", "pcm_s16le"],
-    ".m4a": ["-c:a", "aac", "-b:a", "8k"],
-    ".aac": ["-c:a", "aac", "-b:a", "8k"],
+    ".m4a": ["-c:a", "aac", "-b:a", "96k"],
+    ".aac": ["-c:a", "aac", "-b:a", "96k"],
 }
 _VIDEO_EXT_ARGS: dict[str, list[str]] = {
-    ".mp4": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "8k"],
-    ".mov": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "8k"],
+    ".mp4": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k"],
+    ".mov": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k"],
 }
 # Raster stills the placeholder can honestly mux through ffmpeg (`ffmpeg -formats`/`-muxers` on this
 # build: png/jpeg/webp all have a raster muxer; svg does not — confirmed empty `ffmpeg -muxers | grep svg`).
@@ -123,13 +123,35 @@ _VECTOR_IMAGE_EXTS = {".svg"}
 _IMAGE_EXTS = _RASTER_IMAGE_EXTS | _VECTOR_IMAGE_EXTS
 
 
+DRY_AUDIO_WHY = """
+A DRY FAKE IS NEVER SILENT: THE ENGINE'S MASTER CONTRACT REFUSES A FINAL WITHOUT SOUND.
+
+video-editor scripts/check_master.py::gate refuses («OFF-CONTRACT … silent audio: loudness measured as -inf»)
+any master whose audio stream measures no programme, or under SILENT_LUFS -40, or outside target ± TOL 3 LU.
+anullsrc is bit-exact silence, so every dry master failed the REAL gate. The stand-in is a 997 Hz sine on both
+channels at 48 kHz (check_master WANT_SAMPLE_RATE) with peak amplitude 10^(L/20): BS.1770 K-weighting is ~0 dB
+at 997 Hz, so a stereo sine of peak L dBFS integrates to L LUFS (measured with ffmpeg loudnorm here: -14 → -14.1,
+-20 → -20.1; true peak L + 1.2 dBTP after AAC) — the contract's loudness by construction, no measure pass.
+"""
+
+DRY_AUDIO_RATE = 48000
+DRY_TONE_LUFS = -14.0   # the brand delivery target check_master.TARGET_LUFS reads (audio.master_lufs)
+
+
+def dry_tone_lavfi(*, lufs: float = DRY_TONE_LUFS, dur: float | None = None) -> str:
+    """The lavfi spec of the never-silent stand-in programme at `lufs` integrated (DRY_AUDIO_WHY)."""
+    amp = 10 ** (float(lufs) / 20.0)
+    wave = f"{amp:.6f}*sin(2*PI*997*t)"
+    return f"aevalsrc={wave}|{wave}:s={DRY_AUDIO_RATE}" + (f":d={dur:.3f}" if dur is not None else "")
+
+
 def _write_audio(dst: Path, *, op_name: str) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     args = _AUDIO_EXT_ARGS.get(dst.suffix.lower())
     if args is None:
         raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "audio")
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-           "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=1", "-t", "1", *args, str(dst)]
+           "-f", "lavfi", "-i", dry_tone_lavfi(dur=1.0), "-t", "1", *args, str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
 
@@ -164,7 +186,7 @@ def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None) -> N
         args = _VIDEO_EXT_ARGS[dst.suffix.lower()]
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
-               "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=1", "-t", "1", *args, str(dst)]
+               "-f", "lavfi", "-i", dry_tone_lavfi(dur=1.0), "-t", "1", *args, str(dst)]
     elif _has_audio_stream(audio_src):
         # `-shortest` against an infinite colour source sizes the output to the real audio's own duration.
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -268,19 +290,17 @@ def _synth_media_image_tile_meta(params: dict[str, Any], _inputs: dict[str, Path
     return {"cells": n, "drawn": list(range(n)), "width": int(params["width"]) * n, "height": int(params["height"])}
 
 
-def _synth_media_still_meta(_params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
-    # dark/bbox/mark_w/mark_h/width/height/finished/plated/rasterizer read at scripts/broll_resolve.py:2231
-    # and scripts/fetch_photo.py:1633-1931; all come off probe(src)'s pixel/host reality, none off params.
-    raise DryStubUnderivedField("media.still", "dark", why="pixel/alpha/host facts, not a param function")
-
-
 def _synth_range_filmstrip_receipt(params: dict[str, Any], _inputs: dict[str, Path]) -> dict[str, Any]:
-    # Shape read back by scripts/fetch_broll.py:1537; `object_bytes` is the ORIGIN object's size, which only
-    # the GET this stub abolishes could know — so this is empty_receipt()'s shape, never a fabricated green.
+    # Shape read back by scripts/fetch_broll.py:1537 and validated by montyops.media_range.RangeTransportReceipt
+    # (+ run_ledger.RANK_TRANSPORT_FIELDS' strict fold). The strip DID land, so the receipt is green: a "failed"
+    # receipt with outputs_present=1 made every dry b-roll candidate a transport failure the real gate counts.
+    # Nothing was read from any origin (origin/proven bytes 0, no requests — CONTOUR_DRY_CLAIMS); the dry
+    # origin object is the plan's own declared ceiling, the only object size the plan names, so the green
+    # receipt's strict inequality origin+proven < object holds without inventing a transfer.
+    cap = max(1, int(params.get("max_origin_bytes") or 0))
     return {
-        "schema_version": 1, "status": "failed", "reason": "", "origin_class": "transient",
-        "object_bytes": None, "origin_bytes": 0, "proven_bytes": 0,
-        "byte_cap": max(0, int(params.get("max_origin_bytes") or 0)),
+        "schema_version": 1, "status": "ok", "reason": "", "origin_class": "transient",
+        "object_bytes": cap, "origin_bytes": 0, "proven_bytes": 0, "byte_cap": cap,
         "range_requests": 0, "whole_attempts": 0, "whole_reads": 0, "ignored_range_responses": 0,
         "cap_exceeded": False, "outputs_expected": 1, "outputs_present": 1,
     }
@@ -291,7 +311,6 @@ _JSON_SYNTH: dict[str, Callable[[dict[str, Any], dict[str, Path]], dict[str, Any
     "media.range_filmstrip": _synth_range_filmstrip_receipt,
     "media.sheet": _synth_media_sheet_meta,
     "media.image_tile": _synth_media_image_tile_meta,
-    "media.still": _synth_media_still_meta,
 }
 
 
@@ -347,7 +366,127 @@ def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inp
     fn(dst, op_name=op_name)
 
 
+DRY_STILL_WHY = """
+media.still's sidecar is a MEASUREMENT of pixels, so the dry stand-in measures pixels — the placeholder ones.
+
+The engine reads `dark` (scripts/mark_backing.py::treatment_for, glass vs shadow), `bbox`/`mark_w`/`mark_h`
+(mark_backing._mark_rect), `width`/`height` (scripts/fetch_photo.py:1908), `plated`/`finished`/`rasterizer`
+(fetch_photo.py:1648, :1897-1902, :1952) — the old stub refused with DryStubUnderivedField, so the dry photo and
+logo lanes died at the first still. Here the bound `src` (the media.fetch placeholder) is read with the REAL
+op's own rules, vendored verbatim from video-editor scripts/montyops/media_still.py (is_dark_image: alpha-
+weighted mean luminance of a 48x48 RGBA resize < 110; has_alpha: mode carries alpha and min alpha of a 64x64
+resize < 250; mark_probe: alpha bbox at >= 24 as canvas fractions; probe: 0x0 for a vector); a vector is
+"rasterised" to a solid placeholder at `width` (rasterizer `contour-dry-stub`), and the plate is a solid
+`width`-square canvas in the tone the same luminance rule picks. The real op's plate condition decides whether
+`dst` is written at all (vector, plate=always, or real transparency), exactly as `run` does.
+"""
+
+_PLATE_DARK, _PLATE_LIGHT = "0x111111", "0xf2f2f2"   # media_still._PLATE_DARK / _PLATE_LIGHT
+_DRY_RASTERIZER = "contour-dry-stub"
+
+
+def _still_is_vector(p: Path) -> bool:
+    try:
+        head = p.read_bytes()[:256].lstrip()
+    except OSError:
+        return False
+    return p.suffix.lower() == ".svg" or head.startswith(b"<?xml") or head.startswith(b"<svg")
+
+
+def _still_is_dark(path: Path) -> bool:
+    from PIL import Image
+    px: Any = Image.open(path).convert("RGBA").resize((48, 48)).load()
+    tot, n = 0.0, 0
+    for y in range(48):
+        for x in range(48):
+            r, g, b, a = px[x, y]
+            if a < 24:
+                continue
+            tot += 0.299 * r + 0.587 * g + 0.114 * b
+            n += 1
+    return bool(n) and (tot / n) < 110
+
+
+def _still_has_alpha(path: Path) -> bool:
+    from PIL import Image
+    im = Image.open(path)
+    if im.mode not in ("RGBA", "LA", "PA") and "transparency" not in im.info:
+        return False
+    return bool(im.convert("RGBA").resize((64, 64)).getchannel("A").getextrema()[0] < 250)
+
+
+def _still_mark(path: Path) -> dict[str, Any]:
+    from PIL import Image
+    out: dict[str, Any] = {"dark": _still_is_dark(path), "bbox": [0.0, 0.0, 1.0, 1.0], "mark_w": 0, "mark_h": 0}
+    im = Image.open(path)
+    w, h = im.width, im.height
+    out["mark_w"], out["mark_h"] = int(w), int(h)
+    if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
+        bb = im.convert("RGBA").getchannel("A").point(lambda a: 255 if a >= 24 else 0).getbbox()
+        if bb and w and h:
+            out["bbox"] = [bb[0] / w, bb[1] / h, bb[2] / w, bb[3] / h]
+    return out
+
+
+def _solid_png(dst: Path, colour: str, w: int, h: int) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.suffix.lower() not in _RASTER_IMAGE_EXTS:
+        raise DryStubUnsupportedOutput("media.still", dst.suffix.lower(), "image")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", f"color=c={colour}:s={w}x{h}", "-frames:v", "1", str(dst)]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
+
+
+def _run_media_still(*, params: dict[str, Any], inputs: dict[str, Path], outputs: dict[str, Any]) -> None:
+    """media.still under the dry tier (DRY_STILL_WHY): same sidecar shape and plate condition as the real
+    `montyops.media_still.run`, measured off the bound placeholder's pixels."""
+    from PIL import Image
+    raw_src = inputs.get("src")
+    src = Path(raw_src) if raw_src is not None else None
+    if src is None or not src.exists() or src.stat().st_size == 0:
+        raise registry.OpError(f"contour-dry: 'media.still' input src {raw_src!r} is empty — nothing to finish")
+    width = int(params.get("width") or 1080)
+    plate = str(params.get("plate") or "always")
+    if plate not in ("always", "if_transparent", "none"):
+        raise registry.OpError(f"contour-dry: 'media.still' unknown plate mode {plate!r}")
+    vector = _still_is_vector(src)
+    if vector:
+        w, h = 0, 0
+    else:
+        with Image.open(src) as im:
+            w, h = int(im.width), int(im.height)
+    meta: dict[str, Any] = {"width": w, "height": h, "vector": vector,
+                            "alpha": bool(not vector and _still_has_alpha(src)),
+                            "plated": False, "finished": False, "rasterizer": None, "width_requested": width}
+    dst = outputs.get("dst")
+    if dst is not None and (vector or plate == "always" or meta["alpha"]):
+        dst = Path(dst)
+        with tempfile.TemporaryDirectory(prefix="dry-still-") as td:
+            raw = Path(td) / "raw.png"
+            if vector:
+                _solid_png(raw, "0x000000", width, width)   # the placeholder svg's own fill, rasterised
+            else:
+                Image.open(src).save(raw)
+            mark = _still_mark(raw)
+            if plate != "none":
+                _solid_png(dst, _PLATE_LIGHT if mark["dark"] else _PLATE_DARK, width, width)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                Image.open(raw).save(dst)
+        meta.update(plated=plate != "none", finished=True, rasterizer=_DRY_RASTERIZER if vector else None)
+        meta.update(mark)
+    meta_p = Path(outputs["meta"])
+    meta_p.parent.mkdir(parents=True, exist_ok=True)
+    meta_p.write_text(json.dumps(meta, sort_keys=True), encoding="utf-8")
+
+
+# Ops whose dry stand-in is a whole-op function, because the real op's sidecar decides which outputs exist.
+_OP_SYNTH: dict[str, Callable[..., None]] = {"media.still": _run_media_still}
+
+
 def _handler(op: registry.Op) -> Callable[..., None]:
+    if (whole := _OP_SYNTH.get(op.op)) is not None:
+        return whole
     def run(*, params: dict[str, Any], inputs: dict[str, Path], outputs: dict[str, Any]) -> None:
         declared = {p.id: p for p in op.outputs}
         audio_src = _content_input(op, inputs)

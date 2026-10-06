@@ -6,13 +6,14 @@ import pytest
 
 from podagent import infer_cliprank
 from podagent import main as agent_main
-from podagent.infer_lanes import KIND_VRAM_MIB, RESERVE_MIB
+from podagent.infer_lanes import KIND_VRAM_MIB, RENDER_HEADROOM_MIB, RESERVE_MIB
 
 
 @pytest.fixture(autouse=True)
 def _isolated_live_mark(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
     monkeypatch.delenv("MONTY_INFER_KINDS", raising=False)   # every kind served: the fleet floor
+    monkeypatch.delenv("MONTY_OPS_CONTOUR_DRY", raising=False)   # a FULL pod
 
 
 class _CP:
@@ -37,8 +38,9 @@ def _stub_other_probes(monkeypatch, timeline: list[str]) -> None:
     monkeypatch.setattr(agent_main, "_report_ready", lambda _cp, **_k: timeline.append("ready"))
 
 
-def test_the_floor_is_the_heaviest_kind_plus_reserve():
-    assert agent_main.boot_vram_floor_mib() == max(KIND_VRAM_MIB.values()) + RESERVE_MIB == 3248.0
+def test_the_floor_is_the_heaviest_kind_plus_render_headroom_plus_reserve():
+    assert agent_main.boot_vram_floor_mib() == \
+        max(KIND_VRAM_MIB.values()) + RENDER_HEADROOM_MIB + RESERVE_MIB == 4208.0
 
 
 def test_boot_refuses_when_foreign_processes_hold_the_vram(monkeypatch):
@@ -55,7 +57,7 @@ def test_boot_refuses_when_foreign_processes_hold_the_vram(monkeypatch):
     assert len(cp.events) == 1
     ev = cp.events[0]
     assert (ev["stage"], ev["status"], ev["phase"]) == ("boot", "error", "work_finished")
-    assert ev["step"].startswith("gpu_vram_occupied: free=19 total=15852 floor=3248")
+    assert ev["step"].startswith("gpu_vram_occupied: free=19 total=15852 floor=4208")
     assert not agent_main._LIVE_MARK.exists(), "a deliberate refusal must read as a STOP, not a death"
 
 
