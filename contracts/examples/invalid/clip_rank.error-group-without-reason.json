@@ -1,0 +1,11 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "groups": [
+    {
+      "status": "error",
+      "scores": [null],
+      "embeds": [null],
+      "errors": [{"kind": "fetch_timeout", "detail": "TransferTimeout — https://r2.example/tiles/a.jpg"}]
+    }
+  ]
+}

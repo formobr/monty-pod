@@ -64,7 +64,7 @@ def test_detect_flares_timeouts_refuse_loudly(monkeypatch, which, timeout):
 
 def test_render_accepts_film_burn_spec_and_reaches_execution_gate(monkeypatch):
     spec = RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
+        "spec_version": 7, "job_id": "j", "slug": "s", "mode": "final",
         "inputs": [
             {"id": "base", "kind": "video", "sha256": "0" * 64, "url": "u"},
             {"id": "burn.mp4", "kind": "video", "sha256": "1" * 64, "url": "u"},

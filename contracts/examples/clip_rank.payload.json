@@ -2,53 +2,45 @@
   "model": "google/siglip2-so400m-patch14-384",
   "groups": [
     {
-      "scores": [
-        0.3114,
-        0.0822,
-        -1.0
-      ],
+      "status": "ok",
+      "scores": [0.3114, 0.0822, null],
       "embeds": [
-        [
-          0.0412,
-          -0.1187,
-          0.0663
-        ],
-        [
-          -0.0021,
-          0.0904,
-          -0.1338
-        ],
+        [0.0412, -0.1187, 0.0663],
+        [-0.0021, 0.0904, -0.1338],
         null
+      ],
+      "errors": [
+        null,
+        null,
+        {"kind": "fetch_failed", "detail": "HTTPError (HTTP 404) — https://r2.example/tiles/c.jpg"}
       ]
     },
     {
-      "scores": [
-        0.1907
-      ],
+      "status": "ok",
+      "scores": [0.1907],
+      "embeds": [[0.1122, 0.0067, -0.0459]],
+      "errors": [null]
+    },
+    {
+      "status": "ok",
+      "scores": [null, null],
       "embeds": [
-        [
-          0.1122,
-          0.0067,
-          -0.0459
-        ]
+        [0.0731, -0.0288, 0.1015],
+        [-0.0994, 0.0342, 0.0578]
+      ],
+      "errors": [
+        {"kind": "empty_intent", "detail": "embed-only group: the intent is empty, so no tile has a score"},
+        {"kind": "empty_intent", "detail": "embed-only group: the intent is empty, so no tile has a score"}
       ]
     },
     {
-      "scores": [
-        -1.0,
-        -1.0
-      ],
-      "embeds": [
-        [
-          0.0731,
-          -0.0288,
-          0.1015
-        ],
-        [
-          -0.0994,
-          0.0342,
-          0.0578
-        ]
+      "status": "error",
+      "error": {"kind": "url_not_allowed", "detail": "UrlNotAllowed: REFUSED stock host — https://stock.example/a.jpg"},
+      "scores": [null, null],
+      "embeds": [null, null],
+      "errors": [
+        {"kind": "url_not_allowed", "detail": "UrlNotAllowed: REFUSED stock host — https://stock.example/a.jpg"},
+        {"kind": "url_not_allowed", "detail": "UrlNotAllowed: REFUSED stock host — https://stock.example/b.jpg"}
       ]
     }
   ]

@@ -507,10 +507,13 @@ def resolve(op: registry.Op) -> Callable[..., None]:
     return _handler(op)
 
 
-def _clip_rank_group_verdict(n: int) -> tuple[list[float], list[None]]:
+def _clip_rank_group_verdict(n: int) -> tuple[list[float], list[list[float]]]:
     """Strictly descending scores over ALL candidates: real SigLIP on identical STUB placeholder pixels
-    would score every candidate near-equally, clearing no relevance floor and shortlisting nothing."""
-    return [round(max(0.05, 0.95 - 0.05 * i), 4) for i in range(n)], [None] * n
+    would score every candidate near-equally, clearing no relevance floor and shortlisting nothing. Each
+    tile gets a distinct unit embedding (one-hot): a scored tile always has an embed, as on a real pod, and
+    distinct ones keep the planner's MMR dedup from collapsing the shortlist."""
+    return ([round(max(0.05, 0.95 - 0.05 * i), 4) for i in range(n)],
+            [[1.0 if k == i else 0.0 for k in range(n)] for i in range(n)])
 
 
 def run_clip_rank(params: Any, put_url: str, progress: Callable[[str], None] | None = None) -> SimpleNamespace:
@@ -523,11 +526,11 @@ def run_clip_rank(params: Any, put_url: str, progress: Callable[[str], None] | N
     groups = []
     for g in params.groups:
         scores, embeds = _clip_rank_group_verdict(len(g.image_urls))
-        groups.append(ClipRankGroupResult(scores=scores, embeds=embeds))
+        groups.append(ClipRankGroupResult(status="ok", scores=scores, embeds=embeds, errors=[None] * len(scores)))
     payload = ClipRankPayload(model="contour-dry-stub", groups=groups)
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "clip_rank.json"
-        out.write_text(payload.model_dump_json())
+        out.write_text(payload.model_dump_json(exclude_none=True))
         cp.upload(out, put_url, "application/json")
     infer_s = time.monotonic() - t0
     if progress is not None:

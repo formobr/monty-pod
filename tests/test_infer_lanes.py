@@ -9,10 +9,10 @@ from podagent import infer_lanes as m
 from podagent import main as agent_main
 
 _W = {"url": "https://x/w.tar", "sha256": "b" * 64}
-_RANK_REQ = {"infer_version": 6, "job_id": "j", "kind": "clip_rank", "model": "siglip",
+_RANK_REQ = {"infer_version": 7, "job_id": "j", "kind": "clip_rank", "model": "siglip",
              "put_url": "https://x/o/r.json", "weights": _W,
              "clip_rank": {"groups": [{"intent": "chart", "image_urls": ["u1"]}]}}
-_ALIGN_REQ = {"infer_version": 6, "job_id": "j", "kind": "align", "model": "w2v",
+_ALIGN_REQ = {"infer_version": 7, "job_id": "j", "kind": "align", "model": "w2v",
               "put_url": "https://x/o/a.json", "weights": _W,
               "align": {"audio_url": "https://x/a.wav", "windows": [[0.0, 1.0]]}}
 

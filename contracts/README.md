@@ -20,7 +20,7 @@ Transport: the planner and the pod NEVER talk directly. Jobs, lifecycle events, 
 typed EventStream WebSocket; media payloads ride presigned URLs.
 The two EventStream schemas and their shared goldens are not copied into this directory: they come from
 `../vendor/monty-contracts/wire_bundle.json` and generate `../podagent/wire_generated.py`. This directory's
-`VERSION=6` therefore remains solely the render/infer domain pin; shared transport currently has its own v13.
+`VERSION=7` therefore remains solely the render/infer domain pin; shared transport currently has its own v13.
 
 ## The job envelope
 
@@ -111,16 +111,35 @@ optional parallel array of `[x,y,width,height,sheet_width,sheet_height]` crops. 
 distinct sheet once, validates its exact declared shape, and slices cells locally; a missing/malformed cell
 fails the request instead of scoring the whole sheet.
 
-- `scores[j]` — cosine(image, intent). `-1.0` means "no score to give": an image the pod could not
-  fetch or decode, or an embed-only group.
+- `scores[j]` — cosine(image, intent), or `null` exactly when `errors[j]` names why. There is NO
+  sentinel number: `-1.0` used to mean "no score" and in prod hid 11 days of refused tile fetches as
+  11 days of irrelevant footage.
+- `errors[j]` — `null` for a tile that scored, else `{kind, detail}`: `url_not_allowed` (the fetch guard
+  refused the address), `fetch_timeout`, `fetch_failed` (HTTP/connection; detail names the status),
+  `decode_error` (bytes arrived but are not an image), `empty_intent` (embed-only group), `non_finite`
+  (the forward produced NaN/inf for that tile — JSON would otherwise carry it as an unnamed null; score
+  and embed are both null). A scored tile always has an embed. `detail` is
+  secret-safe: the tile address appears without its query.
 - `embeds[j]` — the L2-normalized image embedding (image↔image cosine is then a plain dot, which is
   what the planner's MMR anti-repeat runs on); `null` for an image that never decoded.
+- `status` / `error` — `status: "error"` when NO tile of the group produced anything (no score, no
+  embed); `error` then repeats the first tile's reason. Otherwise `status: "ok"` and `error` is absent —
+  individual tiles may still have failed, and say so in `errors`.
 - `intent: ""` — **embed-only**. The image tower is text-independent, so the group still yields
-  embeddings and every score comes back `-1.0`. Bailing out instead would blind a caller that asked
-  ONLY for embeddings.
+  embeddings, every score is `null` with `errors[j].kind = "empty_intent"`, and the group stays
+  `status: "ok"` because its embeddings are the answer the caller asked for.
 - Both towers and the cosine run inside one fp16/no_grad block, so a group is a single forward.
-- A dead image is data, not a fault: it is scored `-1.0`/`null` and the batch completes. Only a
-  failure that invalidates the whole call raises.
+- A dead image is a NAMED per-tile failure, not a fault of the batch: the batch completes and the dead
+  tile reads `score: null`, `embed: null`, `errors[j]: {kind, detail}`. Only a failure that invalidates
+  the whole call raises (→ InferResult `status: "error"`).
+- Parallel length (`scores`/`embeds`/`errors` == `image_urls`) and "score null ⇔ error named" are
+  cross-field rules the model mirror enforces (`examples/model-invalid/`); JSON Schema cannot.
+
+## face_probe — an undecodable source is an error
+
+A source the decoder cannot open, that has no video stream, or from which a requested shot decodes no
+frame at all ends the job `status: "error"` naming the reason (`UndecodableVideo: …`). It is never a
+payload of zero-frame shots — that would read as "no faces here", which is data.
 
 ## weights — the model is an INPUT
 
@@ -144,6 +163,10 @@ together on ANY change; there is no back-compat — a mismatch is a loud fail on
 Goldens: every `examples/*.json` must validate, every `examples/invalid/*.json` must be rejected
 (`python validate.py`).
 
+- **v6→v7** (MISC-342, a failed item carries an error, never a value): `clip_rank` groups gain required
+  `status` + `errors[]` (and `error` when `status: "error"`); `scores[j]` becomes `number | null` and the
+  `-1.0` sentinel is gone. face_probe on an undecodable source is now an InferResult error (no schema
+  shape change there). Every version const moves with it, per the rule above.
 - **v5→v6**: `overlays.opener` (the pre-rendered cold-open + its film-burn junction assets — `cold`
   required, `burn`/`clicks` optional) and accent `kind: "film_burn"` (the same junction bundle, body-side;
   its `burn`/`clicks` inputs are required together, forbidden on every other kind) — both single-pass prep

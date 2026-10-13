@@ -1,0 +1,11 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "groups": [
+    {
+      "status": "ok",
+      "scores": [0.31, null],
+      "embeds": [[0.1, 0.2], null],
+      "errors": [null, null]
+    }
+  ]
+}

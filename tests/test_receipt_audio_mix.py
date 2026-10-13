@@ -24,7 +24,7 @@ def _spec(*, music: bool, sfx: int) -> RenderSpec:
         inputs += [{"id": f"sfx/{k}.wav", "kind": "audio", "sha256": SHA, "url": "u"} for k in range(sfx)]
         overlays["sfx"] = [{"sound": f"sfx/{k}.wav", "at": 1.0 + k, "gain": 0.5} for k in range(sfx)]
     return RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "j-am", "slug": "am", "mode": "final", "inputs": inputs,
+        "spec_version": 7, "job_id": "j-am", "slug": "am", "mode": "final", "inputs": inputs,
         "timeline": {"fps": 30, "width": 320, "height": 240,
                      "segments": [{"src": "base", "in": 0.0, "out": 6.0, "speed": 1.0}]},
         "encode": {"video": "libx264", "preset": "veryfast", "cq": 23, "pix_fmt": "yuv420p",

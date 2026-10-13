@@ -16,7 +16,7 @@ _TIMELINE = {"fps": 30, "width": 1080, "height": 1920,
 
 def _spec() -> RenderSpec:
     return RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
+        "spec_version": 7, "job_id": "j", "slug": "s", "mode": "preview",
         "inputs": [_BASE_INPUT], "timeline": _TIMELINE, "encode": _ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
     })

@@ -16,6 +16,11 @@ from .models import FaceProbeParams, FaceProbePayload, ProbeFrame, ProbeShot
 _DIFF_WIDTH = 160
 
 
+class UndecodableVideo(ValueError):
+    """The probe's source could not be decoded. Raised so the job ends status=error WITH this reason — a
+    payload of zero-frame shots would read as "no faces here", which is data, and this is a failure."""
+
+
 class ProbeService:
     """Loads the YuNet detector once (the dominant cost); serves every shot batch after that."""
 
@@ -29,17 +34,28 @@ class ProbeService:
         t0 = time.monotonic()
         with tempfile.TemporaryDirectory() as td:
             video_path = download(params.video_url, Path(td) / "video")
+            size = Path(video_path).stat().st_size
             cap = cv2.VideoCapture(str(video_path))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.detector.setInputSize((width, height))
+            try:
+                if not cap.isOpened():
+                    raise UndecodableVideo(f"face_probe source ({size} bytes) could not be opened by the decoder")
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if not fps or fps <= 0 or width < 2 or height < 2:
+                    raise UndecodableVideo(f"face_probe source ({size} bytes) has no decodable video stream "
+                                           f"(fps={fps}, {width}x{height})")
+                self.detector.setInputSize((width, height))
 
-            shots = [
-                ProbeShot(a=a, b=b, frames=self._probe_shot(cap, fps, a, b, params.stride, params.frame_diff))
-                for a, b in ((s[0], s[1]) for s in params.shots)
-            ]
-            cap.release()
+                shots = []
+                for a, b in ((s[0], s[1]) for s in params.shots):
+                    frames = self._probe_shot(cap, fps, a, b, params.stride, params.frame_diff)
+                    if not frames and round(b * fps) > round(a * fps):
+                        raise UndecodableVideo(f"face_probe shot [{a}, {b}] decoded no frame from the source "
+                                               f"({size} bytes, {width}x{height} @ {fps:.3f} fps)")
+                    shots.append(ProbeShot(a=a, b=b, frames=frames))
+            finally:
+                cap.release()
 
             payload = FaceProbePayload(model=self.model_name, width=width, height=height, shots=shots)
             out = Path(td) / "face_probe.json"

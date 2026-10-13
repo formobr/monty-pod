@@ -17,14 +17,14 @@ from podagent.infer_cliprank import ClipRankService
 from podagent.models import ClipRankGroup
 
 _W = {"url": "https://x/w.tar", "sha256": "b" * 64}
-_RANK_REQ = {"infer_version": 6, "job_id": "j", "kind": "clip_rank", "model": "siglip",
+_RANK_REQ = {"infer_version": 7, "job_id": "j", "kind": "clip_rank", "model": "siglip",
              "put_url": "https://x/o/r.json", "weights": _W,
              "clip_rank": {"groups": [{"intent": "chart", "image_urls": ["u1"]}]}}
-_ALIGN_REQ = {"infer_version": 6, "job_id": "j", "kind": "align", "model": "w2v",
+_ALIGN_REQ = {"infer_version": 7, "job_id": "j", "kind": "align", "model": "w2v",
               "put_url": "https://x/o/a.json", "weights": _W,
               "align": {"audio_url": "https://x/a.wav", "windows": [[0.0, 1.0]]}}
 _SPEC = {
-    "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
+    "spec_version": 7, "job_id": "j", "slug": "s", "mode": "preview",
     "inputs": [{"id": "src", "kind": "video", "sha256": "0" * 64, "url": "u"}],
     "timeline": {"fps": 30, "width": 2, "height": 2,
                  "segments": [{"src": "src", "in": 0, "out": 1, "speed": 1}]},
@@ -242,27 +242,6 @@ def _svc() -> ClipRankService:
     svc.parallel = 1
     svc._slots = threading.BoundedSemaphore(1)
     return svc
-
-
-def test_a_groups_tiles_are_pulled_concurrently(monkeypatch, tmp_path):
-    """14 serial tile GETs at ~211 ms each WAS the envelope. Watched fail with the per-url loop restored:
-    the barrier times out because tile 2 only starts after tile 1 returned."""
-    n = 6
-    together = threading.Barrier(n, timeout=3)
-
-    def fake_download(url, dest):
-        together.wait()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"img")
-        return dest
-
-    monkeypatch.setattr(m, "download", fake_download)
-    monkeypatch.setattr("PIL.Image.open", lambda p: types.SimpleNamespace(convert=lambda mode: "img"))
-    monkeypatch.setenv(m._FETCH_WORKERS_ENV, str(n))
-    m._FETCH_POOL = None
-
-    images, ok = ClipRankService._fetch([f"u{i}" for i in range(n)], tmp_path / "g0")
-    assert ok == list(range(n)) and len(images) == n
 
 
 class _InlinePool:

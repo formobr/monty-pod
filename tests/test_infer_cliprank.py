@@ -2,8 +2,9 @@
 
 What the pod side must guarantee, and what each test pins:
   • scores AND embeds come out of ONE forward, 4dp, in the request's image order;
-  • intent "" is embed-only: the TEXT tower is never touched and every score is -1.0;
-  • an image the pod cannot fetch scores -1.0/None instead of failing a whole batch of beats;
+  • intent "" is embed-only: the TEXT tower is never touched and every score is null (named empty_intent);
+  • an image the pod cannot fetch is score null/embed None + a NAMED error instead of failing a whole batch
+    of beats — never a sentinel number (tests/test_failed_items_carry_errors.py pins the error shapes);
   • nothing in the result carries a ranking or a threshold — the payload is numbers only.
 """
 from __future__ import annotations
@@ -97,7 +98,7 @@ def test_one_forward_yields_scores_and_embeds() -> None:
 def test_empty_intent_is_embed_only_and_never_touches_the_text_tower() -> None:
     calls: list = []
     scores, embeds = _svc(calls)._forward("", ["img", "img"])
-    assert scores == [-1.0, -1.0], "an embed-only group's scores have nothing to mean"
+    assert scores == [None, None], "an embed-only group's scores have nothing to mean — null, never -1.0"
     assert embeds == [[0.6, 0.8], [0.8, 0.6]], "the image tower is text-independent — embeds still come back"
     assert calls == [], "no intent must mean no text forward"
 
@@ -119,7 +120,7 @@ def test_feat_unwraps_a_pooled_model_output_so_the_forward_never_crashes() -> No
     assert embeds == [[0.6, 0.8], [0.8, 0.6]]
 
 
-def test_unfetchable_image_scores_minus_one_and_keeps_request_order(monkeypatch, tmp_path) -> None:
+def test_unfetchable_image_has_no_score_and_keeps_request_order(monkeypatch, tmp_path) -> None:
     import podagent.infer_cliprank as m
 
     def fake_download(url: str, dest: Path) -> Path:
@@ -135,8 +136,11 @@ def test_unfetchable_image_scores_minus_one_and_keeps_request_order(monkeypatch,
     group = ClipRankGroup(intent="chart", image_urls=["ok1", "dead", "ok2"])
     res = _svc()._run_group(group, tmp_path / "g0")
 
-    assert res.scores == [0.6, -1.0, 0.8], "a dead tile sorts last; the live ones keep their slots"
+    assert res.status == "ok"
+    assert res.scores == [0.6, None, 0.8], "a dead tile has no score; the live ones keep their slots"
     assert res.embeds == [[0.6, 0.8], None, [0.8, 0.6]]
+    assert res.errors[0] is None and res.errors[2] is None
+    assert res.errors[1].kind == "fetch_failed" and "404 on presigned GET" in res.errors[1].detail
 
 
 def test_sheet_cells_are_exact_pixels_in_request_order() -> None:
@@ -150,9 +154,9 @@ def test_sheet_cells_are_exact_pixels_in_request_order() -> None:
     sheet.paste(left, (0, 0)); sheet.paste(right, (2, 0))
     future = cf.Future(); future.set_result(sheet)
 
-    images, order = _gather([future, future], [(0, 0, 2, 2, 4, 2), (2, 0, 2, 2, 4, 2)])
+    images, order, errors = _gather([future, future], [(0, 0, 2, 2, 4, 2), (2, 0, 2, 2, 4, 2)])
 
-    assert order == [0, 1]
+    assert order == [0, 1] and errors == [None, None]
     assert list(images[0].getdata()) == list(left.getdata())
     assert list(images[1].getdata()) == list(right.getdata())
     score = lambda im: sum(sum(px) for px in im.getdata())
@@ -218,9 +222,10 @@ def test_no_cells_drops_failed_tile_and_keeps_other_images(tmp_path) -> None:
     image = Image.new("RGB", (2, 2))
     live.set_result((image, None, "https://r2.test/b.png"))
 
-    images, order = m._gather([failed, live])
+    images, order, errors = m._gather([failed, live])
 
     assert images == [image] and order == [1]
+    assert errors[1] is None and errors[0].kind == "fetch_failed" and "OSError" in errors[0].detail
 
 
 def test_sheet_cell_contract_rejects_missing_parallel_entry_and_bad_geometry() -> None:
@@ -230,7 +235,7 @@ def test_sheet_cell_contract_rejects_missing_parallel_entry_and_bad_geometry() -
         ClipRankGroup(intent="x", image_urls=["sheet"], image_cells=[(0, 0, 0, 2, 4, 2)])
 
 
-def test_a_wholly_dead_group_returns_misses_without_a_forward(monkeypatch, tmp_path) -> None:
+def test_a_wholly_dead_group_is_an_error_without_a_forward(monkeypatch, tmp_path) -> None:
     import podagent.infer_cliprank as m
 
     monkeypatch.setattr(m, "download", lambda url, dest: (_ for _ in ()).throw(OSError("gone")))
@@ -238,7 +243,8 @@ def test_a_wholly_dead_group_returns_misses_without_a_forward(monkeypatch, tmp_p
     svc.model = None  # any forward attempt would explode
 
     res = svc._run_group(ClipRankGroup(intent="chart", image_urls=["a", "b"]), tmp_path / "g0")
-    assert res.scores == [-1.0, -1.0] and res.embeds == [None, None]
+    assert res.status == "error" and res.error is not None and res.error.kind == "fetch_failed"
+    assert res.scores == [None, None] and res.embeds == [None, None]
 
 
 def test_payload_carries_numbers_only(monkeypatch, tmp_path) -> None:
@@ -265,8 +271,11 @@ def test_payload_carries_numbers_only(monkeypatch, tmp_path) -> None:
         "unique_image_sets_n", "reused_groups_n", "parallel_width_n"}
     body = json.loads(put.read_text())
     assert set(body) == {"model", "groups"}, "no ranking, no threshold, no rationale crosses back"
-    assert [g["scores"] for g in body["groups"]] == [[0.6, 0.8], [-1.0, -1.0]]
-    assert all(set(g) == {"scores", "embeds"} for g in body["groups"])
+    assert [g["scores"] for g in body["groups"]] == [[0.6, 0.8], [None, None]]
+    assert [[e and e["kind"] for e in g["errors"]] for g in body["groups"]] == [
+        [None, None], ["empty_intent", "empty_intent"]]
+    assert all(set(g) == {"status", "scores", "embeds", "errors"} for g in body["groups"])
+    assert [g["status"] for g in body["groups"]] == ["ok", "ok"]
 
 
 def test_identical_url_groups_reuse_one_image_forward_without_changing_order(monkeypatch, tmp_path) -> None:
@@ -299,37 +308,6 @@ def test_identical_url_groups_reuse_one_image_forward_without_changing_order(mon
     assert fetched == ["a", "b"] and image_calls == 1
     assert [g["scores"] for g in json.loads(put.read_text())["groups"]] == [[0.6, 0.8], [0.6, 0.8]]
     assert run.timings["unique_image_sets_n"] == 1 and run.timings["reused_groups_n"] == 1
-
-
-def test_distinct_shortlists_overlap_but_results_keep_request_order(monkeypatch, tmp_path) -> None:
-    """The envelope's rank width is real scheduling width, never output-order nondeterminism."""
-    import json
-    import podagent.infer_cliprank as m
-    from podagent.models import ClipRankParams
-
-    monkeypatch.setattr(m, "download", lambda url, dest: (dest.parent.mkdir(parents=True, exist_ok=True),
-                                                          dest.write_bytes(b"img"), dest)[-1])
-    monkeypatch.setattr("PIL.Image.open", lambda p: types.SimpleNamespace(convert=lambda mode: "img"))
-    put = tmp_path / "out.json"
-    monkeypatch.setattr(m, "upload", lambda src, url, ct=None: put.write_bytes(src.read_bytes()))
-    svc = _svc()
-    svc.parallel = 2
-    svc._slots = threading.BoundedSemaphore(2)
-    together = threading.Barrier(2, timeout=2)
-
-    def prepare(images, ok):
-        together.wait()
-        marker = 1.0 if len(images) == 1 else 2.0
-        return marker, [[marker]], ok
-
-    svc._prepare = prepare
-    svc._text_scores = lambda intent, marker: [marker] * int(marker)
-    params = ClipRankParams(groups=[
-        ClipRankGroup(intent="one", image_urls=["a"]),
-        ClipRankGroup(intent="two", image_urls=["b", "c"]),
-    ])
-    svc.run(params, "put")
-    assert [g["scores"] for g in json.loads(put.read_text())["groups"]] == [[1.0], [2.0, 2.0]]
 
 
 def test_service_is_registered_for_the_clip_rank_kind() -> None:

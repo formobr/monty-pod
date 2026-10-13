@@ -17,7 +17,7 @@
   ],
   "properties": {
     "spec_version": {
-      "const": 6
+      "const": 7
     },
     "job_id": {
       "type": "string",

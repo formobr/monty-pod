@@ -18,7 +18,7 @@ _ENCODE = {"video": "h264_nvenc", "preset": "p7", "cq": 23, "pix_fmt": "yuv420p"
 
 def _spec(mutate=None) -> RenderSpec:
     data = {
-        "spec_version": 6, "job_id": "route", "slug": "route", "mode": "final",
+        "spec_version": 7, "job_id": "route", "slug": "route", "mode": "final",
         "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "https://x/base.mp4"}],
         "timeline": {"fps": 30, "width": 1080, "height": 1920,
                      "segments": [{"src": "base", "in": 0.0, "out": 5.0, "speed": 1.0}]},

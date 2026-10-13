@@ -49,7 +49,7 @@ def _job_body(corr_id: str) -> dict[str, Any]:
     return {
         "type": "infer", "session_id": "s", "corr_id": corr_id,
         "request": {
-            "infer_version": 6, "job_id": "j", "kind": "face_probe", "model": "m",
+            "infer_version": 7, "job_id": "j", "kind": "face_probe", "model": "m",
             "put_url": "https://storage.example/out?sig=x",
             "face_probe": {"video_url": "https://storage.example/in?sig=x", "shots": [[0.0, 1.0]],
                            "stride": 1, "frame_diff": False},

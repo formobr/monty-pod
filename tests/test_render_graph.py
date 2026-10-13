@@ -48,7 +48,7 @@ def test_real_cpu_master_output_is_bt709(tmp_path: Path) -> None:
         "-c:a", "aac", "-shortest", str(source),
     ], check=True)
     spec = RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "colour-proof", "slug": "colour-proof", "mode": "preview",
+        "spec_version": 7, "job_id": "colour-proof", "slug": "colour-proof", "mode": "preview",
         "inputs": [{"id": "source", "kind": "video", "sha256": "0" * 64, "url": "unused"}],
         "timeline": {"fps": 8, "width": 16, "height": 16,
                       "segments": [{"src": "source", "in": 0.0, "out": 4.0, "speed": 1.0}]},

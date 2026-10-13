@@ -2,11 +2,12 @@
 tests/test_contracts_goldens.py — every golden must round-trip through both."""
 from __future__ import annotations
 
+import math
 from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION: Final = 6
+SPEC_VERSION: Final = 7
 
 
 class SpecInput(BaseModel):
@@ -413,7 +414,7 @@ class SpecOutput(BaseModel):
 class RenderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    spec_version: Literal[6]
+    spec_version: Literal[7]
     job_id: str = Field(min_length=1)
     slug: str = Field(min_length=1)
     mode: Literal["preview", "final"]
@@ -526,7 +527,7 @@ class FaceProbeParams(BaseModel):
 
 class ClipRankGroup(BaseModel):
     """One (intent, images) scoring unit. `intent` == "" means embed-only — the image tower is
-    text-independent, so the group still yields embeddings and its scores come back as -1.0."""
+    text-independent, so the group still yields embeddings; each score is null with an `empty_intent` error."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -571,7 +572,7 @@ _NEEDS_WEIGHTS = ("align", "clip_rank")   # face_probe's YuNet is 227 KB and sta
 class InferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[6]
+    infer_version: Literal[7]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     model: str = Field(min_length=1)
@@ -613,7 +614,7 @@ class InferTiming(BaseModel):
 class InferResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    infer_version: Literal[6]
+    infer_version: Literal[7]
     job_id: str = Field(min_length=1)
     kind: Literal["align", "face_probe", "clip_rank"]
     status: Literal["ok", "error"]
@@ -886,13 +887,61 @@ class FaceProbePayload(BaseModel):
     shots: list[ProbeShot] = Field(min_length=1)
 
 
-class ClipRankGroupResult(BaseModel):
-    """One group's raw SigLIP output; order mirrors the request group's image_urls."""
+ClipRankTileErrorKind = Literal["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error",
+                                "empty_intent", "non_finite"]
+
+
+class ClipRankTileError(BaseModel):
+    """Why one tile has no score (and, unless kind=empty_intent, no embed). A failure is NAMED, never a
+    valid-looking number: -1.0 once read as "irrelevant" for 11 days while every tile was UrlNotAllowed."""
 
     model_config = ConfigDict(extra="forbid")
 
-    scores: list[float]
+    kind: ClipRankTileErrorKind
+    detail: str = Field(min_length=1)
+
+
+class ClipRankGroupResult(BaseModel):
+    """One group's raw SigLIP output; order mirrors the request group's image_urls.
+
+    `scores[j]` is null exactly when `errors[j]` names why. A group in which NO tile produced anything (no
+    score and no embed) is status=error carrying its first tile's reason — an all-failed group is an error,
+    never a row of misses."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "error"]
+    error: ClipRankTileError | None = None
+    scores: list[float | None]
     embeds: list[list[float] | None]
+    errors: list[ClipRankTileError | None]
+
+    @model_validator(mode="after")
+    def _failures_are_named(self) -> "ClipRankGroupResult":
+        if not len(self.scores) == len(self.embeds) == len(self.errors):
+            raise ValueError("scores, embeds and errors must be parallel to the request group's image_urls")
+        for j, (score, embed, err) in enumerate(zip(self.scores, self.embeds, self.errors)):
+            if (score is None) != (err is not None):
+                raise ValueError(f"tile {j}: score is null exactly when errors[{j}] names why")
+            # NaN/inf serialize to JSON null — an UNNAMED failure; refuse them so the writer must name them.
+            if score is not None and not math.isfinite(score):
+                raise ValueError(f"tile {j}: score {score} is not finite — name it in errors[{j}] instead")
+            if embed is not None and not all(math.isfinite(x) for x in embed):
+                raise ValueError(f"tile {j}: embedding is not finite — name it in errors[{j}] instead")
+            if embed is None and (err is None or err.kind == "empty_intent"):
+                raise ValueError(f"tile {j}: a null embed needs errors[{j}] naming a fetch/decode/forward failure")
+        dead = bool(self.scores) and all(s is None and e is None for s, e in zip(self.scores, self.embeds))
+        if self.status == "error":
+            if self.error is None:
+                raise ValueError("status=error requires error")
+            if not dead:
+                raise ValueError("status=error is only for a group in which no tile produced anything")
+        else:
+            if self.error is not None:
+                raise ValueError("status=ok must not carry error")
+            if dead:
+                raise ValueError("a group in which no tile produced anything is status=error, not ok")
+        return self
 
 
 class ClipRankPayload(BaseModel):

@@ -21,7 +21,7 @@ from podagent.models import RenderSpec
 SHA = "0" * 64
 
 _BASE_SPEC = {
-    "spec_version": 6, "job_id": "job_w2a", "slug": "onepass", "mode": "final",
+    "spec_version": 7, "job_id": "job_w2a", "slug": "onepass", "mode": "final",
     "inputs": [
         {"id": "base", "kind": "video", "sha256": SHA, "url": "https://x/base.mp4"},
         {"id": "music/bed.mp3", "kind": "audio", "sha256": SHA, "url": "https://x/bed.mp3"},
@@ -716,7 +716,7 @@ _PHOTO_TIMELINE = {"fps": 30, "width": 320, "height": 240,
 
 def _photo_spec(still_kind: str = "image") -> RenderSpec:
     return RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "final",
+        "spec_version": 7, "job_id": "j", "slug": "s", "mode": "final",
         "inputs": [_PHOTO_BASE, {**_PHOTO_STILL, "kind": still_kind}, _PHOTO_VIDEO_CLIP],
         "timeline": _PHOTO_TIMELINE, "encode": _PHOTO_ENCODE,
         "outputs": [{"id": "master", "kind": "master", "put_url": "p"}],
@@ -1470,7 +1470,7 @@ def test_real_onepass_master_survives_loudnorm_bt709_tagged(tmp_path: Path) -> N
     ], check=True)
 
     spec = RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "colour-onepass", "slug": "colour-onepass", "mode": "final",
+        "spec_version": 7, "job_id": "colour-onepass", "slug": "colour-onepass", "mode": "final",
         "inputs": [{"id": "source", "kind": "video", "sha256": SHA, "url": "unused"}],
         "timeline": {"fps": 10, "width": 64, "height": 64,
                      "segments": [{"src": "source", "in": 0.0, "out": 1.0, "speed": 1.0}]},
@@ -1516,7 +1516,7 @@ def test_real_photo_cutaway_survives_its_whole_window(tmp_path: Path) -> None:
                    check=True)
 
     spec = RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "photo-cutaway", "slug": "photo-cutaway", "mode": "final",
+        "spec_version": 7, "job_id": "photo-cutaway", "slug": "photo-cutaway", "mode": "final",
         "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "unused"},
                    {"id": "broll/photo", "kind": "image", "sha256": SHA, "url": "unused"}],
         "timeline": {"fps": 25, "width": 320, "height": 240,
@@ -1563,7 +1563,7 @@ def _tap_spec(clips: int = 1, *, logo: bool = True, outputs=None, srcs: int = 3)
         overlays["finalize"] = {"logo": {"asset": "brand/logo.png", "corner": "tr", "width": 150,
                                         "opacity": 0.55, "margin": 40, "cover_hold": 0.6}}
     return RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "j-tap", "slug": "tap", "mode": "final", "inputs": inputs,
+        "spec_version": 7, "job_id": "j-tap", "slug": "tap", "mode": "final", "inputs": inputs,
         "timeline": {"fps": 30, "width": 320, "height": 240, "segments": segments},
         "encode": _PHOTO_ENCODE, "overlays": overlays,
         "outputs": [_RECEIPT_OUT, _MASTER_OUT] if outputs is None else outputs})
@@ -1693,7 +1693,7 @@ def test_the_receipt_output_must_precede_the_master() -> None:
 
 def test_a_preview_spec_may_not_declare_a_receipt() -> None:
     preview = RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
+        "spec_version": 7, "job_id": "j", "slug": "s", "mode": "preview",
         "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "u"}],
         "timeline": {"fps": 30, "width": 320, "height": 240,
                      "segments": [{"src": "base", "in": 0.0, "out": 2.0, "speed": 1.0}]},
@@ -1708,7 +1708,7 @@ def test_a_preview_spec_declaring_a_receipt_refuses_through_render_spec(monkeypa
     production door — a preview spec paid its full encode before the upload loop caught it."""
     _no_subprocess(monkeypatch)
     preview = RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "j", "slug": "s", "mode": "preview",
+        "spec_version": 7, "job_id": "j", "slug": "s", "mode": "preview",
         "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "u"}],
         "timeline": {"fps": 30, "width": 320, "height": 240,
                      "segments": [{"src": "base", "in": 0.0, "out": 2.0, "speed": 1.0}]},
@@ -1720,7 +1720,7 @@ def test_a_preview_spec_declaring_a_receipt_refuses_through_render_spec(monkeypa
 def test_the_producer_names_the_baked_image_tag(monkeypatch) -> None:
     monkeypatch.setenv("POD_IMAGE_TAG", "a" * 40)
     assert op.producer() == {"image": "a" * 40, "podagent_version": op.__version__,
-                             "spec_version": 6}
+                             "spec_version": 7}
 
 
 @pytest.mark.parametrize("tag", ["dev", "unknown", "latest", "none",
@@ -1823,7 +1823,7 @@ def test_run_encode_writes_one_receipt_of_the_encode_that_ran(monkeypatch, tmp_p
     assert receipt["filtergraph"] == graph == p.filter_script.read_text()
     assert json.loads(p.receipt_out.read_text()) == receipt
     assert receipt["producer"] == {"image": "b" * 40, "podagent_version": op.__version__,
-                                   "spec_version": 6}
+                                   "spec_version": 7}
     assert (receipt["schema"], receipt["job_id"], receipt["mode"]) == (op.RECEIPT_SCHEMA, "j-tap", "final")
     assert receipt["overlays"]["broll"][0] == {
         "clip": "broll/0.jpg", "input_index": 3, "start": 12.0, "end": 15.0,
@@ -1992,7 +1992,7 @@ def _real_cutaway_fixture(tmp_path: Path, *, fps: int = 25, dur: float = 2.4) ->
                     "-f", "lavfi", "-i", "testsrc=size=320x240:rate=1", "-frames:v", "1", str(photo)],
                    check=True)
     spec = RenderSpec.model_validate({
-        "spec_version": 6, "job_id": "tap-cutaway", "slug": "tap-cutaway", "mode": "final",
+        "spec_version": 7, "job_id": "tap-cutaway", "slug": "tap-cutaway", "mode": "final",
         "inputs": [{"id": "base", "kind": "video", "sha256": SHA, "url": "unused"},
                    {"id": "broll/photo", "kind": "image", "sha256": SHA, "url": "unused"}],
         "timeline": {"fps": fps, "width": 320, "height": 240,

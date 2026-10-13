@@ -11,7 +11,7 @@ from podagent import infer_lanes as lanes
 from podagent import main as agent_main
 
 _W = {"url": "https://x/w.tar", "sha256": "b" * 64}
-_RANK_REQ = {"infer_version": 6, "job_id": "j", "kind": "clip_rank", "model": "siglip",
+_RANK_REQ = {"infer_version": 7, "job_id": "j", "kind": "clip_rank", "model": "siglip",
              "put_url": "https://x/o/r.json", "weights": _W,
              "clip_rank": {"groups": [{"intent": "chart", "image_urls": ["u1"]}]}}
 

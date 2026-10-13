@@ -11,6 +11,7 @@ forwards while k+1.. are still on the wire."""
 from __future__ import annotations
 
 import concurrent.futures as cf
+import math
 import os
 import subprocess
 import sys
@@ -22,11 +23,17 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
-from .cp import download, upload
-from .models import ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload
-from .sanitize import safe_endpoint, safe_text
+import requests
 
-_MISS = -1.0   # unreadable image, or an embed-only group where a score has nothing to mean
+from .cp import TransferTimeout, UrlNotAllowed, download, upload
+from .models import ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload, ClipRankTileError
+from .sanitize import safe_endpoint, safe_error, safe_text
+
+# NO SENTINEL SCORE. A tile with nothing to score is `score: null` + a named error, never -1.0: in prod every
+# b-roll tile was refused by the fetch guard (UrlNotAllowed) for 11 days, each came back a well-formed -1.0,
+# and the planner read eleven days of failures as eleven days of irrelevant footage.
+_EMPTY_INTENT = ClipRankTileError(kind="empty_intent",
+                                  detail="embed-only group: the intent is empty, so no tile has a score")
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
 
 # Chunk the image tower so ONE lane's VRAM is a known number, not a function of a beat's candidate count —
@@ -219,17 +226,38 @@ def _http_status(exc: BaseException) -> int | None:
         return None
 
 
+def _finite(score: float | None, embed: list[float] | None) -> bool:
+    return all(math.isfinite(x) for x in ([score] if score is not None else []) + (embed or []))
+
+
+def _fetch_kind(exc: BaseException) -> str:
+    if isinstance(exc, UrlNotAllowed):
+        return "url_not_allowed"
+    if isinstance(exc, (TransferTimeout, requests.Timeout, TimeoutError)):
+        return "fetch_timeout"
+    return "fetch_failed"
+
+
+def _tile_error(kind: str, exc: BaseException, redacted_url: str) -> ClipRankTileError:
+    status = _http_status(exc)
+    head = safe_error(exc, 300) + (f" (HTTP {status})" if status is not None else "")
+    return ClipRankTileError(kind=kind, detail=f"{head} — {redacted_url}")
+
+
 def _fetch_tile(url: str, dest: Path):
-    """One tile: presigned GET → decode, returning image or a secret-safe failure record."""
+    """One tile: GET → decode, returning the image or a secret-safe ClipRankTileError naming which stage
+    failed and why (fetch refused / timed out / failed, or bytes that would not decode)."""
     from PIL import Image
 
     redacted_url = _redacted_tile_url(url)
     try:
-        return Image.open(download(url, dest)).convert("RGB"), None, redacted_url
-    except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault
-        status = _http_status(exc)
-        reason = type(exc).__name__ + (f" (HTTP {status})" if status is not None else "")
-        return None, reason, redacted_url
+        path = download(url, dest)
+    except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault; it is NAMED below
+        return None, _tile_error(_fetch_kind(exc), exc, redacted_url), redacted_url
+    try:
+        return Image.open(path).convert("RGB"), None, redacted_url
+    except Exception as exc:  # noqa: BLE001 — undecodable bytes are this tile's error, not the batch's
+        return None, _tile_error("decode_error", exc, redacted_url), redacted_url
 
 
 def _submit_tiles(urls: list[str], workdir: Path) -> list:
@@ -241,10 +269,12 @@ def _submit_tiles(urls: list[str], workdir: Path) -> list:
     return [by_url[u] for u in urls]
 
 
-def _gather(futs: list, cells=None) -> tuple[list, list[int]]:
-    """The decoded images and REQUEST indices; failed tiles stay data, with sheet failures named loudly."""
+def _gather(futs: list, cells=None) -> tuple[list, list[int], list[ClipRankTileError | None]]:
+    """The decoded images, their REQUEST indices, and per request index the error that kept a tile out (None
+    for a tile that decoded). A failed tile stays data — a NAMED error in the result; sheet failures raise."""
     images: list = []
     ok: list[int] = []
+    errors: list[ClipRankTileError | None] = []
     for i, f in enumerate(futs):
         fetched = f.result()
         if isinstance(fetched, tuple) and len(fetched) == 3:
@@ -254,14 +284,20 @@ def _gather(futs: list, cells=None) -> tuple[list, list[int]]:
             redacted_url = "[redacted-url]"
         else:  # Compatibility for direct/unit-test futures made before failure records existed.
             img, reason, redacted_url = fetched, None, "[redacted-url]"
+        if img is None and reason is None:
+            reason = ClipRankTileError(kind="fetch_failed",
+                                       detail=f"unknown fetch/decode failure — {redacted_url}")
+        elif isinstance(reason, str):
+            reason = ClipRankTileError(kind="fetch_failed", detail=f"{reason} — {redacted_url}")
         if reason is not None:
-            print(f"[clip_rank] tile fetch failed — {reason} — {redacted_url}",
-                  file=sys.stderr, flush=True)
+            # stderr is the operator's view; the SAME reason also rides in the result (errors[i]) — a failure
+            # reported only to a log is a failure the planner reads as data.
+            print(f"[clip_rank] tile {reason.kind} — {reason.detail}", file=sys.stderr, flush=True)
         cell = cells[i] if cells is not None else None
         if cell is not None:
             if img is None:
                 raise ValueError(f"clip_rank sheet for cell {i} could not be fetched or decoded — "
-                                 f"{reason or 'unknown fetch/decode failure'} — {redacted_url}")
+                                 f"{reason.kind}: {reason.detail}")
             x, y, w, h, sheet_w, sheet_h = (int(v) for v in cell)
             if min(x, y) < 0 or min(w, h, sheet_w, sheet_h) <= 0:
                 raise ValueError(f"clip_rank cell {i} has non-positive geometry")
@@ -274,7 +310,8 @@ def _gather(futs: list, cells=None) -> tuple[list, list[int]]:
         if img is not None:
             images.append(img)
             ok.append(i)
-    return images, ok
+        errors.append(reason if img is None else None)
+    return images, ok, errors
 
 
 class ClipRankService:
@@ -319,13 +356,13 @@ class ClipRankService:
 
             def prepare(key):
                 tg = time.monotonic()
-                images, ok = _gather(pending[key], key[1])
+                images, ok, errors = _gather(pending[key], key[1])
                 gs = time.monotonic() - tg
                 if not self._slots.acquire(timeout=60.0):
                     raise TimeoutError("clip_rank image forward waited 60s for a card lane")
                 try:
                     tf = time.monotonic()
-                    prepared = self._prepare(images, ok)
+                    prepared = (*self._prepare(images, ok), errors)
                     return prepared, gs, time.monotonic() - tf
                 finally:
                     self._slots.release()
@@ -354,7 +391,7 @@ class ClipRankService:
             tp = time.monotonic()
             payload = ClipRankPayload(model=self.model_id, groups=groups)
             out = Path(td) / "clip_rank.json"
-            out.write_text(payload.model_dump_json())
+            out.write_text(payload.model_dump_json(exclude_none=True))
             payload_s = time.monotonic() - tp
             infer_s = time.monotonic() - t0
             if progress is not None:
@@ -381,8 +418,9 @@ class ClipRankService:
         """One group, both phases — run() pipelines them instead, so the fetch of k+1 overlaps k's forward."""
         return self._score(group, *self._fetch(group.image_urls, workdir))
 
-    def _score(self, group: ClipRankGroup, images: list, ok: list[int]) -> ClipRankGroupResult:
-        return self._score_prepared(group, *self._prepare(images, ok))
+    def _score(self, group: ClipRankGroup, images: list, ok: list[int],
+               errors: list[ClipRankTileError | None]) -> ClipRankGroupResult:
+        return self._score_prepared(group, *self._prepare(images, ok), errors)
 
     def _prepare(self, images: list, ok: list[int]):
         if not images:
@@ -392,22 +430,42 @@ class ClipRankService:
             embeds = [[round(x, _DP) for x in e] for e in ie.float().cpu().tolist()]
         return ie, embeds, ok
 
-    def _score_prepared(self, group: ClipRankGroup, ie, embeds: list, ok: list[int]) -> ClipRankGroupResult:
+    def _score_prepared(self, group: ClipRankGroup, ie, embeds: list, ok: list[int],
+                        errors: list[ClipRankTileError | None]) -> ClipRankGroupResult:
         n = len(group.image_urls)
         if ie is None:
-            return ClipRankGroupResult(scores=[_MISS] * n, embeds=[None] * n)
+            # NO tile produced anything: the group itself is the error, carrying its first tile's reason.
+            first = next(e for e in errors if e is not None)
+            return ClipRankGroupResult(status="error", error=first, scores=[None] * n, embeds=[None] * n,
+                                       errors=list(errors))
         scores = self._text_scores(group.intent, ie)
-        # re-align onto the REQUESTED order: an image we could not fetch keeps -1.0/None so it sorts last
+        # re-align onto the REQUESTED order: an image we could not fetch keeps score null + its named error
         by_idx = dict(zip(ok, scores))
         emb_by_idx = dict(zip(ok, embeds))
-        return ClipRankGroupResult(
-            scores=[by_idx.get(i, _MISS) for i in range(n)],
-            embeds=[emb_by_idx.get(i) for i in range(n)],
-        )
+        out_scores: list[float | None] = []
+        out_embeds: list[list[float] | None] = []
+        out_errors: list[ClipRankTileError | None] = []
+        for i in range(n):
+            score, embed, err = by_idx.get(i), emb_by_idx.get(i), errors[i]
+            if err is None and not _finite(score, embed):
+                # A NaN/inf (a degenerate fp16 row) is a failure too: JSON would carry it as an UNNAMED null.
+                err = ClipRankTileError(kind="non_finite",
+                                        detail=f"the forward produced a non-finite score/embedding for tile {i}")
+                score = embed = None
+            elif err is None and score is None:
+                err = _EMPTY_INTENT
+            out_scores.append(score)
+            out_embeds.append(embed)
+            out_errors.append(err)
+        if all(s is None and e is None for s, e in zip(out_scores, out_embeds)):
+            first = next(e for e in out_errors if e is not None)
+            return ClipRankGroupResult(status="error", error=first, scores=out_scores, embeds=out_embeds,
+                                       errors=out_errors)
+        return ClipRankGroupResult(status="ok", scores=out_scores, embeds=out_embeds, errors=out_errors)
 
-    def _text_scores(self, intent: str, ie) -> list[float]:
+    def _text_scores(self, intent: str, ie) -> list[float | None]:
         if not intent:
-            return [_MISS] * len(getattr(ie, "rows", ie))
+            return [None] * len(getattr(ie, "rows", ie))
         torch = self.torch
         with torch.no_grad():
             tin = self.proc(text=[intent], return_tensors="pt", padding="max_length", truncation=True)
@@ -438,11 +496,12 @@ class ClipRankService:
                 self._feat(self.model.get_image_features(**iin)), dim=-1))
         return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
-    def _forward(self, intent: str, images: list) -> tuple[list[float], list[list[float]]]:
+    def _forward(self, intent: str, images: list) -> tuple[list[float | None], list[list[float]]]:
         ie, embeds, _ = self._prepare(images, list(range(len(images))))
         return self._text_scores(intent, ie), embeds
 
     @staticmethod
-    def _fetch(urls: list[str], workdir: Path) -> tuple[list, list[int]]:
-        """Download+decode every url CONCURRENTLY; returns the decoded images and their REQUEST indices."""
+    def _fetch(urls: list[str], workdir: Path) -> tuple[list, list[int], list[ClipRankTileError | None]]:
+        """Download+decode every url CONCURRENTLY; returns the decoded images, their REQUEST indices and the
+        per-index errors."""
         return _gather(_submit_tiles(urls, workdir))
