@@ -4,6 +4,7 @@ on this machine."""
 from __future__ import annotations
 
 import concurrent.futures as cf
+import contextvars
 import os
 import re
 import shutil
@@ -17,6 +18,8 @@ from urllib.request import url2pathname
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 from podagent import event_stream
 from podagent.sanitize import safe_error, safe_text
@@ -144,10 +147,90 @@ def _store_pool() -> int:
         return max(16, _transport_cap_fallback())
 
 
+# urllib3 2.x has NO write timeout: the REQUEST (headers AND body) is sent under the CONNECT timeout, the read
+# timeout starts only once the response is awaited. PUBLISHED docs (urllib3 User Guide, "Timeouts":
+# https://urllib3.readthedocs.io/en/stable/user-guide.html#timeouts) define only `connect` and `read` — no
+# third parameter for the body send — and the `Timeout` reference docs
+# (https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html) scope `read` in so many words: "The
+# read and total timeouts only measure the time between read operations on the socket connecting the client
+# and the server, not the total amount of time for the request to return a complete response." Nothing is
+# documented as bounding the send, so it falls under whatever the connect leg's `conn.timeout` is at send
+# time — confirmed in source for BOTH ends of the Dockerfile's floor ('urllib3>=2,<3'): the installed 2.8.0
+# (its connection-pool module, around line 465, sets `conn.timeout = timeout_obj.connect_timeout`, then
+# around line 499 calls `conn.request(..., body=body)`, and only around lines 523-536 THEN "Reset the
+# timeout for the recv() on the socket" `conn.timeout = read_timeout`) and the pinned-floor tag 2.7.0 (same
+# shape, same module, around lines 542 / 554-561 / 578) — identical across the version range this image can
+# resolve to. `HTTPConnection.request` (urllib3's connection module, around lines 503-506) applies
+# `conn.timeout` to the socket right before sending — "Update the inner socket's timeout value to send the
+# request" — so `timeout=(10, deadline)` cut every PUT body on a slow uplink at 10 s whatever its size
+# (prod 2026-10-13, MISC-306: "The write operation timed out" x3 in 33 s).
+#
+# `socket.settimeout` bounds ONE syscall, not a running total across a connection's lifetime (the stdlib
+# gives no "deadline" primitive — each `sendall()` gets its own fresh window at whatever value is set when it
+# is called). A multi-chunk body calls `HTTPConnection.send()` once per chunk, so simply setting
+# `conn.timeout = bound` once (as `request()` does for headers) would hand EVERY chunk its own `bound`-sized
+# window — a stall after the first chunk would fail at 2×bound, not at bound. `_SendBoundMixin.send()` below
+# tracks an absolute deadline and re-derives the REMAINING time before each actual write, so the whole send
+# — however many chunks — is bounded by `_PUT_SEND_TIMEOUT_S`, matching `_put_deadline_s`.
+_PUT_SEND_TIMEOUT_S: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_PUT_SEND_TIMEOUT_S", default=None)
+
+
+class _SendBoundMixin:
+    """Overrides BOTH `request()` (sets the absolute wall for this send) and `send()` (the call every header
+    and body chunk goes through) — `request()` alone cannot bound a multi-chunk body (see module comment
+    above `_PUT_SEND_TIMEOUT_S`)."""
+
+    _send_deadline: float | None = None
+
+    def request(self, method: str, url: str, body: Any = None, headers: Any = None, **kw: Any) -> None:
+        bound = _PUT_SEND_TIMEOUT_S.get()
+        self._send_deadline = None if bound is None else time.monotonic() + bound
+        try:
+            super().request(method, url, body=body, headers=headers, **kw)  # type: ignore[misc]
+        finally:
+            self._send_deadline = None
+
+    def send(self, data: Any) -> None:
+        if self._send_deadline is not None and getattr(self, "sock", None) is not None:
+            remaining = self._send_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("The write operation timed out")
+            self.sock.settimeout(remaining)  # type: ignore[attr-defined]
+        super().send(data)  # type: ignore[misc]
+
+
+class _SendBoundHTTPConnection(_SendBoundMixin, HTTPConnection):
+    pass
+
+
+class _SendBoundHTTPSConnection(_SendBoundMixin, HTTPSConnection):
+    pass
+
+
+class _SendBoundHTTPPool(HTTPConnectionPool):
+    ConnectionCls = _SendBoundHTTPConnection
+
+
+class _SendBoundHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = _SendBoundHTTPSConnection
+
+
+class _StoreAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {"http": _SendBoundHTTPPool, "https": _SendBoundHTTPSPool}
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+        manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        manager.pool_classes_by_scheme = {"http": _SendBoundHTTPPool, "https": _SendBoundHTTPSPool}
+        return manager
+
+
 _store = requests.Session()
 for _scheme in ("http://", "https://"):
-    _store.mount(_scheme, HTTPAdapter(pool_connections=_store_pool(), pool_maxsize=_store_pool(),
-                                      pool_block=False))
+    _store.mount(_scheme, _StoreAdapter(pool_connections=_store_pool(), pool_maxsize=_store_pool(),
+                                        pool_block=False))
 
 # A PUT's per-attempt deadline is sized to the OBJECT and to the uplink it actually shares, not a flat 30 s:
 # measured 2026-10-01, three concurrent previews spent 680/811/460 s in `put` (155-320 s alone) because every
@@ -159,6 +242,7 @@ for _scheme in ("http://", "https://"):
 _MEASURED_STREAM_BYTES_PER_S = 25e6
 _PUT_FLOOR_BYTES_PER_S = _MEASURED_STREAM_BYTES_PER_S / _store_pool()
 # Connect + TLS + the store's own answer after the last byte; matches the 10 s connect leg in STORE_POOL_WHY.
+# It bounds the DIAL only — never the body send (`_PUT_SEND_TIMEOUT_S`).
 _PUT_CONNECT_MARGIN_S = 10.0
 # A measured rate is a sample, not a promise: the deadline assumes half of it before it cuts a transfer off.
 _PUT_RATE_SLACK = 2.0
@@ -931,13 +1015,19 @@ def upload(src: Path, put_url: str, content_type: str | None = None) -> None:
             put_rate.begin()
             try:
                 with src.open("rb") as f:
-                    # (connect, read): the read leg bounds every socket op, the body's wall the whole attempt
-                    # — both sized to this object (`_put_deadline_s`); the wall keeps the old 300 s drip bound.
-                    r = _store.put(
-                        put_url, data=_DeadlineBody(f, size, max(_XFER_DEADLINE_S, deadline)),
-                        headers={"Content-Type": content_type, "Content-Length": str(size)},
-                        timeout=(_PUT_CONNECT_MARGIN_S, deadline),
-                    )
+                    # (connect, read) + send: urllib3 sends the body under the CONNECT leg (see
+                    # `_PUT_SEND_TIMEOUT_S`), so the body's socket ops get their own bound and the read leg the
+                    # store's answer — both sized to this object (`_put_deadline_s`); the body's wall bounds the
+                    # whole attempt and keeps the old 300 s drip bound.
+                    send_bound = _PUT_SEND_TIMEOUT_S.set(deadline)
+                    try:
+                        r = _store.put(
+                            put_url, data=_DeadlineBody(f, size, max(_XFER_DEADLINE_S, deadline)),
+                            headers={"Content-Type": content_type, "Content-Length": str(size)},
+                            timeout=(_PUT_CONNECT_MARGIN_S, deadline),
+                        )
+                    finally:
+                        _PUT_SEND_TIMEOUT_S.reset(send_bound)
                 r.raise_for_status()
             except BaseException:
                 put_rate.end()

@@ -6,8 +6,13 @@ presign (403) was retried with backoff although it can only fail again.
 """
 from __future__ import annotations
 
+import http.client
+import math
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 import requests
@@ -138,3 +143,190 @@ def test_a_timeout_keeps_the_bounded_retry(tmp_path: Path, monkeypatch: pytest.M
 def test_floor_is_the_measured_stream_split_across_the_transfer_width() -> None:
     assert cp._MEASURED_STREAM_BYTES_PER_S == 25e6
     assert cp._PUT_FLOOR_BYTES_PER_S == pytest.approx(cp._MEASURED_STREAM_BYTES_PER_S / cp._store_pool())
+
+
+# Prod 2026-10-13 (MISC-306): urllib3 2.x sends the request BODY under the CONNECT timeout, so every PUT body on
+# a slow pod was cut at the 10 s connect leg whatever its size-derived deadline (see `cp._PUT_SEND_TIMEOUT_S`).
+# The PUT below goes through the REAL `cp._store` -> requests -> urllib3 -> socket path to a local HTTP server;
+# only the uplink's pace is modelled, at `http.client.HTTPConnection.send` (what urllib3 sends headers and body
+# chunks through): a send that the modelled link needs longer for than the socket timeout in force raises the
+# exact error the kernel would ("The write operation timed out"). No wall clock, no sleeps: the verdict is a
+# comparison of the socket timeout urllib3 actually set against the modelled need.
+_SLOW_BODY_NEEDS_S = 15.0
+
+
+class _Store(BaseHTTPRequestHandler):
+    received: list[bytes]
+
+    def do_PUT(self) -> None:  # noqa: N802 — http.server's naming
+        want = int(self.headers["Content-Length"])
+        body = self.rfile.read(want)
+        if len(body) == want:
+            self.received.append(body)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+class _ThrottledUplink:
+    """`rate` bytes/s, steady, for the first `stall_after` bytes of each connection; nothing after that."""
+
+    def __init__(self, rate_bytes_per_s: float, stall_after: float = math.inf) -> None:
+        self.rate, self.stall_after = rate_bytes_per_s, stall_after
+        self.sends: list[tuple[int, float | None]] = []  # (bytes, socket timeout in force)
+        self._sent: dict[int, int] = {}
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_send = http.client.HTTPConnection.send
+        link = self
+
+        def send(conn: http.client.HTTPConnection, data: Any) -> None:
+            if conn.sock is None:
+                conn.connect()
+            n = len(data)
+            timeout = conn.sock.gettimeout()
+            link.sends.append((n, timeout))
+            sent = link._sent.get(id(conn.sock), 0)
+            need = math.inf if sent + n > link.stall_after else n / link.rate
+            if timeout is not None and need > timeout:
+                raise TimeoutError("The write operation timed out")
+            link._sent[id(conn.sock)] = sent + n
+            real_send(conn, data)
+
+        monkeypatch.setattr(http.client.HTTPConnection, "send", send)
+
+
+@pytest.fixture
+def store() -> Iterator[tuple[str, list[bytes]]]:
+    received: list[bytes] = []
+    handler = type("_StoreHandler", (_Store,), {"received": received})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/object?{_URL.split('?', 1)[1]}"
+    try:
+        yield url, received
+    finally:
+        server.shutdown()
+        server.server_close()
+        cp._store.close()  # no keep-alive socket into a server that is gone
+
+
+def test_a_slow_uplink_body_completes_within_its_size_derived_deadline(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sleeps: list[float],
+        store: tuple[str, list[bytes]]) -> None:
+    url, received = store
+    size = cp._CHUNK  # one body send: the whole object rides one socket op
+    payload = os.urandom(size)
+    src = tmp_path / "v3.audio.mp3"
+    src.write_bytes(payload)
+    link = _ThrottledUplink(rate_bytes_per_s=size / _SLOW_BODY_NEEDS_S)
+    link.install(monkeypatch)
+    monkeypatch.setattr(cp.time, "monotonic", lambda: 0.0)  # frozen: no real-clock dependency in the verdict
+    deadline = cp._put_deadline_s(size)
+    assert cp._PUT_CONNECT_MARGIN_S < _SLOW_BODY_NEEDS_S <= deadline, \
+        "the scenario: a body the 10 s connect leg cannot carry but its own deadline can"
+
+    cp.upload(src, url)
+
+    assert received == [payload]
+    assert sleeps == [] and [r["outcome"] for r in cp.put_trace.collect()] == ["ok"]
+    body_sends = [t for n, t in link.sends if n == size]
+    assert body_sends == [deadline], "the body is sent under the size-derived deadline, not the connect leg"
+    assert cp._PUT_SEND_TIMEOUT_S.get() is None, "the send bound never leaks past the PUT"
+
+
+def test_a_stalled_body_still_fails_at_the_deadline(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sleeps: list[float],
+        store: tuple[str, list[bytes]]) -> None:
+    url, received = store
+    size = cp._CHUNK
+    link = _ThrottledUplink(rate_bytes_per_s=1e9, stall_after=64 << 10)  # headers go out, the body never does
+    link.install(monkeypatch)
+    monkeypatch.setattr(cp.time, "monotonic", lambda: 0.0)  # frozen: no real-clock dependency in the verdict
+    deadline = cp._put_deadline_s(size)
+
+    with pytest.raises(requests.ConnectionError, match="The write operation timed out"):
+        cp.upload(_obj(tmp_path, size), url)
+
+    assert received == []
+    assert sleeps == [1, 2], "the attempt count and backoff are unchanged"
+    assert [r["outcome"] for r in cp.put_trace.collect()] == ["retry", "retry", "error"]
+    stalled = [t for n, t in link.sends if n == size]
+    assert stalled == [deadline] * cp._XFER_ATTEMPTS, "each stalled body is cut at its deadline, no later"
+    assert cp.put_rate.per_put() == 0.0
+
+
+class _FakeClock:
+    """A monotonic() stand-in the test drives explicitly — no sleeps, no thread timing, no real elapsed time
+    anywhere in the verdict."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class _DummySock:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+
+class _DummyConn:
+    """Stands in for `http.client.HTTPConnection`: real `request()` sends headers AND every body chunk via
+    its own `send()` calls, ALL from within the one `request()` call — `send_plan` reproduces that shape
+    (each entry is a clock value to jump to, then a chunk to send) so `_SendBoundMixin`'s deadline stays live
+    across them exactly as it would on the real class."""
+
+    def __init__(self, clock: "_FakeClock", send_plan: list[tuple[float, bytes]]) -> None:
+        self.sock = _DummySock()
+        self._clock = clock
+        self._send_plan = send_plan
+
+    def request(self, method: str, url: str, body: Any = None, headers: Any = None, **kw: Any) -> None:
+        for t, chunk in self._send_plan:
+            self._clock.t = t
+            self.send(chunk)
+
+    def send(self, data: Any) -> None:
+        pass
+
+
+class _BoundDummyConn(cp._SendBoundMixin, _DummyConn):
+    pass
+
+
+def test_a_stalled_chunk_does_not_hand_the_next_chunk_a_fresh_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression for the bug a prior fix introduced: `socket.settimeout` bounds ONE syscall, not a running
+    # total, so setting `conn.timeout = bound` once (as plain `request()` does for headers) would let a
+    # multi-chunk body's SECOND `send()` call start its own fresh `bound`-sized window — a stall after the
+    # first chunk would then fail at 2x the size-derived deadline, not at it. `_SendBoundMixin.send()` must
+    # instead shrink the window it grants by whatever time the deadline already has behind it, and fail
+    # inside the SAME `request()` call once that absolute deadline is reached — not after a fresh window.
+    clock = _FakeClock(start=0.0)
+    monkeypatch.setattr(cp.time, "monotonic", clock)
+    send_plan = [
+        (0.0, b"first chunk"),           # remaining = 30.0 - 0.0 = 30.0
+        (25.0, b"second chunk"),         # the first chunk alone ate 25s: remaining must be 5.0, not a fresh 30.0
+        (29.9, b"third chunk, barely"),  # remaining 0.1 — still inside the ORIGINAL deadline
+        (30.0, b"fourth chunk, exhausted"),  # remaining <= 0: must fail here, not after a 4th window
+    ]
+    conn = _BoundDummyConn(clock, send_plan)
+    token = cp._PUT_SEND_TIMEOUT_S.set(30.0)
+    try:
+        with pytest.raises(TimeoutError, match="The write operation timed out"):
+            conn.request("PUT", "/object")
+    finally:
+        cp._PUT_SEND_TIMEOUT_S.reset(token)
+
+    assert conn.sock.timeouts == pytest.approx([30.0, 5.0, 0.1]), \
+        "each send gets the REMAINING time before the absolute deadline, not a fresh `bound` every call"
+    assert conn._send_deadline is None, "the deadline is cleared once request() is done, success or failure"
