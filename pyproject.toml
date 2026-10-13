@@ -30,6 +30,9 @@ ml = [
 dev = [
     "pytest",
     "jsonschema",
+    # tests/test_ci_installs_what_tests_need.py PARSES .github/workflows/ci.yml (yaml.safe_load) to prove the CI
+    # test job installs the ffmpeg the tests spawn. Receipt: docs/research/ci-runner-ffmpeg-and-pyyaml.md.
+    "pyyaml",
 ]
 
 [build-system]
