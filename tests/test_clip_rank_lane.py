@@ -62,7 +62,7 @@ def _pump(cp, ops_pool, heavy_pool, rank_pool, heavy, n):
 def test_a_big_card_scales_past_the_one_worker_it_used_to_get():
     """A rented 24 GB card must not inherit the single GPU worker: 23000 − 512 reserve − 2322 shared
     weights = 20166 MiB / 414 per lane = 48 by VRAM, so the host is the binding side."""
-    n, why = m._width_from(free_mb=23000.0, threads=16, env_raw=None)
+    n, why = m._width_from(free_mb=23000.0, threads=16)
     assert n == 16
     assert "vram-bound=48" in why and "host-bound=16" in why
 
@@ -70,46 +70,26 @@ def test_a_big_card_scales_past_the_one_worker_it_used_to_get():
 def test_the_dev_2060_gets_exactly_one_lane():
     """3254 MiB free under a desktop − 512 − 2322 = 420, which holds ONE 414 MiB forward — the formula must
     reproduce the card it was measured on, not flatter it."""
-    assert m._width_from(free_mb=3254.0, threads=12, env_raw=None)[0] == 1
+    assert m._width_from(free_mb=3254.0, threads=12)[0] == 1
 
 
 def test_a_card_that_reports_nothing_runs_narrow_on_the_gpu_and_says_so():
     """Placement law: no number => serialise ON THE CARD. 0 would raise in ThreadPoolExecutor and 'rank on
     CPU' would move the work across the placement axis."""
-    n, why = m._width_from(free_mb=None, threads=32, env_raw=None)
+    n, why = m._width_from(free_mb=None, threads=32)
     assert n == 1
     assert "never the CPU" in why
 
 
 def test_a_card_with_no_room_left_still_gets_one_lane_never_zero():
     """Less free VRAM than the shared weights alone: the floor holds at 1 rather than going negative."""
-    assert m._width_from(free_mb=800.0, threads=8, env_raw=None)[0] == 1
-    assert m._width_from(free_mb=0.0, threads=8, env_raw=None)[0] == 1
-
-
-def test_an_operators_number_wins_over_the_derivation():
-    n, why = m._width_from(free_mb=3254.0, threads=12, env_raw="6")
-    assert n == 6 and "env=6" in why
-
-
-def test_a_garbage_override_is_loud_and_falls_back_to_the_card(capsys):
-    """A typo may not kill a box that is already billed, nor silently become some other number. Watched
-    fail with the except branch returning a default."""
-    n, _ = m._width_from(free_mb=23000.0, threads=4, env_raw="wide-please")
-    assert n == 4, "the derivation must still run"
-    assert "not an integer" in capsys.readouterr().err
-
-
-def test_lane_width_never_asks_the_card_when_an_operator_already_answered(monkeypatch):
-    monkeypatch.setenv(m._LANES_ENV, "3")
-    monkeypatch.setattr(m, "_free_vram_mb", lambda: pytest.fail("asked the card despite an explicit width"))
-    assert m.lane_width() == 3
+    assert m._width_from(free_mb=800.0, threads=8)[0] == 1
+    assert m._width_from(free_mb=0.0, threads=8)[0] == 1
 
 
 def test_an_unaskable_card_costs_one_lane_not_a_crashed_boot(monkeypatch):
     """A missing nvidia-smi raises out of subprocess.run — on a rented box that must be a narrow lane with a
     loud line, not an exception that ends main() before the first poll."""
-    monkeypatch.delenv(m._LANES_ENV, raising=False)
     monkeypatch.setattr(m, "_free_vram_mb", lambda: (_ for _ in ()).throw(OSError("no nvidia-smi")))
     assert m.lane_width() == 1
 
@@ -289,10 +269,9 @@ def test_the_next_groups_tiles_are_already_on_the_wire_while_this_one_forwards(m
 
 def test_the_fetch_pool_is_one_per_process_not_one_per_envelope(monkeypatch):
     """A per-envelope pool multiplies with the lanes — the box-wide budget lesson ops/runner already learned."""
-    m._FETCH_POOL = None
-    monkeypatch.setenv(m._FETCH_WORKERS_ENV, "2")
+    monkeypatch.setattr(m, "_FETCH_POOL", None)
     assert m._fetch_pool() is m._fetch_pool()
-    assert m._fetch_pool()._max_workers == 2
+    assert m._fetch_pool()._max_workers == m._FETCH_WORKERS
 
 
 # ── the forward is chunked, so one lane's VRAM is a number ───────────────────────────────────────

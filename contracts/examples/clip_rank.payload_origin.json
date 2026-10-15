@@ -19,7 +19,7 @@
         null,
         {
           "kind": "decode_error",
-          "detail": "UnidentifiedImageError — https://images.stock.example/photo/1002/thumb.jpg"
+          "detail": "UnidentifiedImageError \u2014 https://images.stock.example/photo/1002/thumb.jpg"
         }
       ],
       "measures": [
@@ -34,8 +34,8 @@
     {
       "status": "error",
       "error": {
-        "kind": "origin_fetch_unavailable",
-        "detail": "origin_urls tiles are not fetched by this pod yet"
+        "kind": "origin_refused",
+        "detail": "REFUSED: scheme 'http' is not https (http://images.stock.example/photo/2001/thumb.jpg). A keyless RENTED pod fetches over TLS or not at all. \u2014 http://images.stock.example/photo/2001/thumb.jpg"
       },
       "scores": [
         null,
@@ -47,13 +47,17 @@
       ],
       "errors": [
         {
-          "kind": "origin_fetch_unavailable",
-          "detail": "origin_urls tiles are not fetched by this pod yet"
+          "kind": "origin_refused",
+          "detail": "REFUSED: scheme 'http' is not https (http://images.stock.example/photo/2001/thumb.jpg). A keyless RENTED pod fetches over TLS or not at all. \u2014 http://images.stock.example/photo/2001/thumb.jpg"
         },
         {
-          "kind": "origin_fetch_unavailable",
-          "detail": "origin_urls tiles are not fetched by this pod yet"
+          "kind": "fetch_timeout",
+          "detail": "TimeoutError: timed out \u2014 https://images.stock.example/photo/2002/thumb.jpg"
         }
+      ],
+      "measures": [
+        null,
+        null
       ]
     }
   ]

@@ -900,7 +900,7 @@ class FaceProbePayload(BaseModel):
 
 
 ClipRankTileErrorKind = Literal["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error",
-                                "empty_intent", "non_finite", "origin_fetch_unavailable"]
+                                "empty_intent", "non_finite", "origin_fetch_unavailable", "origin_refused"]
 
 
 class ClipRankTileError(BaseModel):

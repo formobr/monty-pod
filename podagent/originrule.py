@@ -20,7 +20,7 @@ a redirect's body is never read at all (the connection is simply closed), so the
 tied to a 3xx response the way a stock redirect-handler's own `fp.read()` would be.
 
 Standard library only: it is the guard, so it may not depend on anything that is not already the interpreter.
-Nothing calls it yet.
+Its caller is infer_cliprank, for every tile of a clip_rank origin_urls group.
 """
 from __future__ import annotations
 

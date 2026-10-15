@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -25,8 +26,11 @@ from urllib.parse import urlsplit
 
 import requests
 
+from . import originrule
+from .cp import _TIMEOUT as _TILE_TIMEOUT_S
 from .cp import TransferTimeout, UrlNotAllowed, download, upload
-from .models import ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload, ClipRankTileError
+from .models import (ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload, ClipRankTileError,
+                     ClipRankTileMeasure)
 from .sanitize import safe_endpoint, safe_error, safe_text
 
 # NO SENTINEL SCORE. A tile with nothing to score is `score: null` + a named error, never -1.0: in prod every
@@ -34,10 +38,11 @@ from .sanitize import safe_endpoint, safe_error, safe_text
 # and the planner read eleven days of failures as eleven days of irrelevant footage.
 _EMPTY_INTENT = ClipRankTileError(kind="empty_intent",
                                   detail="embed-only group: the intent is empty, so no tile has a score")
-# Until the pod fetches stock-provider origin URLs itself (next MISC-333 slice), an origin group is answered
-# tile by tile with this named error — never fetched under the presigned-only rule, never a crash.
-_ORIGIN_UNAVAILABLE = ClipRankTileError(kind="origin_fetch_unavailable",
-                                        detail="origin_urls tiles are not fetched by this pod yet")
+# An origin tile (a stock provider's thumbnail) is fetched through originrule, never cp.download: it is an
+# address a third party handed us, not a capability we minted. Its body cap is the engine's own
+# provider-thumbnail cap (THUMB_MAX_BYTES, in its preview-link resolver) — what the box accepts off a
+# provider; its per-read timeout is the same `cp._TIMEOUT` an image_urls tile's download runs under.
+_ORIGIN_MAX_BYTES = 8_000_000
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
 
 # Chunk the image tower so ONE lane's VRAM is a known number, not a function of a beat's candidate count —
@@ -54,7 +59,7 @@ group's turn, so the card idled through most of the envelope. A one-worker GPU q
 against work that barely touches the card, and a render blocked every ranking envelope of a b-roll wave.
 
 TWO PHASES, TWO WIDTHS. Tiles are latency-bound, so their width is a count of round trips in flight
-(_FETCH_WORKERS_DEFAULT, the same 8 the engine's tile PUTs use). ONE pool for the whole process: a
+(_FETCH_WORKERS, the same 8 the engine's tile PUTs use). ONE pool for the whole process: a
 per-envelope pool would multiply with the lanes, which is the box-wide-budget lesson ops/runner.step_slots()
 already learned. The towers are VRAM-bound and keep their own narrow lane.
 
@@ -79,9 +84,9 @@ axis, which is the fallback the ruling forbids.
 _VRAM_WEIGHTS_MB = 2322.0
 _VRAM_PER_LANE_MB = 414.0
 _VRAM_RESERVE_MB = 512.0
-_LANES_ENV = "CLIP_RANK_LANES"
-_FETCH_WORKERS_ENV = "CLIP_RANK_FETCH_WORKERS"
-_FETCH_WORKERS_DEFAULT = 8
+# No env lever for either width (MISC-333 §5): neither CLIP_RANK_LANES nor CLIP_RANK_FETCH_WORKERS was set on
+# prod, so the lane count is the card's derivation and the fetch width is this constant.
+_FETCH_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -158,14 +163,8 @@ def usable_cores() -> int:
     return max(1, int(cores))
 
 
-def _width_from(free_mb: float | None, threads: int, env_raw: str | None) -> tuple[int, str]:
+def _width_from(free_mb: float | None, threads: int) -> tuple[int, str]:
     """The lane width and the sentence that explains it (LANE_SIZING_WHY). Pure — readings are injected."""
-    if env_raw:
-        try:
-            return max(1, int(env_raw)), f"env={env_raw}"
-        except ValueError:
-            # A typo in an operator's env may not kill a box that is already being billed: be loud, derive.
-            _log(f"⚠ {_LANES_ENV}={env_raw!r} is not an integer — ignoring it and sizing from the card")
     if free_mb is None:
         return 1, "the card reports no free VRAM — one lane, still the GPU, never the CPU"
     by_vram = max(1, int((free_mb - _VRAM_RESERVE_MB - _VRAM_WEIGHTS_MB) // _VRAM_PER_LANE_MB))
@@ -175,24 +174,20 @@ def _width_from(free_mb: float | None, threads: int, env_raw: str | None) -> tup
 
 
 def lane_width() -> int:
-    """How many clip_rank envelopes may run at once on THIS card. An operator's number still wins."""
-    env_raw = os.environ.get(_LANES_ENV)
+    """How many clip_rank envelopes may run at once on THIS card — derived from the card, never an env."""
     try:
-        free = None if env_raw else _free_vram_mb()
+        free = _free_vram_mb()
     except (OSError, ValueError) as e:
         _log(f"⚠ could not ask the card for free VRAM ({type(e).__name__}: {e}) — one lane, still the GPU")
         return 1
-    n, why = _width_from(free, _host_threads(), env_raw)
+    n, why = _width_from(free, _host_threads())
     _log(f"{n} concurrent clip_rank lane(s): {why}")
     return n
 
 
 def fetch_width() -> int:
     """The process-wide tile-fetch width, resolved without constructing its pool."""
-    try:
-        return max(1, int(os.environ.get(_FETCH_WORKERS_ENV, "") or _FETCH_WORKERS_DEFAULT))
-    except ValueError:
-        return _FETCH_WORKERS_DEFAULT
+    return _FETCH_WORKERS
 
 
 _fetch_pool_lock = threading.Lock()
@@ -262,6 +257,71 @@ def _fetch_tile(url: str, dest: Path):
         return Image.open(path).convert("RGB"), None, redacted_url
     except Exception as exc:  # noqa: BLE001 — undecodable bytes are this tile's error, not the batch's
         return None, _tile_error("decode_error", exc, redacted_url), redacted_url
+
+
+def _fetch_origin_tile(url: str, dest: Path):
+    """One stock-provider tile: GET through the origin guard → workdir file → decode, exactly like an image_urls
+    tile after its download. Returns (image, error, redacted url, measure); the measure is the fetched bytes
+    and decoded size, None for a tile that did not decode. A guard refusal is `origin_refused`."""
+    from PIL import Image
+
+    redacted_url = _redacted_tile_url(url)
+    try:
+        data = originrule.fetch(url, max_bytes=_ORIGIN_MAX_BYTES, timeout_s=_TILE_TIMEOUT_S)
+    except originrule.OriginRefused as exc:
+        return None, _tile_error("origin_refused", exc, redacted_url), redacted_url, None
+    except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault; it is NAMED below
+        return None, _tile_error(_fetch_kind(exc), exc, redacted_url), redacted_url, None
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        img = Image.open(dest).convert("RGB")
+    except Exception as exc:  # noqa: BLE001 — undecodable bytes are this tile's error, not the batch's
+        return None, _tile_error("decode_error", exc, redacted_url), redacted_url, None
+    return img, None, redacted_url, ClipRankTileMeasure(bytes=len(data), w=img.width, h=img.height)
+
+
+def _submit_origins(urls: list[str], workdir: Path, shared: dict) -> list:
+    """Put every origin tile on the wire, ONE fetch per url per REQUEST: `shared` (url → future) spans every
+    origin group of the request, so a thumbnail two beats both shortlisted is fetched once."""
+    pool = _fetch_pool()
+    for u in urls:
+        if u not in shared:
+            shared[u] = pool.submit(_fetch_origin_tile, u, workdir / f"{len(shared)}.img")
+    return [shared[u] for u in urls]
+
+
+def _gather_origins(futs: list):
+    """An origin group's decoded images, their indices, per-index errors and measures, and the first failed
+    tile's redacted url (None when every tile decoded)."""
+    images: list = []
+    ok: list[int] = []
+    errors: list[ClipRankTileError | None] = []
+    measures: list[ClipRankTileMeasure | None] = []
+    first_failed: str | None = None
+    for i, f in enumerate(futs):
+        img, reason, redacted_url, measure = f.result()
+        if reason is not None:
+            print(f"[clip_rank] tile {reason.kind} — {reason.detail}", file=sys.stderr, flush=True)
+            first_failed = first_failed or redacted_url
+        else:
+            images.append(img)
+            ok.append(i)
+        errors.append(reason)
+        measures.append(measure)
+    return images, ok, errors, measures, first_failed
+
+
+def _origin_report(i: int, n: int, result: ClipRankGroupResult, first_failed: str | None) -> str:
+    """The one progress line an origin group earns: its failure count per kind and the first failed tile's
+    redacted url — stderr alone never reaches the box, and a failure the box cannot see reads as data."""
+    kinds = Counter(e.kind for e in result.errors if e is not None)
+    line = f"clip_rank origin group {i + 1}/{n}: {sum(kinds.values())}/{len(result.errors)} tile(s) failed"
+    if kinds:
+        line += " (" + ", ".join(f"{k}={c}" for k, c in sorted(kinds.items())) + ")"
+    if first_failed is not None:
+        line += f", first {first_failed}"
+    return line
 
 
 def _submit_tiles(urls: list[str], workdir: Path) -> list:
@@ -354,16 +414,21 @@ class ClipRankService:
                      g.origin_urls is not None)
                     for g in params.groups]
             unique = list(dict.fromkeys(keys))
-            pending = {key: _submit_tiles(list(key[0]), Path(td) / f"g{i}")
-                       for i, key in enumerate(unique) if not key[2]}
+            shared_origins: dict = {}
+            pending = {key: (_submit_origins(list(key[0]), Path(td) / "origins", shared_origins) if key[2]
+                             else _submit_tiles(list(key[0]), Path(td) / f"g{i}"))
+                       for i, key in enumerate(unique)}
+            origin_extra: dict = {}
             if progress is not None:
                 progress(f"clip_rank preparing {len(unique)} unique image set(s) for {n} group(s)")
 
             def prepare(key):
-                if key[2]:
-                    return (None, [], [], [_ORIGIN_UNAVAILABLE] * len(key[0])), 0.0, 0.0
                 tg = time.monotonic()
-                images, ok, errors = _gather(pending[key], key[1])
+                if key[2]:
+                    images, ok, errors, measures, first_failed = _gather_origins(pending[key])
+                    origin_extra[key] = (measures, first_failed)
+                else:
+                    images, ok, errors = _gather(pending[key], key[1])
                 gs = time.monotonic() - tg
                 if not self._slots.acquire(timeout=60.0):
                     raise TimeoutError("clip_rank image forward waited 60s for a card lane")
@@ -391,10 +456,13 @@ class ClipRankService:
                     raise TimeoutError("clip_rank text forward waited 60s for a card lane")
                 tf = time.monotonic()
                 try:
-                    groups.append(self._score_prepared(g, *ready[key]))
+                    measures, first_failed = origin_extra.get(key, (None, None))
+                    groups.append(self._score_prepared(g, *ready[key], measures=measures))
                     forward_s += time.monotonic() - tf
                 finally:
                     self._slots.release()
+                if key[2] and progress is not None:
+                    progress(_origin_report(i, n, groups[-1], first_failed))
             tp = time.monotonic()
             payload = ClipRankPayload(model=self.model_id, groups=groups)
             out = Path(td) / "clip_rank.json"
@@ -424,7 +492,8 @@ class ClipRankService:
     def _run_group(self, group: ClipRankGroup, workdir: Path) -> ClipRankGroupResult:
         """One group, both phases — run() pipelines them instead, so the fetch of k+1 overlaps k's forward."""
         if group.origin_urls is not None:
-            return self._score_prepared(group, None, [], [], [_ORIGIN_UNAVAILABLE] * len(group.tile_urls))
+            images, ok, errors, measures, _ = _gather_origins(_submit_origins(group.origin_urls, workdir, {}))
+            return self._score_prepared(group, *self._prepare(images, ok), errors, measures=measures)
         return self._score(group, *self._fetch(group.tile_urls, workdir))
 
     def _score(self, group: ClipRankGroup, images: list, ok: list[int],
@@ -440,13 +509,15 @@ class ClipRankService:
         return ie, embeds, ok
 
     def _score_prepared(self, group: ClipRankGroup, ie, embeds: list, ok: list[int],
-                        errors: list[ClipRankTileError | None]) -> ClipRankGroupResult:
+                        errors: list[ClipRankTileError | None],
+                        measures: list[ClipRankTileMeasure | None] | None = None) -> ClipRankGroupResult:
+        """`measures` rides only on an origin group (parallel to its tiles); an image_urls group carries none."""
         n = len(group.tile_urls)
         if ie is None:
             # NO tile produced anything: the group itself is the error, carrying its first tile's reason.
             first = next(e for e in errors if e is not None)
             return ClipRankGroupResult(status="error", error=first, scores=[None] * n, embeds=[None] * n,
-                                       errors=list(errors))
+                                       errors=list(errors), measures=measures)
         scores = self._text_scores(group.intent, ie)
         # re-align onto the REQUESTED order: an image we could not fetch keeps score null + its named error
         by_idx = dict(zip(ok, scores))
@@ -469,8 +540,9 @@ class ClipRankService:
         if all(s is None and e is None for s, e in zip(out_scores, out_embeds)):
             first = next(e for e in out_errors if e is not None)
             return ClipRankGroupResult(status="error", error=first, scores=out_scores, embeds=out_embeds,
-                                       errors=out_errors)
-        return ClipRankGroupResult(status="ok", scores=out_scores, embeds=out_embeds, errors=out_errors)
+                                       errors=out_errors, measures=measures)
+        return ClipRankGroupResult(status="ok", scores=out_scores, embeds=out_embeds, errors=out_errors,
+                                   measures=measures)
 
     def _text_scores(self, intent: str, ie) -> list[float | None]:
         if not intent:

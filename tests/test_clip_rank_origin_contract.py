@@ -3,8 +3,8 @@ carry each tile's measured size — without a contracts VERSION bump and without
 
   • a group carries EXACTLY ONE of image_urls / origin_urls; image_cells only ride with image_urls;
   • `measures`, when present, is parallel to the tiles; absent unless asked (today's results are unchanged);
-  • until the origin fetch lands, an origin group is answered per tile with a NAMED
-    `origin_fetch_unavailable` error — never fetched, never a crash;
+  • an origin group is never fetched under the presigned-only rule (cp.download): it goes through the
+    origin guard (tests/test_clip_rank_origin_fetch.py pins that path), and only it carries `measures`;
   • the dry stub sizes an origin group by its origin_urls.
 """
 from __future__ import annotations
@@ -117,8 +117,9 @@ def test_schema_and_models_agree_on_both_shapes(group: dict, valid: bool) -> Non
     assert _model_ok(InferRequest, data) is valid
 
 
-def test_an_origin_group_gets_a_named_error_not_a_crash(monkeypatch, tmp_path) -> None:
+def test_an_origin_group_never_goes_through_the_presigned_download(monkeypatch, tmp_path) -> None:
     import podagent.infer_cliprank as m
+    from podagent import originrule
     from test_infer_cliprank import _svc
 
     fetched: list[str] = []
@@ -129,7 +130,11 @@ def test_an_origin_group_gets_a_named_error_not_a_crash(monkeypatch, tmp_path) -
         dest.write_bytes(b"img")
         return dest
 
+    def refuse(url, *, max_bytes, timeout_s):
+        raise originrule.OriginRefused("REFUSED: test")
+
     monkeypatch.setattr(m, "download", fake_download)
+    monkeypatch.setattr(m.originrule, "fetch", refuse)
     monkeypatch.setattr("PIL.Image.open", lambda p: type("I", (), {"convert": lambda self, mode: "img"})())
     put = tmp_path / "out.json"
     monkeypatch.setattr(m, "upload", lambda src, url, ct=None: put.write_bytes(src.read_bytes()))
@@ -138,18 +143,19 @@ def test_an_origin_group_gets_a_named_error_not_a_crash(monkeypatch, tmp_path) -
                                     ClipRankGroup(intent="chart", image_urls=["a", "b"])])
     _svc().run(params, "put")
 
-    assert fetched == ["a", "b"], "an origin url is never fetched (not yet, and never as presigned)"
+    assert fetched == ["a", "b"], "an origin url is never fetched as presigned"
     body = json.loads(put.read_text())
     assert _schema_ok(RESULT_SCHEMA, body)
     origin, presigned = body["groups"]
-    assert origin["status"] == "error" and origin["error"]["kind"] == "origin_fetch_unavailable"
+    assert origin["status"] == "error" and origin["error"]["kind"] == "origin_refused"
     assert origin["scores"] == [None, None] and origin["embeds"] == [None, None]
-    assert [e["kind"] for e in origin["errors"]] == ["origin_fetch_unavailable"] * 2
+    assert [e["kind"] for e in origin["errors"]] == ["origin_refused"] * 2
+    assert origin["measures"] == [None, None]
     assert presigned == {"status": "ok", "scores": [0.6, 0.8], "embeds": [[0.6, 0.8], [0.8, 0.6]],
                          "errors": [None, None]}, "an image_urls group carries no new field"
 
     single = _svc()._run_group(ClipRankGroup(intent="", origin_urls=ORIGINS[:1]), tmp_path / "g")
-    assert single.status == "error" and [e.kind for e in single.errors] == ["origin_fetch_unavailable"]
+    assert single.status == "error" and [e.kind for e in single.errors] == ["origin_refused"]
 
 
 def test_the_dry_stub_sizes_origin_groups(monkeypatch) -> None:
