@@ -70,19 +70,30 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["intent", "image_urls"],
+            "required": ["intent"],
+            "oneOf": [
+              { "required": ["image_urls"], "not": { "required": ["origin_urls"] } },
+              { "required": ["origin_urls"], "not": { "anyOf": [{ "required": ["image_urls"] }, { "required": ["image_cells"] }] } }
+            ],
             "properties": {
               "intent": {
                 "description": "The English meaning to score against. \"\" = embed-only: the image tower is text-independent, so the group still yields embeddings and its scores come back as -1.0.",
                 "type": "string"
               },
               "image_urls": {
+                "description": "Presigned GETs, fetched under the presigned-only rule. A group carries exactly one of image_urls or origin_urls.",
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "origin_urls": {
+                "description": "Stock-provider ORIGIN thumbnail URLs the pod fetches itself (MISC-333). A group carries exactly one of image_urls or origin_urls; image_cells are not allowed with origin_urls.",
                 "type": "array",
                 "minItems": 1,
                 "items": { "type": "string", "minLength": 1 }
               },
               "image_cells": {
-                "description": "Optional crop per image_urls item: [x,y,width,height,sheet_width,sheet_height].",
+                "description": "Optional crop per image_urls item: [x,y,width,height,sheet_width,sheet_height]. Only with image_urls.",
                 "type": "array",
                 "items": {
                   "anyOf": [

@@ -1,0 +1,26 @@
+{
+  "model": "m",
+  "groups": [
+    {
+      "status": "ok",
+      "scores": [
+        0.1
+      ],
+      "embeds": [
+        [
+          0.1
+        ]
+      ],
+      "errors": [
+        null
+      ],
+      "measures": [
+        {
+          "bytes": 10,
+          "w": 0,
+          "h": 5
+        }
+      ]
+    }
+  ]
+}

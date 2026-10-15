@@ -34,6 +34,10 @@ from .sanitize import safe_endpoint, safe_error, safe_text
 # and the planner read eleven days of failures as eleven days of irrelevant footage.
 _EMPTY_INTENT = ClipRankTileError(kind="empty_intent",
                                   detail="embed-only group: the intent is empty, so no tile has a score")
+# Until the pod fetches stock-provider origin URLs itself (next MISC-333 slice), an origin group is answered
+# tile by tile with this named error — never fetched under the presigned-only rule, never a crash.
+_ORIGIN_UNAVAILABLE = ClipRankTileError(kind="origin_fetch_unavailable",
+                                        detail="origin_urls tiles are not fetched by this pod yet")
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
 
 # Chunk the image tower so ONE lane's VRAM is a known number, not a function of a beat's candidate count —
@@ -346,15 +350,18 @@ class ClipRankService:
             # score_many sends several phrasings over the SAME pixels. Download/decode/image-forward that exact
             # URL tuple once, then reuse its image embeddings for every text tower. Distinct shortlists occupy
             # the already-sized rank lanes concurrently; result assembly remains in request order.
-            keys = [(tuple(g.image_urls), tuple(g.image_cells) if g.image_cells is not None else None)
+            keys = [(tuple(g.tile_urls), tuple(g.image_cells) if g.image_cells is not None else None,
+                     g.origin_urls is not None)
                     for g in params.groups]
             unique = list(dict.fromkeys(keys))
             pending = {key: _submit_tiles(list(key[0]), Path(td) / f"g{i}")
-                       for i, key in enumerate(unique)}
+                       for i, key in enumerate(unique) if not key[2]}
             if progress is not None:
                 progress(f"clip_rank preparing {len(unique)} unique image set(s) for {n} group(s)")
 
             def prepare(key):
+                if key[2]:
+                    return (None, [], [], [_ORIGIN_UNAVAILABLE] * len(key[0])), 0.0, 0.0
                 tg = time.monotonic()
                 images, ok, errors = _gather(pending[key], key[1])
                 gs = time.monotonic() - tg
@@ -379,7 +386,7 @@ class ClipRankService:
             groups = []
             for i, (g, key) in enumerate(zip(params.groups, keys)):
                 if progress is not None:
-                    progress(f"clip_rank group {i + 1}/{n} ({len(g.image_urls)} tiles)")
+                    progress(f"clip_rank group {i + 1}/{n} ({len(g.tile_urls)} tiles)")
                 if not self._slots.acquire(timeout=60.0):
                     raise TimeoutError("clip_rank text forward waited 60s for a card lane")
                 tf = time.monotonic()
@@ -416,7 +423,9 @@ class ClipRankService:
 
     def _run_group(self, group: ClipRankGroup, workdir: Path) -> ClipRankGroupResult:
         """One group, both phases — run() pipelines them instead, so the fetch of k+1 overlaps k's forward."""
-        return self._score(group, *self._fetch(group.image_urls, workdir))
+        if group.origin_urls is not None:
+            return self._score_prepared(group, None, [], [], [_ORIGIN_UNAVAILABLE] * len(group.tile_urls))
+        return self._score(group, *self._fetch(group.tile_urls, workdir))
 
     def _score(self, group: ClipRankGroup, images: list, ok: list[int],
                errors: list[ClipRankTileError | None]) -> ClipRankGroupResult:
@@ -432,7 +441,7 @@ class ClipRankService:
 
     def _score_prepared(self, group: ClipRankGroup, ie, embeds: list, ok: list[int],
                         errors: list[ClipRankTileError | None]) -> ClipRankGroupResult:
-        n = len(group.image_urls)
+        n = len(group.tile_urls)
         if ie is None:
             # NO tile produced anything: the group itself is the error, carrying its first tile's reason.
             first = next(e for e in errors if e is not None)

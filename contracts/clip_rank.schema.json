@@ -22,7 +22,7 @@
           },
           "error": { "$ref": "#/$defs/tile_error" },
           "scores": {
-            "description": "Cosine(image, intent) per image, order mirrors the request group's image_urls. null exactly when errors[j] names why (unfetchable/undecodable image, or an embed-only group with intent \"\"). Never a sentinel number.",
+            "description": "Cosine(image, intent) per image, order mirrors the request group's tiles (image_urls or origin_urls). null exactly when errors[j] names why (unfetchable/undecodable image, or an embed-only group with intent \"\"). Never a sentinel number.",
             "type": "array",
             "items": { "type": ["number", "null"] }
           },
@@ -35,12 +35,22 @@
             }
           },
           "errors": {
-            "description": "Per image, same order: null when the tile scored, otherwise why it has no score. Parallel length (scores/embeds/errors == image_urls) is enforced by the model mirror — JSON Schema cannot express it.",
+            "description": "Per image, same order: null when the tile scored, otherwise why it has no score. Parallel length (scores/embeds/errors == the request group's tiles) is enforced by the model mirror — JSON Schema cannot express it.",
             "type": "array",
             "items": {
               "oneOf": [
                 { "type": "null" },
                 { "$ref": "#/$defs/tile_error" }
+              ]
+            }
+          },
+          "measures": {
+            "description": "Optional, absent unless the pod measured its tiles: per tile, same order, the fetched tile's encoded bytes and decoded width/height, or null for a tile not measured. Parallel length is enforced by the model mirror.",
+            "type": "array",
+            "items": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/tile_measure" }
               ]
             }
           }
@@ -61,8 +71,18 @@
       "additionalProperties": false,
       "required": ["kind", "detail"],
       "properties": {
-        "kind": { "enum": ["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error", "empty_intent", "non_finite"] },
+        "kind": { "enum": ["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error", "empty_intent", "non_finite", "origin_fetch_unavailable"] },
         "detail": { "type": "string", "minLength": 1 }
+      }
+    },
+    "tile_measure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes", "w", "h"],
+      "properties": {
+        "bytes": { "type": "integer", "minimum": 0 },
+        "w": { "type": "integer", "minimum": 1 },
+        "h": { "type": "integer", "minimum": 1 }
       }
     }
   }

@@ -1,0 +1,60 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "groups": [
+    {
+      "status": "ok",
+      "scores": [
+        0.2441,
+        null
+      ],
+      "embeds": [
+        [
+          0.0412,
+          -0.1187,
+          0.0663
+        ],
+        null
+      ],
+      "errors": [
+        null,
+        {
+          "kind": "decode_error",
+          "detail": "UnidentifiedImageError — https://images.stock.example/photo/1002/thumb.jpg"
+        }
+      ],
+      "measures": [
+        {
+          "bytes": 18342,
+          "w": 320,
+          "h": 180
+        },
+        null
+      ]
+    },
+    {
+      "status": "error",
+      "error": {
+        "kind": "origin_fetch_unavailable",
+        "detail": "origin_urls tiles are not fetched by this pod yet"
+      },
+      "scores": [
+        null,
+        null
+      ],
+      "embeds": [
+        null,
+        null
+      ],
+      "errors": [
+        {
+          "kind": "origin_fetch_unavailable",
+          "detail": "origin_urls tiles are not fetched by this pod yet"
+        },
+        {
+          "kind": "origin_fetch_unavailable",
+          "detail": "origin_urls tiles are not fetched by this pod yet"
+        }
+      ]
+    }
+  ]
+}

@@ -532,11 +532,23 @@ class ClipRankGroup(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     intent: str
-    image_urls: list[str] = Field(min_length=1)
+    # Exactly one URL kind per group: presigned `image_urls` (fetched under the presigned-only rule) or
+    # stock-provider `origin_urls` (the pod fetches the provider thumbnail itself; MISC-333).
+    image_urls: list[str] | None = Field(default=None, min_length=1)
+    origin_urls: list[str] | None = Field(default=None, min_length=1)
     image_cells: list[tuple[int, int, int, int, int, int] | None] | None = None
+
+    @property
+    def tile_urls(self) -> list[str]:
+        """The group's tiles, whichever URL kind carries them."""
+        return self.image_urls if self.image_urls is not None else self.origin_urls  # type: ignore[return-value]
 
     @model_validator(mode="after")
     def _cells_match(self) -> "ClipRankGroup":
+        if (self.image_urls is None) == (self.origin_urls is None):
+            raise ValueError("a clip_rank group carries exactly one of image_urls or origin_urls")
+        if self.image_cells is not None and self.image_urls is None:
+            raise ValueError("image_cells are allowed only with image_urls")
         if self.image_cells is not None and len(self.image_cells) != len(self.image_urls):
             raise ValueError("image_cells must be parallel to image_urls")
         for cell in self.image_cells or []:
@@ -888,7 +900,7 @@ class FaceProbePayload(BaseModel):
 
 
 ClipRankTileErrorKind = Literal["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error",
-                                "empty_intent", "non_finite"]
+                                "empty_intent", "non_finite", "origin_fetch_unavailable"]
 
 
 class ClipRankTileError(BaseModel):
@@ -901,8 +913,18 @@ class ClipRankTileError(BaseModel):
     detail: str = Field(min_length=1)
 
 
+class ClipRankTileMeasure(BaseModel):
+    """One tile's measured size as the pod fetched it: encoded bytes and decoded pixel dimensions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bytes: int = Field(ge=0)
+    w: int = Field(gt=0)
+    h: int = Field(gt=0)
+
+
 class ClipRankGroupResult(BaseModel):
-    """One group's raw SigLIP output; order mirrors the request group's image_urls.
+    """One group's raw SigLIP output; order mirrors the request group's tiles (image_urls or origin_urls).
 
     `scores[j]` is null exactly when `errors[j]` names why. A group in which NO tile produced anything (no
     score and no embed) is status=error carrying its first tile's reason — an all-failed group is an error,
@@ -915,11 +937,15 @@ class ClipRankGroupResult(BaseModel):
     scores: list[float | None]
     embeds: list[list[float] | None]
     errors: list[ClipRankTileError | None]
+    # Optional, parallel to the tiles when present: null for a tile the pod did not measure.
+    measures: list[ClipRankTileMeasure | None] | None = None
 
     @model_validator(mode="after")
     def _failures_are_named(self) -> "ClipRankGroupResult":
         if not len(self.scores) == len(self.embeds) == len(self.errors):
-            raise ValueError("scores, embeds and errors must be parallel to the request group's image_urls")
+            raise ValueError("scores, embeds and errors must be parallel to the request group's tiles")
+        if self.measures is not None and len(self.measures) != len(self.scores):
+            raise ValueError("measures must be parallel to the request group's tiles")
         for j, (score, embed, err) in enumerate(zip(self.scores, self.embeds, self.errors)):
             if (score is None) != (err is not None):
                 raise ValueError(f"tile {j}: score is null exactly when errors[{j}] names why")

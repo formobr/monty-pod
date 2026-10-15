@@ -525,7 +525,7 @@ def run_clip_rank(params: Any, put_url: str, progress: Callable[[str], None] | N
     t0 = time.monotonic()
     groups = []
     for g in params.groups:
-        scores, embeds = _clip_rank_group_verdict(len(g.image_urls))
+        scores, embeds = _clip_rank_group_verdict(len(g.tile_urls))
         groups.append(ClipRankGroupResult(status="ok", scores=scores, embeds=embeds, errors=[None] * len(scores)))
     payload = ClipRankPayload(model="contour-dry-stub", groups=groups)
     with tempfile.TemporaryDirectory() as td:
