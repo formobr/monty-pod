@@ -1,6 +1,6 @@
 {
   "op": "media.scale",
-  "version": 4,
+  "version": 5,
   "summary": "Downscale a video to a target height, preserving aspect, and re-encode at a named profile.",
   "needs": ["video_encode"],
   "judgement": false,
@@ -52,10 +52,11 @@
         "description": "Encode only this many seconds from `seek`. Geometry, paired with `seek`; absent = to the end."
       },
       "fps": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 240,
-        "description": "Resample to this constant frame rate. Stock lands at 23.976 or 25 and a player left to retime it live JUDDERS. Same spelling and same range as media.normalize.fps — one vocabulary. Absent = the source's own rate, unchanged."
+        "anyOf": [
+          {"type": "integer", "minimum": 1, "maximum": 240},
+          {"type": "string", "pattern": "^[1-9]\\d*/[1-9]\\d*$"}
+        ],
+        "description": "Resample to this constant frame rate. Stock lands at 23.976 or 25 and a player left to retime it live JUDDERS. The integer branch keeps media.normalize.fps's spelling and range. An exact rational rate may cross instead as a \"num/den\" string of positive integers with no leading zeros (e.g. \"30000/1001\"), so a proxy can land on a 29.97 grid exactly rather than on a truncated 29 or 30; an integer keeps its meaning. Absent = the source's own rate, unchanged."
       },
       "tonemap": {
         "enum": ["none", "hlg", "pq", "auto"],

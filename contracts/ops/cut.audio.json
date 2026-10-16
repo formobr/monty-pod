@@ -1,6 +1,6 @@
 {
   "op": "cut.audio",
-  "version": 1,
+  "version": 2,
   "summary": "Compose an already-decided keep-list into ONE audio track: the same frame-quantized per-segment trim/fade/atempo as the picture cut, joined by the same room-tone crossfade, with no video encode at all. The product is a coarse DECISION axis — the dead-air, pace and tempo passes all read audio, so rendering pixels for them was waste — and it is produced beside the recording because composing it meant decoding the raw container once per kept span. Mechanics only: WHICH spans to keep, at which speed, on which frame grid, are decided elsewhere and arrive as data.",
   "needs": ["video_encode"],
   "judgement": false,
@@ -32,10 +32,11 @@
         }
       },
       "fps_grid": {
-        "type": "number",
-        "exclusiveMinimum": 0,
-        "maximum": 240,
-        "description": "The source video frame rate the keep boundaries were snapped to. Each segment is cut to exactly nf=round(dur*fps_grid) frames' worth of audio — a video grid, in an audio-only op, on purpose: the offsets this produces are compared against a picture cut of the same keep-list, and a track measured on its own clock would drift from it."
+        "anyOf": [
+          {"type": "number", "exclusiveMinimum": 0, "maximum": 240},
+          {"type": "string", "pattern": "^[1-9]\\d*/[1-9]\\d*$"}
+        ],
+        "description": "The source video frame rate the keep boundaries were snapped to. Each segment is cut to exactly nf=round(dur*fps_grid) frames' worth of audio — a video grid, in an audio-only op, on purpose: the offsets this produces are compared against a picture cut of the same keep-list, and a track measured on its own clock would drift from it. An exact rational frame rate may cross instead as a \"num/den\" string of positive integers with no leading zeros (e.g. \"30000/1001\" for a 29.97 source), so a non-integer grid arrives exact instead of as a float or a truncated integer; a number keeps its meaning."
       },
       "speed": {
         "type": "number",

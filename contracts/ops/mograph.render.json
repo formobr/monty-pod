@@ -1,6 +1,6 @@
 {
   "op": "mograph.render",
-  "version": 1,
+  "version": 2,
   "summary": "Render ONE Remotion composition to a transparent qtrle .mov (headless Chrome PNG sequence, then pack).",
   "needs": ["browser", "video_encode"],
   "judgement": false,
@@ -30,7 +30,13 @@
         "type": "object",
         "description": "inputProps for the composition. Free-form BY DESIGN: these are already brand/plan DATA computed upstream (brandTokens, brandFonts, copy), not encoder tuning. This is the one open sub-object in the registry and it is open because the alternative is mirroring the entire Remotion prop surface into a schema that would rot on every comp change."
       },
-      "fps": {"type": "integer", "minimum": 1, "maximum": 120},
+      "fps": {
+        "anyOf": [
+          {"type": "integer", "minimum": 1, "maximum": 120},
+          {"type": "string", "pattern": "^[1-9]\\d*/[1-9]\\d*$"}
+        ],
+        "description": "The frame rate the composition renders at. An integer, or an exact rational rate as a \"num/den\" string of positive integers with no leading zeros (e.g. \"30000/1001\") so an overlay can sit on a 29.97 film's own grid instead of a truncated integer one; an integer keeps its meaning."
+      },
       "duration_frames": {
         "type": "integer",
         "minimum": 1,

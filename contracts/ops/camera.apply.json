@@ -1,6 +1,6 @@
 {
   "op": "camera.apply",
-  "version": 1,
+  "version": 2,
   "summary": "Bake the talking-head camera onto the clean cut: a rect-keyframe crop trajectory rendered to pixels (GPU libplacebo, CPU-static fallback).",
   "needs": ["video_encode"],
   "judgement": false,
@@ -41,8 +41,11 @@
           "ax": {"type": "number"},
           "ay": {"type": "number"},
           "fps": {
-            "type": "number", "exclusiveMinimum": 0,
-            "description": "The render's own frame rate (MISC-141 fold rounds 2-5) — used ONLY to express a chunk splitter's internal trim boundary as an integer FRAME INDEX (`trim=start_frame=N`, the first frame at or after the split keyframe's time, exact rational arithmetic, no tolerance), never to resample the output (camera.apply never emits an fps filter)."
+            "anyOf": [
+              {"type": "number", "exclusiveMinimum": 0},
+              {"type": "string", "pattern": "^[1-9]\\d*/[1-9]\\d*$"}
+            ],
+            "description": "The render's own frame rate (MISC-141 fold rounds 2-5), a positive number or an exact rational \"num/den\" string of positive integers with no leading zeros (e.g. \"30000/1001\") so a 29.97 grid's frame indices come from the exact rate rather than a float — used ONLY to express a chunk splitter's internal trim boundary as an integer FRAME INDEX (`trim=start_frame=N`, the first frame at or after the split keyframe's time, exact rational arithmetic, no tolerance), never to resample the output (camera.apply never emits an fps filter)."
           }
         },
         "description": "Source geometry + anchor + fps, constant for the whole segment (MISC-141 fold round 1-2) — camera.apply folds z back into a rect exactly as the engine's head-trajectory rect builder does. Present only on the zoom shape."

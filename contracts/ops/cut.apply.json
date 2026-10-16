@@ -1,6 +1,6 @@
 {
   "op": "cut.apply",
-  "version": 2,
+  "version": 3,
   "summary": "Apply an already-decided EDL keep-list to the source: the frame-quantized trim/setpts/atempo per-segment render + video-only concat + room-tone crossfade audio graph that turns a decided cut into the spliced film. Mechanics only — WHICH spans to keep and the per-segment speed are decided on the brain and cross as data.",
   "needs": [
     "video_encode"
@@ -51,10 +51,11 @@
         }
       },
       "fps_grid": {
-        "type": "number",
-        "exclusiveMinimum": 0,
-        "maximum": 240,
-        "description": "The source video frame rate the keep boundaries were snapped to. Renders exactly nf=round(dur*fps_grid) frames per segment so V and A agree to the sample."
+        "anyOf": [
+          {"type": "number", "exclusiveMinimum": 0, "maximum": 240},
+          {"type": "string", "pattern": "^[1-9]\\d*/[1-9]\\d*$"}
+        ],
+        "description": "The source video frame rate the keep boundaries were snapped to. Renders exactly nf=round(dur*fps_grid) frames per segment so V and A agree to the sample. An exact rational frame rate may cross instead as a \"num/den\" string of positive integers with no leading zeros (e.g. \"30000/1001\" for a 29.97 source), so a non-integer grid arrives exact instead of as a float or a truncated integer; a number keeps its meaning."
       },
       "speed": {
         "type": "number",
