@@ -4,8 +4,7 @@ and without changing today's requests.
 
   • a request/payload carries EITHER >=1 group and no judge_tiles, OR groups == [] and >=1 judge tile;
   • an ok judge tile carries bytes, w, h and cache; an error one names its error and carries no size;
-  • the rank payload carries the timings known before its own PUT (finite, never negative);
-  • until the pod serves judge tiles, such a request is a NAMED error before any weights fetch or load.
+  • the rank payload carries the timings known before its own PUT (finite, never negative).
 """
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from podagent import main as agent_main
 from podagent.models import ClipRankJudgeTileResult, ClipRankParams, ClipRankPayload, InferRequest
 
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
@@ -163,44 +161,6 @@ def test_the_rank_payload_carries_its_timings(monkeypatch, tmp_path) -> None:
     for key in ("unique_image_sets_n", "reused_groups_n", "parallel_width_n"):
         assert body["timings"][key] == run.timings[key]
     assert all(v >= 0 for v in body["timings"].values())
-
-
-class _CP:
-    def __init__(self) -> None:
-        self.events: list[dict] = []
-        self.results: list[dict] = []
-
-    def send_event(self, ev: dict, *, wait: bool = False) -> bool:
-        self.events.append(ev)
-        return True
-
-    def note(self, ev: dict) -> None:
-        self.events.append(ev)
-
-    def report_infer_result(self, payload: dict, wake=None) -> bool:
-        self.results.append(payload)
-        return True
-
-
-@pytest.mark.parametrize("dry", [False, True], ids=["full", "dry"])
-def test_a_judge_tiles_request_is_a_named_error_without_a_weights_load(monkeypatch, tmp_path, dry) -> None:
-    monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
-    touched: list[str] = []
-    monkeypatch.setattr("podagent.ops.dry.armed", lambda: dry)
-    monkeypatch.setattr("podagent.ops.dry.run_clip_rank", lambda *a, **k: touched.append("dry"))
-    monkeypatch.setattr("podagent.weights.ensure", lambda *a, **k: touched.append("fetch") or tmp_path)
-    monkeypatch.setattr("podagent.infer_cliprank.ClipRankService", lambda *a, **k: touched.append("load"))
-    align_cache = {"a" * 64: object()}
-    cp = _CP()
-    agent_main._run_infer(_load("infer_request.clip_rank_judge_tiles.json"), cp, align_cache, {}, {},
-                          Path("/opt/models/yunet.onnx"), True, corr_id="c", session_id="s",
-                          one_kind_resident=True)
-    assert touched == []
-    assert list(align_cache) == ["a" * 64], "no resident weights are dropped for a request the pod refuses"
-    (res,) = cp.results
-    assert res["status"] == "error" and res["kind"] == "clip_rank" and res["corr_id"] == "c"
-    assert agent_main.JUDGE_TILES_NOT_SERVED in res["error"]
-    assert agent_main.JUDGE_TILES_NOT_SERVED == "judge_tiles are not served by this image"
 
 
 @pytest.mark.parametrize("name, model", [

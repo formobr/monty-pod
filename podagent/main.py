@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from .infer_probe import ProbeService
 
 INFER_KINDS = ("align", "face_probe", "clip_rank")
-JUDGE_TILES_NOT_SERVED = "judge_tiles are not served by this image"
 
 # THERE IS NO POLL ANY MORE. Work arrives on the socket the pod already holds (podagent.event_stream); the
 # floor below survives it for one reason only — a socket that will NOT open returns immediately, and a bare
@@ -763,15 +762,12 @@ def _run_infer(
     work_started = time.monotonic()
     try:
         req = InferRequest.model_validate(raw)
-        if req.clip_rank is not None and req.clip_rank.judge_tiles is not None:
-            # The contract can carry a judge-tiles request before this image makes tiles: refuse it by name,
-            # before any weights fetch, service load or dry stub — never an empty rank that reads as data.
-            raise ValueError(JUDGE_TILES_NOT_SERVED)
         if served is not None:
             # Never a lazy load of a kind this pod was not given (infer_lanes.SERVED_INFER_KINDS_WHY).
             from .infer_lanes import refuse_unserved
             refuse_unserved(req.kind, served)
-        if one_kind_resident:
+        judge_tiles = req.clip_rank is not None and req.clip_rank.judge_tiles is not None
+        if one_kind_resident and not judge_tiles:
             # A cached service holds its weights on the card forever, so on a card too small for both kinds
             # the idle one must go before this load — the kinds are already serialised onto one lane.
             from .infer_lanes import release_other_kinds
@@ -794,6 +790,15 @@ def _run_infer(
                     note(f"loading {req.model}")
                     align_svc = align_cache[req.weights.sha256] = AlignService(req.model, wdir)
             infer_s = align_svc.run(req.align, req.put_url, note)
+        elif judge_tiles:
+            # Judge tiles are bytes in, JPEGs out: no weights fetch, no service load, and no resident kind is
+            # released for them — the SigLIP a rank request warmed stays on the card for the next rank.
+            from .infer_cliprank import run_judge_tiles
+
+            assert req.clip_rank is not None
+            rank_run = run_judge_tiles(req.clip_rank, req.put_url, note, model=req.model)
+            infer_s = rank_run.infer_s
+            work_timings = rank_run.timings
         elif req.kind == "clip_rank":
             from .ops import dry as _ops_dry
 
