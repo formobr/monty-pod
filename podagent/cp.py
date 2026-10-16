@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import parse_qsl, urljoin, urlparse
 from urllib.request import url2pathname
 
@@ -227,20 +227,24 @@ class _StoreAdapter(HTTPAdapter):
         return manager
 
 
+# The ONE width the pool and the PUT floor below are both sized from, read once here at import: a later
+# OPS_MAX_TRANSFERS change can move neither, so the floor always names the width it was split by.
+_STORE_POOL_WIDTH: Final[int] = _store_pool()
+
 _store = requests.Session()
 for _scheme in ("http://", "https://"):
-    _store.mount(_scheme, _StoreAdapter(pool_connections=_store_pool(), pool_maxsize=_store_pool(),
+    _store.mount(_scheme, _StoreAdapter(pool_connections=_STORE_POOL_WIDTH, pool_maxsize=_STORE_POOL_WIDTH,
                                         pool_block=False))
 
 # A PUT's per-attempt deadline is sized to the OBJECT and to the uplink it actually shares, not a flat 30 s:
 # measured 2026-10-01, three concurrent previews spent 680/811/460 s in `put` (155-320 s alone) because every
 # object under 30 MiB got the same 30 s read window, timed out on a shared uplink and was re-sent from byte 0.
-# Floor arithmetic: one stream measures ~25 MB/s (see `_XFER_DEADLINE_S`); the pod may run `_store_pool()`
+# Floor arithmetic: one stream measures ~25 MB/s (see `_XFER_DEADLINE_S`); the pod may run `_STORE_POOL_WIDTH`
 # PUTs at once on that same uplink, so the worst honest per-PUT rate is 25 MB/s / that width — e.g. 64
 # transfers -> ~0.39 MB/s, so a 40 MiB object gets ~117 s instead of 40 s. Pessimistic on purpose: the
 # deadline only ever SHORTENS from it when a measured rate says the uplink really is faster.
 _MEASURED_STREAM_BYTES_PER_S = 25e6
-_PUT_FLOOR_BYTES_PER_S = _MEASURED_STREAM_BYTES_PER_S / _store_pool()
+_PUT_FLOOR_BYTES_PER_S = _MEASURED_STREAM_BYTES_PER_S / _STORE_POOL_WIDTH
 # Connect + TLS + the store's own answer after the last byte; matches the 10 s connect leg in STORE_POOL_WHY.
 # It bounds the DIAL only — never the body send (`_PUT_SEND_TIMEOUT_S`).
 _PUT_CONNECT_MARGIN_S = 10.0
