@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .infer_probe import ProbeService
 
 INFER_KINDS = ("align", "face_probe", "clip_rank")
+JUDGE_TILES_NOT_SERVED = "judge_tiles are not served by this image"
 
 # THERE IS NO POLL ANY MORE. Work arrives on the socket the pod already holds (podagent.event_stream); the
 # floor below survives it for one reason only — a socket that will NOT open returns immediately, and a bare
@@ -762,6 +763,10 @@ def _run_infer(
     work_started = time.monotonic()
     try:
         req = InferRequest.model_validate(raw)
+        if req.clip_rank is not None and req.clip_rank.judge_tiles is not None:
+            # The contract can carry a judge-tiles request before this image makes tiles: refuse it by name,
+            # before any weights fetch, service load or dry stub — never an empty rank that reads as data.
+            raise ValueError(JUDGE_TILES_NOT_SERVED)
         if served is not None:
             # Never a lazy load of a kind this pod was not given (infer_lanes.SERVED_INFER_KINDS_WHY).
             from .infer_lanes import refuse_unserved

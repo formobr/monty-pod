@@ -1,0 +1,112 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "groups": [
+    {
+      "status": "ok",
+      "scores": [
+        0.3114,
+        0.0822,
+        null
+      ],
+      "embeds": [
+        [
+          0.0412,
+          -0.1187,
+          0.0663
+        ],
+        [
+          -0.0021,
+          0.0904,
+          -0.1338
+        ],
+        null
+      ],
+      "errors": [
+        null,
+        null,
+        {
+          "kind": "fetch_failed",
+          "detail": "HTTPError (HTTP 404) \u2014 https://r2.example/tiles/c.jpg"
+        }
+      ]
+    },
+    {
+      "status": "ok",
+      "scores": [
+        0.1907
+      ],
+      "embeds": [
+        [
+          0.1122,
+          0.0067,
+          -0.0459
+        ]
+      ],
+      "errors": [
+        null
+      ]
+    },
+    {
+      "status": "ok",
+      "scores": [
+        null,
+        null
+      ],
+      "embeds": [
+        [
+          0.0731,
+          -0.0288,
+          0.1015
+        ],
+        [
+          -0.0994,
+          0.0342,
+          0.0578
+        ]
+      ],
+      "errors": [
+        {
+          "kind": "empty_intent",
+          "detail": "embed-only group: the intent is empty, so no tile has a score"
+        },
+        {
+          "kind": "empty_intent",
+          "detail": "embed-only group: the intent is empty, so no tile has a score"
+        }
+      ]
+    },
+    {
+      "status": "error",
+      "error": {
+        "kind": "url_not_allowed",
+        "detail": "UrlNotAllowed: REFUSED stock host \u2014 https://stock.example/a.jpg"
+      },
+      "scores": [
+        null,
+        null
+      ],
+      "embeds": [
+        null,
+        null
+      ],
+      "errors": [
+        {
+          "kind": "url_not_allowed",
+          "detail": "UrlNotAllowed: REFUSED stock host \u2014 https://stock.example/a.jpg"
+        },
+        {
+          "kind": "url_not_allowed",
+          "detail": "UrlNotAllowed: REFUSED stock host \u2014 https://stock.example/b.jpg"
+        }
+      ]
+    }
+  ],
+  "timings": {
+    "infer_s": 3.412,
+    "tile_gather_work_s": 2.118,
+    "forward_work_s": 0.904,
+    "unique_image_sets_n": 2.0,
+    "reused_groups_n": 0.0,
+    "parallel_width_n": 2.0
+  }
+}

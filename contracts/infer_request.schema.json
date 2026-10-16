@@ -59,14 +59,31 @@
       }
     },
     "clip_rank": {
-      "description": "MANY groups per call: a montage scores many candidates across many beats, and one round trip per beat would dominate the wall clock.",
+      "description": "MANY groups per call: a montage scores many candidates across many beats, and one round trip per beat would dominate the wall clock. A request is EITHER a rank (>=1 group, no judge_tiles) OR a judge-tiles request (groups == [] and >=1 judge tile); groups stays required.",
       "type": "object",
       "additionalProperties": false,
       "required": ["groups"],
+      "oneOf": [
+        { "properties": { "groups": { "minItems": 1 } }, "not": { "required": ["judge_tiles"] } },
+        { "properties": { "groups": { "maxItems": 0 } }, "required": ["judge_tiles"] }
+      ],
       "properties": {
-        "groups": {
+        "judge_tiles": {
+          "description": "Judge tiles to make: per pair the pod fetches the stock-provider ORIGIN url and PUTs one small JPEG of it to the presigned put_url (the judge keeps PER-TILE images — one object per tile, never a sheet). Only with groups == [].",
           "type": "array",
           "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["origin_url", "put_url"],
+            "properties": {
+              "origin_url": { "type": "string", "minLength": 1 },
+              "put_url": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "groups": {
+          "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": false,

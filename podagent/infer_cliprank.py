@@ -464,7 +464,19 @@ class ClipRankService:
                 if key[2] and progress is not None:
                     progress(_origin_report(i, n, groups[-1], first_failed))
             tp = time.monotonic()
-            payload = ClipRankPayload(model=self.model_id, groups=groups)
+            counts = {
+                "unique_image_sets_n": float(len(unique)),
+                "reused_groups_n": float(n - len(unique)),
+                "parallel_width_n": float(self.parallel),
+            }
+            # The result the box reads carries the walls known before its own PUT: its infer_s stops at the
+            # payload build (serialisation and upload cannot time themselves into the bytes they produce).
+            payload = ClipRankPayload(model=self.model_id, groups=groups, timings={
+                "infer_s": round(tp - t0, 3),
+                "tile_gather_work_s": round(gather_s, 3),
+                "forward_work_s": round(forward_s, 3),
+                **counts,
+            })
             out = Path(td) / "clip_rank.json"
             out.write_text(payload.model_dump_json(exclude_none=True))
             payload_s = time.monotonic() - tp
@@ -483,9 +495,7 @@ class ClipRankService:
                 "payload_s": round(payload_s, 3),
                 "upload_s": round(upload_s, 3),
                 "work_s": round(time.monotonic() - t0, 3),
-                "unique_image_sets_n": float(len(unique)),
-                "reused_groups_n": float(n - len(unique)),
-                "parallel_width_n": float(self.parallel),
+                **counts,
             },
         )
 

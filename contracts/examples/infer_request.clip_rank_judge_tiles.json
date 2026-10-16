@@ -1,0 +1,25 @@
+{
+  "infer_version": 7,
+  "job_id": "job_9f2c1b",
+  "kind": "clip_rank",
+  "model": "google/siglip2-so400m-patch14-384",
+  "put_url": "https://storage.example/o/70413.json?sig=PUT",
+  "weights": {
+    "url": "https://r2.example/models/siglip2-so400m-patch14-384.tar?X-Amz-Signature=deadbeef",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "size": 4581234567
+  },
+  "clip_rank": {
+    "groups": [],
+    "judge_tiles": [
+      {
+        "origin_url": "https://images.stock.example/photo/1001/thumb.jpg",
+        "put_url": "https://storage.example/o/judge/1001.jpg?sig=PUT"
+      },
+      {
+        "origin_url": "https://images.stock.example/photo/1002/thumb.jpg",
+        "put_url": "https://storage.example/o/judge/1002.jpg?sig=PUT"
+      }
+    ]
+  }
+}

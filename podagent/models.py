@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Annotated, Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 SPEC_VERSION: Final = 7
 
@@ -557,13 +557,44 @@ class ClipRankGroup(BaseModel):
         return self
 
 
-class ClipRankParams(BaseModel):
-    """Both SigLIP towers over MANY groups → cosines + image embeddings back. The reorder, the relevance
-    floor and the MMR dedup are PLANNER decisions — no threshold is in this block by construction."""
+class ClipRankJudgeTile(BaseModel):
+    """One judge tile to make: the pod fetches the stock-provider ORIGIN url and PUTs one small JPEG of it to
+    the presigned `put_url` (the judge keeps PER-TILE images, so it is one object per tile, never a sheet)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    groups: list[ClipRankGroup] = Field(min_length=1)
+    origin_url: str = Field(min_length=1)
+    put_url: str = Field(min_length=1)
+
+
+class ClipRankParams(BaseModel):
+    """Both SigLIP towers over MANY groups → cosines + image embeddings back. The reorder, the relevance
+    floor and the MMR dedup are PLANNER decisions — no threshold is in this block by construction.
+
+    A request is EITHER a rank (>=1 group, no judge_tiles) OR a judge-tiles request (`groups == []` and >=1
+    judge tile). `groups` stays required so today's requests are unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    groups: list[ClipRankGroup]
+    judge_tiles: list[ClipRankJudgeTile] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _judge_tiles_absent_not_null(cls, data: Any) -> Any:
+        # The schema has no type for an explicit null here (judge_tiles is an array when present, absent
+        # otherwise) — an explicit null must fail the SAME way as the schema, not be read as "absent".
+        if isinstance(data, dict) and data.get("judge_tiles", False) is None:
+            raise ValueError("judge_tiles must be a non-empty array when present, never null — omit it instead")
+        return data
+
+    @model_validator(mode="after")
+    def _groups_or_judge_tiles(self) -> "ClipRankParams":
+        if self.judge_tiles is None and not self.groups:
+            raise ValueError("a clip_rank request carries at least one group (or judge_tiles with groups == [])")
+        if self.judge_tiles is not None and self.groups:
+            raise ValueError("a judge_tiles request carries groups == [] — never groups and judge_tiles together")
+        return self
 
 
 class WeightsRef(BaseModel):
@@ -899,8 +930,22 @@ class FaceProbePayload(BaseModel):
     shots: list[ProbeShot] = Field(min_length=1)
 
 
+def _json_number(value: Any) -> Any:
+    # JSON Schema's number/integer never match a boolean or a string; pydantic's lax mode would coerce both
+    # (True -> 1, "5" -> 5). Refuse them here so the mirror accepts exactly what the schema accepts.
+    if isinstance(value, (bool, str, bytes, bytearray)):
+        raise ValueError(f"{value!r} is not a JSON number")
+    return value
+
+
+# A JSON integer / number exactly as the schema types read it: 5 and 5.0 are integers, True and "5" are not.
+JsonIntT = Annotated[int, BeforeValidator(_json_number)]
+JsonNumberT = Annotated[float, BeforeValidator(_json_number)]
+
+
 ClipRankTileErrorKind = Literal["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error",
-                                "empty_intent", "non_finite", "origin_fetch_unavailable", "origin_refused"]
+                                "empty_intent", "non_finite", "origin_fetch_unavailable", "origin_refused",
+                                "put_failed"]
 
 
 class ClipRankTileError(BaseModel):
@@ -970,10 +1015,77 @@ class ClipRankGroupResult(BaseModel):
         return self
 
 
+class ClipRankJudgeTileResult(BaseModel):
+    """One judge tile's outcome, in request order: ok carries the PUT JPEG's bytes and size and whether the
+    origin fetch hit the pod's cache; error names why no tile was written. A failure is never a size."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "error"]
+    error: ClipRankTileError | None = None
+    bytes: JsonIntT | None = Field(default=None, ge=0)
+    w: JsonIntT | None = Field(default=None, gt=0)
+    h: JsonIntT | None = Field(default=None, gt=0)
+    cache: Literal["hit", "miss"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _absent_not_null(cls, data: Any) -> Any:
+        # Rule shared with the schema: a judge-tile result never carries an explicit null — a field is
+        # present with its value or absent (an ok tile has no `error` key at all, `"error": null` included).
+        if isinstance(data, dict):
+            nulls = sorted(k for k, v in data.items() if v is None)
+            if nulls:
+                raise ValueError(f"a judge-tile result omits a field instead of null: {nulls}")
+        return data
+
+    @model_validator(mode="after")
+    def _ok_is_measured(self) -> "ClipRankJudgeTileResult":
+        measured = (self.bytes, self.w, self.h, self.cache)
+        if self.status == "ok":
+            if self.error is not None:
+                raise ValueError("an ok judge tile must not carry error")
+            if any(v is None for v in measured):
+                raise ValueError("an ok judge tile carries bytes, w, h and cache")
+        else:
+            if self.error is None:
+                raise ValueError("an error judge tile names its error")
+            if any(v is not None for v in measured):
+                raise ValueError("an error judge tile carries no bytes, w, h or cache")
+        return self
+
+
 class ClipRankPayload(BaseModel):
-    """The JSON the pod PUTs for kind=clip_rank — numbers only, no ranking and no threshold."""
+    """The JSON the pod PUTs for kind=clip_rank — numbers only, no ranking and no threshold.
+
+    EITHER rank results (>=1 group, no judge_tiles) OR judge-tile results (`groups == []`, >=1 judge tile).
+    `timings` are the pod's own request walls and counts known before this payload's PUT."""
 
     model_config = ConfigDict(extra="forbid")
 
     model: str = Field(min_length=1)
-    groups: list[ClipRankGroupResult] = Field(min_length=1)
+    groups: list[ClipRankGroupResult]
+    judge_tiles: list[ClipRankJudgeTileResult] | None = Field(default=None, min_length=1)
+    timings: dict[str, JsonNumberT] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _judge_tiles_absent_not_null(cls, data: Any) -> Any:
+        # Same mirror rule as ClipRankParams: the schema has no null for judge_tiles or timings, only
+        # value-or-absent.
+        if isinstance(data, dict):
+            for key in ("judge_tiles", "timings"):
+                if data.get(key, False) is None:
+                    raise ValueError(f"{key} must be present with a value or absent, never null — omit it")
+        return data
+
+    @model_validator(mode="after")
+    def _groups_or_judge_tiles(self) -> "ClipRankPayload":
+        if self.judge_tiles is None and not self.groups:
+            raise ValueError("a clip_rank payload carries at least one group (or judge_tiles with groups == [])")
+        if self.judge_tiles is not None and self.groups:
+            raise ValueError("a judge_tiles payload carries groups == [] — never groups and judge_tiles together")
+        for name, value in (self.timings or {}).items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"timings[{name!r}] = {value} must be finite and >= 0")
+        return self

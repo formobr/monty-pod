@@ -1,0 +1,12 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "groups": [],
+  "judge_tiles": [
+    {
+      "status": "ok",
+      "w": 384,
+      "h": 216,
+      "cache": "miss"
+    }
+  ]
+}

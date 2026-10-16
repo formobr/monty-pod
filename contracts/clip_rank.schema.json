@@ -6,11 +6,25 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["model", "groups"],
+  "oneOf": [
+    { "properties": { "groups": { "minItems": 1 } }, "not": { "required": ["judge_tiles"] } },
+    { "properties": { "groups": { "maxItems": 0 } }, "required": ["judge_tiles"] }
+  ],
   "properties": {
     "model": { "type": "string", "minLength": 1 },
-    "groups": {
+    "timings": {
+      "description": "Optional: the pod's own request walls (seconds) and counts known before this payload's PUT. Finite, never negative; a JSON number, never a boolean or a string.",
+      "type": "object",
+      "additionalProperties": { "type": "number", "minimum": 0 }
+    },
+    "judge_tiles": {
+      "description": "Judge-tile results, one per request judge tile, same order; only with groups == []. ok carries the PUT JPEG's bytes, w, h and whether the origin fetch hit the pod's cache; error names why no tile was written and carries no size.",
       "type": "array",
       "minItems": 1,
+      "items": { "$ref": "#/$defs/judge_tile_result" }
+    },
+    "groups": {
+      "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -71,9 +85,26 @@
       "additionalProperties": false,
       "required": ["kind", "detail"],
       "properties": {
-        "kind": { "enum": ["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error", "empty_intent", "non_finite", "origin_fetch_unavailable", "origin_refused"] },
+        "kind": { "enum": ["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error", "empty_intent", "non_finite", "origin_fetch_unavailable", "origin_refused", "put_failed"] },
         "detail": { "type": "string", "minLength": 1 }
       }
+    },
+    "judge_tile_result": {
+      "description": "A judge-tile result never carries an explicit null: a field is present with its value or absent. An ok tile has no error key at all (\"error\": null included); an error tile has no bytes, w, h or cache key.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["ok", "error"] },
+        "error": { "$ref": "#/$defs/tile_error" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "w": { "type": "integer", "minimum": 1 },
+        "h": { "type": "integer", "minimum": 1 },
+        "cache": { "enum": ["hit", "miss"] }
+      },
+      "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
+      "then": { "required": ["bytes", "w", "h", "cache"], "not": { "required": ["error"] } },
+      "else": { "required": ["error"], "not": { "anyOf": [{ "required": ["bytes"] }, { "required": ["w"] }, { "required": ["h"] }, { "required": ["cache"] }] } }
     },
     "tile_measure": {
       "type": "object",
