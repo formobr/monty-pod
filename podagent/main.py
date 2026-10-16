@@ -793,10 +793,16 @@ def _run_infer(
         elif judge_tiles:
             # Judge tiles are bytes in, JPEGs out: no weights fetch, no service load, and no resident kind is
             # released for them — the SigLIP a rank request warmed stays on the card for the next rank.
-            from .infer_cliprank import run_judge_tiles
+            from .ops import dry as _ops_dry
 
             assert req.clip_rank is not None
-            rank_run = run_judge_tiles(req.clip_rank, req.put_url, note, model=req.model)
+            if _ops_dry.armed():
+                # no origin fetch: one deterministic JPEG per tile, still PUT for real.
+                rank_run = _ops_dry.run_judge_tiles(req.clip_rank, req.put_url, note)
+            else:
+                from .infer_cliprank import run_judge_tiles
+
+                rank_run = run_judge_tiles(req.clip_rank, req.put_url, note, model=req.model)
             infer_s = rank_run.infer_s
             work_timings = rank_run.timings
         elif req.kind == "clip_rank":

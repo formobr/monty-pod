@@ -249,7 +249,12 @@ def test_a_judge_tiles_request_loads_no_weights_and_releases_nothing(monkeypatch
         calls.append(([t.origin_url for t in params.judge_tiles], put_url, model))
         return m.ClipRankRun(infer_s=0.25, timings={"infer_s": 0.25, "judge_tiles_n": 2.0})
 
+    def dry_judge_tiles(params, put_url, progress=None):
+        calls.append(([t.origin_url for t in params.judge_tiles], put_url, "contour-dry"))
+        return m.ClipRankRun(infer_s=0.25, timings={"infer_s": 0.25, "judge_tiles_n": 2.0})
+
     monkeypatch.setattr(m, "run_judge_tiles", run_judge_tiles)
+    monkeypatch.setattr("podagent.ops.dry.run_judge_tiles", dry_judge_tiles)
     raw = json.loads((CONTRACTS / "examples" / "infer_request.clip_rank_judge_tiles.json").read_text())
     align_cache = {"a" * 64: object()}
     rank_cache = {"b" * 64: object()}
@@ -258,7 +263,9 @@ def test_a_judge_tiles_request_loads_no_weights_and_releases_nothing(monkeypatch
                           corr_id="c", session_id="s", one_kind_resident=True)
     assert touched == []
     assert list(align_cache) == ["a" * 64] and list(rank_cache) == ["b" * 64]
-    assert calls == [([t["origin_url"] for t in raw["clip_rank"]["judge_tiles"]], raw["put_url"], raw["model"])]
+    # the dry tier answers with its own stub (no origin fetch); the full pod with the real one
+    assert calls == [([t["origin_url"] for t in raw["clip_rank"]["judge_tiles"]], raw["put_url"],
+                      "contour-dry" if dry else raw["model"])]
     (res,) = cp_.results
     assert res["status"] == "ok" and res["kind"] == "clip_rank" and res["corr_id"] == "c"
 

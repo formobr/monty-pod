@@ -516,23 +516,95 @@ def _clip_rank_group_verdict(n: int) -> tuple[list[float], list[list[float]]]:
             [[1.0 if k == i else 0.0 for k in range(n)] for i in range(n)])
 
 
+# An origin group's tiles were "fetched" by nobody here; each still gets a measure, as on a real pod, so the
+# engine's readers of `measures` run in the dry tier. A typical provider thumbnail, not a measured one.
+_DRY_ORIGIN_MEASURE = {"bytes": 40000, "w": 512, "h": 512}
+# The real judge tile's size and quality (infer_cliprank._JUDGE_LONG_SIDE / _JUDGE_QUALITY), drawn solid.
+_DRY_JUDGE_SIDE = 512
+_DRY_JUDGE_QUALITY = 82
+# Every dry stub progress line starts with this: the engine recognises a stub run by it (DRY_STUB_MARKS).
+_CLIP_RANK_STUB_MARK = "contour-dry clip_rank stub"
+
+
 def run_clip_rank(params: Any, put_url: str, progress: Callable[[str], None] | None = None) -> SimpleNamespace:
     """The dry-tier stand-in for `infer_cliprank.ClipRankService.run` — same `(infer_s, timings)` shape,
-    no weights loaded, no GPU touched, and the PUT contract kept so the resolver reads it identically."""
+    no weights loaded, no GPU touched, and the PUT contract kept so the resolver reads it identically. An
+    origin group also carries one deterministic measure per tile, and the payload carries its timings."""
     from .. import cp
-    from ..models import ClipRankGroupResult, ClipRankPayload
+    from ..models import ClipRankGroupResult, ClipRankPayload, ClipRankTileMeasure
 
     t0 = time.monotonic()
     groups = []
     for g in params.groups:
         scores, embeds = _clip_rank_group_verdict(len(g.tile_urls))
-        groups.append(ClipRankGroupResult(status="ok", scores=scores, embeds=embeds, errors=[None] * len(scores)))
-    payload = ClipRankPayload(model="contour-dry-stub", groups=groups)
+        measures = ([ClipRankTileMeasure(**_DRY_ORIGIN_MEASURE) for _ in scores]
+                    if g.origin_urls is not None else None)
+        groups.append(ClipRankGroupResult(status="ok", scores=scores, embeds=embeds, errors=[None] * len(scores),
+                                          measures=measures))
+    payload = ClipRankPayload(model="contour-dry-stub", groups=groups,
+                              timings={"infer_s": round(time.monotonic() - t0, 3)})
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "clip_rank.json"
         out.write_text(payload.model_dump_json(exclude_none=True))
         cp.upload(out, put_url, "application/json")
     infer_s = time.monotonic() - t0
     if progress is not None:
-        progress(f"contour-dry clip_rank stub: {len(groups)} group(s), deterministic descending scores")
+        progress(f"{_CLIP_RANK_STUB_MARK}: {len(groups)} group(s), deterministic descending scores")
     return SimpleNamespace(infer_s=infer_s, timings={"infer_s": round(infer_s, 3), "work_s": round(infer_s, 3)})
+
+
+def _write_judge_tile(dst: Path, origin_url: str) -> None:
+    """A solid 512x512 JPEG whose colour is a hash of the origin url: two candidates never share one tile."""
+    from PIL import Image
+
+    digest = hashlib.sha256(origin_url.encode("utf-8")).digest()
+    Image.new("RGB", (_DRY_JUDGE_SIDE, _DRY_JUDGE_SIDE), (digest[0], digest[1], digest[2])).save(
+        dst, "JPEG", quality=_DRY_JUDGE_QUALITY)
+
+
+# Mirrors infer_cliprank's own default when `cp._STORE_POOL_WIDTH` is ever renamed out from under this
+# private reach-through — the dry tier degrades to serial PUTs rather than raising at import time.
+_FALLBACK_POOL_WIDTH = 8
+
+
+def run_judge_tiles(params: Any, put_url: str, progress: Callable[[str], None] | None = None) -> SimpleNamespace:
+    """The dry-tier stand-in for `infer_cliprank.run_judge_tiles`: no origin fetch — each tile is a
+    deterministic JPEG — but its real PUT (in parallel, as on the pod) and the same one result JSON after.
+    A failed PUT is a NAMED `put_failed` tile result, never a raise — one bad tile must not cost the judge
+    the others nor the result JSON, same as the real pod (infer_cliprank._judge_tile)."""
+    import concurrent.futures as cf
+
+    from .. import cp
+    from ..infer_cliprank import _redacted_tile_url, _tile_error
+    from ..models import ClipRankJudgeTileResult, ClipRankPayload
+
+    t0 = time.monotonic()
+    tiles = params.judge_tiles or []
+    pool_width = getattr(cp, "_STORE_POOL_WIDTH", _FALLBACK_POOL_WIDTH)
+    with tempfile.TemporaryDirectory() as td:
+        def one(i: int, tile: Any) -> ClipRankJudgeTileResult:
+            dst = Path(td) / f"{i}.jpg"
+            _write_judge_tile(dst, tile.origin_url)
+            try:
+                cp.upload(dst, tile.put_url, "image/jpeg")
+            except Exception as exc:  # noqa: BLE001 — a refused or exhausted PUT is this tile's error
+                err = _tile_error("put_failed", exc, _redacted_tile_url(tile.put_url))
+                return ClipRankJudgeTileResult(status="error", error=err)
+            return ClipRankJudgeTileResult(status="ok", bytes=dst.stat().st_size, w=_DRY_JUDGE_SIDE,
+                                           h=_DRY_JUDGE_SIDE, cache="hit")
+
+        with cf.ThreadPoolExecutor(max_workers=max(1, min(len(tiles), pool_width)),
+                                   thread_name_prefix="dry-judge-tile") as ex:
+            futs = [ex.submit(one, i, t) for i, t in enumerate(tiles)]
+            results = [f.result() for f in futs]
+        timings = {"infer_s": round(time.monotonic() - t0, 3), "judge_tiles_n": float(len(tiles)),
+                   "judge_cache_miss_n": 0.0}
+        payload = ClipRankPayload(model="contour-dry-stub", groups=[], judge_tiles=results, timings=timings)
+        out = Path(td) / "clip_rank.json"
+        out.write_text(payload.model_dump_json(exclude_none=True))
+        cp.upload(out, put_url, "application/json")
+    infer_s = time.monotonic() - t0
+    if progress is not None:
+        progress(f"{_CLIP_RANK_STUB_MARK}: {len(results)} judge tile(s), deterministic solid JPEGs")
+    return SimpleNamespace(infer_s=infer_s, timings={**timings, "infer_s": round(infer_s, 3),
+                                                     "work_s": round(infer_s, 3)})
