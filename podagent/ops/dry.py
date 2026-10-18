@@ -177,16 +177,31 @@ def _content_input(op: registry.Op, inputs: dict[str, Path]) -> Path | None:
     return None
 
 
-def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None) -> None:
+def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None, dur: float | None = None) -> None:
+    # `dur` (a cut's own reported length) pins the placeholder's length; None keeps each branch's own length.
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.suffix.lower() not in _VIDEO_EXT_ARGS:
         raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "video")
+    secs = f"{dur:.6f}" if dur is not None else "1"
+    # At r=1 a colour source's last frame carries a full 1s duration, so e.g. d=5.656 rounds the
+    # container's reported length UP to 6.0 regardless of a trailing -t — a dry replay would then probe
+    # a length the live run never recorded. r=30 keeps that rounding under one 1/30s frame (the tolerance
+    # every caller of a `dur`-pinned placeholder checks against); d=None (no cut length to pin) keeps the
+    # pre-existing r=1:d=1 one-second placeholder untouched.
+    rate = 30 if dur is not None else 1
     if audio_src is None:
         # No video-kind input bound at all — nothing real to reflect, stays fully synthetic.
         args = _VIDEO_EXT_ARGS[dst.suffix.lower()]
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
-               "-f", "lavfi", "-i", dry_tone_lavfi(dur=1.0), "-t", "1", *args, str(dst)]
+               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}:d={secs}",
+               "-f", "lavfi", "-i", dry_tone_lavfi(dur=float(secs)), "-t", secs, *args, str(dst)]
+    elif _has_audio_stream(audio_src) and dur is not None:
+        # The real audio trimmed (or silence-padded) to the cut's length, so audio and video both end there.
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-i", str(audio_src),
+               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}",
+               "-map", "1:v", "-map", "0:a", "-af", "apad",
+               *_VIDEO_EXT_ARGS[dst.suffix.lower()], "-t", secs, str(dst)]
     elif _has_audio_stream(audio_src):
         # `-shortest` against an infinite colour source sizes the output to the real audio's own duration.
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -197,8 +212,11 @@ def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None) -> N
                "-c:a", "copy", "-shortest", str(dst)]
     else:
         # Real input, genuinely no audio track — the placeholder gets none, never a fabricated anullsrc.
+        # `-t` must also cap THIS branch (the previous fix missed it): without it the lavfi colour
+        # source's own `d=` is the only cap, which at r=1 rounds up (see `rate` above).
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
+               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}:d={secs}",
+               "-t", secs,
                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
@@ -306,6 +324,14 @@ def _synth_range_filmstrip_receipt(params: dict[str, Any], _inputs: dict[str, Pa
     }
 
 
+# A video placeholder whose op REPORTS its own length lasts exactly that long (MISC-756: the cut.apply
+# placeholder ran the source's full length while its rdurs summed to the cut, so a dry replay probed a length
+# the live run never recorded). Every other op's video placeholder keeps its branch's own length.
+_VIDEO_DUR: dict[str, Callable[[dict[str, Any]], float]] = {
+    "cut.apply": lambda params: sum(_synth_cut_apply_durs(params, {})["rdurs"]),
+}
+
+
 _JSON_SYNTH: dict[str, Callable[[dict[str, Any], dict[str, Path]], dict[str, Any]]] = {
     "cut.apply": _synth_cut_apply_durs,
     "media.range_filmstrip": _synth_range_filmstrip_receipt,
@@ -355,7 +381,9 @@ def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inp
         return
     resolved = _resolve_media_class(kind, dst.suffix.lower())
     if resolved == "video":
-        _write_video(dst, op_name=op_name, audio_src=audio_src)
+        dur_of = _VIDEO_DUR.get(op_name)
+        _write_video(dst, op_name=op_name, audio_src=audio_src,
+                     dur=dur_of(params) if dur_of is not None else None)
         return
     if resolved == "image" and (image_synth := _IMAGE_SYNTH.get(op_name)) is not None:
         image_synth(dst, op_name=op_name, params=params)
