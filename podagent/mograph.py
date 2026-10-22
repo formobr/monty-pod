@@ -246,13 +246,53 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
     return layers
 
 
+# SUPER-DIRECTOR v13 LAYOUT LAYERS (engine viewer_bridge.sd_layer_section): a `SdLayer` section whose props carry
+# `sdFace: "base"` draws the SPEAKER inside its layout (side_shift / pip / vsplit …) — the clean head plate this job
+# composites over. It is staged ONCE into the bundle's public/ and handed to the comp as faceSrc + faceStart (the
+# section's start on the plate's own clock), so the layout frames the very pixels the base shows outside its window.
+SD_FACE_KEY, SD_FACE_BASE = "sdFace", "base"
+_SD_FACE_DIR = "_sd"
+_SD_LAYER_COMP = "SdLayer"
+_SD_LAYER_TAIL_S = 2.0       # a long (persistent) layer's own ceiling: its length + this, never under the default
+
+
+def _stage_sd_face(rd: Path, base_path: Path) -> str:
+    """public/_sd/base<suffix> → the public-relative name; a hard link when the filesystem allows one, else a copy
+    (never a symlink: _stage_dest refuses anything resolving outside the workspace)."""
+    rel = f"{_SD_FACE_DIR}/base{Path(base_path).suffix.lower() or '.mp4'}"
+    dest = rd / "public" / rel
+    if not dest.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(base_path, dest)
+        except OSError:
+            shutil.copy2(base_path, dest)
+    return rel
+
+
+def sd_face_props(props: dict, start: float, face_rel: str | None) -> dict:
+    """Pure: a section's props with `sdFace` swapped for the staged plate. No plate → the request is refused by name
+    (a layout with no speaker is a black panel the preview never showed)."""
+    if props.get(SD_FACE_KEY) != SD_FACE_BASE:
+        return props
+    if face_rel is None:
+        raise RuntimeError("mograph: an SdLayer layout asks for the head plate (sdFace=base) but no base input "
+                           "path reached _render_layers — refusing a master with an empty speaker slot")
+    out = {k: v for k, v in props.items() if k != SD_FACE_KEY}
+    out["faceSrc"], out["faceStart"] = face_rel, float(start)
+    return out
+
+
 def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path,
-                   bundle_ref=None, max_seconds: float | None = None) -> list[dict]:
+                   bundle_ref=None, max_seconds: float | None = None, base_path: Path | None = None) -> list[dict]:
     """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch; each Bespoke
     (LLM .tsx delivered + staged by the brain) via its own per-job entry. A missing bespoke entry = skip loud.
-    `max_seconds` rides on every item as render_batch.mjs's per-item ceiling (independent of props)."""
+    `max_seconds` rides on every item as render_batch.mjs's per-item ceiling (independent of props).
+    `base_path` = the head plate, staged only when a v13 layout layer asks for it (sd_face_props)."""
     rd = remotion_dir(bundle_ref, tmp)
     _stage_public(input_paths, rd)
+    wants_face = any((sec.props or {}).get(SD_FACE_KEY) == SD_FACE_BASE for sec in sections)
+    face_rel = _stage_sd_face(rd, base_path) if wants_face and base_path is not None else None
     tok = (brand or {}).get("tokens")
     fnt = (brand or {}).get("fonts")
 
@@ -271,9 +311,13 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
         meta = {"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass),
                 "head_below": bool((sec.props or {}).get("headBelow")),
                 "backing": (sec.props or {}).get("backing")}
-        item = {"comp": sec.comp, "props": _props(sec), "seqdir": str(seqdir)}
+        item = {"comp": sec.comp, "props": sd_face_props(_props(sec), sec.start, face_rel), "seqdir": str(seqdir)}
         if max_seconds is not None:
             item["maxSeconds"] = max_seconds
+        if sec.comp == _SD_LAYER_COMP:
+            # a persistent layer can outlast render_batch's 120 s default; its own length is its ceiling
+            need = float((sec.props or {}).get("durationInSeconds") or 0.0) + _SD_LAYER_TAIL_S
+            item["maxSeconds"] = max(float(item.get("maxSeconds") or 120.0), need)
         if sec.comp.startswith("Bespoke"):
             entry = f"src/index.bespoke.{sec.comp}.tsx"
             if not (rd / entry).is_file():

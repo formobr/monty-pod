@@ -480,7 +480,7 @@ def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
     if mp is not None and mp.sections:
         arms["mograph"] = lambda: tuple(_mograph._render_layers(
             mp.sections, mp.brand.model_dump() if mp.brand else None, input_paths, tmp,
-            getattr(mp, "bundle", None)))
+            getattr(mp, "bundle", None), base_path=input_paths.get(spec.timeline.segments[0].src)))
     if fin is not None and any(a.kind == "film_burn" for a in fin.accents):
         # The pure shape refusals (film_burn_plan) fire BEFORE the flare decode — cheap checks first.
         plan = _accents.film_burn_plan(fin.accents)
