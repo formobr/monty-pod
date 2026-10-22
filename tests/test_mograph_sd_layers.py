@@ -64,3 +64,74 @@ def test_no_face_request_stages_nothing(tmp_path, monkeypatch):
     mograph._render_layers([SimpleNamespace(comp="Stat", start=0.0, glass=False, props={})], None, {}, tmp_path,
                            base_path=base)
     assert not (tmp_path / "rd" / "public" / "_sd").exists()
+
+
+def test_a_layer_item_carries_its_tag_and_deadline(tmp_path, monkeypatch):
+    got = _capture(monkeypatch, tmp_path)
+    secs = [SimpleNamespace(comp="SdLayer", start=0.0, glass=False,
+                            props={"durationInSeconds": 2.0, "layer": {"id": "sd13_m_m8"}}),
+            SimpleNamespace(comp="SplitScreen", start=1.0, glass=False,
+                            props={"durationInSeconds": 1.0, "sdLayer": "sd13_frame_c1"}),
+            SimpleNamespace(comp="Stat", start=0.0, glass=False, props={"durationInSeconds": 1.0})]
+    mograph._render_layers(secs, None, {}, tmp_path)
+    a, b, c = got["items"]
+    assert (a["tag"], a["wallS"]) == ("sd13_m_m8", 60.0 + 60)
+    assert (b["tag"], b["wallS"]) == ("sd13_frame_c1", 60.0 + 30)
+    assert "tag" not in c and "wallS" not in c                 # a legacy section is untouched
+
+
+def test_the_wall_names_the_layer_in_flight(tmp_path, monkeypatch):
+    """Live 056 v13: the batch hung on one layer and the pod said only «ran out its 900s wall». The wall now
+    reads render_batch's on-disk item log and names what was in flight, what failed, and what never started."""
+    import subprocess
+
+    spec = tmp_path / "batch.json"
+    items = [{"comp": "SdLayer", "tag": t, "seqdir": str(tmp_path / t)} for t in ("a", "b", "c")]
+
+    def hang(*_a, **_k):
+        log = mograph._items_log(spec)
+        log.write_text('{"tag":"a","comp":"SdLayer","start":true}\n'
+                       '{"tag":"a","comp":"SdLayer","ok":false,"error":"boom"}\n'
+                       '{"tag":"b","comp":"SdLayer","start":true}\n')
+        raise subprocess.TimeoutExpired("node", 900)
+    monkeypatch.setattr(mograph.subprocess, "run", hang)
+    monkeypatch.setattr(mograph, "_oom_count", lambda: None)
+    with pytest.raises(RuntimeError) as e:
+        mograph._run_batch(tmp_path, items, spec, None)
+    msg = str(e.value)
+    assert "in flight: b" in msg and "a (boom)" in msg and "not reached: 1" in msg
+
+
+def test_the_cost_receipt_does_not_clobber_the_batch_result(tmp_path, monkeypatch, capsys):
+    """Regression (stand bench r3b-056-bench): the receipt loop reused `r`, the batch's CompletedProcess."""
+    import subprocess
+
+    spec = tmp_path / "batch.json"
+    seq = tmp_path / "s"
+    seq.mkdir()
+    (seq / "element-0.png").write_bytes(b"x")
+
+    def ran(*_a, **_k):
+        mograph._items_log(spec).write_text('{"tag":"a","comp":"SdLayer","ok":true,"frames":3,"s":1.5}\n')
+        return subprocess.CompletedProcess([], 0, b"", b"")
+    monkeypatch.setattr(mograph.subprocess, "run", ran)
+    mograph._run_batch(tmp_path, [{"comp": "SdLayer", "tag": "a", "seqdir": str(seq)}], spec, None)
+    assert "layer a (SdLayer) ok 3 frames in 1.5s" in capsys.readouterr().err
+
+
+def test_a_failed_layer_is_refused_by_id_even_with_leftover_frames(tmp_path, monkeypatch):
+    import subprocess
+
+    spec = tmp_path / "batch.json"
+    seq = tmp_path / "s"
+    seq.mkdir()
+    (seq / "element-0.png").write_bytes(b"x")          # a crash-retry's leftover frame
+
+    def ran(*_a, **_k):
+        mograph._items_log(spec).write_text(
+            '{"tag":"sd13_frame_c2","comp":"SplitScreen","ok":false,"error":"undefined was passed to staticFile()"}\n')
+        return subprocess.CompletedProcess([], 1, b"", b"")
+    monkeypatch.setattr(mograph.subprocess, "run", ran)
+    monkeypatch.setattr(mograph, "_oom_count", lambda: None)
+    with pytest.raises(RuntimeError, match=r"sd13_frame_c2 \(undefined was passed to staticFile\(\)\)"):
+        mograph._run_batch(tmp_path, [{"comp": "SplitScreen", "tag": "sd13_frame_c2", "seqdir": str(seq)}], spec, None)

@@ -198,10 +198,47 @@ def _box_facts(oom_before: int | None, conc: int, cache: int, tmp: Path) -> str:
 _BATCH_WALL_S = 900  # bundle + every comp; each comp is already ceilinged by maxSeconds inside the batch
 
 
+def _items_log(spec_path: Path) -> Path:
+    return spec_path.with_suffix(".items.jsonl")
+
+
+def read_item_log(path: Path) -> list[dict]:
+    """render_batch.mjs's per-item lines ({tag, comp, start} then {tag, comp, ok, frames, s, …}); absent = []."""
+    if not path.is_file():
+        return []
+    out = []
+    for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            continue
+    return out
+
+
+def item_progress(items: list, rows: list[dict]) -> str:
+    """Which TAGGED item (a v13 layer) the batch finished, failed, or still had in flight — the names a wall must carry."""
+    done = {r["tag"]: r for r in rows if "ok" in r}
+    started = [r["tag"] for r in rows if r.get("start")]
+    in_flight = [t for t in started if t not in done]
+    parts = [f"in flight: {', '.join(in_flight)}" if in_flight else ""]
+    bad = [f"{t} ({r.get('error') or 'failed'})" for t, r in done.items() if not r.get("ok")]
+    if bad:
+        parts.append(f"failed: {'; '.join(bad)}")
+    tagged = [it["tag"] for it in items if it.get("tag")]
+    never = [t for t in tagged if t not in started]
+    if never:
+        parts.append(f"not reached: {len(never)} layer(s)")
+    if done:
+        parts.append(f"done: {sum(1 for r in done.values() if r.get('ok'))}")
+    return " · ".join(p for p in parts if p)
+
+
 def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) -> None:
     conc = _render_concurrency()
     cache = _offthread_cache_bytes()
-    body = {"concurrency": conc, "offthreadVideoCacheSizeInBytes": cache, "items": items}
+    log = _items_log(spec_path)
+    log.unlink(missing_ok=True)
+    body = {"concurrency": conc, "offthreadVideoCacheSizeInBytes": cache, "items": items, "itemsLog": str(log)}
     if entry_point:
         body["entryPoint"] = entry_point
     spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
@@ -210,15 +247,29 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
         r = subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, capture_output=True,
                            timeout=_BATCH_WALL_S)
     except subprocess.TimeoutExpired as exc:
+        prog = item_progress(items, read_item_log(log))
         raise RuntimeError(f"render_batch ran out its {_BATCH_WALL_S}s wall "
-                           f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]") from exc
+                           f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]"
+                           + (f" — {prog}" if prog else "")) from exc
     # Unconditional: the per-comp "[batch] <comp>: <frames> in <s>" line was DROPPED on the success path.
     batch_log = (r.stderr or b"").decode("utf-8", "replace")
     if batch_log.strip():
         sys.stderr.write(batch_log if batch_log.endswith("\n") else batch_log + "\n")
     # JUDGE THE FRAMES, NOT THE EXIT CODE: headless Chrome aborts on teardown often enough (SIGABRT after every
     # sequence is already on disk) that a rc check throws away finished work and fails the whole master.
-    missing = [str(i.get("comp")) for i in items if not any(Path(i["seqdir"]).glob("*.png"))]
+    rows = read_item_log(log)
+    for row in rows:   # the per-layer cost receipt, on the pod's own log
+        if "ok" in row:
+            print(f"mograph: layer {row['tag']} ({row.get('comp')}) {'ok' if row['ok'] else 'FAILED'} "
+                  f"{row.get('frames')} frames in {row.get('s')}s" + ("" if row["ok"] else f" — {row.get('error')}"),
+                  file=sys.stderr)
+    # a v13 layer render_batch reported FAILED is refused even when a crash-retry left some PNGs in its seqdir:
+    # packing those would ship a partial layer the preview never showed (stand bench r3b-056-bench-2: c2, c3)
+    failed = [f"{row['tag']} ({row.get('error') or 'failed'})" for row in rows if row.get("ok") is False]
+    if failed:
+        raise RuntimeError(f"render_batch FAILED {len(failed)} v13 layer(s): {'; '.join(failed)} "
+                           f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]")
+    missing = [str(i.get("tag") or i.get("comp")) for i in items if not any(Path(i["seqdir"]).glob("*.png"))]
     if not missing:
         if r.returncode:
             print(f"mograph: render_batch exited {r.returncode} AFTER writing every sequence "
@@ -254,6 +305,24 @@ SD_FACE_KEY, SD_FACE_BASE = "sdFace", "base"
 _SD_FACE_DIR = "_sd"
 _SD_LAYER_COMP = "SdLayer"
 _SD_LAYER_TAIL_S = 2.0       # a long (persistent) layer's own ceiling: its length + this, never under the default
+# A v13 layer's render DEADLINE (render_batch.mjs `wallS`): a hang-ender, not a budget. Measured on the stand
+# (sd_stand L4, a loaded 16-core box, 10 tabs): 0.14-0.4 s per frame for library / engine / layout layers; the
+# deadline sits ~2.5x above the slowest of those plus the bundle-warm first item, so only a stuck item reaches it.
+SD_ITEM_WALL_BASE_S = 60.0
+SD_ITEM_WALL_PER_FRAME_S = 1.0
+
+
+def sd_layer_tag(props: dict) -> str | None:
+    """The v13 layer id a section renders (viewer_bridge: `sdLayer` on an engine section, `layer.id` on SdLayer)."""
+    if props.get("sdLayer"):
+        return str(props["sdLayer"])
+    layer = props.get("layer")
+    return str(layer["id"]) if isinstance(layer, dict) and layer.get("id") else None
+
+
+def sd_item_wall_s(props: dict) -> float:
+    frames = math.ceil(float(props.get("durationInSeconds") or 0.0) * FPS)
+    return SD_ITEM_WALL_BASE_S + SD_ITEM_WALL_PER_FRAME_S * frames
 
 
 def _stage_sd_face(rd: Path, base_path: Path) -> str:
@@ -314,6 +383,8 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
         item = {"comp": sec.comp, "props": sd_face_props(_props(sec), sec.start, face_rel), "seqdir": str(seqdir)}
         if max_seconds is not None:
             item["maxSeconds"] = max_seconds
+        if (tag := sd_layer_tag(sec.props or {})) is not None:
+            item["tag"], item["wallS"] = tag, sd_item_wall_s(sec.props or {})
         if sec.comp == _SD_LAYER_COMP:
             # a persistent layer can outlast render_batch's 120 s default; its own length is its ceiling
             need = float((sec.props or {}).get("durationInSeconds") or 0.0) + _SD_LAYER_TAIL_S
