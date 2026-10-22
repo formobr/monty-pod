@@ -276,6 +276,9 @@
         },
         "opener": {
           "$ref": "#/$defs/opener"
+        },
+        "person_matte": {
+          "$ref": "#/$defs/person_matte"
         }
       }
     },
@@ -1056,6 +1059,41 @@
         },
         "loudnorm": {
           "$ref": "#/$defs/loudnorm"
+        }
+      }
+    },
+    "person_matte": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "alpha",
+        "windows"
+      ],
+      "description": "super-director v13 R4 person plane: `alpha` = the inputs[].id of the gray FFV1 alpha, frame-for-frame with timeline.segments[0].src (every segment must cut that one plate). The one-pass alphamerges plate+alpha through the base's own trims/speed, and overlays the plane between the mograph sections with layer z < 3 and the rest, gated to `windows` (master clock, seconds; minus b-roll cutaway windows). Refused by name when the alpha is missing or its frame count is not the plate's.",
+      "properties": {
+        "alpha": {
+          "type": "string",
+          "minLength": 1
+        },
+        "windows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number",
+                "minimum": 0
+              },
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2,
+            "items": false
+          }
         }
       }
     }

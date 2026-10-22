@@ -293,7 +293,7 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
                         "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", *_BT709, str(mov)], check=True)
         layers.append({"mov": str(mov), "start": m["start"], "dur": len(pngs) / FPS,
                        "glass": m["glass"], "head_below": m.get("head_below", False),
-                       "backing": m.get("backing")})
+                       "backing": m.get("backing"), "z": m.get("z")})
     return layers
 
 
@@ -318,6 +318,14 @@ def sd_layer_tag(props: dict) -> str | None:
         return str(props["sdLayer"])
     layer = props.get("layer")
     return str(layer["id"]) if isinstance(layer, dict) and layer.get("id") else None
+
+
+def sd_layer_z(props: dict) -> int | None:
+    """The v13 layer's stack z (sd_layers.LAYER_Z) a section renders: `layer.z` on SdLayer, `sdZ` on an engine section;
+    None = a legacy mograph section (drawn above the person plane, as the preview draws plan.mograph)."""
+    layer = props.get("layer")
+    z = layer.get("z") if isinstance(layer, dict) else props.get("sdZ")
+    return int(z) if isinstance(z, (int, float)) and not isinstance(z, bool) else None
 
 
 def sd_item_wall_s(props: dict) -> float:
@@ -379,7 +387,7 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
         seqdir.mkdir(parents=True, exist_ok=True)
         meta = {"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass),
                 "head_below": bool((sec.props or {}).get("headBelow")),
-                "backing": (sec.props or {}).get("backing")}
+                "backing": (sec.props or {}).get("backing"), "z": sd_layer_z(sec.props or {})}
         item = {"comp": sec.comp, "props": sd_face_props(_props(sec), sec.start, face_rel), "seqdir": str(seqdir)}
         if max_seconds is not None:
             item["maxSeconds"] = max_seconds
@@ -407,6 +415,61 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
         _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
         metas.append(meta)
     return _pack(metas, tmp)
+
+
+# ── PERSON PLANE (super-director v13 R4, spec overlays.person_matte) ─────────────────────────────────────
+PERSON_Z = 3   # sd_layers.LAYER_Z["person"]: layers below it draw UNDER the person cut-out, the rest over it
+
+
+def split_by_person(layers: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(below, above) the person plane, each in its own order: z < PERSON_Z below, everything else (z ≥ 3 and every
+    legacy section, which the preview draws between its two layer bands) above."""
+    below = [x for x in layers if x.get("z") is not None and int(x["z"]) < PERSON_Z]
+    above = [x for x in layers if not (x.get("z") is not None and int(x["z"]) < PERSON_Z)]
+    return below, above
+
+
+def person_plane_chain(plate_v: str, alpha_v: str, segments: list[tuple[str, str, str]], w: int, h: int,
+                       out: str) -> str:
+    """Pure: [plate][alpha] → the person plane `out` (yuva420p), cut through the base's own segments (trim + speed +
+    scale, the chain render.build_filtergraph runs on the plate) so frame i of the plane stays frame i of the base.
+    `segments` = (in, out, speed) per timeline segment, ALREADY spelled by render._num (the base chain's own
+    spelling — a re-formatted float would cut a different frame); the alpha is gray, merged before any rescale."""
+    n = len(segments)
+    parts = [f"[{plate_v}][{alpha_v}]alphamerge,format=yuva420p" + (f",split={n}" if n > 1 else "")
+             + "".join(f"[pmsrc{k}]" for k in range(n))]
+    pads = []
+    for k, (a, b, sp) in enumerate(segments):
+        parts.append(f"[pmsrc{k}]trim=start={a}:end={b},setpts=(PTS-STARTPTS)/{sp},"
+                     f"scale={w}:{h}:flags=lanczos,setsar=1,format=yuva420p[pmseg{k}]")
+        pads.append(f"[pmseg{k}]")
+    parts.append(f"{''.join(pads)}concat=n={n}:v=1:a=0[{out}]" if n > 1 else f"[pmseg0]null[{out}]")
+    return ";".join(parts)
+
+
+def person_overlay(base: str, plane: str, windows: list[tuple[float, float]], fps: float, out: str) -> str:
+    """Pure: the person plane over [base], shown only on the output frames of `windows` (frames.between — the same
+    frame rounding every other window of this graph gets)."""
+    enable = "+".join(_frames.between(*_frames.frame_range(a, b, fps), fps) for a, b in windows)
+    return f"[{base}][{plane}]overlay=enable='{enable}':eof_action=pass:format=yuv420[{out}]"
+
+
+def person_windows(windows: list[tuple[float, float]], cut: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """`windows` minus every `cut` span (the b-roll cutaways covering the head) — no cutaway between the plate and
+    the person plane."""
+    out = [(float(a), float(b)) for a, b in windows]
+    for c0, c1 in cut:
+        nxt: list[tuple[float, float]] = []
+        for a, b in out:
+            if c1 <= a or c0 >= b:
+                nxt.append((a, b))
+                continue
+            if c0 > a:
+                nxt.append((a, c0))
+            if c1 < b:
+                nxt.append((c1, b))
+        out = nxt
+    return [(a, b) for a, b in out if b - a > 1e-6]
 
 
 # ── MARK BACKING (the final half) ────────────────────────────────────────────────────────────────────────

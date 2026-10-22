@@ -377,6 +377,24 @@ class SpecFinalize(BaseModel):
     loudnorm: SpecLoudnorm | None = None
 
 
+class SpecPersonMatte(BaseModel):
+    """super-director v13 R4 person plane (contracts/spec.schema.json `person_matte`): `alpha` = the inputs[].id of
+    the gray FFV1 alpha, frame-for-frame with timeline.segments[0].src; `windows` = [start, end) seconds on the master
+    clock where the plane shows (the union of the matte layers' windows minus layouts / head-below)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alpha: str = Field(min_length=1)
+    windows: list[tuple[float, float]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _windows_forward(self) -> "SpecPersonMatte":
+        for a, b in self.windows:
+            if a < 0 or b <= a:
+                raise ValueError(f"person_matte window [{a}, {b}] must be 0 <= start < end")
+        return self
+
+
 class Overlays(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -388,6 +406,7 @@ class Overlays(BaseModel):
     sfx: list[SpecSfx] | None = None
     finalize: SpecFinalize | None = None
     opener: SpecOpener | None = None
+    person_matte: SpecPersonMatte | None = None
 
 
 class Encode(BaseModel):
@@ -438,6 +457,14 @@ class RenderSpec(BaseModel):
             if seg.src not in ids:
                 raise ValueError(f"timeline.segments[{n}].src {seg.src!r} is not an inputs[].id")
         if self.overlays is not None:
+            pm = self.overlays.person_matte
+            if pm is not None:
+                if pm.alpha not in ids:
+                    raise ValueError(f"person_matte.alpha {pm.alpha!r} is not an inputs[].id")
+                plates = {seg.src for seg in self.timeline.segments}
+                if len(plates) != 1:
+                    raise ValueError(f"person_matte pairs its alpha frame-for-frame with ONE plate; the timeline "
+                                     f"cuts {sorted(plates)}")
             if self.overlays.broll_final is not None:
                 for n, c in enumerate(self.overlays.broll_final.broll):
                     if c.clip not in ids:

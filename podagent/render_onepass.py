@@ -57,6 +57,7 @@ V_ACCENT_IN, V_ACCENTS = "vaccentin", "vaccents"
 V_LOGO = "vlogo"
 V_WATERMARK, A_WATERMARK = "vwatermark", "awatermark"
 V_MASTER = "vmaster"
+V_MOG_BELOW, V_PERSON_PLANE, V_PERSON = "vmogbelow", "vpersonplane", "vperson"
 V_TAP_LOGO = "vtaplogo"
 
 
@@ -330,6 +331,54 @@ def _check_inputs(spec: RenderSpec, input_paths: dict) -> None:
         last_probed = rel
 
 
+def person_matte_windows(spec: RenderSpec) -> list[tuple[float, float]]:
+    """overlays.person_matte.windows minus every b-roll cutaway window (render.broll_window, the frames the cutaway
+    covers): no cutaway may sit between the plate and the person plane."""
+    ov = spec.overlays
+    pm = ov.person_matte if ov is not None else None
+    if pm is None:
+        return []
+    fps = spec.timeline.fps
+    r = _frames.rate(fps)
+    cut = []
+    for c in (ov.broll_final.broll if ov is not None and ov.broll_final is not None else []):
+        a, b = _render.broll_window(c, fps)
+        cut.append((float(a / r), float(b / r)))
+    return _mograph.person_windows(list(pm.windows), cut)
+
+
+def _frame_count(path: Path) -> int:
+    """Packets of the first video stream (FFV1 / H.264 intra-or-not: one packet per frame), bounded like every probe."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
+                          "stream=nb_read_packets", "-of", "csv=p=0", str(path)], capture_output=True, text=True,
+                         timeout=_finalize._PROBE_TIMEOUT_S * 4)
+    try:
+        return int(out.stdout.strip().split(",")[0])
+    except ValueError:
+        raise RuntimeError(f"cannot count frames of {path.name}: {out.stderr.strip()[-200:]}") from None
+
+
+def _check_person_matte(spec: RenderSpec, input_paths: dict) -> None:
+    """Refuse by name, before a frame renders: the alpha is missing, or its frame count is not the plate's (a short
+    matte would put the cut-out on the wrong frames of the head)."""
+    ov = spec.overlays if spec.mode == "final" else None
+    pm = ov.person_matte if ov is not None else None
+    if pm is None:
+        return
+    if spec.motion is not None and spec.motion.segments:
+        raise RuntimeError("person_matte: the timeline carries motion keyframes — the final's plate has its camera "
+                           "baked; a person plane over a re-cropped base would not stay on the head")
+    alpha = input_paths.get(pm.alpha)
+    if alpha is None or not Path(alpha).is_file() or Path(alpha).stat().st_size == 0:
+        raise RuntimeError(f"person_matte: alpha input {pm.alpha!r} is missing — refusing a master whose "
+                           f"behind-the-head layers would cover the face")
+    plate = input_paths[spec.timeline.segments[0].src]
+    na, npl = _frame_count(Path(alpha)), _frame_count(Path(plate))
+    if na != npl:
+        raise RuntimeError(f"person_matte: alpha {pm.alpha!r} has {na} frames, the plate "
+                           f"{spec.timeline.segments[0].src!r} has {npl} — frame i must be frame i")
+
+
 # --- 2. prepare ---------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -463,6 +512,7 @@ def prepare(spec: RenderSpec, input_paths: dict, tmp: Path, gpu: bool, *,
     flare scan read none of each other; layers with no frames simply do not appear (mograph.py:143/275)."""
     _check_assets(spec, input_paths)
     _check_inputs(spec, input_paths)
+    _check_person_matte(spec, input_paths)
     tmp = Path(tmp)
     dur = body_duration(spec)
     ov = spec.overlays if spec.mode == "final" else None
@@ -544,11 +594,13 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
 
     inputs = Inputs()
     spec_pads: dict[str, str] = {}
+    spec_index: dict[str, int] = {}
     for iid in _render.input_ids(spec):
         bound = p.loop_bounds.get(iid)
         # A still image otherwise yields one frame at PTS 0 and EOFs before its overlay window opens.
         flags = ("-loop", "1", "-framerate", _render._num(fps), "-t", _render._num(bound)) if bound else ()
         n = inputs.add(p.input_paths[iid], *flags)
+        spec_index[iid] = n
         spec_pads[f"{n}:v"] = f"{n}:v"
         spec_pads[f"{n}:a"] = f"{n}:a"
     if p.bed is not None:
@@ -564,9 +616,28 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
                       **{pad: pad for pad in broll_taps}})]
     vlink = V_COMPOSITE
 
-    if p.layers:
-        layers_v = [f"{inputs.add(Path(lay['mov']))}:v" for lay in p.layers]
-        frag, last = _mograph.overlay_filtergraph(list(p.layers), fps=fps, base=vlink, layers_v=layers_v)
+    pm = ov.person_matte if ov is not None else None
+    windows = person_matte_windows(spec) if pm is not None else []
+    if windows:
+        # sd13 R4: sections under the person (z < 3) → the person plane → the rest, in that order
+        below, above = _mograph.split_by_person(list(p.layers))
+        if below:
+            below_v = [f"{inputs.add(Path(lay['mov']))}:v" for lay in below]
+            frag, last = _mograph.overlay_filtergraph(below, fps=fps, base=vlink, layers_v=below_v)
+            chains.append(rewire(frag, "mgb", {vlink: vlink, **{lv: lv for lv in below_v}, last: V_MOG_BELOW}))
+            vlink = V_MOG_BELOW
+        plate_n = spec_index[spec.timeline.segments[0].src]
+        alpha_n = inputs.add(p.input_paths[pm.alpha])
+        segs = [(_render._num(sg.in_), _render._num(sg.out), _render._num(sg.speed)) for sg in spec.timeline.segments]
+        chains.append(_mograph.person_plane_chain(f"{plate_n}:v", f"{alpha_n}:v", segs, w, h, V_PERSON_PLANE))
+        chains.append(_mograph.person_overlay(vlink, V_PERSON_PLANE, windows, fps, V_PERSON))
+        vlink = V_PERSON
+        layers_above = above
+    else:
+        layers_above = list(p.layers)
+    if layers_above:
+        layers_v = [f"{inputs.add(Path(lay['mov']))}:v" for lay in layers_above]
+        frag, last = _mograph.overlay_filtergraph(layers_above, fps=fps, base=vlink, layers_v=layers_v)
         chains.append(rewire(frag, "mog", {vlink: vlink, **{lv: lv for lv in layers_v}, last: V_MOGRAPH}))
         vlink = V_MOGRAPH
 
