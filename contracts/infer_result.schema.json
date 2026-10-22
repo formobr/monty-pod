@@ -5,30 +5,97 @@
   "description": "The payload itself was already PUT to the request's put_url; result_key echoes the put_url path (opaque, possibly bucket-prefixed under path-style presigning — consumers must use the key they presigned, not parse this). timing.infer_s is mandatory on success — face-probe latency is a watched number.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["infer_version", "job_id", "kind", "status"],
+  "required": [
+    "infer_version",
+    "job_id",
+    "kind",
+    "status"
+  ],
   "properties": {
-    "infer_version": { "const": 7 },
-    "job_id": { "type": "string", "minLength": 1 },
-    "kind": { "enum": ["align", "face_probe", "clip_rank"] },
-    "status": { "enum": ["ok", "error"] },
-    "result_key": { "type": "string", "minLength": 1 },
-    "corr_id": { "type": "string", "minLength": 1 },
-    "error": { "type": "string", "minLength": 1 },
+    "infer_version": {
+      "const": 7
+    },
+    "job_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "enum": [
+        "align",
+        "face_probe",
+        "clip_rank",
+        "person_matte"
+      ]
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "error"
+      ]
+    },
+    "result_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "corr_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "error": {
+      "type": "string",
+      "minLength": 1
+    },
     "timing": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["infer_s"],
+      "required": [
+        "infer_s"
+      ],
       "properties": {
-        "infer_s": { "type": "number", "minimum": 0 },
-        "boot_s": { "type": "number", "minimum": 0 }
+        "infer_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "boot_s": {
+          "type": "number",
+          "minimum": 0
+        }
       }
     }
   },
   "allOf": [
     {
-      "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
-      "then": { "required": ["result_key", "timing"], "not": { "required": ["error"] } },
-      "else": { "required": ["error"], "not": { "required": ["result_key"] } }
+      "if": {
+        "properties": {
+          "status": {
+            "const": "ok"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "result_key",
+          "timing"
+        ],
+        "not": {
+          "required": [
+            "error"
+          ]
+        }
+      },
+      "else": {
+        "required": [
+          "error"
+        ],
+        "not": {
+          "required": [
+            "result_key"
+          ]
+        }
+      }
     }
   ]
 }

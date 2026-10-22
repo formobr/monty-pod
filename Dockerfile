@@ -163,6 +163,16 @@ RUN mkdir -p /opt/models \
         https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
 ENV MODEL_YUNET=/opt/models/yunet.onnx
 
+# RVM mobilenetv3 fp16 TorchScript (person_matte) STAYS baked for the same reason: 7.9 MB, the upstream's own
+# scripted export (the image has no torchvision, which the .pth + model-source route needs). Pinned by sha256 here
+# AND in podagent/infer_matte.py, which refuses any other bytes. GPL-3.0 — owner decision 2026-10-22
+# (the engine's person-matte research receipt).
+RUN curl -fL -o /opt/models/rvm_mobilenetv3_fp16.torchscript \
+        https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp16.torchscript \
+    && echo "847a8b5139498afbf7abde9cc347b41030540f6498db593a0e3d9dde1eccdd96  /opt/models/rvm_mobilenetv3_fp16.torchscript" \
+        | sha256sum -c -
+ENV MODEL_RVM=/opt/models/rvm_mobilenetv3_fp16.torchscript
+
 # --- Montserrat (cover/caption rendering) -----------------------------------
 RUN mkdir -p /usr/share/fonts/truetype/montserrat \
     && curl -L -o /usr/share/fonts/truetype/montserrat/Montserrat.ttf \

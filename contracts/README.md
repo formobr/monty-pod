@@ -5,16 +5,17 @@ code**: the planning side decides, writes a spec (`spec.schema.json`), the pod a
 SSOT for that seam — JSON Schema (draft 2020-12) + golden examples + a `validate.py` tripwire.
 Consumers on both sides mirror these schemas and re-run the same goldens against their mirrors.
 
-## The six schemas
+## The seven schemas
 
 | schema | direction | what |
 |---|---|---|
 | `pod_job.schema.json` | CP→pod (`job` frame) | the job envelope: `type` dispatches to `request`, `spec`, or `chain` |
 | `spec.schema.json` | planner→pod (object storage) | the render instruction: inputs, timeline (EDL+speed), motion keyframes, overlays (final only), encode, outputs |
-| `infer_request.schema.json` | planner→pod (CP job queue) | one BATCHED inference task: `align`, `face_probe` or `clip_rank` |
+| `infer_request.schema.json` | planner→pod (CP job queue) | one BATCHED inference task: `align`, `face_probe`, `clip_rank` or `person_matte` |
 | `infer_result.schema.json` | pod→CP (`result` frame) | completion envelope; payload already PUT to storage |
 | `face_probe.schema.json` | payload (object storage) | raw face boxes + frame_diff per shot, pixel space |
 | `clip_rank.schema.json` | payload (object storage) | per-group SigLIP cosines + L2-normalized image embeddings |
+| `person_matte.schema.json` | receipt (object storage) | RVM person matte: frames/size/fps + size+sha256 of each output the pod PUT to its own URL (alpha: gray FFV1 Matroska; cutout: VP9-alpha WebM) |
 
 Transport: the planner and the pod NEVER talk directly. Jobs, lifecycle events, and results use one
 typed EventStream WebSocket; media payloads ride presigned URLs.

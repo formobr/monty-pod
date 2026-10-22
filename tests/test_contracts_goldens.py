@@ -23,6 +23,7 @@ from podagent.models import (
     FaceProbePayload,
     InferRequest,
     InferResult,
+    PersonMattePayload,
     PodJob,
     RenderSpec,
 )
@@ -37,6 +38,7 @@ MODELS = {
     "infer_result": InferResult,
     "face_probe": FaceProbePayload,
     "clip_rank": ClipRankPayload,
+    "person_matte": PersonMattePayload,
     "pod_job": PodJob,
 }
 

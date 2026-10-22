@@ -1,0 +1,19 @@
+{
+  "model": "rvm_mobilenetv3_fp16",
+  "model_sha256": "847a8b5139498afbf7abde9cc347b41030540f6498db593a0e3d9dde1eccdd96",
+  "width": 1080,
+  "height": 1920,
+  "fps": "30/1",
+  "frames": 300,
+  "downsample_ratio": 0.25,
+  "alpha": {
+    "bytes": 18403311,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "timings": {
+    "model_s": 7.6,
+    "first_frame_s": 8.5,
+    "encode_drain_s": 0.4,
+    "wall_s": 17.9
+  }
+}

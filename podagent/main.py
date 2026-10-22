@@ -28,9 +28,13 @@ from .sanitize import safe_error, safe_text, safe_traceback
 if TYPE_CHECKING:
     from .infer_align import AlignService
     from .infer_cliprank import ClipRankService
+    from .infer_matte import MatteService
     from .infer_probe import ProbeService
 
-INFER_KINDS = ("align", "face_probe", "clip_rank")
+INFER_KINDS = ("align", "face_probe", "clip_rank", "person_matte")
+# person_matte's frozen RVM, by model id (the baked file is sha-pinned, so the id names exactly one checkpoint).
+# Module-level so the one heavy lane reuses it across envelopes without widening _run_infer's positional surface.
+_MATTE_CACHE: "dict[str, MatteService]" = {}
 
 # THERE IS NO POLL ANY MORE. Work arrives on the socket the pod already holds (podagent.event_stream); the
 # floor below survives it for one reason only — a socket that will NOT open returns immediately, and a bare
@@ -722,12 +726,15 @@ def _run_infer(
     rank_slots: threading.BoundedSemaphore | None = None,
     one_kind_resident: bool = False,
     served: "frozenset[str] | None" = None,
+    matte_cache: "dict[str, MatteService] | None" = None,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag.
 
     corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
+    if matte_cache is None:
+        matte_cache = _MATTE_CACHE
 
     @contextmanager
     def phase(name: str):
@@ -770,7 +777,8 @@ def _run_infer(
             # A cached service holds its weights on the card forever, so on a card too small for both kinds
             # the idle one must go before this load — the kinds are already serialised onto one lane.
             from .infer_lanes import release_other_kinds
-            dropped = release_other_kinds(req.kind, {"align": align_cache, "clip_rank": rank_cache})
+            dropped = release_other_kinds(req.kind, {"align": align_cache, "clip_rank": rank_cache,
+                                                     "person_matte": matte_cache})
             if dropped:
                 note(f"dropped {'+'.join(dropped)} weights: this card holds one infer kind at a time")
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
@@ -815,6 +823,22 @@ def _run_infer(
                 rank_run = rank_svc.run(req.clip_rank, req.put_url, note)
             infer_s = rank_run.infer_s
             work_timings = rank_run.timings
+        elif req.kind == "person_matte":
+            from .infer_matte import MatteRefused, MatteService
+            from .ops import dry as _ops_dry
+
+            assert req.person_matte is not None
+            if _ops_dry.armed():
+                raise MatteRefused("person_matte is a real GPU forward and a contour-dry pod does no GPU work "
+                                   "(DRY_POD_NO_GPU_WHY) — the engine must not send it to a dry pod")
+            matte_svc = matte_cache.get(req.model)
+            if matte_svc is None:
+                with phase("model_load"):
+                    note(f"loading {req.model}")
+                    matte_svc = matte_cache[req.model] = MatteService(req.model)
+            matte_run = matte_svc.run(req.person_matte, req.put_url, note)
+            infer_s = matte_run.infer_s
+            work_timings = {**matte_run.timings, "work_s": time.monotonic() - work_started}
         else:
             from .infer_probe import ProbeService
 
@@ -825,7 +849,7 @@ def _run_infer(
                 with phase("model_load"):
                     probe_svc = probe_cache[key] = ProbeService(yunet_path, req.model)
             infer_s = probe_svc.run(req.face_probe, req.put_url)
-        if req.kind != "clip_rank":
+        if req.kind not in ("clip_rank", "person_matte"):
             work_timings = {
                 "infer_s": infer_s,
                 "work_s": time.monotonic() - work_started,

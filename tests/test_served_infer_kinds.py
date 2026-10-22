@@ -68,7 +68,7 @@ def test_a_pod_serves_and_sizes_only_its_given_infer_kinds(monkeypatch, tmp_path
     assert agent_main.boot_vram_floor_mib(set(), render=False) is None
 
     # unset env = every kind, the fleet floor
-    assert lanes.served_kinds(None) == frozenset({"align", "clip_rank", "face_probe"})
+    assert lanes.served_kinds(None) == frozenset({"align", "clip_rank", "face_probe", "person_matte"})
     assert agent_main.boot_vram_floor_mib() == 4208.0
     with pytest.raises(SystemExit) as exc:
         _boot(monkeypatch, env=None, free=3236.0)          # the 2026-10-02 laptop, all kinds

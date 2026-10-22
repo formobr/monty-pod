@@ -566,6 +566,27 @@ class ClipRankParams(BaseModel):
     groups: list[ClipRankGroup] = Field(min_length=1)
 
 
+class PersonMatteParams(BaseModel):
+    """RVM person matte over ONE whole video (the plate a tier's layers composite over). Every number is the
+    planner's: `downsample_ratio` is resolved from the frame size before the request is written. The pod PUTs
+    the requested outputs to their own presigned URLs and the receipt (person_matte.schema.json) to put_url."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    video_url: str = Field(min_length=1)
+    downsample_ratio: float = Field(gt=0, le=1)
+    # FINAL: the alpha as a lossless gray FFV1 Matroska, frame-for-frame with the input
+    alpha_put_url: str | None = Field(default=None, min_length=1)
+    # PREVIEW: the input's pixels under the alpha as a VP9-alpha (yuva420p) WebM, no audio
+    cutout_put_url: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _some_output(self) -> "PersonMatteParams":
+        if self.alpha_put_url is None and self.cutout_put_url is None:
+            raise ValueError("person_matte must request at least one output (alpha_put_url / cutout_put_url)")
+        return self
+
+
 class WeightsRef(BaseModel):
     """Where the pod gets this job's checkpoint. A presigned GET for a tar of the model directory, plus
     that tar's sha256 — which is BOTH the integrity check and the pod's cache key, so a re-exported or
@@ -578,7 +599,11 @@ class WeightsRef(BaseModel):
     size: int | None = Field(default=None, gt=0)
 
 
-_NEEDS_WEIGHTS = ("align", "clip_rank")   # face_probe's YuNet is 227 KB and stays baked in the image
+# face_probe's YuNet (227 KB) and person_matte's RVM (7.9 MB fp16 TorchScript) stay baked in the image
+_NEEDS_WEIGHTS = ("align", "clip_rank")
+
+
+InferKind = Literal["align", "face_probe", "clip_rank", "person_matte"]
 
 
 class InferRequest(BaseModel):
@@ -586,18 +611,19 @@ class InferRequest(BaseModel):
 
     infer_version: Literal[7]
     job_id: str = Field(min_length=1)
-    kind: Literal["align", "face_probe", "clip_rank"]
+    kind: InferKind
     model: str = Field(min_length=1)
     put_url: str = Field(min_length=1)
     weights: WeightsRef | None = None
     align: AlignParams | None = None
     face_probe: FaceProbeParams | None = None
     clip_rank: ClipRankParams | None = None
+    person_matte: PersonMatteParams | None = None
 
     @model_validator(mode="after")
     def _block_matches_kind(self) -> "InferRequest":
         blocks: dict[str, Any] = {"align": self.align, "face_probe": self.face_probe,
-                                  "clip_rank": self.clip_rank}
+                                  "clip_rank": self.clip_rank, "person_matte": self.person_matte}
         if blocks[self.kind] is None:
             raise ValueError(f"kind={self.kind} requires its params block")
         extra = [k for k, v in blocks.items() if k != self.kind and v is not None]
@@ -628,7 +654,7 @@ class InferResult(BaseModel):
 
     infer_version: Literal[7]
     job_id: str = Field(min_length=1)
-    kind: Literal["align", "face_probe", "clip_rank"]
+    kind: InferKind
     status: Literal["ok", "error"]
     result_key: str | None = Field(default=None, min_length=1)
     # Echoed from the job corr_id for errors; a success also carries result_key as durable business identity.
@@ -897,6 +923,48 @@ class FaceProbePayload(BaseModel):
     width: int = Field(ge=2)
     height: int = Field(ge=2)
     shots: list[ProbeShot] = Field(min_length=1)
+
+
+class MatteOutput(BaseModel):
+    """One PUT person_matte output, as the pod wrote it (the engine verifies the object against these)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class PersonMatteTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_s: float = Field(ge=0)          # GPU forward + device copies, summed over frames
+    first_frame_s: float = Field(ge=0)    # the cudnn autotune frame, inside model_s
+    encode_drain_s: float = Field(ge=0)   # encoders finishing after the last frame
+    wall_s: float = Field(ge=0)           # download excluded, upload excluded
+
+
+class PersonMattePayload(BaseModel):
+    """person_matte.schema.json — the receipt the pod PUTs to put_url. `frames` is what the decoder delivered
+    AND what each output carries (the pod refuses a mismatch, so a short matte can never be composited)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    width: int = Field(ge=2)
+    height: int = Field(ge=2)
+    fps: str = Field(pattern=r"^[1-9][0-9]*(/[1-9][0-9]*)?$")   # the input's r_frame_rate, verbatim
+    frames: int = Field(ge=1)
+    downsample_ratio: float = Field(gt=0, le=1)
+    alpha: MatteOutput | None = None
+    cutout: MatteOutput | None = None
+    timings: PersonMatteTimings
+
+    @model_validator(mode="after")
+    def _some_output(self) -> "PersonMattePayload":
+        if self.alpha is None and self.cutout is None:
+            raise ValueError("a person_matte receipt names at least one output")
+        return self
 
 
 ClipRankTileErrorKind = Literal["url_not_allowed", "fetch_timeout", "fetch_failed", "decode_error",

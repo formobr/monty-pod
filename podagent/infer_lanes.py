@@ -33,13 +33,19 @@ KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY
     "align": 1500.0,
     "clip_rank": _VRAM_WEIGHTS_MB + _VRAM_PER_LANE_MB,
     "face_probe": 0.0,
+    # RVM fp16 at 1080x1920: nvidia-smi peak +1094 MiB over the idle card during the first frame's cudnn autotune
+    # (torch max reserved 990), +228 MiB resident between videos — sized at the peak, the moment it must fit.
+    # It rides the one-wide heavy lane, so it never runs beside align; it CAN run beside a clip_rank lane.
+    "person_matte": 1100.0,
 }
 RESERVE_MIB = _VRAM_RESERVE_MB
 
 
 def coresident_mib() -> float:
     """Free MiB a card must report for both weight-holding kinds to be resident together (4748 here; the
-    engine's own VRAM-budget concurrent-residency figure reads 4752 off its own rounding of the same measurements)."""
+    engine's own VRAM-budget concurrent-residency figure reads 4752 off its own rounding of the same measurements).
+    person_matte is not added: it shares align's one-wide lane, and its 228 MiB between videos sits inside the
+    reserve; the two lanes' peak overlap is clip_rank + max(align, person_matte) = clip_rank + align."""
     return KIND_VRAM_MIB["align"] + KIND_VRAM_MIB["clip_rank"] + RESERVE_MIB
 
 
