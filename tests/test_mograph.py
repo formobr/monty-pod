@@ -256,3 +256,62 @@ def test_render_layers_omits_the_bound_when_none_is_reachable(tmp_path: Path, mo
     sec = SimpleNamespace(comp="Stat", start=1.0, props={}, glass=False)
     mograph._render_layers([sec], None, {}, tmp_path)
     assert "maxSeconds" not in captured["items"][0]
+
+
+def test_bespoke_batches_run_side_by_side_on_a_split_tab_budget_and_keep_plan_order(tmp_path: Path, monkeypatch) -> None:
+    """BESPOKE_PARALLEL_WHY: each Bespoke entry still gets its own render_batch, after the catalog batch, at most
+    _BESPOKE_PARALLEL_MAX at once, each on its share of the tabs; the layers come back in plan order."""
+    import threading
+    import time
+    monkeypatch.setattr(mograph, "remotion_dir", lambda ref, tmp: tmp_path)
+    monkeypatch.setattr(mograph, "_render_concurrency", lambda: 10)
+    monkeypatch.setattr(mograph, "_pack", lambda metas, tmp: metas)
+    (tmp_path / "src").mkdir()
+    ids = ["Bespoke-a", "Bespoke-b", "Bespoke-c", "Bespoke-d"]
+    for i in ids:
+        (tmp_path / "src" / f"index.bespoke.{i}.tsx").write_text("x")
+    calls, live, peak, lock = [], [0], [0], threading.Lock()
+
+    def fake_batch(rd, items, spec, entry):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+            calls.append((entry, items[0]["comp"], mograph._batch_concurrency(), list(live)))
+        time.sleep(0.1)
+        with lock:
+            live[0] -= 1
+
+    monkeypatch.setattr(mograph, "_run_batch", fake_batch)
+    secs = [SimpleNamespace(comp="Stat", start=0.0, props={}, glass=False)] + [
+        SimpleNamespace(comp=i, start=float(n + 1), props={}, glass=False) for n, i in enumerate(ids)]
+    metas = mograph._render_layers(secs, None, {}, tmp_path)
+
+    assert calls[0][0] is None and calls[0][2] == 10, "the catalog batch runs first, alone, on every tab"
+    bes = calls[1:]
+    assert sorted(c[0] for c in bes) == sorted(f"src/index.bespoke.{i}.tsx" for i in ids)
+    assert all(c[2] == 10 // mograph._BESPOKE_PARALLEL_MAX for c in bes)
+    assert peak[0] == mograph._BESPOKE_PARALLEL_MAX
+    assert [m["start"] for m in metas] == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert mograph._batch_concurrency() == 10, "the share never leaks out of a bespoke worker"
+
+
+def test_a_failed_bespoke_batch_raises_only_after_its_siblings_land(tmp_path: Path, monkeypatch) -> None:
+    import time
+    monkeypatch.setattr(mograph, "remotion_dir", lambda ref, tmp: tmp_path)
+    monkeypatch.setattr(mograph, "_render_concurrency", lambda: 6)
+    (tmp_path / "src").mkdir()
+    for i in ("Bespoke-a", "Bespoke-b"):
+        (tmp_path / "src" / f"index.bespoke.{i}.tsx").write_text("x")
+    landed = []
+
+    def fake_batch(rd, items, spec, entry):
+        if items[0]["comp"] == "Bespoke-a":
+            raise RuntimeError("render_batch FAILED Bespoke-a")
+        time.sleep(0.1)
+        landed.append(items[0]["comp"])
+
+    monkeypatch.setattr(mograph, "_run_batch", fake_batch)
+    secs = [SimpleNamespace(comp=i, start=0.0, props={}, glass=False) for i in ("Bespoke-a", "Bespoke-b")]
+    with pytest.raises(RuntimeError, match="Bespoke-a"):
+        mograph._render_layers(secs, None, {}, tmp_path)
+    assert landed == ["Bespoke-b"]

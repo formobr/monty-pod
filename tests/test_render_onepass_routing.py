@@ -226,3 +226,30 @@ def test_onepass_defects_reach_the_terminal_result_and_the_degraded_event(monkey
     assert degraded and degraded[0]["outcome"] == "ok" and "error" not in degraded[0]
     assert cp.results[0]["defects"] == [defect]
     assert puts, "the PUT must still happen despite the mismatch"
+
+
+def test_a_long_render_phase_ticks_so_the_pool_never_reads_it_as_a_silent_pod(monkeypatch):
+    """PHASE_SILENCE_WHY: a prepare that outlives the heartbeat says `prepare_progress` while it works, and
+    every tick stops before the phase's own terminal event."""
+    import time as _time
+    _wire(monkeypatch)
+    monkeypatch.setattr(render, "_PHASE_HEARTBEAT_S", 0.05)
+    real_arms = op._run_arms
+
+    def slow_arms(arms):                     # the arms run INSIDE the `prepare` phase (render_onepass.prepare)
+        _time.sleep(0.3)                     # ~6 ticks of the shrunk heartbeat
+        return real_arms(arms)
+
+    monkeypatch.setattr(op, "_run_arms", slow_arms)
+    monkeypatch.setattr(finalize, "apply_loudnorm",
+                        lambda _fin, src, out: (Path(out).write_bytes(b"v"), out)[1])
+    cp = _CP()
+    render.render_spec(_spec(), cp)
+
+    phases = [e.get("phase") for e in cp.events if e.get("stage") == "render"]
+    beats = [e for e in cp.events if e.get("phase") == "prepare_progress"]
+    assert len(beats) >= 2, phases
+    assert all(e["status"] == "step" and e["op"] == "prepare" and e["timings"]["phase_s"] > 0 for e in beats)
+    first = phases.index("prepare_started")
+    last = max(i for i, p in enumerate(phases) if p == "prepare_progress")
+    assert first < last < phases.index("prepare_finished"), "no heartbeat may land after its phase's terminal event"

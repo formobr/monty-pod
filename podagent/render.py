@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -760,6 +761,38 @@ def _caption_colours(caps, motion_plan) -> tuple[str, str]:
 
 # --- I/O orchestration --------------------------------------------------------
 
+PHASE_SILENCE_WHY = """
+A RENDER PHASE THAT SAYS NOTHING FOR FOUR MINUTES IS ROTATED AS A DEAD POD — AND RENDERED AGAIN FROM ZERO.
+
+Measured on every v13 final (R0 1205 s, r4a 1531 s, r4b 1388 s, r4c 1547 s; work/v13logs/*/run.log): the
+render envelope is RECEIVED THREE TIMES. `prepare` (the mograph arm: Remotion bundle + every SdLayer/Bespoke
+comp, 390-540 s) sends `prepare_started` and then nothing until `prepare_finished`, so the pool's
+silent_claimed rule (scripts/broker/pod_pool.py SILENT_CLAIMED_AFTER_S = 240 s of no committed frame while
+owning a claim) retires the pod mid-prepare, Go requeues the envelope, a fresh pod starts the render over —
+twice, until SILENT_ROTATIONS_PER_HOUR_MAX stops rotating. ~285 s x 2 thrown away per final (r4c: received
+at +260 s, +549 s, +831 s of assemble_master; pm2 pod-pool log: "fleet reaped ... silent_claimed: no frame
+committed for 243s").
+
+The ops lane already solved this shape (ops/runner.py RUN_SILENCE_WHY): a heartbeat BESIDE the call, never
+inside it. The render phases now do the same: every _PHASE_HEARTBEAT_S a `<op>_progress` step event with the
+elapsed seconds. It changes nothing the pod renders or when it gives up — it only stops a live render from
+looking like a dead one. Sent through the swallowing sender: a heartbeat that fails to enqueue must never
+be the thing that fails a render.
+"""
+# Same knob and default as the ops lane's run heartbeat (ops/runner.py _RUN_HEARTBEAT_S): 30 s is 8 ticks
+# inside the pool's 240 s silence bound and 4 inside the api's 120 s busy-mark lifetime.
+_PHASE_HEARTBEAT_S = float(os.environ.get("POD_RUN_HEARTBEAT_S") or 30.0)
+_PHASE_HEARTBEAT_JOIN_S = 5.0  # an enqueue is a local durable append; this only bounds a wedged one
+
+
+def _phase_heartbeat(cp: ControlPlane, base: dict, t0: float, stop: threading.Event, tick: float) -> None:
+    """Beside the phase, never inside it (PHASE_SILENCE_WHY); `stop` is set in the phase's `finally`."""
+    while not stop.wait(tick):
+        _safe_send_event(cp, {k: v for k, v in {
+            **base, "phase": f"{base['op']}_progress",
+            "timings": {"phase_s": round(time.monotonic() - t0, 3)}}.items() if v is not None})
+
+
 def _safe_send_event(cp: ControlPlane, event: dict) -> None:
     """Swallow+log, never raise: past this seam the master is already encoded (~20 GPU-min paid)."""
     try:
@@ -947,9 +980,20 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         send = (lambda ev: _safe_send_event(cp, ev)) if guarded else cp.send_event
         send({k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
         started = time.monotonic()
+        beat_stop = threading.Event()
+        beat = threading.Thread(target=_phase_heartbeat, args=(cp, base, started, beat_stop, _PHASE_HEARTBEAT_S),
+                                name=f"render-{op}-heartbeat", daemon=True)
+        beat.start()
+
+        def quiet() -> None:
+            # the terminal event is the LAST word of the phase: no progress frame may land after it
+            beat_stop.set()
+            beat.join(timeout=_PHASE_HEARTBEAT_JOIN_S)
+
         try:
             yield
         except BaseException as exc:
+            quiet()
             send({
                 k: v for k, v in {
                     **base,
@@ -964,6 +1008,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             })
             raise
         else:
+            quiet()
             send({
                 k: v for k, v in {
                     **base,
@@ -972,6 +1017,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                     "timings": {"phase_s": round(time.monotonic() - started, 3)},
                 }.items() if v is not None
             })
+        finally:
+            beat_stop.set()
     # function-local: render_onepass imports this module, so a top-level import would cycle.
     from . import render_onepass as _onepass
     if spec.mode == "final":

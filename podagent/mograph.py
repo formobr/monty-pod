@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections import namedtuple
 from pathlib import Path
 
@@ -233,8 +234,59 @@ def item_progress(items: list, rows: list[dict]) -> str:
     return " · ".join(p for p in parts if p)
 
 
+BESPOKE_PARALLEL_WHY = """
+EACH BESPOKE COMP IS ITS OWN ENTRY, SO ITS OWN WEBPACK BUNDLE — AND WEBPACK IS ONE CORE.
+
+r4c final (pm2 pod-pool log, 2026-10-22): after the catalog batch, three Bespoke batches ran back to back,
+each `bundled ONCE in 21.7-23.9s` then rendered ~9 s — 97 s of the mograph arm, ~70 s of it single-threaded
+bundling on a 12-core box. Measured on the dev box (cold webpack cache, the pod's state): the three entries
+bundle in 70.8 s one after another, 76.0 s as concurrent bundle() calls in ONE node process (no gain — the
+compile is JS on one event loop), and 36.5 s as three node processes side by side.
+
+So the Bespoke batches run as concurrent render_batch processes AFTER the catalog batch (never beside it: that
+batch already holds every tab the box can afford). The Chrome tab budget is SPLIT between them, so the box
+holds no more tabs than one batch did. Every comp still gets its own entry, its own bundle and its own seqdir;
+`concurrency` only decides how many frames render at once, never what a frame is — the PNGs are the same.
+"""
+_BESPOKE_PARALLEL_MAX = 3
+_TABS = threading.local()   # a bespoke worker's share of the tab budget; unset = the whole budget
+
+
+def _batch_concurrency() -> int:
+    share = getattr(_TABS, "share", None)
+    return share if share is not None else _render_concurrency()
+
+
+def _run_bespoke(rd: Path, bespoke: list, tmp: Path) -> None:
+    """Every (entry, item, meta) of `bespoke` through its own render_batch, up to _BESPOKE_PARALLEL_MAX at
+    once (BESPOKE_PARALLEL_WHY). All land before this returns; the FIRST failure in plan order is re-raised."""
+    if not bespoke:
+        return
+    width = min(len(bespoke), _BESPOKE_PARALLEL_MAX)
+    if width == 1:
+        for n, (entry, item, _meta) in enumerate(bespoke):
+            _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
+        return
+    share = max(2, _render_concurrency() // width)
+
+    def one(n: int) -> None:
+        entry, item, _meta = bespoke[n]
+        _TABS.share = share
+        try:
+            _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
+        finally:
+            _TABS.share = None
+
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(max_workers=width, thread_name_prefix="bespoke") as ex:
+        futs = [ex.submit(one, n) for n in range(len(bespoke))]
+        cf.wait(futs)          # every batch lands (or fails) before anything is raised — no orphan node
+    for f in futs:
+        f.result()             # first fault in plan order wins
+
+
 def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) -> None:
-    conc = _render_concurrency()
+    conc = _batch_concurrency()
     cache = _offthread_cache_bytes()
     log = _items_log(spec_path)
     log.unlink(missing_ok=True)
@@ -411,9 +463,8 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
     if cat_items:
         _run_batch(rd, cat_items, tmp / "batch_catalog.json", None)
         metas += cat_metas
-    for n, (entry, item, meta) in enumerate(bespoke):
-        _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
-        metas.append(meta)
+    _run_bespoke(rd, bespoke, tmp)
+    metas += [meta for _entry, _item, meta in bespoke]
     return _pack(metas, tmp)
 
 
