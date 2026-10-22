@@ -163,24 +163,30 @@ def usable_cores() -> int:
     return max(1, int(cores))
 
 
-def _width_from(free_mb: float | None, threads: int) -> tuple[int, str]:
-    """The lane width and the sentence that explains it (LANE_SIZING_WHY). Pure — readings are injected."""
+def _width_from(free_mb: float | None, threads: int, held_mb: float = 0.0,
+                held_why: str = "") -> tuple[int, str]:
+    """The lane width and the sentence that explains it (LANE_SIZING_WHY). Pure — readings are injected.
+    `held_mb` = what ANOTHER lane of this process may hold on the card at the same time (infer_lanes.heavy_lane_mib
+    when the kinds coexist): the 056 v13 OOM was 4 lanes sized against the whole free card while align's weights
+    and forward sat beside them (4835 free − 512 − 2322 = 2001 → 4 lanes; align then took 1762 of it)."""
     if free_mb is None:
         return 1, "the card reports no free VRAM — one lane, still the GPU, never the CPU"
-    by_vram = max(1, int((free_mb - _VRAM_RESERVE_MB - _VRAM_WEIGHTS_MB) // _VRAM_PER_LANE_MB))
+    by_vram = max(1, int((free_mb - _VRAM_RESERVE_MB - _VRAM_WEIGHTS_MB - held_mb) // _VRAM_PER_LANE_MB))
+    held = f" − {held_mb:.0f} {held_why or 'held beside'}" if held_mb else ""
     return min(by_vram, max(1, threads)), (f"{free_mb:.0f} MiB free − {_VRAM_RESERVE_MB:.0f} reserve − "
-                                           f"{_VRAM_WEIGHTS_MB:.0f} weights → vram-bound={by_vram} "
+                                           f"{_VRAM_WEIGHTS_MB:.0f} weights{held} → vram-bound={by_vram} "
                                            f"({_VRAM_PER_LANE_MB:.0f} MiB per lane), host-bound={threads}")
 
 
-def lane_width() -> int:
-    """How many clip_rank envelopes may run at once on THIS card — derived from the card, never an env."""
+def lane_width(held_mb: float = 0.0, held_why: str = "") -> int:
+    """How many clip_rank envelopes may run at once on THIS card — derived from the card, never an env.
+    `held_mb`: the other weight-holding lane's measured peak when it runs beside this one (see _width_from)."""
     try:
         free = _free_vram_mb()
     except (OSError, ValueError) as e:
         _log(f"⚠ could not ask the card for free VRAM ({type(e).__name__}: {e}) — one lane, still the GPU")
         return 1
-    n, why = _width_from(free, _host_threads())
+    n, why = _width_from(free, _host_threads(), held_mb, held_why)
     _log(f"{n} concurrent clip_rank lane(s): {why}")
     return n
 

@@ -1419,13 +1419,24 @@ def main() -> None:
         _log_gpu_status()
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
-    from .infer_lanes import card_holds_both_kinds
-    rank_width = lane_width()
-    if {"align", "clip_rank"} <= served:
-        kinds_coexist, residency_why = card_holds_both_kinds()
+    from .infer_lanes import RENDER_HEADROOM_MIB, card_holds_both_kinds, heavy_lane_mib
+    heavy = served & {"align", "person_matte"}
+    if "clip_rank" in served and heavy:
+        kinds_coexist, residency_why = card_holds_both_kinds(served=served)
     else:
         kinds_coexist, residency_why = True, "this pod serves at most one weight-holding kind"
     _log(f"infer kinds {'run in parallel' if kinds_coexist else 'take turns on one lane'}: {residency_why}")
+    # the rank lanes share the card with whatever the heavy lane can hold BESIDE them (infer_lanes
+    # HEAVY_LANE_MEASURED_WHY); when the kinds take turns, the idle kind's weights are dropped first, so the
+    # lanes own the card alone
+    # ... and a render op (one NVENC session, the boot floor's own RENDER_HEADROOM_MIB) is dispatched beside them
+    # either way, so the lanes leave it too — a contour-dry pod renders nothing and keeps no such headroom
+    render_mib = 0.0 if _dry_pod() else RENDER_HEADROOM_MIB
+    if kinds_coexist and "clip_rank" in served and heavy:
+        rank_width = lane_width(heavy_lane_mib(served) + render_mib,
+                                "heavy lane beside (align resident + its peak) + one NVENC render session")
+    else:
+        rank_width = lane_width(render_mib, "one NVENC render session (infer_lanes.RENDER_HEADROOM_WHY)")
     capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width(),
                                 vram_total_mb=vram_total_mb(),
                                 artifact_fetch_workers=range_fetch_width(),

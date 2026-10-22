@@ -59,11 +59,12 @@ def test_a_pod_serves_and_sizes_only_its_given_infer_kinds(monkeypatch, tmp_path
     # the floor follows the served set, plus one NVENC session for the render ops every full pod serves
     # (infer_lanes.RENDER_HEADROOM_WHY)
     assert agent_main.boot_vram_floor_mib({"clip_rank", "align"}) == 4208.0
-    assert agent_main.boot_vram_floor_mib({"align"}) == 2972.0
+    # align = 1244 resident + 518 for one 20 s window (infer_lanes.HEAVY_LANE_MEASURED_WHY) + 960 NVENC + 512
+    assert agent_main.boot_vram_floor_mib({"align"}) == 3234.0
     assert agent_main.boot_vram_floor_mib({"face_probe"}) == 1472.0
     assert agent_main.boot_vram_floor_mib(set()) == 1472.0
     assert agent_main.boot_vram_floor_mib({"clip_rank", "align"}, render=False) == 3248.0
-    assert agent_main.boot_vram_floor_mib({"align"}, render=False) == 2012.0
+    assert agent_main.boot_vram_floor_mib({"align"}, render=False) == 2274.0
     assert agent_main.boot_vram_floor_mib({"face_probe"}, render=False) is None
     assert agent_main.boot_vram_floor_mib(set(), render=False) is None
 

@@ -29,47 +29,83 @@ ordering is the pool's and the bound is the envelope budget the box already gran
 unreadable card is treated as narrow, because serialising costs wall clock and guessing costs the envelope.
 """
 
+HEAVY_LANE_MEASURED_WHY = """
+THE HEAVY LANE NEXT TO clip_rank, MEASURED ON THE CARD THAT OOM'd (056 v13, 2026-10-22).
+
+The pod's own classes in the pod image (09adca1, torch 2.11+cu128) on the dev RTX 2060, card-wide nvidia-smi
+sampled every 20 ms (the number an OOM is about); the bench script and its JSON results are kept engine-side:
+  align (wav2vec2 xlsr-56)   weights resident 1244 MiB · one 20 s window forward +518 MiB over that
+  clip_rank (SigLIP so400m)  2322 MiB weights + context · 12-tile lanes at once: 1 → +354, 2 → +726, 3 → +864,
+                              4 → +1040 MiB (≤ 414 per lane: the per-lane figure holds)
+  person_matte (RVM 1080x1920, ds 0.25) first-frame autotune +958..1010 MiB over everything already resident
+                              (+1094 over an idle card, the figure below), 16 MiB weights, 228 between videos
+  align + SigLIP + 2 lanes running together: 4310 MiB over the idle card.
+The old floor said align = 1500 (weights + forward) and sized the clip_rank lanes against the WHOLE free card, as
+if align were never there: 4835 free → 4 lanes, + align 1762 → over the card, «Tried to allocate 72 MiB».
+Every kind's service stays cached, so on a card where the kinds coexist align's weights are resident while
+person_matte (same one-wide lane) autotunes: the heavy lane holds align_resident + max(align forward + RVM
+resident, RVM peak). That is subtracted from the clip_rank lane budget, and it is the second term of the
+coexist floor. A card under that floor serialises the kinds with the idle weights dropped (never the CPU).
+"""
+ALIGN_RESIDENT_MIB = 1244.0     # measured (HEAVY_LANE_MEASURED_WHY)
+ALIGN_FORWARD_MIB = 518.0       # one 20 s window (the engine aligns in 20 s chunks)
+PERSON_MATTE_PEAK_MIB = 1100.0  # +1094 over an idle card, first-frame cudnn autotune
+PERSON_MATTE_RESIDENT_MIB = 228.0
+
 KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY_WHY for each number
-    "align": 1500.0,
+    "align": ALIGN_RESIDENT_MIB + ALIGN_FORWARD_MIB,
     "clip_rank": _VRAM_WEIGHTS_MB + _VRAM_PER_LANE_MB,
     "face_probe": 0.0,
     # RVM fp16 at 1080x1920: nvidia-smi peak +1094 MiB over the idle card during the first frame's cudnn autotune
     # (torch max reserved 990), +228 MiB resident between videos — sized at the peak, the moment it must fit.
     # It rides the one-wide heavy lane, so it never runs beside align; it CAN run beside a clip_rank lane.
-    "person_matte": 1100.0,
+    "person_matte": PERSON_MATTE_PEAK_MIB,
 }
 RESERVE_MIB = _VRAM_RESERVE_MB
 
 
-def coresident_mib() -> float:
-    """Free MiB a card must report for both weight-holding kinds to be resident together (4748 here; the
-    engine's own VRAM-budget concurrent-residency figure reads 4752 off its own rounding of the same measurements).
-    person_matte is not added: it shares align's one-wide lane, and its 228 MiB between videos sits inside the
-    reserve; the two lanes' peak overlap is clip_rank + max(align, person_matte) = clip_rank + align."""
-    return KIND_VRAM_MIB["align"] + KIND_VRAM_MIB["clip_rank"] + RESERVE_MIB
+def heavy_lane_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
+    """The peak the one-wide heavy lane can hold beside a clip_rank lane (HEAVY_LANE_MEASURED_WHY): align's weights
+    stay resident once loaded, and the lane's transient is align's forward (+ RVM's cached weights) or RVM's
+    autotune peak, whichever is larger. `served` None = every kind."""
+    kinds = set(KIND_VRAM_MIB) if served is None else set(served)
+    align = "align" in kinds
+    matte = "person_matte" in kinds
+    resident = ALIGN_RESIDENT_MIB if align else 0.0
+    transient = max((ALIGN_FORWARD_MIB + (PERSON_MATTE_RESIDENT_MIB if matte else 0.0)) if align else 0.0,
+                    PERSON_MATTE_PEAK_MIB if matte else 0.0)
+    return resident + transient
 
 
-def kinds_fit_together(free_mib: float | None) -> tuple[bool, str]:
+def coresident_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
+    """Free MiB a card must report for clip_rank (weights + one lane) to run beside the heavy lane:
+    2736 + heavy_lane_mib + 512 — 5592 with every kind served (2736 + 1244 + max(518 + 228, 1100) + 512)."""
+    return KIND_VRAM_MIB["clip_rank"] + heavy_lane_mib(served) + RESERVE_MIB
+
+
+def kinds_fit_together(free_mib: float | None, served: "frozenset[str] | set[str] | None" = None
+                       ) -> tuple[bool, str]:
     """May align and clip_rank be resident at once on a card reporting `free_mib`, and why. Pure — the reading
     is injected."""
-    need = coresident_mib()
+    need = coresident_mib(served)
     if free_mib is None:
         return False, ("the card reports no free VRAM — one infer kind resident at a time, still the GPU, "
                        "never the CPU")
     if free_mib >= need:
-        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for align+clip_rank+reserve — both kinds may "
-                      f"hold the card, the lanes stay parallel")
-    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for align+clip_rank+reserve — the kinds "
+        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for clip_rank+heavy lane+reserve — both "
+                      f"kinds may hold the card, the lanes stay parallel")
+    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for clip_rank+heavy lane+reserve — the kinds "
                    f"serialise on one lane and the idle kind's weights are dropped")
 
 
-def card_holds_both_kinds(probe: Callable[[], float | None] | None = None) -> tuple[bool, str]:
+def card_holds_both_kinds(probe: Callable[[], float | None] | None = None,
+                          served: "frozenset[str] | set[str] | None" = None) -> tuple[bool, str]:
     """The same answer against the LIVE card. A probe failure is a reading, not a raise (this is a budget)."""
     try:
         free = (probe or _free_vram_mb)()
     except (OSError, ValueError) as e:
         return False, f"could not ask the card for free VRAM ({type(e).__name__}: {e}) — one kind at a time"
-    return kinds_fit_together(free)
+    return kinds_fit_together(free, served)
 
 
 def release_other_kinds(kind: str, caches: Mapping[str, dict[Any, Any]]) -> list[str]:
