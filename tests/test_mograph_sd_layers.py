@@ -1,5 +1,6 @@
 """super-director v13 layout layers on the pod (podagent/mograph.py `sdFace`): the head plate is staged ONCE into the
 bundle and handed to every `SdLayer` section that asks for it; nothing changes for a section that does not."""
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -75,9 +76,10 @@ def test_a_layer_item_carries_its_tag_and_deadline(tmp_path, monkeypatch):
             SimpleNamespace(comp="Stat", start=0.0, glass=False, props={"durationInSeconds": 1.0})]
     mograph._render_layers(secs, None, {}, tmp_path)
     a, b, c = got["items"]
-    assert (a["tag"], a["wallS"]) == ("sd13_m_m8", 60.0 + 60)
-    assert (b["tag"], b["wallS"]) == ("sd13_frame_c1", 60.0 + 30)
-    assert "tag" not in c and "wallS" not in c                 # a legacy section is untouched
+    # a NO-PROGRESS deadline, the same for every layer whatever its length (mograph.SD_ITEM_STALL_S, measured)
+    assert (a["tag"], a["stallS"]) == ("sd13_m_m8", 51.4) and "wallS" not in a
+    assert (b["tag"], b["stallS"]) == ("sd13_frame_c1", 51.4)
+    assert "tag" not in c and "stallS" not in c                # a legacy section is untouched
 
 
 def test_the_wall_names_the_layer_in_flight(tmp_path, monkeypatch):
@@ -135,3 +137,26 @@ def test_a_failed_layer_is_refused_by_id_even_with_leftover_frames(tmp_path, mon
     monkeypatch.setattr(mograph, "_oom_count", lambda: None)
     with pytest.raises(RuntimeError, match=r"sd13_frame_c2 \(undefined was passed to staticFile\(\)\)"):
         mograph._run_batch(tmp_path, [{"comp": "SplitScreen", "tag": "sd13_frame_c2", "seqdir": str(seq)}], spec, None)
+
+
+def test_a_panel_clip_is_cut_to_its_box_keeping_its_own_clock(tmp_path):
+    """PANEL_NORMALISE_WHY: live 056 v13 drew a side_shift panel from a 3840x2160 one-keyframe original at ~1.7 s/frame.
+    The clip is scaled to COVER the panel box and centre-cropped to it, with the source's own timestamps (no -ss, no fps
+    resample: both moved frames by one against the raw on the stand) and clipStart left alone."""
+    argv = mograph.panel_normalise_argv(Path("/w/in.mp4"), 0.3, 4.133, (540.0, 1920.0), Path("/w/out.mp4"))
+    vf = argv[argv.index("-vf") + 1]
+    assert "scale=540:1920:force_original_aspect_ratio=increase" in vf and "crop=540:1920" in vf
+    assert "fps=" not in vf and "-ss" not in argv and argv[argv.index("-t") + 1] == f"{0.3 + 4.133 + 2 / 30:.3f}"
+    assert argv[argv.index("-fps_mode") + 1] == "passthrough" and argv[argv.index("-c:v") + 1] == "h264_nvenc"
+    # odd box sides round to the encoder's even grid
+    argv = mograph.panel_normalise_argv(Path("a"), 0, 1, (907.0, 490.0), Path("b"))
+    assert "crop=908:490" in argv[argv.index("-vf") + 1]
+
+
+def test_only_a_layout_video_panel_is_normalised(tmp_path):
+    lay = {"id": "x", "kind": "layout", "props": {"kind": "image"}}
+    assert mograph.normalise_panel_clip({"src": "a.jpg", "layer": lay}, tmp_path, 0) == {"src": "a.jpg", "layer": lay}
+    lib = {"id": "y", "kind": "library", "props": {}}
+    assert mograph.normalise_panel_clip({"layer": lib}, tmp_path, 0) == {"layer": lib}
+    missing = {"src": "media/none.mp4", "layer": {"id": "z", "kind": "layout", "props": {"kind": "video"}}}
+    assert mograph.normalise_panel_clip(missing, tmp_path, 0) == missing   # the comp names its own media error

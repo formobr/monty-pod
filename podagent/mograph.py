@@ -357,11 +357,21 @@ SD_FACE_KEY, SD_FACE_BASE = "sdFace", "base"
 _SD_FACE_DIR = "_sd"
 _SD_LAYER_COMP = "SdLayer"
 _SD_LAYER_TAIL_S = 2.0       # a long (persistent) layer's own ceiling: its length + this, never under the default
-# A v13 layer's render DEADLINE (render_batch.mjs `wallS`): a hang-ender, not a budget. Measured on the stand
-# (sd_stand L4, a loaded 16-core box, 10 tabs): 0.14-0.4 s per frame for library / engine / layout layers; the
-# deadline sits ~2.5x above the slowest of those plus the bundle-warm first item, so only a stuck item reaches it.
-SD_ITEM_WALL_BASE_S = 60.0
-SD_ITEM_WALL_PER_FRAME_S = 1.0
+# A v13 layer's render DEADLINE is a NO-PROGRESS deadline (render_batch.mjs `stallS`): the item is cancelled, by name,
+# only when no new frame has landed for this long — a hang-ender that never kills slow work that is moving. The live
+# 056 v13 final had a 60 s + 1 s/frame WALL cancel a side_shift layer at frame 108/124 while it rendered.
+# Derived from measurement (the panel bench, 2026-10-23: the pod's own _render_layers → render_batch on the 2060,
+# the layer that failed, one item per run, render_batch's own `firstFrameS` / `maxGapS`):
+#   worst wait seen         5.14 s — start → first frame of a blur_bg layer in the stand's L4 batch (run r3d-panels-norm2,
+#                                     10 tabs); that side_shift over its raw 4K one-keyframe panel clip: first frame
+#                                     3.4 s, max gap between frames 2.71 s, 52 s for 124 frames (normalised: 1.64 / 0.76)
+#   load factor            ×4      — the same layer on the loaded live pod: 108 frames in 184 s = 1.70 s/frame,
+#                                     vs 0.42 s/frame on the idle stand
+#   margin                 ×2.5    — the wall's own margin over the slowest measured layer (sd_stand L4)
+SD_STALL_WORST_WAIT_S = 5.14
+SD_STALL_LOAD_X = 4.0
+SD_STALL_MARGIN_X = 2.5
+SD_ITEM_STALL_S = round(SD_STALL_WORST_WAIT_S * SD_STALL_LOAD_X * SD_STALL_MARGIN_X, 1)   # 51.4 s
 
 
 def sd_layer_tag(props: dict) -> str | None:
@@ -380,9 +390,10 @@ def sd_layer_z(props: dict) -> int | None:
     return int(z) if isinstance(z, (int, float)) and not isinstance(z, bool) else None
 
 
-def sd_item_wall_s(props: dict) -> float:
-    frames = math.ceil(float(props.get("durationInSeconds") or 0.0) * FPS)
-    return SD_ITEM_WALL_BASE_S + SD_ITEM_WALL_PER_FRAME_S * frames
+def sd_item_stall_s(_props: dict | None = None) -> float:
+    """The no-progress deadline of one v13 layer (SD_ITEM_STALL_S): a frame-rate fact, not a length — a long layer
+    that keeps landing frames is never cancelled; its absolute ceiling stays `maxSeconds` / the batch wall."""
+    return SD_ITEM_STALL_S
 
 
 def _stage_sd_face(rd: Path, base_path: Path) -> str:
@@ -397,6 +408,57 @@ def _stage_sd_face(rd: Path, base_path: Path) -> str:
         except OSError:
             shutil.copy2(base_path, dest)
     return rel
+
+
+PANEL_NORMALISE_WHY = """
+A LAYOUT'S PANEL CLIP IS DECODED ONCE, AT THE PANEL'S SIZE, BEFORE THE BROWSER SEES IT.
+
+Live 056 v13 final: the b-roll lane downloaded the approved pexels original for a side_shift panel — 3840x2160 h264
+High, 22 Mb/s, 24 fps, ONE keyframe — and OffthreadVideo extracted every one of the layer's 124 frames out of it:
+~1.7 s per frame against 0.14-0.4 s for every other layer (the stand's L4), cancelled at 108/124. The panel only ever
+shows the clip COVER-fitted into its box (the layout's panel box, objectFit cover), so the clip is cut
+here to exactly that: the first clipStart + the layer's length (+ a frame), scaled to cover the box and centre-cropped
+to it — the same pixels a cover fit of the original shows (cover = scale-to-cover + centre crop) — with the source's
+OWN timestamps and frame rate (a 24→30 resample or a start-trim moved some frames by one against the preview on the
+stand), short GOP, h264_nvenc (the pod refuses to boot without it). clipStart stays as it was.
+"""
+PANEL_DIR = "_sd"
+
+
+def panel_normalise_argv(src: Path, start: float, dur: float, box_wh: tuple[int, int], out: Path) -> list[str]:
+    """Pure: the ffmpeg argv that turns a panel clip into its box (PANEL_NORMALISE_WHY)."""
+    w, h = (max(2, int(round(v / 2)) * 2) for v in box_wh)
+    vf = f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},setsar=1,format=yuv420p"
+    return ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", f"{max(0.0, start) + dur + 2.0 / FPS:.3f}",
+            "-an", "-vf", vf, "-fps_mode", "passthrough", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18",
+            "-g", str(FPS // 2), "-bf", "0", *_BT709, str(out)]
+
+
+def normalise_panel_clip(props: dict, rd: Path, i: int) -> dict:
+    """An SdLayer LAYOUT section with a video `src`: the clip cut to its panel box (PANEL_NORMALISE_WHY) and `src`
+    rewritten to it. Anything else passes through. A failed normalise is named."""
+    layer = props.get("layer")
+    src = props.get("src")
+    if not (isinstance(layer, dict) and layer.get("kind") == "layout" and isinstance(src, str) and src):
+        return props
+    lp = dict(layer.get("props") or {})
+    if lp.get("kind") == "image":
+        return props
+    path = rd / "public" / src
+    if not path.is_file():
+        return props        # the comp's own media error names it; nothing to cut
+    box = (layer.get("panel") or {}).get("box") or [0, 0, 1080, 1920]
+    rel = f"{PANEL_DIR}/panel_{i}.mp4"
+    out = rd / "public" / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    dur = float(props.get("durationInSeconds") or layer.get("dur") or 0.0)
+    r = subprocess.run(panel_normalise_argv(path, float(lp.get("clipStart") or 0.0), dur,
+                                            (float(box[2]), float(box[3])), out),
+                       capture_output=True, text=True, timeout=max(60.0, 20.0 * dur))
+    if r.returncode != 0 or not out.is_file():
+        raise RuntimeError(f"mograph: v13 layer {layer.get('id')} panel clip {src} could not be cut to its "
+                           f"{int(box[2])}x{int(box[3])} box: {r.stderr.strip()[-300:]}")
+    return {**props, "src": rel}
 
 
 def sd_face_props(props: dict, start: float, face_rel: str | None) -> dict:
@@ -440,11 +502,14 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
         meta = {"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass),
                 "head_below": bool((sec.props or {}).get("headBelow")),
                 "backing": (sec.props or {}).get("backing"), "z": sd_layer_z(sec.props or {})}
-        item = {"comp": sec.comp, "props": sd_face_props(_props(sec), sec.start, face_rel), "seqdir": str(seqdir)}
+        props = _props(sec)
+        if sec.comp == _SD_LAYER_COMP:
+            props = normalise_panel_clip(props, rd, i)
+        item = {"comp": sec.comp, "props": sd_face_props(props, sec.start, face_rel), "seqdir": str(seqdir)}
         if max_seconds is not None:
             item["maxSeconds"] = max_seconds
         if (tag := sd_layer_tag(sec.props or {})) is not None:
-            item["tag"], item["wallS"] = tag, sd_item_wall_s(sec.props or {})
+            item["tag"], item["stallS"] = tag, sd_item_stall_s(sec.props or {})
         if sec.comp == _SD_LAYER_COMP:
             # a persistent layer can outlast render_batch's 120 s default; its own length is its ceiling
             need = float((sec.props or {}).get("durationInSeconds") or 0.0) + _SD_LAYER_TAIL_S
