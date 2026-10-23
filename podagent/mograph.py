@@ -523,6 +523,136 @@ def person_windows(windows: list[tuple[float, float]], cut: list[tuple[float, fl
     return [(a, b) for a, b in out if b - a > 1e-6]
 
 
+# ── PERSON STYLES (super-director R6, spec overlays.person_matte.styles) ──────────────────────────────────────
+# How the person plane is drawn on a style's windows — the twin of the preview player's SVG filter, operation for
+# operation: ring = the alpha dilated `width` times by a 3x3 max (`dilation`: a (2w+1) square,
+# SVG feMorphology dilate radius w), glow = `gblur` sigma g of that dilated alpha (feGaussianBlur stdDeviation g),
+# shadow = gblur of the ringed alpha, offset, black × opacity; gray = U = V = 128 (the BT.709 luma the SVG
+# saturate(0) keeps); bottom → top: shadow, glow, ring, the person. The heavy filters carry `enable` = the style's
+# windows, so outside them the frames pass through untouched (and are not shown: every overlay is gated too).
+
+
+def _cut(spans: list[tuple[float, float]], cut: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return person_windows(spans, cut)
+
+
+def _clip(spans: list[tuple[float, float]], within: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    out = []
+    for a, b in spans:
+        for c, d in within:
+            lo, hi = max(float(a), float(c)), min(float(b), float(d))
+            if hi - lo > 1e-6:
+                out.append((lo, hi))
+    return out
+
+
+def yuv709(hex_color: str) -> tuple[int, int, int]:
+    """#rrggbb → limited-range BT.709 (Y, Cb, Cr) — the matrix the master is tagged with (render._BT709)."""
+    r, g, b = (int(hex_color[k:k + 2], 16) / 255.0 for k in (1, 3, 5))
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return (round(16 + 219 * y), round(128 + 224 * (b - y) / 1.8556), round(128 + 224 * (r - y) / 1.5748))
+
+
+def style_windows(styles: list[dict], windows: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+    """Each style's own windows inside the plane's `windows` (already minus the b-roll cutaways) — a style given
+    later in the list wins where two overlap (the engine orders them by layer start, as the preview does)."""
+    taken: list[tuple[float, float]] = []
+    out: list[list[tuple[float, float]]] = [[] for _ in styles]
+    for k in range(len(styles) - 1, -1, -1):
+        own = _clip([(float(a), float(b)) for a, b in styles[k]["windows"]], windows)
+        out[k] = _cut(own, taken)
+        taken += [(float(a), float(b)) for a, b in styles[k]["windows"]]
+    return out
+
+
+def _enable(windows: list[tuple[float, float]], fps: float) -> str:
+    return "+".join(_frames.between(*_frames.frame_range(a, b, fps), fps) for a, b in windows)
+
+
+def frame_gray_chain(base: str, styles: list[dict], windows: list[tuple[float, float]], fps: float,
+                     out: str) -> str | None:
+    """Pure: the composite under the person greyed on the `frame_gray` styles' windows (hue s=0, timeline-gated),
+    None when no style asks for it — the preview greys its base video on the same spans."""
+    gw = [w for st, ws in zip(styles, style_windows(styles, windows), strict=True) if st.get("frame_gray") for w in ws]
+    if not gw:
+        return None
+    return f"[{base}]hue=s=0:enable='{_enable(gw, fps)}'[{out}]"
+
+
+def person_style_overlays(base: str, plane: str, windows: list[tuple[float, float]], styles: list[dict] | None,
+                          fps: float, out: str) -> str:
+    """Pure: the person plane over [base] — with no styles exactly person_overlay (the R4 graph); with styles the
+    plane is split: the plain cut-out on `windows` minus every style window, each style's look on its own windows."""
+    if not styles:
+        return person_overlay(base, plane, windows, fps, out)
+    per = style_windows(styles, windows)
+    plain = _cut(list(windows), [w for ws in per for w in ws])
+    branches = ([("plain", None, plain)] if plain else []) + [
+        (f"s{k}", st, ws) for k, (st, ws) in enumerate(zip(styles, per, strict=True)) if ws]
+    if not branches:
+        return person_overlay(base, plane, windows, fps, out)
+    parts = [f"[{plane}]split={len(branches)}" + "".join(f"[pp{tag}]" for tag, _, _ in branches)
+             if len(branches) > 1 else f"[{plane}]null[pp{branches[0][0]}]"]
+    link = base
+    n = 0
+
+    def over(src: str, en: str, xy: str = "") -> None:
+        nonlocal link, n
+        nxt = f"psv{n}"
+        n += 1
+        parts.append(f"[{link}][{src}]overlay={xy}enable='{en}':eof_action=pass:format=yuv420[{nxt}]")
+        link = nxt
+
+    for tag, st, ws in branches:
+        en = _enable(ws, fps)
+        src = f"pp{tag}"
+        if st is None:
+            over(src, en)
+            continue
+        ring, shadow = st.get("ring"), st.get("shadow")
+        glow = float(ring.get("glow") or 0) if ring else 0.0
+        masks = (1 if ring else 0) + (1 if glow else 0) + (1 if shadow else 0)
+        colours = masks
+        outs = ["p"] + (["a"] if masks else []) + [f"c{j}" for j in range(colours)]
+        parts.append(f"[{src}]split={len(outs)}" + "".join(f"[{tag}{o}]" for o in outs) if len(outs) > 1
+                     else f"[{src}]null[{tag}p]")
+        person = f"{tag}p"
+        if st.get("gray"):
+            parts.append(f"[{tag}p]lutyuv=u=128:v=128[{tag}pg]")
+            person = f"{tag}pg"
+        if masks:
+            dil = ",".join([f"dilation=enable='{en}'"] * int(ring["width"])) if ring else ""
+            parts.append(f"[{tag}a]alphaextract,format=gray" + (f",{dil}" if dil else "")
+                         + (f",split={masks}" if masks > 1 else "") + "".join(f"[{tag}m{j}]" for j in range(masks)))
+        layers: list[tuple[str, str]] = []       # (pad, overlay xy) bottom → top
+        m = c = 0
+        if shadow:
+            y0, u0, v0 = yuv709("#000000")
+            op = float(shadow["opacity"])
+            blur = float(shadow["blur"])
+            parts.append(f"[{tag}m{m}]" + (f"gblur=sigma={blur:g}:steps=3:enable='{en}'," if blur > 0 else "")
+                         + f"lut=c0=val*{op:g}[{tag}sm]")
+            parts.append(f"[{tag}c{c}]lutyuv=y={y0}:u={u0}:v={v0}[{tag}sc];[{tag}sc][{tag}sm]alphamerge[{tag}sh]")
+            layers.append((f"{tag}sh", f"x={int(shadow['dx'])}:y={int(shadow['dy'])}:"))
+            m += 1
+            c += 1
+        if ring:
+            y0, u0, v0 = yuv709(str(ring["color"]))
+            if glow:
+                parts.append(f"[{tag}m{m}]gblur=sigma={glow:g}:steps=3:enable='{en}'[{tag}gm]")
+                parts.append(f"[{tag}c{c}]lutyuv=y={y0}:u={u0}:v={v0}[{tag}gc];[{tag}gc][{tag}gm]alphamerge[{tag}gl]")
+                layers.append((f"{tag}gl", ""))
+                m += 1
+                c += 1
+            parts.append(f"[{tag}c{c}]lutyuv=y={y0}:u={u0}:v={v0}[{tag}rc];[{tag}rc][{tag}m{m}]alphamerge[{tag}rg]")
+            layers.append((f"{tag}rg", ""))
+        for pad, xy in layers:
+            over(pad, en, xy)
+        over(person, en)
+    parts.append(f"[{link}]null[{out}]")
+    return ";".join(parts)
+
+
 # ── MARK BACKING (the final half) ────────────────────────────────────────────────────────────────────────
 # A brand mark gets its background under ITSELF, not under the whole frame: frosted glass
 # scoped to the mark's box, or a shadow when the mark is light enough to read alone. The rect is NOT computed

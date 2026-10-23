@@ -58,6 +58,7 @@ V_LOGO = "vlogo"
 V_WATERMARK, A_WATERMARK = "vwatermark", "awatermark"
 V_MASTER = "vmaster"
 V_MOG_BELOW, V_PERSON_PLANE, V_PERSON = "vmogbelow", "vpersonplane", "vperson"
+V_FRAME_GRAY = "vframegray"   # R6: the composite greyed under the person (person_matte.styles frame_gray)
 V_TAP_LOGO = "vtaplogo"
 
 
@@ -621,6 +622,11 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
     if windows:
         # sd13 R4: sections under the person (z < 3) → the person plane → the rest, in that order
         below, above = _mograph.split_by_person(list(p.layers))
+        styles = [st.model_dump() for st in pm.styles] if pm.styles else None
+        if styles and (gray := _mograph.frame_gray_chain(vlink, styles, windows, fps, V_FRAME_GRAY)):
+            # R6 frame_gray: the composite under the person greyed on those windows, before anything is drawn on it
+            chains.append(gray)
+            vlink = V_FRAME_GRAY
         if below:
             below_v = [f"{inputs.add(Path(lay['mov']))}:v" for lay in below]
             frag, last = _mograph.overlay_filtergraph(below, fps=fps, base=vlink, layers_v=below_v)
@@ -630,7 +636,7 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         alpha_n = inputs.add(p.input_paths[pm.alpha])
         segs = [(_render._num(sg.in_), _render._num(sg.out), _render._num(sg.speed)) for sg in spec.timeline.segments]
         chains.append(_mograph.person_plane_chain(f"{plate_n}:v", f"{alpha_n}:v", segs, w, h, V_PERSON_PLANE))
-        chains.append(_mograph.person_overlay(vlink, V_PERSON_PLANE, windows, fps, V_PERSON))
+        chains.append(_mograph.person_style_overlays(vlink, V_PERSON_PLANE, windows, styles, fps, V_PERSON))
         vlink = V_PERSON
         layers_above = above
     else:

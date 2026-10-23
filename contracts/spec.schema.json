@@ -1094,6 +1094,105 @@
             "maxItems": 2,
             "items": false
           }
+        },
+        "styles": {
+          "type": "array",
+          "minItems": 1,
+          "description": "super-director R6 (optional; absent = the plain cut-out, the R4 graph unchanged): how the person plane is drawn on each style's `windows` (master clock seconds, inside person_matte.windows; b-roll cutaway windows are cut out like the plane's own). `gray` = the plane in black and white (U=V=128), `frame_gray` = the composite under it too, `ring` = the alpha dilated `width` px filled with `color` (+ a Gaussian `glow` halo), `shadow` = a blurred offset black copy — drawn under the plane in the order shadow, glow, ring.",
+          "items": {
+            "$ref": "#/$defs/person_style"
+          }
+        }
+      }
+    },
+    "person_style": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "windows"
+      ],
+      "properties": {
+        "windows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number",
+                "minimum": 0
+              },
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2,
+            "items": false
+          }
+        },
+        "gray": {
+          "type": "boolean"
+        },
+        "frame_gray": {
+          "type": "boolean"
+        },
+        "ring": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "color",
+            "width"
+          ],
+          "properties": {
+            "color": {
+              "type": "string",
+              "pattern": "^#[0-9a-fA-F]{6}$"
+            },
+            "width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "glow": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 40
+            }
+          }
+        },
+        "shadow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "dx",
+            "dy",
+            "blur",
+            "opacity"
+          ],
+          "properties": {
+            "dx": {
+              "type": "integer",
+              "minimum": -64,
+              "maximum": 64
+            },
+            "dy": {
+              "type": "integer",
+              "minimum": -64,
+              "maximum": 64
+            },
+            "blur": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 40
+            },
+            "opacity": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            }
+          }
         }
       }
     }

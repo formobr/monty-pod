@@ -377,6 +377,49 @@ class SpecFinalize(BaseModel):
     loudnorm: SpecLoudnorm | None = None
 
 
+class SpecPersonRing(BaseModel):
+    """A contour around the person plane: the alpha dilated `width` px ((2w+1) square max — ffmpeg `dilation` x w),
+    filled with `color` (#rrggbb); `glow` = Gaussian sigma px of a halo of the same colour (0 = none)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    width: int = Field(ge=1, le=32)
+    glow: float = Field(default=0.0, ge=0, le=40)
+
+
+class SpecPersonShadow(BaseModel):
+    """A drop shadow of the (ringed) person plane: offset dx/dy px, Gaussian sigma `blur` px, black at `opacity`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dx: int = Field(ge=-64, le=64)
+    dy: int = Field(ge=-64, le=64)
+    blur: float = Field(ge=0, le=40)
+    opacity: float = Field(gt=0, le=1)
+
+
+class SpecPersonStyle(BaseModel):
+    """super-director R6: how the person plane is drawn on `windows` (master clock, seconds, each inside
+    person_matte.windows; b-roll cutaway windows are cut out like the plane's own): `gray` = the plane in black and white
+    (U = V = 128), `frame_gray` = the composite under it too, `ring` / `shadow` = drawn under the plane."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    windows: list[tuple[float, float]] = Field(min_length=1)
+    gray: bool = False
+    frame_gray: bool = False
+    ring: SpecPersonRing | None = None
+    shadow: SpecPersonShadow | None = None
+
+    @model_validator(mode="after")
+    def _windows_forward(self) -> "SpecPersonStyle":
+        for a, b in self.windows:
+            if a < 0 or b <= a:
+                raise ValueError(f"person_matte style window [{a}, {b}] must be 0 <= start < end")
+        return self
+
+
 class SpecPersonMatte(BaseModel):
     """super-director v13 R4 person plane (contracts/spec.schema.json `person_matte`): `alpha` = the inputs[].id of
     the gray FFV1 alpha, frame-for-frame with timeline.segments[0].src; `windows` = [start, end) seconds on the master
@@ -386,6 +429,8 @@ class SpecPersonMatte(BaseModel):
 
     alpha: str = Field(min_length=1)
     windows: list[tuple[float, float]] = Field(min_length=1)
+    # R6: the plane's looks per window (absent = the plain cut-out everywhere — the R4 graph, byte-identical)
+    styles: list[SpecPersonStyle] | None = None
 
     @model_validator(mode="after")
     def _windows_forward(self) -> "SpecPersonMatte":
