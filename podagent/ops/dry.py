@@ -177,16 +177,31 @@ def _content_input(op: registry.Op, inputs: dict[str, Path]) -> Path | None:
     return None
 
 
-def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None) -> None:
+def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None, dur: float | None = None) -> None:
+    # `dur` (a cut's own reported length) pins the placeholder's length; None keeps each branch's own length.
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.suffix.lower() not in _VIDEO_EXT_ARGS:
         raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "video")
+    secs = f"{dur:.6f}" if dur is not None else "1"
+    # At r=1 a colour source's last frame carries a full 1s duration, so e.g. d=5.656 rounds the
+    # container's reported length UP to 6.0 regardless of a trailing -t — a dry replay would then probe
+    # a length the live run never recorded. r=30 keeps that rounding under one 1/30s frame (the tolerance
+    # every caller of a `dur`-pinned placeholder checks against); d=None (no cut length to pin) keeps the
+    # pre-existing r=1:d=1 one-second placeholder untouched.
+    rate = 30 if dur is not None else 1
     if audio_src is None:
         # No video-kind input bound at all — nothing real to reflect, stays fully synthetic.
         args = _VIDEO_EXT_ARGS[dst.suffix.lower()]
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
-               "-f", "lavfi", "-i", dry_tone_lavfi(dur=1.0), "-t", "1", *args, str(dst)]
+               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}:d={secs}",
+               "-f", "lavfi", "-i", dry_tone_lavfi(dur=float(secs)), "-t", secs, *args, str(dst)]
+    elif _has_audio_stream(audio_src) and dur is not None:
+        # The real audio trimmed (or silence-padded) to the cut's length, so audio and video both end there.
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-i", str(audio_src),
+               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}",
+               "-map", "1:v", "-map", "0:a", "-af", "apad",
+               *_VIDEO_EXT_ARGS[dst.suffix.lower()], "-t", secs, str(dst)]
     elif _has_audio_stream(audio_src):
         # `-shortest` against an infinite colour source sizes the output to the real audio's own duration.
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -197,8 +212,11 @@ def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None) -> N
                "-c:a", "copy", "-shortest", str(dst)]
     else:
         # Real input, genuinely no audio track — the placeholder gets none, never a fabricated anullsrc.
+        # `-t` must also cap THIS branch (the previous fix missed it): without it the lavfi colour
+        # source's own `d=` is the only cap, which at r=1 rounds up (see `rate` above).
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
+               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}:d={secs}",
+               "-t", secs,
                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
 
@@ -306,6 +324,14 @@ def _synth_range_filmstrip_receipt(params: dict[str, Any], _inputs: dict[str, Pa
     }
 
 
+# A video placeholder whose op REPORTS its own length lasts exactly that long (MISC-756: the cut.apply
+# placeholder ran the source's full length while its rdurs summed to the cut, so a dry replay probed a length
+# the live run never recorded). Every other op's video placeholder keeps its branch's own length.
+_VIDEO_DUR: dict[str, Callable[[dict[str, Any]], float]] = {
+    "cut.apply": lambda params: sum(_synth_cut_apply_durs(params, {})["rdurs"]),
+}
+
+
 _JSON_SYNTH: dict[str, Callable[[dict[str, Any], dict[str, Path]], dict[str, Any]]] = {
     "cut.apply": _synth_cut_apply_durs,
     "media.range_filmstrip": _synth_range_filmstrip_receipt,
@@ -355,7 +381,9 @@ def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inp
         return
     resolved = _resolve_media_class(kind, dst.suffix.lower())
     if resolved == "video":
-        _write_video(dst, op_name=op_name, audio_src=audio_src)
+        dur_of = _VIDEO_DUR.get(op_name)
+        _write_video(dst, op_name=op_name, audio_src=audio_src,
+                     dur=dur_of(params) if dur_of is not None else None)
         return
     if resolved == "image" and (image_synth := _IMAGE_SYNTH.get(op_name)) is not None:
         image_synth(dst, op_name=op_name, params=params)
@@ -516,23 +544,95 @@ def _clip_rank_group_verdict(n: int) -> tuple[list[float], list[list[float]]]:
             [[1.0 if k == i else 0.0 for k in range(n)] for i in range(n)])
 
 
+# An origin group's tiles were "fetched" by nobody here; each still gets a measure, as on a real pod, so the
+# engine's readers of `measures` run in the dry tier. A typical provider thumbnail, not a measured one.
+_DRY_ORIGIN_MEASURE = {"bytes": 40000, "w": 512, "h": 512}
+# The real judge tile's size and quality (infer_cliprank._JUDGE_LONG_SIDE / _JUDGE_QUALITY), drawn solid.
+_DRY_JUDGE_SIDE = 512
+_DRY_JUDGE_QUALITY = 82
+# Every dry stub progress line starts with this: the engine recognises a stub run by it (DRY_STUB_MARKS).
+_CLIP_RANK_STUB_MARK = "contour-dry clip_rank stub"
+
+
 def run_clip_rank(params: Any, put_url: str, progress: Callable[[str], None] | None = None) -> SimpleNamespace:
     """The dry-tier stand-in for `infer_cliprank.ClipRankService.run` — same `(infer_s, timings)` shape,
-    no weights loaded, no GPU touched, and the PUT contract kept so the resolver reads it identically."""
+    no weights loaded, no GPU touched, and the PUT contract kept so the resolver reads it identically. An
+    origin group also carries one deterministic measure per tile, and the payload carries its timings."""
     from .. import cp
-    from ..models import ClipRankGroupResult, ClipRankPayload
+    from ..models import ClipRankGroupResult, ClipRankPayload, ClipRankTileMeasure
 
     t0 = time.monotonic()
     groups = []
     for g in params.groups:
         scores, embeds = _clip_rank_group_verdict(len(g.tile_urls))
-        groups.append(ClipRankGroupResult(status="ok", scores=scores, embeds=embeds, errors=[None] * len(scores)))
-    payload = ClipRankPayload(model="contour-dry-stub", groups=groups)
+        measures = ([ClipRankTileMeasure(**_DRY_ORIGIN_MEASURE) for _ in scores]
+                    if g.origin_urls is not None else None)
+        groups.append(ClipRankGroupResult(status="ok", scores=scores, embeds=embeds, errors=[None] * len(scores),
+                                          measures=measures))
+    payload = ClipRankPayload(model="contour-dry-stub", groups=groups,
+                              timings={"infer_s": round(time.monotonic() - t0, 3)})
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "clip_rank.json"
         out.write_text(payload.model_dump_json(exclude_none=True))
         cp.upload(out, put_url, "application/json")
     infer_s = time.monotonic() - t0
     if progress is not None:
-        progress(f"contour-dry clip_rank stub: {len(groups)} group(s), deterministic descending scores")
+        progress(f"{_CLIP_RANK_STUB_MARK}: {len(groups)} group(s), deterministic descending scores")
     return SimpleNamespace(infer_s=infer_s, timings={"infer_s": round(infer_s, 3), "work_s": round(infer_s, 3)})
+
+
+def _write_judge_tile(dst: Path, origin_url: str) -> None:
+    """A solid 512x512 JPEG whose colour is a hash of the origin url: two candidates never share one tile."""
+    from PIL import Image
+
+    digest = hashlib.sha256(origin_url.encode("utf-8")).digest()
+    Image.new("RGB", (_DRY_JUDGE_SIDE, _DRY_JUDGE_SIDE), (digest[0], digest[1], digest[2])).save(
+        dst, "JPEG", quality=_DRY_JUDGE_QUALITY)
+
+
+# Mirrors infer_cliprank's own default when `cp._STORE_POOL_WIDTH` is ever renamed out from under this
+# private reach-through — the dry tier degrades to serial PUTs rather than raising at import time.
+_FALLBACK_POOL_WIDTH = 8
+
+
+def run_judge_tiles(params: Any, put_url: str, progress: Callable[[str], None] | None = None) -> SimpleNamespace:
+    """The dry-tier stand-in for `infer_cliprank.run_judge_tiles`: no origin fetch — each tile is a
+    deterministic JPEG — but its real PUT (in parallel, as on the pod) and the same one result JSON after.
+    A failed PUT is a NAMED `put_failed` tile result, never a raise — one bad tile must not cost the judge
+    the others nor the result JSON, same as the real pod (infer_cliprank._judge_tile)."""
+    import concurrent.futures as cf
+
+    from .. import cp
+    from ..infer_cliprank import _redacted_tile_url, _tile_error
+    from ..models import ClipRankJudgeTileResult, ClipRankPayload
+
+    t0 = time.monotonic()
+    tiles = params.judge_tiles or []
+    pool_width = getattr(cp, "_STORE_POOL_WIDTH", _FALLBACK_POOL_WIDTH)
+    with tempfile.TemporaryDirectory() as td:
+        def one(i: int, tile: Any) -> ClipRankJudgeTileResult:
+            dst = Path(td) / f"{i}.jpg"
+            _write_judge_tile(dst, tile.origin_url)
+            try:
+                cp.upload(dst, tile.put_url, "image/jpeg")
+            except Exception as exc:  # noqa: BLE001 — a refused or exhausted PUT is this tile's error
+                err = _tile_error("put_failed", exc, _redacted_tile_url(tile.put_url))
+                return ClipRankJudgeTileResult(status="error", error=err)
+            return ClipRankJudgeTileResult(status="ok", bytes=dst.stat().st_size, w=_DRY_JUDGE_SIDE,
+                                           h=_DRY_JUDGE_SIDE, cache="hit")
+
+        with cf.ThreadPoolExecutor(max_workers=max(1, min(len(tiles), pool_width)),
+                                   thread_name_prefix="dry-judge-tile") as ex:
+            futs = [ex.submit(one, i, t) for i, t in enumerate(tiles)]
+            results = [f.result() for f in futs]
+        timings = {"infer_s": round(time.monotonic() - t0, 3), "judge_tiles_n": float(len(tiles)),
+                   "judge_cache_miss_n": 0.0}
+        payload = ClipRankPayload(model="contour-dry-stub", groups=[], judge_tiles=results, timings=timings)
+        out = Path(td) / "clip_rank.json"
+        out.write_text(payload.model_dump_json(exclude_none=True))
+        cp.upload(out, put_url, "application/json")
+    infer_s = time.monotonic() - t0
+    if progress is not None:
+        progress(f"{_CLIP_RANK_STUB_MARK}: {len(results)} judge tile(s), deterministic solid JPEGs")
+    return SimpleNamespace(infer_s=infer_s, timings={**timings, "infer_s": round(infer_s, 3),
+                                                     "work_s": round(infer_s, 3)})

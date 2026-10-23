@@ -11,6 +11,7 @@ forwards while k+1.. are still on the wire."""
 from __future__ import annotations
 
 import concurrent.futures as cf
+import io
 import math
 import os
 import subprocess
@@ -18,7 +19,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -26,11 +27,11 @@ from urllib.parse import urlsplit
 
 import requests
 
-from . import originrule
+from . import cp, originrule
 from .cp import _TIMEOUT as _TILE_TIMEOUT_S
 from .cp import TransferTimeout, UrlNotAllowed, download, upload
-from .models import (ClipRankGroup, ClipRankGroupResult, ClipRankParams, ClipRankPayload, ClipRankTileError,
-                     ClipRankTileMeasure)
+from .models import (ClipRankGroup, ClipRankGroupResult, ClipRankJudgeTileResult, ClipRankParams, ClipRankPayload,
+                     ClipRankTileError, ClipRankTileMeasure)
 from .sanitize import safe_endpoint, safe_error, safe_text
 
 # NO SENTINEL SCORE. A tile with nothing to score is `score: null` + a named error, never -1.0: in prod every
@@ -43,6 +44,14 @@ _EMPTY_INTENT = ClipRankTileError(kind="empty_intent",
 # provider-thumbnail cap (THUMB_MAX_BYTES, in its preview-link resolver) — what the box accepts off a
 # provider; its per-read timeout is the same `cp._TIMEOUT` an image_urls tile's download runs under.
 _ORIGIN_MAX_BYTES = 8_000_000
+# The origin bytes a rank request fetched outlive it, so the judge-tiles request that follows on the same warm pod
+# reads them instead of paying the provider fetch twice. Keyed by the EXACT url; bounded by total bytes, least
+# recently used out first — ~32 provider thumbnails at the body cap, hundreds at a thumbnail's usual size.
+_ORIGIN_CACHE_BYTES = 256 * 1024 * 1024
+# The judge reads one image per tile; these are the sizes the primary judge model was measured on (M5: per-tile
+# JPEGs of <=512 px long side at quality 82) — larger buys the judge nothing and costs PUT bytes.
+_JUDGE_LONG_SIDE = 512
+_JUDGE_QUALITY = 82
 _DP = 4        # cosine error is ~1e-3; 4dp keeps the payload ~¼ the size
 
 # Chunk the image tower so ONE lane's VRAM is a known number, not a function of a beat's candidate count —
@@ -265,6 +274,55 @@ def _fetch_tile(url: str, dest: Path):
         return None, _tile_error("decode_error", exc, redacted_url), redacted_url
 
 
+class _OriginCache:
+    """Process-wide origin bytes by exact url, bounded by total bytes, least recently used evicted first."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._lock = threading.Lock()
+        self._items: OrderedDict[str, bytes] = OrderedDict()
+        self._size = 0
+
+    def get(self, url: str) -> bytes | None:
+        with self._lock:
+            data = self._items.get(url)
+            if data is not None:
+                self._items.move_to_end(url)
+            return data
+
+    def put(self, url: str, data: bytes) -> None:
+        if len(data) > self.limit:
+            return
+        with self._lock:
+            old = self._items.pop(url, None)
+            if old is not None:
+                self._size -= len(old)
+            self._items[url] = data
+            self._size += len(data)
+            while self._size > self.limit:
+                _, dropped = self._items.popitem(last=False)
+                self._size -= len(dropped)
+
+    def size(self) -> int:
+        with self._lock:
+            return self._size
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._size = 0
+
+
+_ORIGIN_CACHE = _OriginCache(_ORIGIN_CACHE_BYTES)
+
+
+def _origin_fetch(url: str) -> bytes:
+    """One origin GET through the guard under the rank's caps; a successful body is kept for a later request."""
+    data = originrule.fetch(url, max_bytes=_ORIGIN_MAX_BYTES, timeout_s=_TILE_TIMEOUT_S)
+    _ORIGIN_CACHE.put(url, data)
+    return data
+
+
 def _fetch_origin_tile(url: str, dest: Path):
     """One stock-provider tile: GET through the origin guard → workdir file → decode, exactly like an image_urls
     tile after its download. Returns (image, error, redacted url, measure); the measure is the fetched bytes
@@ -273,7 +331,7 @@ def _fetch_origin_tile(url: str, dest: Path):
 
     redacted_url = _redacted_tile_url(url)
     try:
-        data = originrule.fetch(url, max_bytes=_ORIGIN_MAX_BYTES, timeout_s=_TILE_TIMEOUT_S)
+        data = _origin_fetch(url)
     except originrule.OriginRefused as exc:
         return None, _tile_error("origin_refused", exc, redacted_url), redacted_url, None
     except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault; it is NAMED below
@@ -384,6 +442,134 @@ def _gather(futs: list, cells=None) -> tuple[list, list[int], list[ClipRankTileE
     return images, ok, errors
 
 
+@dataclass(frozen=True)
+class _JudgeTileOutcome:
+    result: ClipRankJudgeTileResult
+    cache_miss: bool
+    compose_s: float
+    put_s: float | None     # None: no PUT was attempted (the tile failed before it)
+    put_retry_n: int
+
+
+def _put_seconds(trace: list[dict]) -> float | None:
+    """One PUT's wall from its attempt trace: first attempt's start to the last attempt's end, retries included."""
+    if not trace:
+        return None
+    start = trace[0]["wire"]["start_mono_ns"]
+    end = max(row.get("retry", row["wire"])["end_mono_ns"] for row in trace)
+    return max(0.0, (end - start) / 1e9)
+
+
+def _judge_tile(tile, dest: Path) -> _JudgeTileOutcome:
+    """One judge tile: origin bytes (cache, else one guarded fetch) → small JPEG → its PUT url. Every failure
+    is a NAMED tile result, never a raise — one bad tile must not cost the judge the others."""
+    from PIL import Image
+
+    def failed(kind: str, exc: BaseException, url: str, **kw) -> _JudgeTileOutcome:
+        err = _tile_error(kind, exc, _redacted_tile_url(url))
+        print(f"[clip_rank] judge tile {err.kind} — {err.detail}", file=sys.stderr, flush=True)
+        return _JudgeTileOutcome(ClipRankJudgeTileResult(status="error", error=err), **kw)
+
+    data = _ORIGIN_CACHE.get(tile.origin_url)
+    miss = data is None
+    if data is None:
+        try:
+            data = _origin_fetch(tile.origin_url)
+        except originrule.OriginRefused as exc:
+            return failed("origin_refused", exc, tile.origin_url, cache_miss=True, compose_s=0.0, put_s=None,
+                          put_retry_n=0)
+        except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a request fault; it is NAMED
+            return failed(_fetch_kind(exc), exc, tile.origin_url, cache_miss=True, compose_s=0.0, put_s=None,
+                          put_retry_n=0)
+    tc = time.monotonic()
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img.thumbnail((_JUDGE_LONG_SIDE, _JUDGE_LONG_SIDE))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        img.save(dest, "JPEG", quality=_JUDGE_QUALITY)
+    except Exception as exc:  # noqa: BLE001 — undecodable bytes are this tile's error, not the request's
+        return failed("decode_error", exc, tile.origin_url, cache_miss=miss, compose_s=time.monotonic() - tc,
+                      put_s=None, put_retry_n=0)
+    compose_s = time.monotonic() - tc
+    cp.put_trace.reset()
+    tp = time.monotonic()
+    put_error: BaseException | None = None
+    try:
+        cp.upload(dest, tile.put_url, "image/jpeg")
+    except Exception as exc:  # noqa: BLE001 — a refused or exhausted PUT is this tile's error
+        put_error = exc
+    trace = cp.put_trace.collect()
+    put_s = _put_seconds(trace)
+    if put_s is None:
+        put_s = time.monotonic() - tp
+    retries = max(0, len(trace) - 1)
+    if put_error is not None:
+        return failed("put_failed", put_error, tile.put_url, cache_miss=miss, compose_s=compose_s, put_s=put_s,
+                      put_retry_n=retries)
+    return _JudgeTileOutcome(
+        ClipRankJudgeTileResult(status="ok", bytes=dest.stat().st_size, w=img.width, h=img.height,
+                                cache="miss" if miss else "hit"),
+        cache_miss=miss, compose_s=compose_s, put_s=put_s, put_retry_n=retries)
+
+
+def _judge_report(outcomes: list[_JudgeTileOutcome]) -> str:
+    """The one progress line a judge-tiles request earns: tiles per result kind and the cache misses."""
+    kinds = Counter(o.result.error.kind if o.result.error is not None else "ok" for o in outcomes)
+    misses = sum(o.cache_miss for o in outcomes)
+    return (f"clip_rank judge tiles {len(outcomes)}: " + ", ".join(f"{k}={c}" for k, c in sorted(kinds.items()))
+            + f"; cache_miss={misses}")
+
+
+def run_judge_tiles(params: ClipRankParams, put_url: str,
+                    progress: "Callable[[str], None] | None" = None, *, model: str = "judge_tiles") -> ClipRankRun:
+    """A judge-tiles request: one small JPEG per tile PUT to its own url, all tiles in parallel, then ONE result
+    JSON. No weights and no card: the bytes are the ones a rank request on this pod already fetched (a miss
+    refetches through the origin guard and is counted). Object count and parallelism decide the wall — each
+    small PUT costs ~a second and a half of latency, not bandwidth — so the pool is as wide as the store's
+    keep-alive pool."""
+    t0 = time.monotonic()
+    tiles = params.judge_tiles or []
+    n = len(tiles)
+    with tempfile.TemporaryDirectory() as td:
+        tw = time.monotonic()
+        with cf.ThreadPoolExecutor(max_workers=max(1, min(n, cp._STORE_POOL_WIDTH)),
+                                   thread_name_prefix="judge-tile") as ex:
+            futs = [ex.submit(_judge_tile, t, Path(td) / f"{i}.jpg") for i, t in enumerate(tiles)]
+            outcomes = [f.result() for f in futs]
+        put_wall_s = time.monotonic() - tw
+        puts = sorted(o.put_s for o in outcomes if o.put_s is not None)
+        mid = len(puts) // 2
+        p50 = (puts[mid] if len(puts) % 2 else (puts[mid - 1] + puts[mid]) / 2) if puts else 0.0
+        tp = time.monotonic()
+        timings = {
+            "infer_s": round(tp - t0, 3),
+            "judge_tiles_n": float(n),
+            "judge_cache_miss_n": float(sum(o.cache_miss for o in outcomes)),
+            "judge_compose_s": round(sum(o.compose_s for o in outcomes), 3),
+            "judge_put_wall_s": round(put_wall_s, 3),
+            "judge_put_p50_s": round(p50, 3),
+            "judge_put_max_s": round(puts[-1] if puts else 0.0, 3),
+            "judge_put_retry_n": float(sum(o.put_retry_n for o in outcomes)),
+        }
+        payload = ClipRankPayload(model=model, groups=[], judge_tiles=[o.result for o in outcomes], timings=timings)
+        out = Path(td) / "clip_rank.json"
+        out.write_text(payload.model_dump_json(exclude_none=True))
+        payload_s = time.monotonic() - tp
+        infer_s = time.monotonic() - t0
+        if progress is not None:
+            progress(_judge_report(outcomes))
+        tu = time.monotonic()
+        cp.upload(out, put_url, "application/json")
+        upload_s = time.monotonic() - tu
+    return ClipRankRun(infer_s=infer_s, timings={
+        **timings,
+        "infer_s": round(infer_s, 3),
+        "payload_s": round(payload_s, 3),
+        "upload_s": round(upload_s, 3),
+        "work_s": round(time.monotonic() - t0, 3),
+    })
+
+
 class ClipRankService:
     """Loads SigLIP once (the dominant cost); serves every group batch after that.
 
@@ -470,7 +656,19 @@ class ClipRankService:
                 if key[2] and progress is not None:
                     progress(_origin_report(i, n, groups[-1], first_failed))
             tp = time.monotonic()
-            payload = ClipRankPayload(model=self.model_id, groups=groups)
+            counts = {
+                "unique_image_sets_n": float(len(unique)),
+                "reused_groups_n": float(n - len(unique)),
+                "parallel_width_n": float(self.parallel),
+            }
+            # The result the box reads carries the walls known before its own PUT: its infer_s stops at the
+            # payload build (serialisation and upload cannot time themselves into the bytes they produce).
+            payload = ClipRankPayload(model=self.model_id, groups=groups, timings={
+                "infer_s": round(tp - t0, 3),
+                "tile_gather_work_s": round(gather_s, 3),
+                "forward_work_s": round(forward_s, 3),
+                **counts,
+            })
             out = Path(td) / "clip_rank.json"
             out.write_text(payload.model_dump_json(exclude_none=True))
             payload_s = time.monotonic() - tp
@@ -489,9 +687,7 @@ class ClipRankService:
                 "payload_s": round(payload_s, 3),
                 "upload_s": round(upload_s, 3),
                 "work_s": round(time.monotonic() - t0, 3),
-                "unique_image_sets_n": float(len(unique)),
-                "reused_groups_n": float(n - len(unique)),
-                "parallel_width_n": float(self.parallel),
+                **counts,
             },
         )
 

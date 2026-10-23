@@ -1,0 +1,25 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "groups": [],
+  "judge_tiles": [
+    {
+      "status": "ok",
+      "bytes": 14210,
+      "w": 384,
+      "h": 216,
+      "cache": "hit"
+    },
+    {
+      "status": "error",
+      "error": {
+        "kind": "put_failed",
+        "detail": "HTTPError: 403 Forbidden \u2014 judge tile 2"
+      }
+    }
+  ],
+  "timings": {
+    "infer_s": 1.204,
+    "fetch_work_s": 0.871,
+    "put_work_s": 0.233
+  }
+}

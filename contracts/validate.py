@@ -19,16 +19,50 @@ def _schema_for(path: pathlib.Path) -> Draft202012Validator:
     return Draft202012Validator(SCHEMAS[key])
 
 
+def _reject_non_finite(token: str) -> None:
+    # json.loads's own extension lets 'NaN'/'Infinity'/'-Infinity' through as Python floats; standard
+    # JSON has no such literal at all. Raising here is what makes _as_json below reject them.
+    raise ValueError(f"{token} is not valid JSON (no NaN/Infinity literal)")
+
+
+def _as_json(data: object) -> object:
+    """`data` round-tripped through the JSON text it would actually travel as. A bare Python object can
+    carry a float('nan') that no JSON document ever can — and Draft202012Validator's own numeric keywords
+    (type, minimum) do not catch it: `nan < 0` and `nan >= 0` are both False, so `minimum: 0` lets it
+    through silently. Raises ValueError for anything that could not have arrived as JSON text."""
+    return json.loads(json.dumps(data, allow_nan=True), parse_constant=_reject_non_finite)
+
+
+def accepts(prefix: str, data: object) -> bool:
+    """The schema verdict for one document, picked by the same filename prefix the goldens use."""
+    if prefix not in SCHEMAS:
+        raise SystemExit(f"no schema for prefix {prefix!r}")
+    try:
+        as_json = _as_json(data)
+    except ValueError:
+        return False
+    return next(Draft202012Validator(SCHEMAS[prefix]).iter_errors(as_json), None) is None
+
+
 def main() -> int:
     fails: list[str] = []
 
     for path in sorted((ROOT / "examples").glob("*.json")):
-        errs = sorted(_schema_for(path).iter_errors(json.loads(path.read_text())), key=str)
+        try:
+            data = _as_json(json.loads(path.read_text()))
+        except ValueError as exc:
+            fails.append(f"VALID example is not valid JSON: {path.name} -> {exc}")
+            continue
+        errs = sorted(_schema_for(path).iter_errors(data), key=str)
         if errs:
             fails.append(f"VALID example rejected: {path.name} -> {errs[0].message}")
 
     for path in sorted((ROOT / "examples" / "invalid").glob("*.json")):
-        if next(_schema_for(path).iter_errors(json.loads(path.read_text())), None) is None:
+        try:
+            data = _as_json(json.loads(path.read_text()))
+        except ValueError:
+            continue  # not valid JSON at all is correctly rejected before the schema even runs
+        if next(_schema_for(path).iter_errors(data), None) is None:
             fails.append(f"INVALID example accepted: {path.name} (schema let it through)")
 
     n = len(list((ROOT / "examples").glob("*.json"))) + len(list((ROOT / "examples" / "invalid").glob("*.json")))

@@ -5,8 +5,9 @@ so it is not a capability we minted (cp.assert_fetchable refuses it, and still m
 pod was merely told to visit, on somebody else's network where `http://169.254.169.254/...` is one string
 away. This module is the rule for that class of url, ported from the engine's own guards so the two cannot
 disagree: the address half from montyops.stock_hosts (scheme, userinfo, port, IP literal, public unicast),
-the credential half from the engine's origin-binding guard (userinfo, credential-named parameters, a
-pre-signed url's own signing fields exempt — its box-only secret-scanning pass stays box-side), and the redirect
+the credential half from the engine's origin-binding guard (userinfo, credential-named parameters, AND the
+box's secret-scanner shapes over every parameter value, path and fragment — a pre-signed url's own signing fields
+exempt, exactly as the box exempts them), and the redirect
 + retry shape from montyops.media_fetch.resolve (every hop checked BEFORE it is followed; 408/429/5xx
 retried once).
 
@@ -26,12 +27,15 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import math
+import re
 import socket
 import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from typing import Any, Final
 from urllib.parse import unquote_plus, urljoin, urlsplit
 
@@ -53,6 +57,67 @@ _CRED_PARAMS: Final[frozenset[str]] = frozenset({
 # Copied verbatim from the same guard's signing-prefix tuple: a pre-signed url's own signing fields
 # are the capability, not a leak.
 _SIGNING_PREFIXES: Final[tuple[str, ...]] = ("x-amz-", "x-goog-", "x-ms-", "x-obs-")
+
+# VENDORED from the engine's secret scanner at engine commit 3d919bab156ebeab9b1f6695f3f0c3b898f83395 — its shape
+# list, its secret-name and not-a-value patterns and its key-material test: everything its shape scan reads with
+# an empty allowlist (one rule id renamed to describe the role, not the provider; the pattern is unchanged).
+# The box's origin-binding guard runs its shape scan on `{name} = "{value}"` over every query pair and over the
+# url's scheme://host/path; a pod that skipped it accepted a secret under a neutral name the box refuses.
+# tests/test_originrule_refuses_a_secret_under_any_name.py pins these against that commit's literals.
+SECRET_SHAPES_SOURCE: Final[str] = "engine secret scanner@3d919bab156ebeab9b1f6695f3f0c3b898f83395"
+_MIN_RUN: Final[int] = 16
+_MIN_ENTROPY: Final[float] = 3.0
+_RUN: Final = re.compile(r"[A-Za-z0-9_-]{%d,}" % _MIN_RUN)
+_SHAPES: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("tiktok",              re.compile(r"\b(?:act|rft)\.[A-Za-z0-9!._-]{20,}")),
+    ("google_oauth_secret", re.compile(r"\bGOCSPX-[A-Za-z0-9_-]{10,}")),
+    ("google_refresh",      re.compile(r"(?<![\w/])1//[A-Za-z0-9_-]{20,}")),
+    ("google_access",       re.compile(r"\bya29\.[A-Za-z0-9_.-]{20,}")),
+    ("meta",                re.compile(r"\bEAA[A-Za-z0-9]{20,}")),
+    ("instagram",           re.compile(r"\bIGQ[A-Za-z0-9_-]{20,}")),
+    ("chat_bot_token",      re.compile(r"\b\d{8,12}:AA[A-Za-z0-9_-]{30,}")),
+    ("huggingface",         re.compile(r"\bhf_[A-Za-z0-9]{20,}")),
+    ("github",              re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("vk",                  re.compile(r"\bvk1\.a\.[A-Za-z0-9_-]{20,}")),
+    ("openai_style",        re.compile(r"\bsk-(?:ant-|or-)?[A-Za-z0-9_-]{20,}")),
+    ("aws_access_key_id",   re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+)
+_SECRET_NAME: Final = re.compile(
+    r"""(?xi)
+    ((?:[A-Za-z_][A-Za-z0-9_.\[\]"'-]*)?
+     (?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|(?-i:[A-Z0-9_]KEY))
+     [A-Za-z0-9_]*)
+    \s*[:=]{1,2}\s*
+    (?:r|f|b|u)?["'`]([^"'`\n]{20,})["'`]
+    """
+)
+_NOT_A_VALUE: Final = re.compile(
+    r"(?i)\$\{|\$[a-z_]|%\(|%s\b|\{\{|<[a-z_]+>|os\.environ|getenv|process\.env|your[_-]|example|"
+    r"placeholder|redact|xxxx|\.\.\.|(?-i:^[a-z0-9_./-]+$)"
+)
+
+
+def _is_key_material(run: str) -> bool:
+    classes = sum(bool(re.search(r, run)) for r in (r"[a-z]", r"[A-Z]", r"\d"))
+    n = len(run)
+    entropy = -sum(c / n * math.log2(c / n) for c in Counter(run).values()) if n else 0.0
+    return n >= _MIN_RUN and classes >= 2 and entropy >= _MIN_ENTROPY
+
+
+def _secret_shape(text: str) -> str | None:
+    """The rule id of the first secret shape in `text` — the box's shape scan with an empty allowlist, made
+    a predicate. Never the matched value: the name is what a refusal may print."""
+    for line in text.splitlines():
+        for rule, rx in _SHAPES:
+            if rx.search(line):
+                return rule
+        for m in _SECRET_NAME.finditer(line):
+            val = m.group(2)
+            if _NOT_A_VALUE.search(val) or not _is_key_material(max(_RUN.findall(val) or [""], key=len)):
+                continue
+            return f"assigned:{m.group(1)[:40]}"
+    return None
+
 
 # Copied verbatim from the engine's montyops.media_fetch (_RETRYABLE_STATUS, _ORIGIN_RETRY_PAUSE_S,
 # _ORIGIN_ATTEMPTS): two attempts, not three — the observed transient failure does not repeat.
@@ -191,6 +256,27 @@ def _check_and_resolve(url: str) -> tuple[str, tuple[str, ...]]:
             continue
         if value and low in _CRED_PARAMS:
             raise OriginRefused(f"REFUSED: {safe} carries the credential-shaped parameter {name!r}. {_FIX}")
+        if rule := _secret_shape(f'{name} = "{value}"'):
+            raise OriginRefused(
+                f"REFUSED: {safe} carries secret-shaped material ({rule}) in its parameter {name!r}. {_FIX}")
+    # The box splits its query on '&' only, so `w=640;X-Amz-Credential=AKIA…` is ONE pair named `w` there —
+    # never exempt. Every '&' pair is therefore scanned whole as well, unless its own name is a signing field.
+    for p in parts.query.split("&"):
+        name, _, value = p.partition("=")
+        name, value = unquote_plus(name), unquote_plus(value)
+        if p and not name.lower().startswith(_SIGNING_PREFIXES):
+            if rule := _secret_shape(f'{name} = "{value}"'):
+                raise OriginRefused(
+                    f"REFUSED: {safe} carries secret-shaped material ({rule}) in its parameter {name!r}. {_FIX}")
+    # The url itself — host, path (raw and decoded, path parameters included) and fragment: the box scans
+    # scheme://host/path; the fragment is scanned too because a refusal costs nothing a real CDN url carries.
+    for where, text in (("host or path", f"{parts.scheme}://{parts.hostname or ''}{parts.path}"),
+                        ("path", unquote_plus(parts.path)), ("fragment", unquote_plus(parts.fragment))):
+        if rule := _secret_shape(text):
+            # Host only: the path IS the secret here, so even the path-parameter-free `safe` would echo it.
+            raise OriginRefused(
+                f"REFUSED: a url on {parts.hostname or ''} carries secret-shaped material ({rule}) in its "
+                f"{where}. {_FIX}")
     host = (parts.hostname or "").lower().rstrip(".")
     if not host:
         raise OriginRefused(f"REFUSED: no host in {safe!r}.")

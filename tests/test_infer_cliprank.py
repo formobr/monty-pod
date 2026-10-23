@@ -270,7 +270,7 @@ def test_payload_carries_numbers_only(monkeypatch, tmp_path) -> None:
         "infer_s", "tile_gather_work_s", "forward_work_s", "payload_s", "upload_s", "work_s",
         "unique_image_sets_n", "reused_groups_n", "parallel_width_n"}
     body = json.loads(put.read_text())
-    assert set(body) == {"model", "groups"}, "no ranking, no threshold, no rationale crosses back"
+    assert set(body) == {"model", "groups", "timings"}, "no ranking, no threshold, no rationale crosses back"
     assert [g["scores"] for g in body["groups"]] == [[0.6, 0.8], [None, None]]
     assert [[e and e["kind"] for e in g["errors"]] for g in body["groups"]] == [
         [None, None], ["empty_intent", "empty_intent"]]

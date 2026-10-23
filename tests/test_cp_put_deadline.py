@@ -140,9 +140,30 @@ def test_a_timeout_keeps_the_bounded_retry(tmp_path: Path, monkeypatch: pytest.M
     assert cp.put_rate.per_put() == 0.0  # failed attempts never pose as a measured rate
 
 
+# The floor and the pool are sized from ONE width recorded at import (`cp._STORE_POOL_WIDTH`); the tests compare
+# against that record, never a fresh `_store_pool()` read, whose answer depends on the environment at test time.
 def test_floor_is_the_measured_stream_split_across_the_transfer_width() -> None:
     assert cp._MEASURED_STREAM_BYTES_PER_S == 25e6
-    assert cp._PUT_FLOOR_BYTES_PER_S == pytest.approx(cp._MEASURED_STREAM_BYTES_PER_S / cp._store_pool())
+    assert cp._PUT_FLOOR_BYTES_PER_S == pytest.approx(cp._MEASURED_STREAM_BYTES_PER_S / cp._STORE_POOL_WIDTH)
+
+
+def test_the_floor_and_the_pool_share_the_recorded_width() -> None:
+    assert isinstance(cp._STORE_POOL_WIDTH, int) and cp._STORE_POOL_WIDTH >= 4
+    assert cp._PUT_FLOOR_BYTES_PER_S == pytest.approx(cp._MEASURED_STREAM_BYTES_PER_S / cp._STORE_POOL_WIDTH)
+    for scheme in ("http://", "https://"):
+        adapter = cp._store.get_adapter(scheme + "store.example/object")
+        assert adapter._pool_connections == cp._STORE_POOL_WIDTH
+        assert adapter._pool_maxsize == cp._STORE_POOL_WIDTH
+
+
+def test_a_later_env_change_moves_neither_the_floor_nor_the_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    width, floor = cp._STORE_POOL_WIDTH, cp._PUT_FLOOR_BYTES_PER_S
+    other = width + 7
+    monkeypatch.setenv("OPS_MAX_TRANSFERS", str(other))
+    assert cp._store_pool() == other, "the env change is real: a fresh read would see it"
+    assert cp._STORE_POOL_WIDTH == width
+    assert cp._PUT_FLOOR_BYTES_PER_S == floor
+    assert cp._PUT_FLOOR_BYTES_PER_S == pytest.approx(cp._MEASURED_STREAM_BYTES_PER_S / cp._STORE_POOL_WIDTH)
 
 
 # Prod 2026-10-13 (MISC-306): urllib3 2.x sends the request BODY under the CONNECT timeout, so every PUT body on

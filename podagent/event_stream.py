@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .sanitize import safe_endpoint, safe_error, safe_text
 from .stream_models import StreamAck, StreamJob, event_payload, job_ack_payload, result_payload
@@ -156,11 +156,15 @@ class EventStream:
     """Durable ordered client frames plus typed jobs on one WebSocket."""
 
     def __init__(self, base_url: str, job_token: str, *,
-                 outbox_path: str | Path | None = None) -> None:
+                 outbox_path: str | Path | None = None,
+                 clock: Callable[[], float] | None = None) -> None:
         self._url = base_url.rstrip("/").replace("https://", "wss://", 1).replace(
             "http://", "ws://", 1) + "/pod/stream"
         self._token = job_token
         self._path = Path(outbox_path or os.environ.get("POD_STREAM_OUTBOX", _DEFAULT_OUTBOX))
+        # The one seam a test needs to settle a caller's delivery wall on injected events instead of real
+        # elapsed time; production always gets the real monotonic clock.
+        self._clock: Callable[[], float] = clock or time.monotonic
 
         self._state = threading.RLock()
         self._work = threading.Condition(self._state)
@@ -175,9 +179,20 @@ class EventStream:
         self._acks: dict[tuple[str, int], dict[str, Any]] = {}
         self._wire_attempts: dict[tuple[str, int], int] = {}
         self._wire_sends: dict[tuple[str, int], tuple[int, int]] = {}
+        # Every key the sender has ever included in a dispatched window, set the moment that window is
+        # sliced — unlike `_wire_attempts`, this is NOT contingent on a write actually reaching the wire.
+        # When the CP is unreachable, `_deliver_window` never gets to `write_window`, so `_wire_attempts`
+        # stays empty forever and a frame would otherwise look "first_time" (and re-extend every other
+        # waiter's deadline) on EVERY cycle, not just its true first one.
+        self._window_dispatched: set[tuple[str, int]] = set()
         self._clock_samples: list[dict[str, Any]] = []
         self._delivery_meta: dict[str, dict[str, Any]] = {}
         self._delivery_waiters: dict[tuple[str, int], threading.Event] = {}
+        # One caller-facing deadline per in-flight `wait=True` frame, keyed the same as `_delivery_waiters`.
+        # Set at append to `_delivery_wall_s()` out; the sender extends it while this frame's own window
+        # has not gone out yet (see `_sender_loop`), so a frame's verdict never depends on how many frames
+        # queued ahead of it — only on whether it is ever actually delivered.
+        self._delivery_deadlines: dict[tuple[str, int], float] = {}
         self._delivery_outcomes: dict[tuple[str, int], bool | BaseException] = {}
         self._admission_error: TransportUnhealthy | None = None
         self._storage_error: TransportUnhealthy | None = None
@@ -457,7 +472,9 @@ class EventStream:
             self._next_seq += 1
             waiter = threading.Event() if wait else None
             if waiter is not None:
-                self._delivery_waiters[(self._stream_id, seq)] = waiter
+                key = (self._stream_id, seq)
+                self._delivery_waiters[key] = waiter
+                self._delivery_deadlines[key] = self._clock() + _delivery_wall_s()
             removed_job = self._inbox.pop(corr_id, None) if kind == "result" else None
             removed_delivery = self._delivery_meta.pop(corr_id, None) if kind == "result" else None
             try:
@@ -470,6 +487,7 @@ class EventStream:
                 self._outbox.pop()
                 self._next_seq -= 1
                 self._delivery_waiters.pop((self._stream_id, seq), None)
+                self._delivery_deadlines.pop((self._stream_id, seq), None)
                 error = TransportUnhealthy(f"durable append failed: {safe_error(e)}")
                 self._latch_locked(error, storage=True)
                 raise error from e
@@ -618,10 +636,30 @@ class EventStream:
     def _await_delivery(self, stream_id: str, seq: int, waiter: threading.Event) -> bool:
         # Sender normally settles a synchronous waiter. This derived outer wall also covers a bug or an
         # unexpected persistence failure inside the daemon, so a terminal caller itself cannot wait forever.
-        if not waiter.wait(_delivery_wall_s()):
+        # The deadline lives in `_delivery_deadlines` rather than being a single fixed sleep: the sender
+        # extends it, every window it dispatches ahead of this frame's own, by that window's own derived
+        # wall (see `_sender_loop`) — so a frame that lands in a LATER window is never charged for the
+        # turns it spent waiting behind someone else's, only for whether it is ever actually delivered.
+        # Waiting on `_work` itself — not polling the bare `waiter` Event on a fixed real-time slice —
+        # means this wakes the instant either a settle (`_settle`'s own `notify_all()`) or a deadline
+        # extension makes rechecking worth it, on the real clock exactly as before (where `remaining`
+        # genuinely is real seconds left to sleep); a test driving an injected clock can notify this same
+        # condition from its own `advance()` to wake this immediately too, rather than depending on a real
+        # poll tick landing inside some narrow window under machine load.
+        key = (stream_id, seq)
+        while True:
             with self._work:
-                key = (stream_id, seq)
+                if waiter.is_set():
+                    break
+                deadline = self._delivery_deadlines.get(key)
+                remaining = (deadline - self._clock()) if deadline is not None else 0.0
+                if remaining <= 0:
+                    break
+                self._work.wait(timeout=remaining)
+        if not waiter.is_set():
+            with self._work:
                 self._delivery_waiters.pop(key, None)
+                self._delivery_deadlines.pop(key, None)
                 raced = self._delivery_outcomes.pop(key, None)
                 if isinstance(raced, BaseException):
                     raise raced
@@ -629,12 +667,11 @@ class EventStream:
                     return bool(raced)
                 self._latch_locked(DeliveryPending(
                     f"{stream_id}:{seq} exceeded its caller delivery wall and remains durable"))
-            _log(f"frame seq={seq} sender exceeded derived delivery wall {_delivery_wall_s():.2f}s; "
-                 "frame remains durable")
+            _log(f"frame seq={seq} sender exceeded its caller delivery wall; frame remains durable")
             return False
         with self._state:
-            key = (stream_id, seq)
             self._delivery_waiters.pop(key, None)
+            self._delivery_deadlines.pop(key, None)
             outcome = self._delivery_outcomes.pop(key, False)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -655,10 +692,33 @@ class EventStream:
                     return
                 window = [dict(frame) for frame in self._outbox[:ACK_WINDOW]]
                 unsent = [frame for frame in window if self._frame_key(frame) not in known]
-            attempted: set[tuple[str, int]] = set()
+                attempted = {self._frame_key(frame) for frame in unsent}
+                # A key already in `_window_dispatched` has been INCLUDED IN A WINDOW before and is
+                # merely being RE-tried (a stuck head retried every BACKGROUND_RETRY_S); that is not a
+                # new window queued ahead of anyone, so it must not keep granting fresh patience on
+                # every retry — a caller behind a head the CP never ACKs would otherwise wait the
+                # head's whole dead-letter budget instead of the ordinary one-or-two-window wall. This
+                # must NOT be read off `_wire_attempts` (set only once a write actually reaches the
+                # wire): when the CP is unreachable, `_deliver_window` never gets that far, so every
+                # cycle would look like this key's first-ever dispatch and keep re-extending everyone
+                # else's deadline for as long as the CP stays unreachable.
+                first_time = {key for key in attempted if key not in self._window_dispatched}
+                self._window_dispatched |= attempted
+                if first_time:
+                    # This window is about to spend one derived wall on `first_time`. Any OTHER caller
+                    # still waiting its turn gets that same wall added to its own patience — its verdict
+                    # must never depend on how many frames were ahead of it, only on whether its own frame
+                    # is ever delivered. A frame entering `first_time` gets its wall restarted fresh from
+                    # now: the wall it is actually owed for THIS, its first, wire attempt.
+                    now, wall = self._clock(), _delivery_wall_s()
+                    for key in first_time:
+                        if key in self._delivery_deadlines:
+                            self._delivery_deadlines[key] = now + wall
+                    for key in self._delivery_deadlines:
+                        if key not in first_time:
+                            self._delivery_deadlines[key] += wall
             try:
                 if unsent:
-                    attempted = {self._frame_key(frame) for frame in unsent}
                     known.update(self._deliver_window(unsent))
 
                 while True:
@@ -689,6 +749,12 @@ class EventStream:
                     with self._work:
                         attempts = self._pending_settlement_attempts.get(head_key, 0) + 1
                         self._pending_settlement_attempts[head_key] = attempts
+                        # Captured in the SAME locked transition as the attempts counter a waiting test
+                        # observes: by the time that counter's new value is visible, this cycle's
+                        # background-retry deadline is already pinned to a clock reading no later than
+                        # the one the test can itself read right then — so a test driving this on an
+                        # injected clock needs no race-prone guess at exactly when the sender reads it.
+                        retry_started = self._clock()
                     if attempts > DELIVERY_PENDING_MAX_ATTEMPTS:
                         _log(f"frame {head_key[0]}:{head_key[1]} dead-lettered after {attempts} "
                              "delivery-pending attempts — that corr is lost, other admission continues")
@@ -700,8 +766,7 @@ class EventStream:
                         # Exhaustion is ambiguous, not a verdict. It wakes a synchronous caller and closes
                         # job admission, while the frame and any ACKed successors stay ordered and durable.
                         self._settle(head, "pending", None, 0.0)
-                    with self._work:
-                        self._work.wait(timeout=BACKGROUND_RETRY_S)
+                    self._background_retry_wait(retry_started)
             except BaseException as e:  # noqa: BLE001 - sender death would strand a synchronous terminal
                 with self._state:
                     frame = dict(self._outbox[0]) if self._outbox else None
@@ -716,7 +781,33 @@ class EventStream:
                     if (waiter := self._delivery_waiters.get(key)) is not None:
                         self._delivery_outcomes[key] = error
                         waiter.set()
-                    self._work.wait(timeout=BACKGROUND_RETRY_S)
+                    retry_started = self._clock()
+                self._background_retry_wait(retry_started)
+
+    def _background_retry_wait(self, started: float) -> None:
+        """Pacing between background retry cycles for a still-unsettled head frame, from `started` (the
+        clock reading captured atomically with this cycle's attempts counter — see the caller).
+
+        On the real clock this is exactly the original single bounded `Condition.wait`: cheap, and
+        already interruptible early by any `notify_all()` (a `close()`, a new append, …), with no
+        periodic re-polling. Every EventStream not injected with a seam clock — production and every
+        other test in this repo — takes this path unchanged. Only a test that injects its own clock
+        differs, and only in WHAT wakes this early: that test's `clock.advance()` notifies this same
+        `_work` condition, so this wakes the instant it moves past `started + BACKGROUND_RETRY_S`
+        rather than depending on a real poll tick."""
+        if self._clock is time.monotonic:
+            with self._work:
+                self._work.wait(timeout=BACKGROUND_RETRY_S)
+            return
+        deadline = started + BACKGROUND_RETRY_S
+        while True:
+            with self._work:
+                if self._stop:
+                    return
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return
+                self._work.wait(timeout=remaining)
 
     def _result_acked_frame(self, frame: dict[str, Any], delivery_s: float) -> dict[str, Any]:
         result = frame["result"]
@@ -760,6 +851,7 @@ class EventStream:
                         raise TransportUnhealthy(f"durable reopen-report drop failed: {safe_error(e)}") from e
                 self._wire_attempts.pop(key, None)
                 self._wire_sends.pop(key, None)
+                self._window_dispatched.discard(key)
                 self._pending_settlement_attempts.pop(key, None)
                 self._work.notify_all()
                 return
@@ -787,6 +879,7 @@ class EventStream:
                 outcome = True
                 self._wire_attempts.pop(key, None)
                 self._wire_sends.pop(key, None)
+                self._window_dispatched.discard(key)
                 self._pending_settlement_attempts.pop(key, None)
                 if (isinstance(self._admission_error, DeliveryPending)
                         and not self._outbox and self._storage_error is None):
@@ -811,6 +904,7 @@ class EventStream:
                 outcome = FrameRejected(frame, ack or {})
                 self._wire_attempts.pop(key, None)
                 self._wire_sends.pop(key, None)
+                self._window_dispatched.discard(key)
                 self._pending_settlement_attempts.pop(key, None)
                 if disposition == "rejected":
                     # A worker-identity verdict: admission closes, same as every other permanent content
@@ -927,8 +1021,12 @@ class EventStream:
             self, frames: list[dict[str, Any]],
     ) -> dict[tuple[str, int], dict[str, Any]]:
         # `websockets.sync.send()` has no timeout. The watchdog below owns one wall shared by every write and
-        # every ACK in this attempt; on expiry, closing the raw socket interrupts a kernel-blocked send.
-        deadline = time.monotonic() + FRAME_WALL_S
+        # every ACK in this attempt; on expiry, closing the raw socket interrupts a kernel-blocked send. It is
+        # read off `self._clock()`, not real `time.monotonic()`, and both waits below park on `_work` (woken
+        # by the write finishing, an ack arriving, `_fail_connection`, or — on an injected clock — a test's own
+        # `advance()`) rather than polling a bare Event on a fixed real-time slice: a batch run stalled for any
+        # length of real time can never make this wall expire on its own: only this clock moving can.
+        deadline = self._clock() + FRAME_WALL_S
         keys = [self._frame_key(frame) for frame in frames]
         ready = {key: threading.Event() for key in keys}
         with self._state:
@@ -960,26 +1058,37 @@ class EventStream:
                 write_errors.append(e)
             finally:
                 write_done.set()
+                with self._work:
+                    self._work.notify_all()
 
         threading.Thread(
             target=write_window, name="pod-stream-window-write", daemon=True).start()
-        while not write_done.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _log(f"frame window write exceeded the shared {FRAME_WALL_S}s wall")
-                self._fail_connection(conn, "write/ACK wall expired", "write_wall")
-                break
-            if write_done.wait(min(0.02, remaining)):
-                break
-            with self._state:
-                if self._conn is not conn:
+        write_timed_out = False
+        while True:
+            with self._work:
+                if write_done.is_set() or self._conn is not conn:
                     break
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    write_timed_out = True
+                    break
+                self._work.wait(timeout=remaining)
+        if write_timed_out:
+            _log(f"frame window write exceeded the shared {FRAME_WALL_S}s wall")
+            self._fail_connection(conn, "write/ACK wall expired", "write_wall")
         if write_errors:
             _log(f"frame window write failed ({safe_error(write_errors[0])})")
             self._fail_connection(conn, f"write: {safe_error(write_errors[0])}", "write_error")
 
         for key in keys:
-            ready[key].wait(max(0.0, deadline - time.monotonic()))
+            while True:
+                with self._work:
+                    if key in self._acks or self._conn is not conn:
+                        break
+                    remaining = deadline - self._clock()
+                    if remaining <= 0:
+                        break
+                    self._work.wait(timeout=remaining)
             with self._state:
                 if self._conn is not conn:
                     break
@@ -1217,6 +1326,10 @@ class EventStream:
                             # enter during that gap. A "one_frame"/unmatched-409 verdict settles normally,
                             # through `_deliver_window`/`_settle` below — admission stays open for it.
                             self._latch_locked(FrameRejected(dict(frame), ack))
+                    # Wakes a watchdog parked on `_work` in `_exchange_window` (its wait there is on this
+                    # SAME condition, not a fixed real-time slice) the instant this ack is recorded, so an
+                    # injected-clock test's exact ack-delivery timing — not real elapsed time — decides it.
+                    self._work.notify_all()
             except Exception as e:  # noqa: BLE001 - malformed peer means connection is unsafe
                 _log(f"reader rejected server frame ({safe_error(e)})")
                 closed = _ConnectionClosed is not None and isinstance(e, _ConnectionClosed)
@@ -1360,6 +1473,8 @@ class EventStream:
                 waiters = []
         for waiter in waiters:
             waiter.set()
+        with self._work:
+            self._work.notify_all()
         self._shutdown_conn(conn)
         _log(f"socket closed ({safe_text(why)}); {self.pending_count()} durable frame(s) pending")
 
