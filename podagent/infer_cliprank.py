@@ -62,13 +62,20 @@ LANE_SIZING_WHY = """
 THE clip_rank ENVELOPE IS ~80% NETWORK, AND IT WAS QUEUED AS IF IT WERE A RENDER.
 
 Everything model-shaped went through ONE pod-side worker: align, face_probe, clip_rank AND render. Measured,
-the SigLIP forward is 0.847 s for 14 tiles on an RTX 2060, while pulling those 14 tiles costs ~14 × 211 ms of
-round-trip latency (the prod box's measured per-tile transfer) — and the fetch ran tile-by-tile INSIDE each
-group's turn, so the card idled through most of the envelope. A one-worker GPU queue was protecting VRAM
-against work that barely touches the card, and a render blocked every ranking envelope of a b-roll wave.
+the SigLIP forward is 0.847 s for 14 tiles on an RTX 2060, while pulling tiles is bound by round-trip latency
+— and the fetch ran tile-by-tile INSIDE each group's turn, so the card idled through most of the envelope. A
+one-worker GPU queue was protecting VRAM against work that barely touches the card, and a render blocked
+every ranking envelope of a b-roll wave.
 
 TWO PHASES, TWO WIDTHS. Tiles are latency-bound, so their width is a count of round trips in flight
-(_FETCH_WORKERS, the same 8 the engine's tile PUTs use). ONE pool for the whole process: a
+(_FETCH_WORKERS = 32). The width was 8, chosen when tiles were measured at ~211 ms each; prod previews then
+spent most of fetch_broll in one clip_rank call (job 237f08c8, 2026-10-24: 1657 tiles, infer_s 105.4,
+summed tile_gather_work_s 788.9, forward 42.3). Re-measured 2026-10-24 from the prod box: 240 uncached
+provider renditions (images.pexels / cdn.pixabay, distinct `w=` variants so no CDN cache hit) per width —
+width 8 → 9.6 s (25 tiles/s), 16 → 4.7 s (51/s), 32 → 2.6 s (94/s), 64 → 1.5 s (159/s); per-tile median
+latency 0.30-0.31 s at every width (provider latency does not grow with width), 0 errors. A cached run at 64
+drew two HTTP 429 from Pexels, so 32 is the widest measured width with no rate-limit answer in either run.
+A 429 is a tile error (counted), not a retry. ONE pool for the whole process: a
 per-envelope pool would multiply with the lanes, which is the box-wide-budget lesson ops/runner.step_slots()
 already learned. The towers are VRAM-bound and keep their own narrow lane.
 
@@ -95,7 +102,7 @@ _VRAM_PER_LANE_MB = 414.0
 _VRAM_RESERVE_MB = 512.0
 # No env lever for either width (MISC-333 §5): neither CLIP_RANK_LANES nor CLIP_RANK_FETCH_WORKERS was set on
 # prod, so the lane count is the card's derivation and the fetch width is this constant.
-_FETCH_WORKERS = 8
+_FETCH_WORKERS = 32
 
 
 @dataclass(frozen=True)

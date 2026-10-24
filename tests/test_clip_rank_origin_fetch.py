@@ -177,10 +177,10 @@ def test_no_env_lever_is_read_for_width_or_lanes(monkeypatch) -> None:
     monkeypatch.setattr(m, "_free_vram_mb", lambda: 3254.0)   # the dev 2060: one lane by VRAM
     monkeypatch.setattr(m, "_host_threads", lambda: 12)
     assert m.lane_width() == 1
-    assert m.fetch_width() == 8
+    assert m.fetch_width() == 32
     monkeypatch.setattr(m, "_FETCH_POOL", None)
     pool = m._fetch_pool()
     try:
-        assert pool._max_workers == 8
+        assert pool._max_workers == 32
     finally:
         pool.shutdown(wait=False)

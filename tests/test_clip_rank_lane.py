@@ -274,6 +274,38 @@ def test_the_fetch_pool_is_one_per_process_not_one_per_envelope(monkeypatch):
     assert m._fetch_pool()._max_workers == m._FETCH_WORKERS
 
 
+def test_the_fetch_pool_admits_32_concurrent_origin_fetches_process_wide(monkeypatch):
+    """Measured 2026-10-24: 32 is the widest width with no provider 429; never more may be in flight."""
+    monkeypatch.setattr(m, "_FETCH_POOL", None)
+    pool = m._fetch_pool()
+    lock = threading.Lock()
+    release = threading.Event()
+    full = threading.Event()
+    state = {"in_flight": 0, "peak": 0}
+
+    def blocked_fetch():
+        with lock:
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+            if state["in_flight"] == 32:
+                full.set()
+        release.wait(10)
+        with lock:
+            state["in_flight"] -= 1
+
+    futures = [pool.submit(blocked_fetch) for _ in range(48)]
+    try:
+        assert full.wait(10), "the pool never reached 32 concurrent fetches"
+        with lock:
+            assert state["in_flight"] == 32
+    finally:
+        release.set()
+        for f in futures:
+            f.result(10)
+        pool.shutdown(wait=True)
+    assert state["peak"] == 32
+
+
 # ── the forward is chunked, so one lane's VRAM is a number ───────────────────────────────────────
 
 class _Rows:
