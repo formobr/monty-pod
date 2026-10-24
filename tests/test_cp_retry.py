@@ -1178,6 +1178,66 @@ def test_waited_terminal_sync_is_in_timeline_context_before_result_build(tmp_pat
     assert context["clock_sync"][-1]["client_recv_mono_ns"] >= frames[-1]["client_send_mono_ns"]
 
 
+@pytest.mark.parametrize("replay", [False, True], ids=["fresh_job", "replayed_job"])
+def test_job_ack_leaves_before_any_later_event_when_the_intake_thread_is_held_after_accept(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replay: bool) -> None:
+    """The receipt of a job is made no later than the moment the job becomes claimable (or its replay is
+    recorded). The intake thread is held at a barrier right after `_accept_job` returns — exactly where a
+    receipt appended by the caller of `_accept_job` would still be missing — while the claimer appends its
+    next event. The wire must still carry the job_ack first, for a fresh job and for a replay of a job
+    that is already claimed."""
+    corr = "ordered-receipt"
+    frames: list[dict[str, Any]] = []
+    held, release, go = threading.Event(), threading.Event(), threading.Event()
+    real_accept = EventStream._accept_job
+
+    def held_accept(self: EventStream, *args: Any, **kwargs: Any) -> Any:
+        delivery = real_accept(self, *args, **kwargs)
+        # Keyed on the intake thread, not on any argument: the barrier sits where the race opens (the intake
+        # has accepted the job and has not yet done whatever follows), whichever way that code is shaped.
+        if threading.current_thread().name == "pod-stream-intake":
+            held.set()
+            release.wait()
+        return delivery
+
+    monkeypatch.setattr(EventStream, "_accept_job", held_accept)
+
+    def handler(ws: Any) -> None:
+        if replay:
+            go.wait()
+            ws.send(json.dumps({**_job(corr), "seq": 42, "replayed": True}))
+        else:
+            ws.send(json.dumps(_job(corr)))
+        while True:
+            try:
+                frame = json.loads(ws.recv())
+            except Exception:
+                return
+            frames.append(frame)
+            ws.send(_ack(frame))
+
+    with _server(handler) as base:
+        stream = EventStream(base, "token", outbox_path=tmp_path / "outbox.json")
+        try:
+            if replay:
+                stream._accept_job(_job(corr))   # already in the inbox: the socket's copy is a replay
+            # The job is already queued (replay: seeded above; fresh: the intake queued it before `held`),
+            # so this returns at once; the wall only bounds a lost job and is never reached.
+            assert stream.claim(3600.0)["corr_id"] == corr
+            go.set()
+            held.wait()
+            stream.send_event({"stage": "ops", "status": "step", "corr_id": corr, "phase": "first"}, wait=False)
+            release.set()
+            assert stream.send_event({"stage": "ops", "status": "step", "corr_id": corr, "phase": "flush"}, wait=True)
+        finally:
+            go.set()
+            release.set()
+            stream.close()
+
+    assert [f["type"] for f in frames] == ["job_ack", "event", "event"]
+    assert [f["seq"] for f in frames] == sorted(f["seq"] for f in frames)
+
+
 def test_job_replay_has_one_work_item_two_exact_receipts_and_no_secret_timeline(tmp_path: Path) -> None:
     corr = "work/infer/result"
     receipts: list[dict[str, Any]] = []

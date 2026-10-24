@@ -130,7 +130,9 @@ class _FakeConn:
         return item
 
     def wait_recv_calls(self, n: int) -> None:
-        """Returns once the reader has come back for its `n`th frame, i.e. fully handled the first n-1."""
+        """Returns once the reader has come back for its `n`th frame, i.e. fully handled the first n-1.
+        The bound is only a hang net for a reader stuck behind an earlier frame; a reader that gets there
+        never depends on it."""
         with self._recv_cv:
             if not self._recv_cv.wait_for(lambda: self._recv_calls >= n, timeout=_BACKSTOP_S):
                 pytest.fail(f"the reader never came back for frame {n} — it is stuck handling an earlier one")
@@ -321,7 +323,7 @@ def test_a_caller_behind_a_never_acked_head_is_told_false_within_one_wall(
 
 
 def _open_stream(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, attach_work: bool = True,
 ) -> "tuple[EventStream, _FakeClock, list[_FakeConn], queue.Queue[dict[str, Any]], queue.Queue[Any]]":
     """A stream on a fake peer whose dispatches are gated (ACK_WINDOW 0) until the test opens them."""
     monkeypatch.setattr(event_stream, "ACK_WINDOW", 0)
@@ -338,7 +340,8 @@ def _open_stream(
     clock = _FakeClock()
     stream = EventStream(
         "http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json", clock=clock)
-    clock.attach(stream._work)
+    if attach_work:
+        clock.attach(stream._work)
     clock.attach(stream._ack_cv)
     return stream, clock, conns, written, incoming
 
@@ -354,13 +357,15 @@ def test_acks_are_registered_while_the_outbox_fsync_is_stuck(
     """Prod 2026-10-24 ack_wall loop: a job frame arriving mid-window makes the pod write its inbox and
     job_ack durably. With the disk busy, that write must not hold back the registration of the acks that
     arrive behind it — the socket stays open and the window completes the moment the disk answers."""
-    stream, clock, conns, written, incoming = _open_stream(tmp_path, monkeypatch)
+    # `advance()` must not take `_work`: the stuck durable write holds it, and the window watchdog under
+    # test parks on `_ack_cv` alone, so that is the only condition this clock needs to wake.
+    stream, clock, conns, written, incoming = _open_stream(tmp_path, monkeypatch, attach_work=False)
     armed, release = threading.Event(), threading.Event()
     real_fsync = event_stream.os.fsync
 
     def slow_fsync(fd: int) -> None:
         if armed.is_set():
-            assert release.wait(_BACKSTOP_S), "the injected slow disk was never released"
+            release.wait()  # the disk answers only when the test says so, never after some elapsed time
         real_fsync(fd)
 
     monkeypatch.setattr(event_stream.os, "fsync", slow_fsync)
@@ -378,7 +383,23 @@ def test_acks_are_registered_while_the_outbox_fsync_is_stuck(
         # although the job's durable write is stuck.
         conns[0].wait_recv_calls(4)
         clock.advance(10 * event_stream.FRAME_WALL_S)
-        assert not conns[0].closed.is_set(), "the socket was closed although every ack had arrived"
+        # The watchdog decides on its own thread. The window has been judged once it has released its ack
+        # waiters (all after its stall check, and before any failure it would report for missing acks), so
+        # wait for exactly that, on the lock the ack path uses (`_state` is held by the stuck write).
+        with stream._ack_cv:
+            stream._ack_cv.wait_for(lambda: not stream._ack_waiters)
+        # A close needs `_state`, which the stuck write holds, so the verdict is read once it is free: the
+        # disk answers, and the next frame must go out on the SAME socket (a window that stalled would
+        # have closed it and replayed a/b on a second one instead).
+        release.set()
+        stream.send_event({"stage": "test", "status": "step", "step": "after"}, wait=False)
+        # The job's receipt (made while the disk was stuck) leaves first, then the new event, both in the
+        # next window on this same socket.
+        receipt = _bounded_get(written, "the job's receipt")
+        nxt = _bounded_get(written, "the frame after the window")
+        assert receipt["type"] == "job_ack" and nxt["event"]["step"] == "after"
+        assert len(conns) == 1 and not conns[0].closed.is_set(), (
+            "the socket was closed although every ack had arrived")
     finally:
         release.set()
         stream.close()
