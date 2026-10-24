@@ -136,7 +136,7 @@ class SpecCaptions(BaseModel):
 
     centerY: float | None = None
     accent: str | None = None
-    style: Literal["oneword", "phrase", "phrase_jump", "bold"] | None = None
+    style: Literal["oneword", "phrase", "phrase_jump", "bold", "word_accent"] | None = None
     hot: list[float] = Field(default_factory=list)
     words: list[SpecCaptionWord] = Field(default_factory=list)
     font: str | None = None

@@ -154,6 +154,24 @@ def test_the_three_legacy_styles_keep_their_own_size_and_stay_not_bold() -> None
         assert fields[7] == "0", f"{style}: Bold flag leaked on from the bold addition"
 
 
+# ── word_accent (5th style): the phrase block, word-synced ───────────────────────────────────────────
+
+def test_word_accent_dims_what_is_not_said_and_lights_the_spoken_word() -> None:
+    """While word k is spoken the block reads: words before k in the body colour, k in the accent, words after k
+    dimmed to WORD_DIM_OPACITY — every colour the one handed in."""
+    font = _real_font()
+    ass = captions.build_ass(_WORDS, font=font, w=1080, h=1920, fg=_FG, accent=_ACCENT, style="word_accent")
+    fg, acc = captions._inline_c(_FG), captions._inline_c(_ACCENT)
+    dim = f"{captions._alpha_byte(captions.WORD_DIM_OPACITY):02X}"
+    events = [ln for ln in ass.splitlines() if ln.startswith("Dialogue:")]
+    assert [ln.split(",")[1] for ln in events] == ["0:00:00.10", "0:00:00.45", "0:00:00.95"]   # one per word change
+    looks = [re.findall(r"\\1c(&H[0-9A-F]{6}&)\\1a&H([0-9A-F]{2})&", ln) for ln in events]
+    # «story» is hot: in the accent before it is spoken (dimmed) and after it (opaque)
+    assert looks == [[(acc, "00"), (acc, dim), (fg, dim)],
+                     [(fg, "00"), (acc, "00"), (fg, dim)],
+                     [(fg, "00"), (acc, "00"), (acc, "00")]]
+
+
 # ── safe width: the same side box as the browser preview ─────────────────────────────────────────────
 
 def test_side_limits_are_the_engine_safe_box() -> None:

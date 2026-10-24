@@ -521,7 +521,8 @@
                 "oneword",
                 "phrase",
                 "phrase_jump",
-                "bold"
+                "bold",
+                "word_accent"
               ]
             },
             "hot": {

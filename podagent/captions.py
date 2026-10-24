@@ -1,5 +1,5 @@
-"""Subtitle track via libass (no browser): brand-neutral ASS builder for four looks
-(oneword/phrase/phrase_jump/bold). The brain bakes words+accent+centerY into the spec; the pod draws
+"""Subtitle track via libass (no browser): brand-neutral ASS builder for five looks
+(oneword/phrase/phrase_jump/bold/word_accent). The brain bakes words+accent+centerY into the spec; the pod draws
 them with a delivered TTF.
 
 NO COLOUR LITERAL LIVES IN THIS FILE. `fg` and `accent` are REQUIRED arguments: this module used to spell
@@ -33,6 +33,13 @@ JUMP_GAP = 8         # extra px between jump words beyond a plain space (the wra
 JUMP_MAX_SCALE = max(JUMP_OVERSHOOT, JUMP_SCALE) / 100.0   # worst-case bounce scale a jump word ever hits
 
 BOLD_SIZE = 80      # "bold" look: same ≤2-line block/wrap as phrase, heavier weight + bigger than PHRASE_SIZE
+
+# "word_accent" look: the phrase block, word-synced — a word the speaker has not reached yet is drawn at this
+# opacity, the word being spoken in the accent, a word already said in the body colour (a hot word in the accent).
+# The browser preview draws the same rule with the same number; the engine's parity test holds the two tiers to it
+# frame by frame.
+WORD_DIM_OPACITY = 0.4
+SHADOW_ALPHA = 0x50  # the Cap style's BackColour alpha (the shadow under every word)
 
 # safe-zone bottom reserve (9:16 only), from the 1080×1920 reference; scales with height
 _REF_H = 1920
@@ -105,7 +112,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,Inter ExtraBold,{size},{white},&H000000FF,&H00000000,&H50000000,{1 if bold else 0},0,0,0,100,100,0,0,1,{OUTLINE},{SHADOW},5,0,0,0,1
+Style: Cap,Inter ExtraBold,{size},{white},&H000000FF,&H00000000,&H{SHADOW_ALPHA:02X}000000,{1 if bold else 0},0,0,0,100,100,0,0,1,{OUTLINE},{SHADOW},5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -115,10 +122,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 def build_ass(words: list[dict], *, font: Path, w: int, h: int, fg: str, accent: str,
               center_y: float = 0.76, style: str = "oneword",
               window_ms: int = PHRASE_WINDOW_MS) -> str:
-    """words = [{text,start,end,hot?}, …] → ASS text; `style` picks oneword/phrase/phrase_jump.
+    """words = [{text,start,end,hot?}, …] → ASS text; `style` picks oneword/phrase/phrase_jump/bold/word_accent.
 
     `fg` (body colour) and `accent` (hot-word colour) are required — see the module docstring."""
-    if style in ("phrase", "phrase_jump"):
+    if style in ("phrase", "phrase_jump", "word_accent"):
         return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind=style)
     if style == "bold":
         return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind="bold",
@@ -225,8 +232,9 @@ def _group_blocks(words, fnt, spc, window_ms, w, maxw=None):
 
 def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kind,
                        size=PHRASE_SIZE, bold=False):
-    """Stable, centred ≤2-line block pinned at a fixed y (never jumps); kind = phrase | phrase_jump | bold
-    (bold reuses the phrase colour-block layout at a bigger, Bold:1 style)."""
+    """Stable, centred ≤2-line block pinned at a fixed y (never jumps); kind = phrase | phrase_jump | bold |
+    word_accent (bold reuses the phrase colour-block layout at a bigger, Bold:1 style; word_accent the same layout
+    word-synced, see _word_accent_block)."""
     white = _ac(fg)
     white_c = _inline_c(fg)
     accent_c = _inline_c(accent)
@@ -259,6 +267,8 @@ def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kin
         if kind == "phrase_jump":
             out += _phrase_jump_block(lines, fits, b_start, b_end, y_top, line_h, wrap_gap, xc, white_c,
                                       accent_c, font)
+        elif kind == "word_accent":
+            out += _word_accent_block(lines, fits, b_start, b_end, y_top, line_h, xc, white_c, accent_c)
         else:
             out += _phrase_colour_block(lines, fits, b_start, b_end, y_top, line_h, xc, white_c, accent_c)
     return _ass_head(white, w, h, size, bold=bold) + "\n".join(out) + "\n"
@@ -284,6 +294,45 @@ def _phrase_colour_block(lines, fits, b_start, b_end, y_top, line_h, xc, white_c
                       else _clean(w2["text"])) for jj, (w2, _) in enumerate(line)]
             out.append(f"Dialogue: 2,{_tc(st)},{_tc(end)},Cap,,0,0,0,,"
                        f"{{\\an8\\pos({xc},{yc})\\blur{BLUR}{_fs_tag(fits[i])}}}{' '.join(parts)}")
+    return out
+
+
+def _alpha_byte(opacity: float) -> int:
+    """opacity 0..1 → the ASS alpha byte (00 = opaque, FF = invisible)."""
+    return round((1.0 - opacity) * 255)
+
+
+def _look_tags(colour_c: str, opacity: float) -> str:
+    """One word's inline colour + alpha. The dim scales fill, outline and the shadow's own style alpha alike, so a
+    dimmed word fades as one piece (the browser's `opacity` on the word's span)."""
+    a = _alpha_byte(opacity)
+    sh = _alpha_byte(opacity * (1.0 - SHADOW_ALPHA / 255))
+    return f"\\1c{colour_c}\\1a&H{a:02X}&\\3a&H{a:02X}&\\4a&H{sh:02X}&"
+
+
+def _word_accent_block(lines, fits, b_start, b_end, y_top, line_h, xc, white_c, accent_c):
+    """Word-synced block: one event per line for every spoken-word change. While word k is spoken (its start to the
+    next word's start, the last word to the block's end), every word before it reads in the body colour, k in the
+    accent, every word after it dimmed to WORD_DIM_OPACITY; a hot word keeps the accent colour (dimmed until said).
+    Two words with one start: the later one is spoken (no zero-length event), as the browser picks it."""
+    flat = [wd for line in lines for wd, _ in line]
+    starts = [float(wd["start"]) for wd in flat]
+    out = []
+    for k, st in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else b_end
+        if end <= st:
+            continue
+        fade = f"\\fad({FADE_IN_MS},0)" if k == 0 else ""
+        g = 0
+        for i, line in enumerate(lines):
+            yc = y_top + i * line_h
+            parts = []
+            for wd, _ in line:
+                colour = accent_c if (g == k or wd.get("hot")) else white_c
+                parts.append(f"{{{_look_tags(colour, 1.0 if g <= k else WORD_DIM_OPACITY)}}}{_clean(wd['text'])}")
+                g += 1
+            out.append(f"Dialogue: 1,{_tc(st)},{_tc(end)},Cap,,0,0,0,,"
+                       f"{{\\an8\\pos({xc},{yc}){fade}\\blur{BLUR}{_fs_tag(fits[i])}}}{' '.join(parts)}")
     return out
 
 
