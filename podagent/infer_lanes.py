@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import sys
 from typing import Any, Callable, Mapping
 
 from .infer_cliprank import _VRAM_PER_LANE_MB, _VRAM_RESERVE_MB, _VRAM_WEIGHTS_MB, _free_vram_mb
@@ -118,6 +119,59 @@ def release_other_kinds(kind: str, caches: Mapping[str, dict[Any, Any]]) -> list
     if freed:
         gc.collect()                # the service graph has cycles; the tensors outlive the dict without this
     return freed
+
+
+CARD_TURNS_WHY = """
+ON A CARD WHERE THE INFER KINDS TAKE TURNS, THE ENCODE IS ONE OF THE TURNS.
+
+A standing pod (decision `the-laptop-holds-a-standing-pod-like-the-fleet`) keeps whatever kind it served last
+on the card for its whole life. On a card too small for two kinds (INFER_KIND_RESIDENCY_WHY) that resident
+kind sat under every encode: 056 v13 r8 (dev RTX 2060, 6144 MiB, ~1.5-2.5 GiB held by the desktop) had SigLIP
+resident (2322 MiB) through cut.apply, whose ledger grant was 1388-1960 MiB, so 1 NVENC session (pm2 pod log
+«1768 MiB granted by the pod's admission ledger → 1 session(s)»); apply_cut took 99 s. The ledger also read
+its budget ONCE for the pod's life, so what the card held at the first heavy op sized every later one.
+
+So, on such a card only, ONE ledger serves both tenants: a weight-holding infer (align, clip_rank,
+person_matte) books the whole budget around its load + forward exactly as a self-sizing heavy op does
+(gpu_admission.admission), so the two never run at once and keep FIFO order with its bounded, visible park. A
+heavy op, once admitted, drops every cached infer service (all idle by construction — no infer can be inside
+the ledger beside it), returns the allocator's blocks to the driver (a separate ffmpeg process cannot use
+blocks torch merely caches), and re-reads the budget from the card (gpu_admission.remeasure_held). The dropped
+kind reloads from the pod's disk cache when next asked (SigLIP measured 6.5 s, r8 run.log). face_probe holds no
+card at all and takes no turn. On a fleet card the kinds coexist, this is never armed, and nothing changes.
+"""
+
+_TURNS: dict[str, Any] = {"armed": False, "caches": {}}
+
+
+def arm_card_turns(armed: bool, caches: Mapping[str, dict[Any, Any]]) -> None:
+    """Boot: arm CARD_TURNS_WHY when the kinds take turns on this card, and name the caches a heavy op may drop."""
+    _TURNS["armed"] = bool(armed)
+    _TURNS["caches"] = caches
+
+
+def card_turns_armed() -> bool:
+    return bool(_TURNS["armed"])
+
+
+def takes_card_turn(kind: str) -> bool:
+    """Does an infer of `kind` take the card's turn? Only a weight-holding kind, only on a turn-taking card."""
+    return card_turns_armed() and KIND_VRAM_MIB.get(kind, 0.0) > 0.0
+
+
+def clear_card_for_render() -> list[str]:
+    """Called by an ADMITTED heavy op (CARD_TURNS_WHY): drop every cached infer service, hand the blocks back to
+    the driver, re-read the ledger budget. Returns the dropped kinds; [] (and nothing touched) when not armed."""
+    if not card_turns_armed():
+        return []
+    from .ops import gpu_admission
+
+    dropped = release_other_kinds("", _TURNS["caches"])
+    torch = sys.modules.get("torch")      # never import torch on a pod that has not loaded a model
+    if dropped and torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gpu_admission.remeasure_held()
+    return dropped
 
 
 SERVED_INFER_KINDS_WHY = """

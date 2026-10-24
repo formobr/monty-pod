@@ -1254,6 +1254,11 @@ def _run_step_inner(step: Any, ws: Workspace, produced: dict[str, dict[str, Any]
                 live("heavy_slot_wait_ended",
                      timings={"heavy_slot_wait_s": timing.heavy_park_s},
                      worker=worker_identity())
+                # infer_lanes.CARD_TURNS_WHY: on a card whose infer kinds take turns the encode is a turn too
+                from ..infer_lanes import clear_card_for_render
+                if dropped := clear_card_for_render():
+                    log(f"{op.op}: dropped {'+'.join(dropped)} weights — this card holds one tenant at a time; "
+                        f"ledger budget re-read at {gpu_admission.budget_mib():.0f} MiB")
                 timing.vram = _VramWatch(str(step.id))
             with handler_slots(op):
                 # the park is its own leg, SUBTRACTED from slot_wait, never inside it (HEAVY_PARK_WHY)

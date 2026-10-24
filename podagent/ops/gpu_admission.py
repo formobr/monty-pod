@@ -127,6 +127,26 @@ def budget_mib() -> float:
         return _budget
 
 
+def remeasure_held() -> float | None:
+    """Re-read the budget from the card while THIS thread holds the ONLY live reservation; the new budget, or
+    None (nothing read, nothing changed) when it is not the sole holder.
+
+    The one-read rule above exists so our own admitted heavies are never double-counted; with this thread the
+    sole holder and its handler not yet started, nothing of ours is on the card, so the read double-counts
+    nothing. Used only where the card's residency moves under a long-lived pod (infer_lanes.CARD_TURNS_WHY):
+    the budget must be the card NOW, not the card the first heavy op of the pod's life happened to see."""
+    global _budget
+    me = threading.get_ident()
+    with _cond:
+        if me not in _holders or len(_live) != 1:
+            return None
+    measured = _measure_budget()   # outside _cond, like budget_mib(): a slow nvidia-smi must not stall release()
+    with _cond:
+        _budget = measured
+        _cond.notify_all()
+        return _budget
+
+
 def reserved_mib() -> float:
     with _cond:
         return sum(_live.values())

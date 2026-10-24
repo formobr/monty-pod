@@ -774,9 +774,11 @@ def _run_infer(
             from .infer_lanes import refuse_unserved
             refuse_unserved(req.kind, served)
         judge_tiles = req.clip_rank is not None and req.clip_rank.judge_tiles is not None
-        if one_kind_resident and not judge_tiles:
+        from .infer_lanes import KIND_VRAM_MIB
+        if one_kind_resident and not judge_tiles and KIND_VRAM_MIB.get(req.kind, 0.0) > 0.0:
             # A cached service holds its weights on the card forever, so on a card too small for both kinds
-            # the idle one must go before this load — the kinds are already serialised onto one lane.
+            # the idle one must go before this load — the kinds are already serialised onto one lane. A kind
+            # that holds no card (face_probe, CPU ONNX) loads nothing there and drops nobody's weights.
             from .infer_lanes import release_other_kinds
             dropped = release_other_kinds(req.kind, {"align": align_cache, "clip_rank": rank_cache,
                                                      "person_matte": matte_cache})
@@ -1287,7 +1289,7 @@ class RestartCoordinator:
     A second latch, `infra_fault`, is tripped by an infrastructure-class run_error (runner.INFRA_FAULT_WHY):
     either one stops the claim loop before its next claim."""
 
-    _POOLS = ("ops", "heavy", "rank")
+    _POOLS = ("ops", "heavy", "rank", "probe")
 
     def __init__(self) -> None:
         self._latch = threading.Event()
@@ -1474,6 +1476,11 @@ def main() -> None:
     probe_cache: dict[tuple[Path, str], "ProbeService"] = {}
     rank_cache: dict[str, "ClipRankService"] = {}
     rank_slots = threading.BoundedSemaphore(rank_width)
+    # infer_lanes.CARD_TURNS_WHY: where the kinds take turns, the encode takes one too (a dry pod renders nothing)
+    from .infer_lanes import arm_card_turns, takes_card_turn
+    from .ops import gpu_admission
+    arm_card_turns(not kinds_coexist and not _dry_pod(),
+                   {"align": align_cache, "clip_rank": rank_cache, "person_matte": _MATTE_CACHE})
     boot: list[bool] = [False]
     boot_lock = threading.Lock()
 
@@ -1489,11 +1496,16 @@ def main() -> None:
             assert pod_job.request is not None
             request_raw = _infer_request_raw(pod_job)
             mine = _claim_boot()
-            if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
-                              yunet_path, not mine, corr_id=pod_job.corr_id,
-                              session_id=pod_job.session_id, rank_parallel=rank_width,
-                              rank_slots=rank_slots, one_kind_resident=not kinds_coexist,
-                              served=served) and mine:
+            kind = pod_job.request.kind
+            # a weight-holding kind books the card's turn in the one ledger the heavy ops use (CARD_TURNS_WHY)
+            with (gpu_admission.admission(f"infer.{kind}")
+                  if takes_card_turn(kind) and not _is_judge_tiles(pod_job) else contextlib.nullcontext()):
+                ran = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
+                                 yunet_path, not mine, corr_id=pod_job.corr_id,
+                                 session_id=pod_job.session_id, rank_parallel=rank_width,
+                                 rank_slots=rank_slots, one_kind_resident=not kinds_coexist,
+                                 served=served)
+            if not ran and mine:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None
@@ -1503,9 +1515,10 @@ def main() -> None:
     coordinator = RestartCoordinator()
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
             cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool, \
-            cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool:
+            cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool, \
+            cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe") as probe_pool:
         _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy, coordinator=coordinator,
-                       kinds_coexist=kinds_coexist)
+                       kinds_coexist=kinds_coexist, probe_pool=probe_pool)
         if coordinator.infra_fault():
             # Before a pending restart: an exec onto the same broken card would claim onto it again.
             _drain_and_stop_on_infra_fault(cp, coordinator)
@@ -1526,11 +1539,33 @@ def _is_clip_rank(pod_job: PodJob) -> bool:
     return pod_job.type == "infer" and pod_job.request is not None and pod_job.request.kind == "clip_rank"
 
 
+def _is_judge_tiles(pod_job: PodJob) -> bool:
+    """Judge tiles are bytes in, JPEGs out — no weights, no card (main._run_infer)."""
+    req = pod_job.request
+    return req is not None and req.clip_rank is not None and req.clip_rank.judge_tiles is not None
+
+
+def _is_face_probe(pod_job: PodJob) -> bool:
+    """face_probe holds no card (infer_lanes.KIND_VRAM_MIB 0): it must never queue behind a weight-holding kind."""
+    return pod_job.type == "infer" and pod_job.request is not None and pod_job.request.kind == "face_probe"
+
+
+FACE_PROBE_LANE_WHY = """
+face_probe (yunet ONNX on the CPU, 0 MiB of card) rode the one-wide heavy lane behind person_matte's whole
+matte: 056 v13 r8 run.log — person_matte claimed at +319.7 s, face_probe claimed at +358.0 s and ran 0.044 s,
+head_segments 55 s on the preview's critical path. It gets its own one-wide lane here (a yunet instance is not
+shared across threads). The control plane admits face_probe under the `heavy` class credit too
+(api internal/queue/redis.go podEnvelopeClass), so the wait ends only when that class moves; this lane is the
+pod's half and is a no-op until then.
+"""
+
+
 def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: Any, heavy: Any,
                    once: bool = False, coordinator: "RestartCoordinator | None" = None,
-                   kinds_coexist: bool = True) -> None:
+                   kinds_coexist: bool = True, probe_pool: Any = None) -> None:
     """Claim envelopes and hand them to a pool; `kinds_coexist=False` folds the rank lane onto the one-wide
-    heavy lane so the weight-holding kinds take turns (infer_lanes). `once` is the test seam — the production
+    heavy lane so the weight-holding kinds take turns (infer_lanes); face_probe takes `probe_pool` when given
+    (FACE_PROBE_LANE_WHY). `once` is the test seam — the production
     loop never returns on its own; a set restart or infra-fault latch is the one other way out, checked before
     each claim."""
     unhealthy_attempts = 0
@@ -1585,12 +1620,16 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                 if coordinator is not None:
                     coordinator.track("ops", str(corr or raw_meta.get("job_id") or "?"), fut)
             else:
-                pool = rank_pool if (_is_clip_rank(pod_job) and kinds_coexist) else heavy_pool
+                if _is_clip_rank(pod_job) and kinds_coexist:
+                    pool, pool_name = rank_pool, "rank"
+                elif probe_pool is not None and _is_face_probe(pod_job):
+                    pool, pool_name = probe_pool, "probe"
+                else:
+                    pool, pool_name = heavy_pool, "heavy"
                 fut = pool.submit(_guarded,
                             lambda j=pod_job, m=raw_meta, q=queued_at:
                             _with_lifecycle(cp, m, q, lambda: heavy(j)), cp, raw_meta)
                 if coordinator is not None:
-                    pool_name = "rank" if pool is rank_pool else "heavy"
                     coordinator.track(pool_name, str(raw_meta.get("corr_id") or raw_meta.get("job_id") or "?"), fut)
             if once:
                 return
