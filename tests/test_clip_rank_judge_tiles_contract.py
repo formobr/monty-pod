@@ -184,6 +184,17 @@ def test_schema_and_model_agree_on_the_new_examples(name, model) -> None:
     assert (CONTRACTS / "VERSION").read_text().strip() == "7"
 
 
+@pytest.mark.parametrize("path", sorted(EXAMPLES.glob("infer_request.*.json")), ids=lambda p: p.name)
+def test_every_infer_example_survives_the_pod_dispatch_reserialisation(path) -> None:
+    from podagent.main import _infer_request_raw
+    from podagent.models import PodJob
+
+    data = json.loads(path.read_text())
+    job = PodJob.model_validate({"type": "infer", "request": data, "session_id": "s", "corr_id": "c"})
+    raw = _infer_request_raw(job)  # what `_heavy` hands `_run_infer`, which re-validates it
+    assert InferRequest.model_validate(raw) == job.request
+
+
 def _contracts_validate():
     import importlib.util
 
