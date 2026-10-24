@@ -32,7 +32,7 @@ import pytest
 
 from podagent import event_stream
 from podagent.event_stream import EventStream
-from test_cp_retry import _ack  # reuse the real ack wire shape, not an invented one (TESTING.md §3b.3)
+from test_cp_retry import _ack, _job  # reuse the real ack wire shape, not an invented one (TESTING.md §3b.3)
 
 _CLOSE = object()
 _BACKSTOP_S = 30.0  # a generous safety net against a genuine hang, never a value anything in this
@@ -82,25 +82,25 @@ class _FakeClock:
     def __init__(self) -> None:
         self._now = 0.0
         self._lock = threading.Lock()
-        self._condition: threading.Condition | None = None
+        self._conditions: list[threading.Condition] = []
 
     def __call__(self) -> float:
         with self._lock:
             return self._now
 
     def attach(self, condition: threading.Condition) -> None:
-        """Wires this clock to the stream's own `_work` condition: `advance()` then notifies it, so a
-        caller parked in `_await_delivery`'s `_work.wait(...)` wakes THE INSTANT this clock moves past
-        its deadline, rather than depending on a real-time poll tick landing inside some narrow window
-        — the exact race a scheduling-starved batch run could otherwise miss."""
+        """Wires this clock to a stream condition: `advance()` then notifies it, so a caller parked in
+        `_await_delivery`'s `_work.wait(...)` (or the window watchdog parked on `_ack_cv`) wakes THE
+        INSTANT this clock moves past its deadline, rather than depending on a real-time poll tick
+        landing inside some narrow window — the exact race a scheduling-starved batch run could miss."""
         with self._lock:
-            self._condition = condition
+            self._conditions.append(condition)
 
     def advance(self, delta: float) -> None:
         with self._lock:
             self._now += delta
-            condition = self._condition
-        if condition is not None:
+            conditions = list(self._conditions)
+        for condition in conditions:
             with condition:
                 condition.notify_all()
 
@@ -113,17 +113,30 @@ class _FakeConn:
     def __init__(self, written: "queue.Queue[dict[str, Any]]", incoming: "queue.Queue[Any]") -> None:
         self._written = written
         self._incoming = incoming
+        self.closed = threading.Event()
+        self._recv_cv = threading.Condition()
+        self._recv_calls = 0
 
     def send(self, data: str) -> None:
         self._written.put(json.loads(data))
 
     def recv(self) -> str:
+        with self._recv_cv:
+            self._recv_calls += 1
+            self._recv_cv.notify_all()
         item = self._incoming.get()  # blocks for the next real ack; no wall-clock bound
         if item is _CLOSE:
             raise OSError("fake connection closed")
         return item
 
+    def wait_recv_calls(self, n: int) -> None:
+        """Returns once the reader has come back for its `n`th frame, i.e. fully handled the first n-1."""
+        with self._recv_cv:
+            if not self._recv_cv.wait_for(lambda: self._recv_calls >= n, timeout=_BACKSTOP_S):
+                pytest.fail(f"the reader never came back for frame {n} — it is stuck handling an earlier one")
+
     def close(self) -> None:
+        self.closed.set()
         self._incoming.put(_CLOSE)
 
 
@@ -305,3 +318,118 @@ def test_a_caller_behind_a_never_acked_head_is_told_false_within_one_wall(
     # being driven all the way to dead-letter, which reopens admission), "behind" would eventually have
     # been dispatched and this would fail.
     assert "behind" not in sent_steps
+
+
+def _open_stream(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> "tuple[EventStream, _FakeClock, list[_FakeConn], queue.Queue[dict[str, Any]], queue.Queue[Any]]":
+    """A stream on a fake peer whose dispatches are gated (ACK_WINDOW 0) until the test opens them."""
+    monkeypatch.setattr(event_stream, "ACK_WINDOW", 0)
+    monkeypatch.setattr(event_stream, "MAX_REOPENS", 0)
+    written: "queue.Queue[dict[str, Any]]" = queue.Queue()
+    incoming: "queue.Queue[Any]" = queue.Queue()
+    conns: list[_FakeConn] = []
+
+    def _connect(*_a: Any, **_k: Any) -> _FakeConn:
+        conns.append(_FakeConn(written, incoming))
+        return conns[-1]
+
+    monkeypatch.setattr(event_stream, "_ws_client", type("_Client", (), {"connect": staticmethod(_connect)}))
+    clock = _FakeClock()
+    stream = EventStream(
+        "http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json", clock=clock)
+    clock.attach(stream._work)
+    clock.attach(stream._ack_cv)
+    return stream, clock, conns, written, incoming
+
+
+def _release_window(stream: EventStream, monkeypatch: pytest.MonkeyPatch, size: int) -> None:
+    monkeypatch.setattr(event_stream, "ACK_WINDOW", size)
+    with stream._work:
+        stream._work.notify_all()
+
+
+def test_acks_are_registered_while_the_outbox_fsync_is_stuck(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prod 2026-10-24 ack_wall loop: a job frame arriving mid-window makes the pod write its inbox and
+    job_ack durably. With the disk busy, that write must not hold back the registration of the acks that
+    arrive behind it — the socket stays open and the window completes the moment the disk answers."""
+    stream, clock, conns, written, incoming = _open_stream(tmp_path, monkeypatch)
+    armed, release = threading.Event(), threading.Event()
+    real_fsync = event_stream.os.fsync
+
+    def slow_fsync(fd: int) -> None:
+        if armed.is_set():
+            assert release.wait(_BACKSTOP_S), "the injected slow disk was never released"
+        real_fsync(fd)
+
+    monkeypatch.setattr(event_stream.os, "fsync", slow_fsync)
+    try:
+        for step in ("a", "b"):
+            stream.send_event({"stage": "test", "status": "step", "step": step}, wait=False)
+        _release_window(stream, monkeypatch, 2)
+        frames = [_bounded_get(written, "a window frame's write") for _ in range(2)]
+
+        armed.set()  # from here on every durable write blocks
+        incoming.put(json.dumps(_job("c-slow-disk")))
+        for frame in frames:
+            incoming.put(_ack(frame))
+        # The reader must get all the way through the job frame AND both acks (4th recv = back for more)
+        # although the job's durable write is stuck.
+        conns[0].wait_recv_calls(4)
+        clock.advance(10 * event_stream.FRAME_WALL_S)
+        assert not conns[0].closed.is_set(), "the socket was closed although every ack had arrived"
+    finally:
+        release.set()
+        stream.close()
+
+
+def test_a_window_whose_acks_keep_arriving_is_not_closed_by_the_stall_bound(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The close is a stall bound: the window's total age may pass FRAME_WALL_S as long as an ack keeps
+    arriving inside it."""
+    stream, clock, conns, written, incoming = _open_stream(tmp_path, monkeypatch)
+    results: list[bool | BaseException] = [False, False]
+
+    def _call(i: int) -> None:
+        try:
+            results[i] = stream.send_event({"stage": "test", "status": "step", "step": f"e{i}"}, wait=True)
+        except BaseException as e:  # noqa: BLE001 - captured for the assertion below
+            results[i] = e
+        finally:
+            with stream._work:
+                stream._work.notify_all()
+
+    threads = [threading.Thread(target=_call, args=(i,), daemon=True) for i in range(2)]
+    try:
+        for t in threads:
+            t.start()
+        _wait_for_all_appended(stream, 2, threads)
+        _release_window(stream, monkeypatch, 2)
+        frames = [_bounded_get(written, "a window frame's write") for _ in range(2)]
+        part = 0.6 * event_stream.FRAME_WALL_S
+        clock.advance(part)
+        incoming.put(_ack(frames[0]))
+        conns[0].wait_recv_calls(2)
+        clock.advance(part)  # 1.2 walls since the window opened, 0.6 since its last sign of life
+        assert not conns[0].closed.is_set()
+        incoming.put(_ack(frames[1]))
+        _bounded_join(threads)
+        # Checked before `stream.close()`, which closes the connection itself.
+        assert not conns[0].closed.is_set()
+    finally:
+        stream.close()
+    assert results == [True, True], results
+
+
+def test_a_window_whose_acks_stop_arriving_is_closed_on_the_stall_bound(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stream, clock, conns, written, incoming = _open_stream(tmp_path, monkeypatch)
+    try:
+        stream.send_event({"stage": "test", "status": "step", "step": "silent"}, wait=False)
+        _release_window(stream, monkeypatch, 1)
+        _bounded_get(written, "the frame's write")  # never acked
+        clock.advance(event_stream.FRAME_WALL_S)
+        assert conns[0].closed.wait(_BACKSTOP_S), "a silent peer never made the window give up"
+    finally:
+        stream.close()
