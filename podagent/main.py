@@ -1452,7 +1452,7 @@ def main() -> None:
     def _heavy(pod_job: PodJob) -> None:
         if pod_job.type == "infer":
             assert pod_job.request is not None
-            request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
+            request_raw = _infer_request_raw(pod_job)
             mine = _claim_boot()
             if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
                               yunet_path, not mine, corr_id=pod_job.corr_id,
@@ -1477,6 +1477,13 @@ def main() -> None:
         if coordinator.restart_requested():
             # Runs INSIDE this `with` on purpose — see _drain_and_restart's docstring.
             _drain_and_restart(cp, coordinator)
+
+
+def _infer_request_raw(pod_job: PodJob) -> dict[str, Any]:
+    """The validated infer request as the dict `_run_infer` re-validates. `exclude_none` like the render branch:
+    an absent optional field equals its default, and an explicit null is refused by absent-not-null validators."""
+    assert pod_job.request is not None
+    return pod_job.request.model_dump(by_alias=True, exclude_none=True, mode="json")
 
 
 def _is_clip_rank(pod_job: PodJob) -> bool:
