@@ -175,8 +175,16 @@ class EventStream:
         self._jobs: "queue.Queue[str | object]" = queue.Queue()
         self._queued_ids: set[str] = set()
         self._claimed_ids: set[str] = set()
+        # The ACK path's own lock. It guards `_ack_waiters`, `_acks`, `_window_frames`, `_clock_samples` and
+        # `_ack_progress` and is NEVER held across disk I/O or while taking `_state`, so the reader registers
+        # an incoming ack without ever queueing behind a durable write (those hold `_state` through two fsyncs).
+        self._ack_cv = threading.Condition(threading.Lock())
         self._ack_waiters: dict[tuple[str, int], threading.Event] = {}
         self._acks: dict[tuple[str, int], dict[str, Any]] = {}
+        self._window_frames: dict[tuple[str, int], dict[str, Any]] = {}
+        # `self._clock()` at the last sign of life of the in-flight window: its start, a frame written, an ack
+        # registered. The window's stall bound runs from here.
+        self._ack_progress: float = 0.0
         self._wire_attempts: dict[tuple[str, int], int] = {}
         self._wire_sends: dict[tuple[str, int], tuple[int, int]] = {}
         # Every key the sender has ever included in a dispatched window, set the moment that window is
@@ -609,6 +617,7 @@ class EventStream:
         """Claim/delivery identity plus exact clock-offset bounds known before the terminal is built."""
         with self._state:
             delivery = self._delivery_meta.get(corr_id)
+        with self._ack_cv:
             samples = [dict(row) for row in self._clock_samples
                        if row["pod_clock_id"] == self._stream_id]
         reasons: list[str] = []
@@ -1020,23 +1029,27 @@ class EventStream:
     def _exchange_window(
             self, frames: list[dict[str, Any]],
     ) -> dict[tuple[str, int], dict[str, Any]]:
-        # `websockets.sync.send()` has no timeout. The watchdog below owns one wall shared by every write and
-        # every ACK in this attempt; on expiry, closing the raw socket interrupts a kernel-blocked send. It is
-        # read off `self._clock()`, not real `time.monotonic()`, and both waits below park on `_work` (woken
-        # by the write finishing, an ack arriving, `_fail_connection`, or — on an injected clock — a test's own
-        # `advance()`) rather than polling a bare Event on a fixed real-time slice: a batch run stalled for any
-        # length of real time can never make this wall expire on its own: only this clock moving can.
-        deadline = self._clock() + FRAME_WALL_S
+        # `websockets.sync.send()` has no timeout. The watchdog below owns a STALL bound, not a total wall:
+        # the socket closes only when nothing has happened for FRAME_WALL_S — no frame written, no ack
+        # registered — while the window is still unfinished, so a slow but progressing window is never cut
+        # short. On expiry, closing the raw socket interrupts a kernel-blocked send. It is read off
+        # `self._clock()`, not real `time.monotonic()`, and the wait parks on `_ack_cv` (woken by a write
+        # finishing, an ack arriving, `_fail_connection`, or — on an injected clock — a test's own
+        # `advance()`) rather than polling a bare Event on a fixed real-time slice: a batch run stalled for
+        # any length of real time can never make this bound expire on its own: only this clock moving can.
+        # It waits on `_ack_cv`, never `_state`: an fsync holding `_state` cannot delay an ack's registration
+        # nor this watchdog's reading of it.
         keys = [self._frame_key(frame) for frame in frames]
         ready = {key: threading.Event() for key in keys}
-        with self._state:
-            conn = self._conn
-            for key, waiter in ready.items():
-                self._ack_waiters[key] = waiter
+        conn = self._conn
+        with self._ack_cv:
+            self._ack_progress = self._clock()
+            if conn is not None:
+                for key, waiter in ready.items():
+                    self._ack_waiters[key] = waiter
+                for frame in frames:
+                    self._window_frames[self._frame_key(frame)] = frame
         if conn is None:
-            with self._state:
-                for key in keys:
-                    self._ack_waiters.pop(key, None)
             return {}
         write_done = threading.Event()
         write_errors: list[BaseException] = []
@@ -1048,59 +1061,50 @@ class EventStream:
                 for frame in frames:
                     key = self._frame_key(frame)
                     send_ns = time.monotonic_ns()
-                    with self._state:
+                    with self._ack_cv:
                         wire_attempt = self._wire_attempts.get(key, 0) + 1
                         self._wire_attempts[key] = wire_attempt
                         self._wire_sends[key] = (send_ns, wire_attempt)
                     wire = {**frame, "client_send_mono_ns": send_ns}
                     conn.send(json.dumps(wire, ensure_ascii=False, separators=(",", ":")))
+                    with self._ack_cv:
+                        self._ack_progress = max(self._ack_progress, self._clock())
             except BaseException as e:  # noqa: BLE001 - watchdog owns failure and durable replay
                 write_errors.append(e)
             finally:
                 write_done.set()
-                with self._work:
-                    self._work.notify_all()
+                with self._ack_cv:
+                    self._ack_cv.notify_all()
 
         threading.Thread(
             target=write_window, name="pod-stream-window-write", daemon=True).start()
-        write_timed_out = False
-        while True:
-            with self._work:
-                if write_done.is_set() or self._conn is not conn:
+        stalled = False
+        with self._ack_cv:
+            while True:
+                if self._conn is not conn or all(key in self._acks for key in keys):
                     break
-                remaining = deadline - self._clock()
+                remaining = self._ack_progress + FRAME_WALL_S - self._clock()
                 if remaining <= 0:
-                    write_timed_out = True
+                    stalled = True
                     break
-                self._work.wait(timeout=remaining)
-        if write_timed_out:
-            _log(f"frame window write exceeded the shared {FRAME_WALL_S}s wall")
-            self._fail_connection(conn, "write/ACK wall expired", "write_wall")
+                self._ack_cv.wait(timeout=remaining)
+        if stalled and not write_done.is_set():
+            _log(f"frame window write made no progress for {FRAME_WALL_S}s")
+            self._fail_connection(conn, "write/ACK stall bound expired", "write_wall")
         if write_errors:
             _log(f"frame window write failed ({safe_error(write_errors[0])})")
             self._fail_connection(conn, f"write: {safe_error(write_errors[0])}", "write_error")
 
-        for key in keys:
-            while True:
-                with self._work:
-                    if key in self._acks or self._conn is not conn:
-                        break
-                    remaining = deadline - self._clock()
-                    if remaining <= 0:
-                        break
-                    self._work.wait(timeout=remaining)
-            with self._state:
-                if self._conn is not conn:
-                    break
-        with self._state:
+        with self._ack_cv:
             acks = {key: self._acks.pop(key) for key in keys if key in self._acks}
             for key in keys:
                 self._ack_waiters.pop(key, None)
+                self._window_frames.pop(key, None)
         if len(acks) != len(keys):
             missing = len(keys) - len(acks)
-            _log(f"frame window has {missing}/{len(keys)} unacknowledged after {FRAME_WALL_S}s")
+            _log(f"frame window has {missing}/{len(keys)} unacknowledged, none arriving for {FRAME_WALL_S}s")
             self._fail_connection(
-                conn, f"{missing}/{len(keys)} unacknowledged after {FRAME_WALL_S}s", "ack_wall",
+                conn, f"{missing}/{len(keys)} unacknowledged, none arriving for {FRAME_WALL_S}s", "ack_wall",
                 unacked=missing)
         return acks
 
@@ -1109,12 +1113,12 @@ class EventStream:
     def _validate_ack(self, frame: dict[str, Any]) -> dict[str, Any]:
         checked = StreamAck.model_validate(frame).model_dump(exclude_none=True, mode="json")
         stream_id, seq = checked["stream_id"], checked["seq"]
-        with self._state:
+        with self._ack_cv:
             if (stream_id, seq) not in self._ack_waiters:
                 raise ProtocolError(f"ACK {stream_id}:{seq} has no in-flight frame")
         return checked
 
-    def _record_clock_sample_locked(
+    def _record_clock_sample_locked(  # called with `_ack_cv` held
             self, key: tuple[str, int], ack: dict[str, Any], client_recv_mono_ns: int) -> None:
         sent = self._wire_sends.get(key)
         if sent is None:
@@ -1288,6 +1292,39 @@ class EventStream:
         return delivery
 
     def _read_loop(self, conn: Any) -> None:
+        """Reads frames and registers acks without ever touching disk or `_state`.
+
+        Everything that needs `_state` (accepting a job and durably appending its job_ack, latching a
+        deterministic verdict) is handed in arrival order to `_deferred_loop`, so a slow fsync delays those,
+        never the registration of an ack the peer already sent."""
+        deferred: "queue.Queue[tuple[str, Any, Any] | None]" = queue.Queue()
+        threading.Thread(
+            target=self._deferred_loop, args=(conn, deferred), name="pod-stream-intake", daemon=True).start()
+        try:
+            self._read_frames(conn, deferred)
+        finally:
+            deferred.put(None)
+
+    def _deferred_loop(self, conn: Any, deferred: "queue.Queue[tuple[str, Any, Any] | None]") -> None:
+        while True:
+            item = deferred.get()
+            if item is None:
+                return
+            kind, first, second = item
+            try:
+                if kind == "job":
+                    delivery = self._accept_job(first, client_recv_mono_ns=second)
+                    if delivery is not None:
+                        self._emit_job_ack(delivery)
+                else:
+                    with self._work:
+                        self._latch_locked(FrameRejected(dict(first), second))
+            except Exception as e:  # noqa: BLE001 - same fail-closed verdict the reader itself gives
+                _log(f"reader rejected server frame ({safe_error(e)})")
+                self._fail_connection(conn, safe_error(e), "reader_error")
+                return
+
+    def _read_frames(self, conn: Any, deferred: "queue.Queue[tuple[str, Any, Any] | None]") -> None:
         while True:
             try:
                 raw = conn.recv()
@@ -1297,39 +1334,40 @@ class EventStream:
                     raise ProtocolError("server frame is not an object")
                 kind = decoded.get("type")
                 if kind == "job":
-                    delivery = self._accept_job(decoded, client_recv_mono_ns=client_recv_mono_ns)
-                    if delivery is not None:
-                        self._emit_job_ack(delivery)
+                    deferred.put(("job", decoded, client_recv_mono_ns))
                     continue
                 if kind != "ack":
                     raise ProtocolError(f"unknown server frame type {kind!r}")
-                with self._state:
-                    if self._conn is not conn:
-                        return
+                if self._conn is not conn:
+                    return
                 ack = self._validate_ack(decoded)
                 seq = int(ack["seq"])
                 key = (str(ack["stream_id"]), seq)
-                with self._work:
+                status = int(ack["status"])
+                verdict_frame = None
+                with self._ack_cv:
                     self._last_ack_mono = time.monotonic()
                     self._record_clock_sample_locked(key, ack, client_recv_mono_ns)
-                    self._acks[key] = ack
-                    waiter = self._ack_waiters.get(key)
-                    status = int(ack["status"])
                     if status in (403, 422, 409):
-                        frame = next(
-                            (item for item in self._outbox if self._frame_key(item) == key), None)
+                        frame = self._window_frames.get(key)
                         if frame is None:
                             raise ProtocolError(f"ACK {key[0]}:{key[1]} has no durable frame")
                         if _classify_verdict(frame, status, str(ack.get("error") or "")) == "closes_admission":
-                            # Ordered persistence may wait for an earlier ACK. Admission cannot: the peer
-                            # already made a deterministic worker-identity verdict, so no new paid job may
-                            # enter during that gap. A "one_frame"/unmatched-409 verdict settles normally,
-                            # through `_deliver_window`/`_settle` below — admission stays open for it.
-                            self._latch_locked(FrameRejected(dict(frame), ack))
-                    # Wakes a watchdog parked on `_work` in `_exchange_window` (its wait there is on this
-                    # SAME condition, not a fixed real-time slice) the instant this ack is recorded, so an
-                    # injected-clock test's exact ack-delivery timing — not real elapsed time — decides it.
-                    self._work.notify_all()
+                            verdict_frame = frame
+                    self._acks[key] = ack
+                    self._ack_progress = max(self._ack_progress, self._clock())
+                    waiter = self._ack_waiters.get(key)
+                    # Wakes the watchdog parked on `_ack_cv` in `_exchange_window` the instant this ack is
+                    # recorded, so an injected-clock test's exact ack-delivery timing decides it.
+                    self._ack_cv.notify_all()
+                if verdict_frame is not None:
+                    # Ordered persistence may wait for an earlier ACK. Admission cannot: the peer already
+                    # made a deterministic worker-identity verdict, so no new paid job may enter during that
+                    # gap. A "one_frame"/unmatched-409 verdict settles normally, through
+                    # `_deliver_window`/`_settle` — admission stays open for it. The latch itself needs
+                    # `_state`, so it rides the deferred queue; `_settle` latches the same verdict if the
+                    # window gets there first.
+                    deferred.put(("verdict", verdict_frame, ack))
             except Exception as e:  # noqa: BLE001 - malformed peer means connection is unsafe
                 _log(f"reader rejected server frame ({safe_error(e)})")
                 closed = _ConnectionClosed is not None and isinstance(e, _ConnectionClosed)
@@ -1452,7 +1490,9 @@ class EventStream:
         with self._state:
             if self._conn is conn:
                 self._conn = None
-                waiters = list(self._ack_waiters.values())
+                with self._ack_cv:
+                    waiters = list(self._ack_waiters.values())
+                    unregistered = sum(1 for key in self._ack_waiters if key not in self._acks)
                 # Only the close of the LIVE socket is recorded: a second failure path observing the same
                 # dead socket (the ACK wall after a write wall, the reader after a forced shutdown) would
                 # otherwise overwrite the first, true reason.
@@ -1462,8 +1502,7 @@ class EventStream:
                     "message": safe_text(why, 200),
                     "open_s": round(now - self._conn_opened_mono, 3)
                     if self._conn_opened_mono is not None else None,
-                    "unacked": unacked if unacked is not None else sum(
-                        1 for key in self._ack_waiters if key not in self._acks),
+                    "unacked": unacked if unacked is not None else unregistered,
                     "since_last_ack_s": round(now - self._last_ack_mono, 3)
                     if self._last_ack_mono is not None else None,
                 }
@@ -1473,6 +1512,8 @@ class EventStream:
                 waiters = []
         for waiter in waiters:
             waiter.set()
+        with self._ack_cv:
+            self._ack_cv.notify_all()
         with self._work:
             self._work.notify_all()
         self._shutdown_conn(conn)
