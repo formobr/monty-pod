@@ -1487,7 +1487,7 @@ def main() -> None:
     def _heavy(pod_job: PodJob) -> None:
         if pod_job.type == "infer":
             assert pod_job.request is not None
-            request_raw = pod_job.request.model_dump(by_alias=True, mode="json")
+            request_raw = pod_job.request.model_dump(by_alias=True, mode="json", exclude_none=True)
             mine = _claim_boot()
             if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
                               yunet_path, not mine, corr_id=pod_job.corr_id,
