@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -769,6 +770,20 @@ def _safe_send_event(cp: ControlPlane, event: dict) -> None:
         print(f"[render] {label}: event send failed, swallowed: {safe_error(exc)}", file=sys.stderr)
 
 
+def _phase_heartbeat_s() -> float:
+    """Same knob and default as the ops lane (ops/runner.py _RUN_HEARTBEAT_S)."""
+    return float(os.environ.get("POD_RUN_HEARTBEAT_S") or 30.0)
+
+
+def _phase_heartbeat(cp: ControlPlane, base: dict, t0: float, stop: threading.Event, tick: float) -> None:
+    """Every `tick` until `stop`: an `<op>_progress` step carrying the phase's elapsed seconds. Sent through
+    the swallowing sender — a heartbeat that fails to enqueue must never fail a render."""
+    while not stop.wait(tick):
+        ev = {**base, "phase": f"{base['op']}_progress",
+              "timings": {"elapsed_s": round(time.monotonic() - t0, 3)}}
+        _safe_send_event(cp, {k: v for k, v in ev.items() if v is not None})
+
+
 _GPU: bool | None = None
 _GPU_CACHE_ENV = "MONTY_GPU_PROBE_CACHE"
 
@@ -947,9 +962,22 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         send = (lambda ev: _safe_send_event(cp, ev)) if guarded else cp.send_event
         send({k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
         started = time.monotonic()
+        # Beside the phase, never inside it (ops/runner.py RUN_SILENCE_WHY): a phase that blocks for minutes
+        # (prepare = the mograph arm) must still say it is alive, or the pool retires a pod that owns a claim.
+        beat_stop = threading.Event()
+        beat = threading.Thread(
+            target=_phase_heartbeat, args=(cp, base, started, beat_stop, _phase_heartbeat_s()),
+            name=f"render-heartbeat-{op}", daemon=True)
+        beat.start()
+
+        def stop_beat() -> None:
+            # joined before any terminal event, so no progress frame can land after it
+            beat_stop.set()
+            beat.join()
         try:
             yield
         except BaseException as exc:
+            stop_beat()
             send({
                 k: v for k, v in {
                     **base,
@@ -964,6 +992,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             })
             raise
         else:
+            stop_beat()
             send({
                 k: v for k, v in {
                     **base,
@@ -972,6 +1001,8 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                     "timings": {"phase_s": round(time.monotonic() - started, 3)},
                 }.items() if v is not None
             })
+        finally:
+            stop_beat()  # idempotent; covers an exit path that skipped both branches above
     # function-local: render_onepass imports this module, so a top-level import would cycle.
     from . import render_onepass as _onepass
     if spec.mode == "final":
