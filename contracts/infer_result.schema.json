@@ -24,7 +24,8 @@
         "align",
         "face_probe",
         "clip_rank",
-        "person_matte"
+        "person_matte",
+        "clean_plate"
       ]
     },
     "status": {

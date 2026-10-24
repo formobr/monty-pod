@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from podagent.models import (
     SPEC_VERSION,
+    CleanPlatePayload,
     ClipRankPayload,
     FaceProbePayload,
     InferRequest,
@@ -39,6 +40,7 @@ MODELS = {
     "face_probe": FaceProbePayload,
     "clip_rank": ClipRankPayload,
     "person_matte": PersonMattePayload,
+    "clean_plate": CleanPlatePayload,
     "pod_job": PodJob,
 }
 

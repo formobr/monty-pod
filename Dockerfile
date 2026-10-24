@@ -173,6 +173,17 @@ RUN curl -fL -o /opt/models/rvm_mobilenetv3_fp16.torchscript \
         | sha256sum -c -
 ENV MODEL_RVM=/opt/models/rvm_mobilenetv3_fp16.torchscript
 
+# big-lama TorchScript (clean_plate, super-director v13 vertigo class) STAYS baked too: 206 MB, the TorchScript export of the
+# original advimman/lama «big-lama» checkpoint (Apache-2.0; weights card huggingface.co/smartywu/big-lama), loaded by the
+# same torch.jit path as RVM — no new runtime in the image. Pinned by sha256 here (the build FAILS on a mismatch) AND in
+# podagent/infer_plate.py, which reads the file once, checks it and hands torch.jit.load those very bytes. The sha256 is our own
+# measurement of the release asset; IOPaint's independent md5 e3aa4aaa15225a33ec84f9f4bc47e500 agrees (docs/research/clean-plate-lama.md).
+RUN curl -fL -o /opt/models/big-lama.pt \
+        https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt \
+    && echo "344c77bbcb158f17dd143070d1e789f38a66c04202311ae3a258ef66667a9ea9  /opt/models/big-lama.pt" \
+        | sha256sum -c -
+ENV MODEL_LAMA=/opt/models/big-lama.pt
+
 # --- Montserrat (cover/caption rendering) -----------------------------------
 RUN mkdir -p /usr/share/fonts/truetype/montserrat \
     && curl -L -o /usr/share/fonts/truetype/montserrat/Montserrat.ttf \

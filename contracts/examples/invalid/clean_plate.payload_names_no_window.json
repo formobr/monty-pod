@@ -1,0 +1,14 @@
+{
+  "model": "big_lama_torchscript",
+  "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "width": 720,
+  "height": 1280,
+  "plates": [],
+  "refused": [],
+  "timings": {
+    "decode_s": 0,
+    "median_s": 0,
+    "inpaint_s": 0,
+    "wall_s": 0
+  }
+}

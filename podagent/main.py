@@ -29,12 +29,15 @@ if TYPE_CHECKING:
     from .infer_align import AlignService
     from .infer_cliprank import ClipRankService
     from .infer_matte import MatteService
+    from .infer_plate import PlateService
     from .infer_probe import ProbeService
 
-INFER_KINDS = ("align", "face_probe", "clip_rank", "person_matte")
+INFER_KINDS = ("align", "face_probe", "clip_rank", "person_matte", "clean_plate")
 # person_matte's frozen RVM, by model id (the baked file is sha-pinned, so the id names exactly one checkpoint).
 # Module-level so the one heavy lane reuses it across envelopes without widening _run_infer's positional surface.
 _MATTE_CACHE: "dict[str, MatteService]" = {}
+# clean_plate's big-lama, by model id (sha-pinned baked file, same reasoning as the RVM cache above).
+_PLATE_CACHE: "dict[str, PlateService]" = {}
 
 # THERE IS NO POLL ANY MORE. Work arrives on the socket the pod already holds (podagent.event_stream); the
 # floor below survives it for one reason only — a socket that will NOT open returns immediately, and a bare
@@ -727,6 +730,7 @@ def _run_infer(
     one_kind_resident: bool = False,
     served: "frozenset[str] | None" = None,
     matte_cache: "dict[str, MatteService] | None" = None,
+    plate_cache: "dict[str, PlateService] | None" = None,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag.
 
@@ -735,6 +739,8 @@ def _run_infer(
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
     if matte_cache is None:
         matte_cache = _MATTE_CACHE
+    if plate_cache is None:
+        plate_cache = _PLATE_CACHE
 
     @contextmanager
     def phase(name: str):
@@ -781,7 +787,7 @@ def _run_infer(
             # that holds no card (face_probe, CPU ONNX) loads nothing there and drops nobody's weights.
             from .infer_lanes import release_other_kinds
             dropped = release_other_kinds(req.kind, {"align": align_cache, "clip_rank": rank_cache,
-                                                     "person_matte": matte_cache})
+                                                     "person_matte": matte_cache, "clean_plate": plate_cache})
             if dropped:
                 note(f"dropped {'+'.join(dropped)} weights: this card holds one infer kind at a time")
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
@@ -857,6 +863,22 @@ def _run_infer(
             matte_run = matte_svc.run(req.person_matte, req.put_url, note)
             infer_s = matte_run.infer_s
             work_timings = {**matte_run.timings, "work_s": time.monotonic() - work_started}
+        elif req.kind == "clean_plate":
+            from .infer_plate import PlateRefused, PlateService
+            from .ops import dry as _ops_dry
+
+            assert req.clean_plate is not None
+            if _ops_dry.armed():
+                raise PlateRefused("clean_plate is a real GPU inpaint and a contour-dry pod does no GPU work "
+                                   "(DRY_POD_NO_GPU_WHY) — the engine must not send it to a dry pod")
+            plate_svc = plate_cache.get(req.model)
+            if plate_svc is None:
+                with phase("model_load"):
+                    note(f"loading {req.model}")
+                    plate_svc = plate_cache[req.model] = PlateService(req.model)
+            plate_run = plate_svc.run(req.clean_plate, req.put_url, note)
+            infer_s = plate_run.infer_s
+            work_timings = {**plate_run.timings, "work_s": time.monotonic() - work_started}
         else:
             from .infer_probe import ProbeService
 
@@ -867,7 +889,7 @@ def _run_infer(
                 with phase("model_load"):
                     probe_svc = probe_cache[key] = ProbeService(yunet_path, req.model)
             infer_s = probe_svc.run(req.face_probe, req.put_url)
-        if req.kind not in ("clip_rank", "person_matte"):
+        if req.kind not in ("clip_rank", "person_matte", "clean_plate"):
             work_timings = {
                 "infer_s": infer_s,
                 "work_s": time.monotonic() - work_started,
@@ -1438,7 +1460,7 @@ def main() -> None:
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
     from .infer_lanes import RENDER_HEADROOM_MIB, card_holds_both_kinds, heavy_lane_mib
-    heavy = served & {"align", "person_matte"}
+    heavy = served & {"align", "person_matte", "clean_plate"}
     if "clip_rank" in served and heavy:
         kinds_coexist, residency_why = card_holds_both_kinds(served=served)
     else:
@@ -1480,7 +1502,8 @@ def main() -> None:
     from .infer_lanes import arm_card_turns, takes_card_turn
     from .ops import gpu_admission
     arm_card_turns(not kinds_coexist and not _dry_pod(),
-                   {"align": align_cache, "clip_rank": rank_cache, "person_matte": _MATTE_CACHE})
+                   {"align": align_cache, "clip_rank": rank_cache, "person_matte": _MATTE_CACHE,
+                    "clean_plate": _PLATE_CACHE})
     boot: list[bool] = [False]
     boot_lock = threading.Lock()
 

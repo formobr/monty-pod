@@ -690,6 +690,54 @@ class PersonMatteParams(BaseModel):
         return self
 
 
+class CleanPlateWindow(BaseModel):
+    """One plate the pod writes: the layer window [t0, t1] (seconds on the video's own clock) and the presigned PNG
+    target. `id` is the sd layer id — the engine reads the plate back by it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    t0: float = Field(ge=0)
+    t1: float = Field(gt=0)
+    put_url: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _forward(self) -> "CleanPlateWindow":
+        if self.t1 <= self.t0:
+            raise ValueError(f"clean_plate window {self.id!r} [{self.t0}, {self.t1}] must have t0 < t1")
+        return self
+
+
+class CleanPlateParams(BaseModel):
+    """The clean background plate of ONE video, one plate per window (super-director v13 vertigo class): a per-pixel
+    temporal median over the pixels the person matte does not cover, then LaMa for what is never uncovered. Every
+    number is the planner's (registry/clean_plate.yaml); the matte is the one the person_matte kind already produced
+    for the SAME video (`matte_kind` says how to read its alpha), so no segmentation runs here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    video_url: str = Field(min_length=1)
+    matte_url: str = Field(min_length=1)
+    matte_kind: Literal["cutout", "alpha"]
+    windows: list[CleanPlateWindow] = Field(min_length=1, max_length=32)
+    samples: int = Field(ge=3, le=48)              # frames sampled per window, evenly spread
+    person_alpha: int = Field(ge=1, le=254)        # a pixel whose matte alpha is above this is the person
+    dilate_px: int = Field(ge=0, le=64)            # the person's silhouette grows by this before it is excluded
+    min_visible: int = Field(ge=1, le=48)          # a pixel seen as background in fewer samples is a hole
+    stable_range: int = Field(ge=4, le=255)        # visible samples that disagree by more than this (0..255) are a hole
+    inpaint_long_side: int = Field(ge=256, le=2048)  # LaMa works at most this big; the result is upsampled into the hole
+    max_hole_fraction: float = Field(gt=0, le=1)   # more hole than this and the plate is refused, not hallucinated
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "CleanPlateParams":
+        if self.min_visible > self.samples:
+            raise ValueError("clean_plate min_visible cannot exceed samples")
+        ids = [w.id for w in self.windows]
+        if len(set(ids)) != len(ids):
+            raise ValueError("clean_plate window ids must be unique")
+        return self
+
+
 class WeightsRef(BaseModel):
     """Where the pod gets this job's checkpoint. A presigned GET for a tar of the model directory, plus
     that tar's sha256 — which is BOTH the integrity check and the pod's cache key, so a re-exported or
@@ -702,11 +750,12 @@ class WeightsRef(BaseModel):
     size: int | None = Field(default=None, gt=0)
 
 
-# face_probe's YuNet (227 KB) and person_matte's RVM (7.9 MB fp16 TorchScript) stay baked in the image
+# face_probe's YuNet (227 KB), person_matte's RVM (7.9 MB fp16 TorchScript) and clean_plate's big-lama (206 MB
+# TorchScript) stay baked in the image
 _NEEDS_WEIGHTS = ("align", "clip_rank")
 
 
-InferKind = Literal["align", "face_probe", "clip_rank", "person_matte"]
+InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate"]
 
 
 class InferRequest(BaseModel):
@@ -722,11 +771,13 @@ class InferRequest(BaseModel):
     face_probe: FaceProbeParams | None = None
     clip_rank: ClipRankParams | None = None
     person_matte: PersonMatteParams | None = None
+    clean_plate: CleanPlateParams | None = None
 
     @model_validator(mode="after")
     def _block_matches_kind(self) -> "InferRequest":
         blocks: dict[str, Any] = {"align": self.align, "face_probe": self.face_probe,
-                                  "clip_rank": self.clip_rank, "person_matte": self.person_matte}
+                                  "clip_rank": self.clip_rank, "person_matte": self.person_matte,
+                                  "clean_plate": self.clean_plate}
         if blocks[self.kind] is None:
             raise ValueError(f"kind={self.kind} requires its params block")
         extra = [k for k, v in blocks.items() if k != self.kind and v is not None]
@@ -1067,6 +1118,62 @@ class PersonMattePayload(BaseModel):
     def _some_output(self) -> "PersonMattePayload":
         if self.alpha is None and self.cutout is None:
             raise ValueError("a person_matte receipt names at least one output")
+        return self
+
+
+class CleanPlateTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decode_s: float = Field(ge=0)     # ffmpeg sampling of the plate video and the matte, all windows
+    median_s: float = Field(ge=0)     # the masked temporal median on the card
+    inpaint_s: float = Field(ge=0)    # LaMa, all windows (0 when no window had a hole)
+    wall_s: float = Field(ge=0)       # download excluded, upload excluded
+
+
+class CleanPlateOut(BaseModel):
+    """One PUT plate, as the pod wrote it. `covered` + `inpainted` = 1: the share of the frame taken from the median
+    of real background pixels, and the share LaMa drew."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    samples: int = Field(ge=1)
+    covered: float = Field(ge=0, le=1)
+    inpainted: float = Field(ge=0, le=1)
+
+
+class CleanPlateRefusal(BaseModel):
+    """A window the pod would not draw a plate for, and why (the other windows are unaffected)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class CleanPlatePayload(BaseModel):
+    """clean_plate.schema.json — the receipt the pod PUTs to put_url. Every requested window is in `plates` (drawn and
+    PUT) or in `refused` (named, with the reason) — never in neither, never in both."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    width: int = Field(ge=2)
+    height: int = Field(ge=2)
+    plates: list[CleanPlateOut] = Field(default_factory=list)
+    refused: list[CleanPlateRefusal] = Field(default_factory=list)
+    timings: CleanPlateTimings
+
+    @model_validator(mode="after")
+    def _every_window_once(self) -> "CleanPlatePayload":
+        ids = [p.id for p in self.plates] + [r.id for r in self.refused]
+        if not ids:
+            raise ValueError("a clean_plate receipt names at least one window")
+        if len(set(ids)) != len(ids):
+            raise ValueError("a clean_plate window is drawn or refused, once")
         return self
 
 

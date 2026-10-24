@@ -52,6 +52,12 @@ ALIGN_RESIDENT_MIB = 1244.0     # measured (HEAVY_LANE_MEASURED_WHY)
 ALIGN_FORWARD_MIB = 518.0       # one 20 s window (the engine aligns in 20 s chunks)
 PERSON_MATTE_PEAK_MIB = 1100.0  # +1094 over an idle card, first-frame cudnn autotune
 PERSON_MATTE_RESIDENT_MIB = 228.0
+# clean_plate (big-lama fp32 TorchScript + the masked median, podagent/infer_plate.py), MEASURED 2026-10-24 in the pod image
+# (torch 2.11+cu128) on the dev RTX 2060, nvidia-smi card-wide every 50 ms, two 3 s windows of the 1080x1920 head plate, LaMa at
+# the 1024 long-side cap: +1276 MiB over the idle card (torch: 677 allocated, 1040 reserved, + the CUDA context); 204 MiB of
+# weights stay resident once the service empties its allocator cache after each request (docs/research/clean-plate-lama.md).
+CLEAN_PLATE_PEAK_MIB = 1300.0
+CLEAN_PLATE_RESIDENT_MIB = 210.0
 
 KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY_WHY for each number
     "align": ALIGN_RESIDENT_MIB + ALIGN_FORWARD_MIB,
@@ -61,6 +67,8 @@ KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY
     # (torch max reserved 990), +228 MiB resident between videos — sized at the peak, the moment it must fit.
     # It rides the one-wide heavy lane, so it never runs beside align; it CAN run beside a clip_rank lane.
     "person_matte": PERSON_MATTE_PEAK_MIB,
+    # rides the same one-wide heavy lane (it reads the matte person_matte wrote, so the two never overlap in one job chain)
+    "clean_plate": CLEAN_PLATE_PEAK_MIB,
 }
 RESERVE_MIB = _VRAM_RESERVE_MB
 
@@ -72,15 +80,20 @@ def heavy_lane_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
     kinds = set(KIND_VRAM_MIB) if served is None else set(served)
     align = "align" in kinds
     matte = "person_matte" in kinds
+    plate = "clean_plate" in kinds
+    matte_res = PERSON_MATTE_RESIDENT_MIB if matte else 0.0
+    plate_res = CLEAN_PLATE_RESIDENT_MIB if plate else 0.0
     resident = ALIGN_RESIDENT_MIB if align else 0.0
-    transient = max((ALIGN_FORWARD_MIB + (PERSON_MATTE_RESIDENT_MIB if matte else 0.0)) if align else 0.0,
-                    PERSON_MATTE_PEAK_MIB if matte else 0.0)
+    transient = max((ALIGN_FORWARD_MIB + matte_res + plate_res) if align else 0.0,
+                    (PERSON_MATTE_PEAK_MIB + plate_res) if matte else 0.0,
+                    (CLEAN_PLATE_PEAK_MIB + matte_res) if plate else 0.0)
     return resident + transient
 
 
 def coresident_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
     """Free MiB a card must report for clip_rank (weights + one lane) to run beside the heavy lane:
-    2736 + heavy_lane_mib + 512 — 5592 with every kind served (2736 + 1244 + max(518 + 228, 1100) + 512)."""
+    2736 + heavy_lane_mib + 512 — 6020 with every kind served (2736 + 1244 + max(518 + 228 + 210, 1100 + 210,
+    1300 + 228) + 512)."""
     return KIND_VRAM_MIB["clip_rank"] + heavy_lane_mib(served) + RESERVE_MIB
 
 

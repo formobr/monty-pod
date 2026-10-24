@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/infer_request.schema.json",
   "title": "InferRequest — planner→pod inference task (CP-mediated; the pod polls, nothing dials in)",
-  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction. person_matte: the pod runs RVM (mobilenetv3, fp16 TorchScript baked in the image) over ONE whole video and PUTs the requested outputs to their own presigned URLs (alpha: lossless gray FFV1 Matroska; cutout: the input's pixels under the alpha as VP9-alpha yuva420p WebM) plus a receipt JSON (person_matte.schema.json) to put_url; the downsample_ratio is resolved by the planner.",
+  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction. person_matte: the pod runs RVM (mobilenetv3, fp16 TorchScript baked in the image) over ONE whole video and PUTs the requested outputs to their own presigned URLs (alpha: lossless gray FFV1 Matroska; cutout: the input's pixels under the alpha as VP9-alpha yuva420p WebM) plus a receipt JSON (person_matte.schema.json) to put_url; the downsample_ratio is resolved by the planner. clean_plate (super-director v13 vertigo class): the pod makes the background of ONE video without the person, one PNG per window — a per-pixel temporal median over the frames sampled in the window with the person (the matte person_matte already produced for the SAME video, alpha above person_alpha grown by dilate_px) excluded, then LaMa (big-lama TorchScript baked in the image, CUDA only) for the pixels never uncovered — and PUTs each PNG to its own presigned URL plus a receipt JSON (clean_plate.schema.json) to put_url; every number is resolved by the planner (registry/clean_plate.yaml).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -25,7 +25,8 @@
         "align",
         "face_probe",
         "clip_rank",
-        "person_matte"
+        "person_matte",
+        "clean_plate"
       ]
     },
     "model": {
@@ -37,7 +38,7 @@
       "minLength": 1
     },
     "weights": {
-      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align and clip_rank; forbidden on face_probe and person_matte, whose YuNet (227 KB) and RVM (7.9 MB) stay in the image.",
+      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align and clip_rank; forbidden on face_probe, person_matte and clean_plate, whose YuNet (227 KB), RVM (7.9 MB) and big-lama (206 MB) stay in the image.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -327,6 +328,118 @@
           "minLength": 1
         }
       }
+    },
+    "clean_plate": {
+      "description": "ONE video, one plate per window. The matte is the person_matte output of the SAME video (cutout WebM: its alpha plane; alpha Matroska: the gray stream). Every number is the planner's.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "video_url",
+        "matte_url",
+        "matte_kind",
+        "windows",
+        "samples",
+        "person_alpha",
+        "dilate_px",
+        "min_visible",
+        "stable_range",
+        "inpaint_long_side",
+        "max_hole_fraction"
+      ],
+      "properties": {
+        "video_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "matte_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "matte_kind": {
+          "enum": [
+            "cutout",
+            "alpha"
+          ]
+        },
+        "windows": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "t0",
+              "t1",
+              "put_url"
+            ],
+            "properties": {
+              "id": {
+                "description": "the sd layer id; the engine reads the plate back by it",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "t0": {
+                "type": "number",
+                "minimum": 0
+              },
+              "t1": {
+                "description": "seconds on the video's own clock; t0 < t1 (a cross-field rule the model enforces)",
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "put_url": {
+                "description": "PUT target of this window's plate PNG",
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "samples": {
+          "description": "frames sampled per window, evenly spread",
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 48
+        },
+        "person_alpha": {
+          "description": "a pixel whose matte alpha is above this (0..255) is the person",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 254
+        },
+        "dilate_px": {
+          "description": "the person silhouette grows by this many pixels before it is excluded",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
+        "min_visible": {
+          "description": "a pixel seen as background in fewer samples than this is a hole (cannot exceed samples)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 48
+        },
+        "stable_range": {
+          "description": "the largest channel range (max - min, 0..255) the samples where a pixel was background may have; a larger spread means the person's edge leaked into them, so the pixel is a hole",
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 255
+        },
+        "inpaint_long_side": {
+          "description": "LaMa works at most this big; its output is upsampled into the hole only",
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 2048
+        },
+        "max_hole_fraction": {
+          "description": "a window whose hole is a larger share of the frame is refused, never hallucinated",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        }
+      }
     }
   },
   "allOf": [
@@ -361,6 +474,11 @@
             {
               "required": [
                 "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
               ]
             }
           ]
@@ -403,6 +521,11 @@
               "required": [
                 "weights"
               ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
             }
           ]
         }
@@ -440,6 +563,11 @@
               "required": [
                 "person_matte"
               ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
             }
           ]
         }
@@ -475,6 +603,57 @@
             {
               "required": [
                 "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "weights"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "clean_plate"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "clean_plate"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
               ]
             },
             {
