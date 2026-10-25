@@ -160,3 +160,14 @@ def test_only_a_layout_video_panel_is_normalised(tmp_path):
     assert mograph.normalise_panel_clip({"layer": lib}, tmp_path, 0) == {"layer": lib}
     missing = {"src": "media/none.mp4", "layer": {"id": "z", "kind": "layout", "props": {"kind": "video"}}}
     assert mograph.normalise_panel_clip(missing, tmp_path, 0) == missing   # the comp names its own media error
+
+
+def test_the_jobs_brand_looks_ride_every_section_like_its_tokens_and_fonts(tmp_path, monkeypatch):
+    got = _capture(monkeypatch, tmp_path)
+    looks = {"default": "signal", "looks": {"signal": {"id": "signal", "text_case": "none"}}}
+    sec = SimpleNamespace(comp="Stat", start=0.0, glass=False, props={"value": 1})
+    mograph._render_layers([sec], {"tokens": {"color": {}}, "fonts": {"roles": {}}, "looks": looks}, {}, tmp_path)
+    assert got["items"][0]["props"]["brandLooks"] == looks
+    got.clear()
+    mograph._render_layers([sec], {"tokens": {"color": {}}, "fonts": {"roles": {}}}, {}, tmp_path)
+    assert "brandLooks" not in got["items"][0]["props"], "a job that carries none: the bundle's own looks"

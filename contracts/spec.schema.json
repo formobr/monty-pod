@@ -581,6 +581,10 @@
             },
             "fonts": {
               "type": "object"
+            },
+            "looks": {
+              "description": "The brand's LOOK values ({default, looks:{id:{case, plate, weights, role mapping, tracking ...}}}), crossed like tokens/fonts so a bundle built once for another brand still draws this brand's looks. Absent = the bundle's own looks.",
+              "type": "object"
             }
           }
         },

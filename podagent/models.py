@@ -150,6 +150,7 @@ class SpecBrandManifest(BaseModel):
 
     tokens: dict[str, Any]
     fonts: dict[str, Any]
+    looks: dict[str, Any] | None = None
 
 
 class BundleRef(BaseModel):

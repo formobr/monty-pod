@@ -486,6 +486,7 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
     face_rel = _stage_sd_face(rd, base_path) if wants_face and base_path is not None else None
     tok = (brand or {}).get("tokens")
     fnt = (brand or {}).get("fonts")
+    lks = (brand or {}).get("looks")
 
     def _props(sec):
         p = dict(sec.props or {})
@@ -493,6 +494,8 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
             p["brandTokens"] = tok
         if fnt is not None:
             p["brandFonts"] = fnt
+        if lks is not None:
+            p["brandLooks"] = lks
         return p
 
     cat_items, cat_metas, bespoke = [], [], []
