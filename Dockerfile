@@ -49,6 +49,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
+# The NVIDIA EGL vendor manifest: libglvnd's libEGL finds libEGL_nvidia (which the injected Vulkan ICD loads)
+# only through this file, and nvidia-container-toolkit has been reported not to inject it on the 595 driver
+# branch (VK_ERROR_INCOMPATIBLE_DRIVER with CUDA working) — see docs/research/pod-image-egl-vendor-manifest.md.
+# Soname only, no driver version; an injected copy at the same path hides this one, one under /etc coexists.
+COPY docker/10_nvidia.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
 # ── builder: resolve the python stack ONCE, then park it in per-bucket staging roots ──────────────────
 # pip resolves the dependency graph (no hand-pinned nvidia wheel list to drift from torch's own requirements),
 # but every version it may pick is fixed by constraints.txt (`-c`): the full freeze of the last image that
