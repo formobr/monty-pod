@@ -55,13 +55,17 @@ def _run(returncode: int = 0, stderr: bytes = b"") -> object:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=b"", stderr=stderr)
 
 
-def test_a_vulkan_probe_warns_and_returns_false_when_the_camera_path_is_unavailable(monkeypatch):
+def test_a_vulkan_probe_refuses_the_pod_when_the_camera_path_is_unavailable(monkeypatch):
+    """Behaviour change, owner 2026-10-27: an unopenable Vulkan device refuses work, it no longer warns on."""
     cp = _CP()
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _run(1, b"first detail\nVK_ERROR_INCOMPATIBLE_DRIVER\n"))
-    assert agent_main._vulkan_preflight(cp) is False
-    warnings = [e for e in cp.events if e.get("status") == "step"]
-    assert warnings and warnings[0]["step"].startswith("WARNING VULKAN UNAVAILABLE: exit 1:")
-    assert "VK_ERROR_INCOMPATIBLE_DRIVER" in warnings[0]["step"]
+    with pytest.raises(SystemExit) as e:
+        agent_main._vulkan_preflight(cp)
+    assert e.value.code == 3
+    errs = [e for e in cp.events if e.get("status") == "error"]
+    prefix = "REFUSING work: vulkan_false — Vulkan/libplacebo device will not open on this pod — exit 1:"
+    assert errs and errs[0]["step"].startswith(prefix)
+    assert "VK_ERROR_INCOMPATIBLE_DRIVER" in errs[0]["step"]
     assert cp.waits == [True]
 
 
@@ -82,7 +86,8 @@ def test_vulkan_probe_warning_keeps_head_and_tail_and_vulkaninfo_summary(monkeyp
 
     monkeypatch.setattr(agent_main.shutil, "which", lambda name: "/usr/bin/vulkaninfo" if name == "vulkaninfo" else None)
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert agent_main._vulkan_preflight(cp) is False
+    with pytest.raises(SystemExit):
+        agent_main._vulkan_preflight(cp)
     step = cp.events[0]["step"]
     assert "VK_ERROR_INCOMPATIBLE_DRIVER" in step
     assert "generic ffmpeg tail" in step
@@ -284,7 +289,7 @@ def test_main_never_reaches_dispatch_while_readiness_stays_ambiguous(monkeypatch
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: None)
-    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
+    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: True)
     # the boot VRAM floor reads the LIVE card — a desktop holding it must not decide a readiness test
     monkeypatch.setattr(agent_main, "_free_vram_or_refuse", lambda _cp: None)
     monkeypatch.delenv("MONTY_OPS_CONTOUR_DRY", raising=False)
@@ -310,7 +315,7 @@ def test_readiness_identity_rejection_exits_4_not_a_crash(monkeypatch):
     monkeypatch.setattr(agent_main, "_report_boot", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvenc_or_refuse", lambda _cp: None)
     monkeypatch.setattr(agent_main, "_nvdec_or_refuse", lambda _cp: None)
-    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp, **_k: None)
+    monkeypatch.setattr(agent_main, "_vulkan_preflight", lambda _cp: True)
     # the boot VRAM floor reads the LIVE card — a desktop holding it must not decide a readiness test
     monkeypatch.setattr(agent_main, "_free_vram_or_refuse", lambda _cp: None)
     monkeypatch.delenv("MONTY_OPS_CONTOUR_DRY", raising=False)
