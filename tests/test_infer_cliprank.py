@@ -423,6 +423,7 @@ def _phase_rig(monkeypatch, tmp_path):
         svc.run(ClipRankParams(groups=[ClipRankGroup(intent="chart", origin_urls=urls)]), "put")
         return json.loads(put.read_text())["groups"][0]
 
+    run.svc = svc
     return run, clock
 
 
@@ -470,3 +471,99 @@ def test_a_healthy_fetch_phase_is_unchanged(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(m, "_origin_fetch", fake)
     g = run(urls)
     assert g["status"] == "ok" and g["errors"] == [None] * 600 and g["scores"] == [0.5] * 600
+
+
+# --- the pod's egress verdict (PROD 2026-10-28 job 20168ee1) ------------------------------------------------
+
+_PEXELS, _PIXABAY = "images.pexels.com", "cdn.pixabay.com"
+
+
+def _failure_of(kind: str, host: str):
+    """The exception originrule would raise for one tile, carrying the record `egress_failed` reads."""
+    import http.client
+    import urllib.error
+
+    from podagent import originrule
+
+    if kind == "reset":
+        return originrule._attach(ConnectionResetError("reset by peer"), phase="read", host=host, addr="1.2.3.4")
+    if kind == "dns":
+        return originrule._attach(originrule.OriginRefused(f"REFUSED: {host} does not resolve"),
+                                  phase="dns", host=host)
+    status, cf = {"404": (404, None), "plain403": (403, None)}[kind]
+    exc = urllib.error.HTTPError(f"https://{host}/x", status, "no", http.client.HTTPMessage(), None)
+    exc.origin_failure = originrule.OriginFailure(phase="http", host=host, status=status, cf_code=cf,
+                                                  exc="HTTPError")
+    return exc
+
+
+def _egress_rig(monkeypatch, tmp_path, behave):
+    """The phase rig with the REAL originrule.fetch on top of a faked `_fetch_once`: `behave(host)` is None for
+    a good tile or the kind of failure. Returns (run(groups_of_urls), urls fetched)."""
+    from podagent import originrule
+    from podagent.models import ClipRankParams
+
+    rig, _clock = _phase_rig(monkeypatch, tmp_path)
+    monkeypatch.setattr(originrule, "_EGRESS", {})
+    fetched: list[str] = []
+
+    def fake_once(url, **_kw):
+        fetched.append(url)
+        host = url.split("/")[2]
+        kind = behave(host)
+        if kind is not None:
+            raise _failure_of(kind, host)
+        return _clock.png
+
+    monkeypatch.setattr(originrule, "_fetch_once", fake_once)
+
+    def run(groups):
+        return rig.svc.run(ClipRankParams(groups=[ClipRankGroup(intent="chart", origin_urls=g) for g in groups]),
+                           "put")
+
+    return run, fetched
+
+
+def _two_host_groups(n_groups: int, per_group: int) -> list[list[str]]:
+    return [[f"https://{(_PEXELS, _PIXABAY)[i % 2]}/p/{g}/{i}.jpg" for i in range(per_group)]
+            for g in range(n_groups)]
+
+
+@pytest.mark.parametrize("kind", ["reset", "dns"])
+def test_a_request_whose_every_host_is_dead_raises_and_names_causes_and_hosts(monkeypatch, tmp_path, kind) -> None:
+    import podagent.infer_cliprank as m
+
+    run, fetched = _egress_rig(monkeypatch, tmp_path, lambda host: kind)
+    with pytest.raises(m.OriginEgressFailed) as e:
+        run(_two_host_groups(5, 12))
+    text = str(e.value)
+    assert text.startswith("0/40 origin tiles fetched — causes: ")
+    assert f"{_PEXELS} 20/20" in text and f"{_PIXABAY} 20/20" in text
+    assert ("read ConnectionResetError×40" if kind == "reset" else "dns OriginRefused×40") in text
+    assert len(set(fetched)) == 40, "the 20 tiles still queued after both hosts reached the minimum were never fetched"
+
+
+@pytest.mark.parametrize("kind", ["404", "plain403"])
+def test_an_origin_verdict_on_every_tile_is_not_an_egress_failure(monkeypatch, tmp_path, kind) -> None:
+    run, fetched = _egress_rig(monkeypatch, tmp_path, lambda host: kind)
+    run(_two_host_groups(5, 12))             # no raise: the network answered, the links are just bad
+    assert len(fetched) == 60
+
+
+def test_one_healthy_host_means_the_network_works(monkeypatch, tmp_path) -> None:
+    run, fetched = _egress_rig(monkeypatch, tmp_path, lambda host: "reset" if host == _PEXELS else None)
+    run(_two_host_groups(5, 12))
+    assert len(set(fetched)) == 60      # a dropped connection is retried, so urls are counted, not calls
+
+
+def test_the_verdict_is_per_process_so_small_requests_cannot_slip_under_it(monkeypatch, tmp_path) -> None:
+    """10 tiles a request is under the per-host minimum of 20 every time; the window spans requests."""
+    import podagent.infer_cliprank as m
+
+    run, _ = _egress_rig(monkeypatch, tmp_path, lambda host: "reset")
+    small = [[f"https://{_PEXELS}/p/{i}.jpg" for i in range(10)]]
+    run(small)                               # 10 attempts: below the minimum, an ordinary empty-scored result
+    small2 = [[f"https://{_PEXELS}/q/{i}.jpg" for i in range(10)]]
+    with pytest.raises(m.OriginEgressFailed) as e:
+        run(small2)                          # the 20th attempt in the process-wide window
+    assert f"{_PEXELS} 10/10" in str(e.value)

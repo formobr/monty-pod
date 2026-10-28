@@ -721,8 +721,10 @@ def _run_infer(
     rank_slots: threading.BoundedSemaphore | None = None,
     one_kind_resident: bool = False,
     served: "frozenset[str] | None" = None,
+    coordinator: "RestartCoordinator | None" = None,
 ) -> bool:
-    """Runs one infer job, reports the result, and returns the updated boot_reported flag.
+    """Runs one infer job, reports the result, and returns the updated boot_reported flag. An error whose text
+    names an infra class (runner._INFRA_CLASSES) is reported FIRST and only then latches `coordinator`.
 
     corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
@@ -902,6 +904,13 @@ def _run_infer(
         wire_error = error_result.model_dump(exclude_none=True)
         wire_error["session_id"] = session_id
         cp.report_infer_result(wire_error)
+        # After the terminal: a latched pod may be discarded with its results, so the error goes out first.
+        if coordinator is not None:
+            from .ops.runner import infra_class
+
+            klass = infra_class(e)
+            if klass is not None:
+                _infra_fault_reporter(cp, coordinator)(klass)
         if not isinstance(e, Exception):
             raise
         return boot_reported
@@ -1456,7 +1465,7 @@ def main() -> None:
                               yunet_path, not mine, corr_id=pod_job.corr_id,
                               session_id=pod_job.session_id, rank_parallel=rank_width,
                               rank_slots=rank_slots, one_kind_resident=not kinds_coexist,
-                              served=served) and mine:
+                              served=served, coordinator=coordinator) and mine:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None

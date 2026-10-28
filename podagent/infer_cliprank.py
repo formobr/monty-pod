@@ -361,21 +361,81 @@ def _deadline_error(redacted_url: str) -> ClipRankTileError:
                f"was fetched — {redacted_url}")
 
 
-def _fetch_origin_tile(url: str, dest: Path, deadline: float | None = None):
+class OriginEgressFailed(RuntimeError):
+    """The pod's network to every CDN host this request touched is dead (originrule.egress_dead). Raised, not
+    scored: an empty-scored success would keep the pod claiming work it cannot do (PROD 2026-10-28)."""
+
+
+class _RequestEgress:
+    """One request's tally of origin tiles, and the verdict that stops it. `error` is set once, by whichever
+    tile first sees the pod's egress dead; every queued fetch is then cancelled."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.hosts: set[str] = set()
+        self.attempted: Counter = Counter()
+        self.failed: Counter = Counter()
+        self.causes: Counter = Counter()
+        self.futures: dict = {}
+        self.error: OriginEgressFailed | None = None
+
+    def attempt(self, redacted_url: str) -> str:
+        host = _url_host(redacted_url)
+        with self._lock:
+            self.hosts.add(host)
+        return host
+
+    def done(self, host: str, error: ClipRankTileError | None) -> None:
+        with self._lock:
+            self.attempted[host] += 1
+            if error is not None:
+                self.failed[host] += 1
+                self.causes[_cause_head(error.detail)] += 1
+            if self.error is not None or error is None or not originrule.egress_dead(self.hosts):
+                return
+            n = sum(self.attempted.values())
+            ok = n - sum(self.failed.values())
+            self.error = OriginEgressFailed(
+                f"{ok}/{n} origin tiles fetched — causes: "
+                + ", ".join(f"{h}×{c}" for h, c in self.causes.most_common(3))
+                + " — hosts: " + ", ".join(f"{h} {self.failed[h]}/{self.attempted[h]}" for h in sorted(self.attempted)))
+            # a snapshot: the request thread is still adding to `futures` while submitting later groups
+            for f in list(self.futures.values()):
+                f.cancel()
+
+
+def _fetch_origin_tile(url: str, dest: Path, deadline: float | None = None, egress: "_RequestEgress | None" = None):
     """One stock-provider tile: GET through the origin guard → workdir file → decode, exactly like an image_urls
     tile after its download. Returns (image, error, redacted url, measure); the measure is the fetched bytes
     and decoded size, None for a tile that did not decode. A guard refusal is `origin_refused`. A tile still
-    queued when the request's fetch-phase `deadline` has passed is never started: it is `fetch_timeout`."""
+    queued when the request's fetch-phase `deadline` has passed is never started: it is `fetch_timeout`.
+    With `egress`, a tile that finds the pod's egress dead stops the request (`OriginEgressFailed`)."""
+    if egress is not None and egress.error is not None:      # already stopped: a tile that slipped past cancel()
+        return None, _deadline_error(_redacted_tile_url(url)), _redacted_tile_url(url), None
+    result = _fetch_origin_tile_once(url, dest, deadline, egress)
+    if egress is not None and result[1] is not None and result[1].kind != "fetch_timeout":
+        egress.done(_url_host(result[2]), result[1])
+    elif egress is not None and result[1] is None:
+        egress.done(_url_host(result[2]), None)
+    return result
+
+
+def _fetch_origin_tile_once(url: str, dest: Path, deadline: float | None, egress: "_RequestEgress | None"):
     from PIL import Image
 
     redacted_url = _redacted_tile_url(url)
     if deadline is not None and originrule._now() >= deadline:
         return None, _deadline_error(redacted_url), redacted_url, None
+    if egress is not None:
+        egress.attempt(redacted_url)
     try:
         data = _origin_fetch(url, deadline)
     except originrule.DeadlineExceeded:
         return None, _deadline_error(redacted_url), redacted_url, None
     except originrule.OriginRefused as exc:
+        failure = getattr(exc, "origin_failure", None)
+        if failure is not None and failure.phase == "dns":     # a name that does not resolve is the network's, not policy's
+            return None, _origin_tile_error("fetch_failed", exc, redacted_url), redacted_url, None
         return None, _origin_tile_error("origin_refused", exc, redacted_url), redacted_url, None
     except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault; it is NAMED below
         return None, _origin_tile_error(_fetch_kind(exc), exc, redacted_url), redacted_url, None
@@ -392,14 +452,19 @@ def _fetch_origin_tile(url: str, dest: Path, deadline: float | None = None):
     return img, None, redacted_url, ClipRankTileMeasure(bytes=len(data), w=img.width, h=img.height)
 
 
-def _submit_origins(urls: list[str], workdir: Path, shared: dict, deadline: float | None = None) -> list:
+def _submit_origins(urls: list[str], workdir: Path, shared: dict, deadline: float | None = None,
+                    egress: "_RequestEgress | None" = None) -> list:
     """Put every origin tile on the wire, ONE fetch per url per REQUEST: `shared` (url → future) spans every
     origin group of the request, so a thumbnail two beats both shortlisted is fetched once. `deadline` ends
-    the request's whole fetch phase."""
+    the request's whole fetch phase. `egress` lets a dead network cancel whatever is still queued in `shared`."""
     pool = _fetch_pool()
+    if egress is not None:
+        egress.futures = shared
     for u in urls:
+        if egress is not None and egress.error is not None:      # the verdict is in: queue nothing new
+            raise egress.error
         if u not in shared:
-            shared[u] = pool.submit(_fetch_origin_tile, u, workdir / f"{len(shared)}.img", deadline)
+            shared[u] = pool.submit(_fetch_origin_tile, u, workdir / f"{len(shared)}.img", deadline, egress)
     return [shared[u] for u in urls]
 
 
@@ -438,16 +503,23 @@ def _cause_head(detail: str) -> str:
     return head
 
 
-def _gather_origins(futs: list):
+def _gather_origins(futs: list, egress: "_RequestEgress | None" = None):
     """An origin group's decoded images, their indices, per-index errors and measures, and the failure trail
-    (`first` is None when every tile decoded)."""
+    (`first` is None when every tile decoded). Raises the request's `OriginEgressFailed` once its egress is dead."""
     images: list = []
     ok: list[int] = []
     errors: list[ClipRankTileError | None] = []
     measures: list[ClipRankTileMeasure | None] = []
     first_failed = _FailTrail()
     for i, f in enumerate(futs):
-        img, reason, redacted_url, measure = f.result()
+        try:
+            img, reason, redacted_url, measure = f.result()
+        except cf.CancelledError:
+            if egress is not None and egress.error is not None:
+                raise egress.error from None
+            raise
+        if egress is not None and egress.error is not None:
+            raise egress.error
         host = _url_host(redacted_url)
         first_failed.attempted[host] += 1
         if reason is not None:
@@ -699,7 +771,9 @@ class ClipRankService:
             unique = list(dict.fromkeys(keys))
             shared_origins: dict = {}
             phase_deadline = originrule._now() + _ORIGIN_FETCH_PHASE_S
-            pending = {key: (_submit_origins(list(key[0]), Path(td) / "origins", shared_origins, phase_deadline)
+            egress = _RequestEgress()
+            pending = {key: (_submit_origins(list(key[0]), Path(td) / "origins", shared_origins, phase_deadline,
+                                             egress)
                              if key[2]
                              else _submit_tiles(list(key[0]), Path(td) / f"g{i}"))
                        for i, key in enumerate(unique)}
@@ -710,7 +784,7 @@ class ClipRankService:
             def prepare(key):
                 tg = time.monotonic()
                 if key[2]:
-                    images, ok, errors, measures, first_failed = _gather_origins(pending[key])
+                    images, ok, errors, measures, first_failed = _gather_origins(pending[key], egress)
                     origin_extra[key] = (measures, first_failed)
                 else:
                     images, ok, errors = _gather(pending[key], key[1])

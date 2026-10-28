@@ -38,7 +38,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Final
 from urllib.parse import unquote_plus, urljoin, urlsplit
@@ -611,7 +612,74 @@ def _fetch_once(url: str, *, max_bytes: int, timeout_s: float, deadline: float |
     raise OriginRefused(f"REFUSED: more than {max_hops} redirect hops fetching {urlsplit(url).hostname or ''}")
 
 
+# EGRESS VERDICT. PROD 2026-10-28 (MISC-836 / MISC-842): two rented pods failed 100 % of their origin tiles
+# (433/433, 538/538) and still claimed work, because a broken tile is data and nothing looked across requests.
+# The verdict is per HOST and per PROCESS, never per request: a small batch must not slip under it. WHY 40:
+# long enough that a CDN's occasional 429 cannot fill it, short enough that a dead network is judged within a
+# few requests. WHY 20: a host tried fewer times than this has not been tried enough to be condemned. WHY 0.9:
+# a dead link fails every time; one in ten succeeding is noise, not a working network.
+_EGRESS_WINDOW_N: Final[int] = 40
+_EGRESS_MIN_N: Final[int] = 20
+_EGRESS_DEAD_FRACTION: Final[float] = 0.9
+
+_EGRESS: dict[str, deque] = {}
+_egress_lock = threading.Lock()
+
+
+def egress_failed(exc: BaseException) -> bool | None:
+    """Does this fetch failure say the pod's NETWORK is broken? True: dns / connect / tls / read, http 429/503,
+    or a 403 carrying Cloudflare evidence. False: an origin verdict on the request (404/410, a plain 403,
+    a body that is not an image). None: not an attempt at all (a policy refusal, a deadline)."""
+    if isinstance(exc, DeadlineExceeded):
+        return None
+    failure = getattr(exc, "origin_failure", None)
+    if isinstance(exc, OriginRefused):
+        return True if failure is not None and failure.phase == "dns" else None
+    if failure is None:
+        return False
+    if failure.phase in ("dns", "connect", "tls", "read"):
+        return True
+    status = failure.status if failure.status is not None else getattr(exc, "code", None)
+    if status in (429, 503):
+        return True
+    return status == 403 and bool(failure.cf_code or failure.cf_mitigated)
+
+
+def _record_egress(host: str, failed: bool | None) -> None:
+    if failed is None or not host:
+        return
+    with _egress_lock:
+        _EGRESS.setdefault(host, deque(maxlen=_EGRESS_WINDOW_N)).append(failed)
+
+
+def host_dead(host: str) -> bool:
+    with _egress_lock:
+        window = list(_EGRESS.get(host, ()))
+    return len(window) >= _EGRESS_MIN_N and sum(window) >= _EGRESS_DEAD_FRACTION * len(window)
+
+
+def egress_dead(hosts: Iterable[str]) -> bool:
+    """The pod's egress is DEAD when every host attempted (those with any record) is dead; one healthy host
+    means the network works."""
+    with _egress_lock:
+        seen = [h for h in hosts if _EGRESS.get(h)]
+    return bool(seen) and all(host_dead(h) for h in seen)
+
+
 def fetch(url: str, *, max_bytes: int, timeout_s: float, deadline: float | None = None) -> bytes:
+    """Record the outcome in the host's egress window; the fetch itself is `_fetch_retrying`."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    try:
+        data = _fetch_retrying(url, max_bytes=max_bytes, timeout_s=timeout_s, deadline=deadline)
+    except BaseException as e:
+        failure = getattr(e, "origin_failure", None)
+        _record_egress(getattr(failure, "host", None) or host, egress_failed(e))
+        raise
+    _record_egress(host, False)
+    return data
+
+
+def _fetch_retrying(url: str, *, max_bytes: int, timeout_s: float, deadline: float | None = None) -> bytes:
     """GET a checked url, refusing every unsafe hop before it is followed and any body over `max_bytes`.
 
     A connection that dies is retried, and so is a status that says the origin could NOT answer — 408, 429,

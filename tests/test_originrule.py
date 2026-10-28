@@ -498,6 +498,49 @@ def test_an_unresolvable_host_records_the_dns_phase(monkeypatch):
     assert (f.phase, f.host, f.addr, f.family, f.exc) == ("dns", "gone.example.com", None, None, "OriginRefused")
 
 
+def test_an_unresolvable_host_counts_as_egress_failed_and_a_policy_refusal_does_not(monkeypatch):
+    """The dns phase is the network's; a private address or a credential-shaped url is policy and never counts."""
+    import socket
+
+    monkeypatch.setattr(originrule, "_EGRESS", {})
+    monkeypatch.setattr(originrule, "resolve_addrs", _REAL_RESOLVE)
+
+    def nxdomain(*a, **k):
+        raise socket.gaierror("no such host")
+
+    monkeypatch.setattr(originrule.socket, "getaddrinfo", nxdomain)
+    with pytest.raises(originrule.OriginRefused) as e:
+        originrule.fetch("https://gone.example.com/a.jpg", max_bytes=100, timeout_s=1)
+    assert e.value.origin_failure.phase == "dns" and originrule.egress_failed(e.value) is True
+    assert list(originrule._EGRESS["gone.example.com"]) == [True]
+
+    monkeypatch.setattr(originrule.socket, "getaddrinfo", lambda *a, **k: [(0, 0, 0, "", ("10.0.0.7", 443))])
+    for url in ("https://lan.example.com/a.jpg", "https://cdn.example.com/a.jpg?api_key=abcdefghijklmnop"):
+        with pytest.raises(originrule.OriginRefused) as e:
+            originrule.fetch(url, max_bytes=100, timeout_s=1)
+        assert originrule.egress_failed(e.value) is None
+    assert set(originrule._EGRESS) == {"gone.example.com"}, "a policy refusal is not an attempt on any host"
+
+
+def test_the_egress_verdict_needs_twenty_attempts_ninety_percent_failed_and_every_host(monkeypatch):
+    monkeypatch.setattr(originrule, "_EGRESS", {})
+    for _ in range(19):
+        originrule._record_egress("a.example.com", True)
+    assert not originrule.host_dead("a.example.com"), "19 attempts is under the minimum"
+    originrule._record_egress("a.example.com", True)
+    assert originrule.host_dead("a.example.com") and originrule.egress_dead(["a.example.com"])
+    for _ in range(40):
+        originrule._record_egress("b.example.com", False)
+    assert not originrule.egress_dead(["a.example.com", "b.example.com"]), "one healthy host: the network works"
+    for _ in range(36):
+        originrule._record_egress("c.example.com", True)
+    for _ in range(4):                           # 4 successes in the last 40 -> 90 % failed: still dead
+        originrule._record_egress("c.example.com", False)
+    assert originrule.host_dead("c.example.com")
+    originrule._record_egress("c.example.com", False)     # 5 in 40 -> 87.5 % failed: alive
+    assert not originrule.host_dead("c.example.com")
+
+
 def test_the_module_imports_only_the_standard_library():
     tree = ast.parse(Path(originrule.__file__).read_text(encoding="utf-8"))
     roots = set()
