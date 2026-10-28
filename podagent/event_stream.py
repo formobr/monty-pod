@@ -1178,7 +1178,9 @@ class EventStream:
                 break
         return delivery, attempt, job_id, session, corr
 
-    def _reject_invalid_job(self, frame: Any, error: BaseException) -> bool:
+    def _reject_invalid_job(
+            self, frame: Any, error: BaseException, *, client_recv_mono_ns: int | None = None,
+    ) -> bool:
         """Durably terminalize an addressed-but-Python-invalid server job.
 
         This runs before latching the stream unhealthy.  A malformed payload
@@ -1203,12 +1205,30 @@ class EventStream:
             event["session_id"] = session
         if corr:
             event["corr_id"] = corr
+        # A terminal is safe only when the outer delivery and inner
+        # correlation agree.  Never invent an address for an untrusted
+        # malformed frame.
+        trusted = bool(job_id and session and corr and attempt and (not delivery or delivery == corr))
+        ack = {
+            "delivery_id": corr,
+            "corr_id": corr,
+            "attempt_id": attempt,
+            "client_recv_mono_ns": client_recv_mono_ns or time.monotonic_ns(),
+        }
         try:
+            if trusted:
+                with self._work:
+                    replayed = corr in self._result_corrs_locked()
+                if replayed:
+                    # Go re-sends the delivery on reconnect: the terminal is already durable, so only
+                    # the fresh receipt goes out (as `_accept_job` does for a deduplicated delivery).
+                    self.send_job_ack(ack, wait=False)
+                    return True
             self.send_event(event, wait=False)
-            # A terminal is safe only when the outer delivery and inner
-            # correlation agree.  Never invent an address for an untrusted
-            # malformed frame.
-            if job_id and session and corr and (not delivery or delivery == corr):
+            if trusted:
+                # The CP commits a result only against a durable job acceptance, which only a job_ack
+                # writes: the receipt must precede the terminal on the outbox.
+                self.send_job_ack(ack, wait=False)
                 self.send_result({
                     "job_id": job_id,
                     "session_id": session,
@@ -1238,7 +1258,7 @@ class EventStream:
             # credit; closing here would strand the claim and cause a fleet-
             # wide retry loop.  Only an unaddressable malformed frame latches
             # the transport below.
-            if self._reject_invalid_job(frame, e):
+            if self._reject_invalid_job(frame, e, client_recv_mono_ns=client_recv_mono_ns):
                 _log("invalid addressed job terminalized; keeping stream admission alive")
                 return None
             error = TransportUnhealthy(f"invalid server job frame: {safe_error(e)}")
