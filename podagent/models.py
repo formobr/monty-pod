@@ -712,7 +712,7 @@ class CleanPlateWindow(BaseModel):
 class CleanPlateParams(BaseModel):
     """The clean background plate of ONE video, one plate per window (super-director v13 vertigo class): a per-pixel
     temporal median over the pixels the person matte does not cover, then LaMa for what is never uncovered. Every
-    number is the planner's (registry/clean_plate.yaml); the matte is the one the person_matte kind already produced
+    number is the planner's (the engine's clean-plate registry entry); the matte is the one the person_matte kind already produced
     for the SAME video (`matte_kind` says how to read its alpha), so no segmentation runs here."""
 
     model_config = ConfigDict(extra="forbid")

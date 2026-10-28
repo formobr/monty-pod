@@ -14,13 +14,14 @@ import concurrent.futures as cf
 import io
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -44,6 +45,12 @@ _EMPTY_INTENT = ClipRankTileError(kind="empty_intent",
 # provider-thumbnail cap (THUMB_MAX_BYTES, in its preview-link resolver) — what the box accepts off a
 # provider; its per-read timeout is the same `cp._TIMEOUT` an image_urls tile's download runs under.
 _ORIGIN_MAX_BYTES = 8_000_000
+# One request's WHOLE origin-tile fetch phase ends here. WHY 120: far under the box's 1200 s infer wall
+# (the control plane's default infer timeout) and ~10x the measured healthy phase of 801 tiles; at the deadline queued
+# fetches never start, in-flight ones get at most their socket timeout, and each tile not fetched is a named
+# `fetch_timeout` whose detail starts `deadline`; scoring proceeds on what arrived unless the phase verdict
+# (`_phase_verdict`) finds the phase dead.
+_ORIGIN_FETCH_PHASE_S = 120
 # The origin bytes a rank request fetched outlive it, so the judge-tiles request that follows on the same warm pod
 # reads them instead of paying the provider fetch twice. Keyed by the EXACT url; bounded by total bytes, least
 # recently used out first — ~32 provider thumbnails at the body cap, hundreds at a thumbnail's usual size.
@@ -62,13 +69,20 @@ LANE_SIZING_WHY = """
 THE clip_rank ENVELOPE IS ~80% NETWORK, AND IT WAS QUEUED AS IF IT WERE A RENDER.
 
 Everything model-shaped went through ONE pod-side worker: align, face_probe, clip_rank AND render. Measured,
-the SigLIP forward is 0.847 s for 14 tiles on an RTX 2060, while pulling those 14 tiles costs ~14 × 211 ms of
-round-trip latency (the prod box's measured per-tile transfer) — and the fetch ran tile-by-tile INSIDE each
-group's turn, so the card idled through most of the envelope. A one-worker GPU queue was protecting VRAM
-against work that barely touches the card, and a render blocked every ranking envelope of a b-roll wave.
+the SigLIP forward is 0.847 s for 14 tiles on an RTX 2060, while pulling tiles is bound by round-trip latency
+— and the fetch ran tile-by-tile INSIDE each group's turn, so the card idled through most of the envelope. A
+one-worker GPU queue was protecting VRAM against work that barely touches the card, and a render blocked
+every ranking envelope of a b-roll wave.
 
 TWO PHASES, TWO WIDTHS. Tiles are latency-bound, so their width is a count of round trips in flight
-(_FETCH_WORKERS, the same 8 the engine's tile PUTs use). ONE pool for the whole process: a
+(_FETCH_WORKERS = 32). The width was 8, chosen when tiles were measured at ~211 ms each; prod previews then
+spent most of fetch_broll in one clip_rank call (job 237f08c8, 2026-10-24: 1657 tiles, infer_s 105.4,
+summed tile_gather_work_s 788.9, forward 42.3). Re-measured 2026-10-24 from the prod box: 240 uncached
+provider renditions (images.pexels / cdn.pixabay, distinct `w=` variants so no CDN cache hit) per width —
+width 8 → 9.6 s (25 tiles/s), 16 → 4.7 s (51/s), 32 → 2.6 s (94/s), 64 → 1.5 s (159/s); per-tile median
+latency 0.30-0.31 s at every width (provider latency does not grow with width), 0 errors. A cached run at 64
+drew two HTTP 429 from Pexels, so 32 is the widest measured width with no rate-limit answer in either run.
+A 429 is a tile error (counted), not a retry. ONE pool for the whole process: a
 per-envelope pool would multiply with the lanes, which is the box-wide-budget lesson ops/runner.step_slots()
 already learned. The towers are VRAM-bound and keep their own narrow lane.
 
@@ -95,7 +109,7 @@ _VRAM_PER_LANE_MB = 414.0
 _VRAM_RESERVE_MB = 512.0
 # No env lever for either width (MISC-333 §5): neither CLIP_RANK_LANES nor CLIP_RANK_FETCH_WORKERS was set on
 # prod, so the lane count is the card's derivation and the fetch width is this constant.
-_FETCH_WORKERS = 8
+_FETCH_WORKERS = 32
 
 
 @dataclass(frozen=True)
@@ -234,6 +248,8 @@ def _http_status(exc: BaseException) -> int | None:
     status = getattr(response, "status_code", None) if response is not None else None
     if status is None:
         status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)     # urllib.error.HTTPError, which originrule raises
     try:
         return int(status) if status is not None else None
     except (TypeError, ValueError):
@@ -256,6 +272,27 @@ def _tile_error(kind: str, exc: BaseException, redacted_url: str) -> ClipRankTil
     status = _http_status(exc)
     head = safe_error(exc, 300) + (f" (HTTP {status})" if status is not None else "")
     return ClipRankTileError(kind=kind, detail=f"{head} — {redacted_url}")
+
+
+def _origin_tile_error(kind: str, exc: BaseException, redacted_url: str, phase: str | None = None) -> ClipRankTileError:
+    """An origin tile's error naming WHERE it failed and, for a refused HTTP answer, what the CDN said:
+    `<phase> <exc>[ HTTP n][ cf-code][ mitigated=v][ retry-after=v] via <addr>/<family> — <url>`, ≤ 300 chars.
+    An exception with no `origin_failure` and no explicit phase (a guard refusal) keeps `_tile_error`'s text."""
+    failure = getattr(exc, "origin_failure", None)
+    phase = phase or (failure.phase if failure is not None else None)
+    if phase is None:
+        return _tile_error(kind, exc, redacted_url)
+    tail = ""
+    if failure is not None:
+        status = failure.status if failure.status is not None else _http_status(exc)
+        tail += f" HTTP {status}" if status is not None else ""
+        tail += f" cf-{failure.cf_code}" if failure.cf_code else ""
+        tail += f" mitigated={failure.cf_mitigated}" if failure.cf_mitigated else ""
+        tail += f" retry-after={failure.retry_after}" if failure.retry_after else ""
+        tail += f" via {failure.addr}/{failure.family}" if failure.addr else ""
+    tail += f" — {redacted_url}"
+    budget = max(300 - len(phase) - 1 - len(tail), 0)
+    return ClipRankTileError(kind=kind, detail=f"{phase} {safe_error(exc, budget)}{tail}"[:300])
 
 
 def _fetch_tile(url: str, dest: Path):
@@ -316,58 +353,243 @@ class _OriginCache:
 _ORIGIN_CACHE = _OriginCache(_ORIGIN_CACHE_BYTES)
 
 
-def _origin_fetch(url: str) -> bytes:
-    """One origin GET through the guard under the rank's caps; a successful body is kept for a later request."""
-    data = originrule.fetch(url, max_bytes=_ORIGIN_MAX_BYTES, timeout_s=_TILE_TIMEOUT_S)
+def _origin_fetch(url: str, deadline: float | None = None) -> bytes:
+    """One origin GET through the guard under the rank's caps; a successful body is kept for a later request.
+    `deadline` is an absolute `originrule._now()` time (None: unbounded, the judge-tiles refetch)."""
+    data = originrule.fetch(url, max_bytes=_ORIGIN_MAX_BYTES, timeout_s=_TILE_TIMEOUT_S, deadline=deadline)
     _ORIGIN_CACHE.put(url, data)
     return data
 
 
-def _fetch_origin_tile(url: str, dest: Path):
+def _deadline_error(redacted_url: str) -> ClipRankTileError:
+    return ClipRankTileError(
+        kind="fetch_timeout",
+        detail=f"deadline {_ORIGIN_FETCH_PHASE_S:g}s for the origin fetch phase passed before this tile "
+               f"was fetched — {redacted_url}")
+
+
+class OriginEgressFailed(RuntimeError):
+    """The pod's network to every CDN host this request touched is dead (originrule.egress_dead). Raised, not
+    scored: an empty-scored success would keep the pod claiming work it cannot do (PROD 2026-10-28)."""
+
+
+class _RequestEgress:
+    """One request's tally of origin tiles, and the verdict that stops it. `error` is set once, by whichever
+    tile first sees the pod's egress dead; every queued fetch is then cancelled."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.hosts: set[str] = set()
+        self.attempted: Counter = Counter()
+        self.failed: Counter = Counter()
+        self.causes: Counter = Counter()
+        self.futures: dict = {}
+        self.error: OriginEgressFailed | None = None
+
+    def attempt(self, redacted_url: str) -> str:
+        host = _url_host(redacted_url)
+        with self._lock:
+            self.hosts.add(host)
+        return host
+
+    def done(self, host: str, error: ClipRankTileError | None) -> None:
+        with self._lock:
+            self.attempted[host] += 1
+            if error is not None:
+                self.failed[host] += 1
+                self.causes[_cause_head(error.detail)] += 1
+            if self.error is not None or error is None or not originrule.egress_dead(self.hosts):
+                return
+            n = sum(self.attempted.values())
+            ok = n - sum(self.failed.values())
+            self.error = OriginEgressFailed(
+                f"{ok}/{n} origin tiles fetched — causes: "
+                + ", ".join(f"{h}×{c}" for h, c in self.causes.most_common(3))
+                + " — hosts: " + ", ".join(f"{h} {self.failed[h]}/{self.attempted[h]}" for h in sorted(self.attempted)))
+            # a snapshot: the request thread is still adding to `futures` while submitting later groups
+            for f in list(self.futures.values()):
+                f.cancel()
+
+
+_NETWORK_PHASES = ("dns", "connect", "tls", "read")
+
+
+def _tile_egress_failed(error: ClipRankTileError) -> bool | None:
+    """`originrule.egress_failed`'s rules read off a tile's error text, plus the phase deadline: True for a
+    dns/connect/tls/read failure, 429/503, a Cloudflare-evidenced 403 or a tile the deadline cut; None for an
+    origin verdict that says nothing about the network (404/410, plain 403, refused, content/decode/write)."""
+    if error.kind == "fetch_timeout" and error.detail.startswith("deadline"):
+        return True
+    if error.kind not in ("fetch_failed", "fetch_timeout"):
+        return None
+    if error.detail.split(" ", 1)[0] in _NETWORK_PHASES:
+        return True
+    m = _CAUSE_STATUS.search(error.detail)
+    status = int(m.group(1)) if m else None
+    if status in (429, 503):
+        return True
+    return status == 403 and (_CAUSE_CF.search(error.detail) is not None or " mitigated=" in error.detail)
+
+
+def _phase_verdict(shared: dict) -> OriginEgressFailed | None:
+    """Judge the request's WHOLE origin fetch phase once, every url once. WHY: PROD 2026-10-28 (preview 067b75a6,
+    MISC-849) got 0/450 tiles from a network that throttles Cloudflare to nothing — 404s and tiles cut by the
+    120 s deadline never fill a per-host window to 90 % failed, so the pod scored nothing and claimed on. A
+    phase with too few ok tiles among those that say anything about the network (ok + egress-failed, the
+    deadline's cuts included) is dead, by the same two constants as the host window."""
+    ok = failed = neutral = 0
+    causes: Counter = Counter()
+    hosts: Counter = Counter()
+    host_failed: Counter = Counter()
+    for f in shared.values():
+        if not f.done() or f.cancelled() or f.exception() is not None:
+            continue
+        _, error, redacted_url, _ = f.result()
+        host = _url_host(redacted_url)
+        hosts[host] += 1
+        if error is None:
+            ok += 1
+            continue
+        verdict = _tile_egress_failed(error)
+        if verdict:
+            failed += 1
+            host_failed[host] += 1
+            causes[_cause_head(error.detail)] += 1
+        else:
+            neutral += 1
+    judged = ok + failed
+    if judged < originrule._EGRESS_MIN_N or ok > (1 - originrule._EGRESS_DEAD_FRACTION) * judged:
+        return None
+    return OriginEgressFailed(
+        f"{ok}/{ok + failed + neutral} origin tiles fetched in the {_ORIGIN_FETCH_PHASE_S:g}s phase — "
+        f"{failed} egress-failed or not fetched before the deadline, {neutral} origin verdicts (404/403/decode)"
+        " — causes: " + ", ".join(f"{h}×{c}" for h, c in causes.most_common(3))
+        + " — hosts: " + ", ".join(f"{h} {host_failed[h]}/{hosts[h]}" for h in sorted(hosts)))
+
+
+def _fetch_origin_tile(url: str, dest: Path, deadline: float | None = None, egress: "_RequestEgress | None" = None):
     """One stock-provider tile: GET through the origin guard → workdir file → decode, exactly like an image_urls
     tile after its download. Returns (image, error, redacted url, measure); the measure is the fetched bytes
-    and decoded size, None for a tile that did not decode. A guard refusal is `origin_refused`."""
+    and decoded size, None for a tile that did not decode. A guard refusal is `origin_refused`. A tile still
+    queued when the request's fetch-phase `deadline` has passed is never started: it is `fetch_timeout`.
+    With `egress`, a tile that finds the pod's egress dead stops the request (`OriginEgressFailed`)."""
+    if egress is not None and egress.error is not None:      # already stopped: a tile that slipped past cancel()
+        return None, _deadline_error(_redacted_tile_url(url)), _redacted_tile_url(url), None
+    result = _fetch_origin_tile_once(url, dest, deadline, egress)
+    if egress is not None and result[1] is not None and result[1].kind != "fetch_timeout":
+        egress.done(_url_host(result[2]), result[1])
+    elif egress is not None and result[1] is None:
+        egress.done(_url_host(result[2]), None)
+    return result
+
+
+def _fetch_origin_tile_once(url: str, dest: Path, deadline: float | None, egress: "_RequestEgress | None"):
     from PIL import Image
 
     redacted_url = _redacted_tile_url(url)
+    if deadline is not None and originrule._now() >= deadline:
+        return None, _deadline_error(redacted_url), redacted_url, None
+    if egress is not None:
+        egress.attempt(redacted_url)
     try:
-        data = _origin_fetch(url)
+        data = _origin_fetch(url, deadline)
+    except originrule.DeadlineExceeded:
+        return None, _deadline_error(redacted_url), redacted_url, None
     except originrule.OriginRefused as exc:
-        return None, _tile_error("origin_refused", exc, redacted_url), redacted_url, None
+        failure = getattr(exc, "origin_failure", None)
+        if failure is not None and failure.phase == "dns":     # a name that does not resolve is the network's, not policy's
+            return None, _origin_tile_error("fetch_failed", exc, redacted_url), redacted_url, None
+        return None, _origin_tile_error("origin_refused", exc, redacted_url), redacted_url, None
     except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault; it is NAMED below
-        return None, _tile_error(_fetch_kind(exc), exc, redacted_url), redacted_url, None
+        return None, _origin_tile_error(_fetch_kind(exc), exc, redacted_url), redacted_url, None
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
+    except Exception as exc:  # noqa: BLE001 — a local write failure is this tile's error, not the batch's
+        return None, _origin_tile_error("decode_error", exc, redacted_url, "write"), redacted_url, None
+    try:
         img = Image.open(dest).convert("RGB")
     except Exception as exc:  # noqa: BLE001 — undecodable bytes are this tile's error, not the batch's
-        return None, _tile_error("decode_error", exc, redacted_url), redacted_url, None
+        phase = "content" if getattr(data, "html", False) else "decode"
+        return None, _origin_tile_error("decode_error", exc, redacted_url, phase), redacted_url, None
     return img, None, redacted_url, ClipRankTileMeasure(bytes=len(data), w=img.width, h=img.height)
 
 
-def _submit_origins(urls: list[str], workdir: Path, shared: dict) -> list:
+def _submit_origins(urls: list[str], workdir: Path, shared: dict, deadline: float | None = None,
+                    egress: "_RequestEgress | None" = None) -> list:
     """Put every origin tile on the wire, ONE fetch per url per REQUEST: `shared` (url → future) spans every
-    origin group of the request, so a thumbnail two beats both shortlisted is fetched once."""
+    origin group of the request, so a thumbnail two beats both shortlisted is fetched once. `deadline` ends
+    the request's whole fetch phase. `egress` lets a dead network cancel whatever is still queued in `shared`."""
     pool = _fetch_pool()
+    if egress is not None:
+        egress.futures = shared
     for u in urls:
+        if egress is not None and egress.error is not None:      # the verdict is in: queue nothing new
+            raise egress.error
         if u not in shared:
-            shared[u] = pool.submit(_fetch_origin_tile, u, workdir / f"{len(shared)}.img")
+            shared[u] = pool.submit(_fetch_origin_tile, u, workdir / f"{len(shared)}.img", deadline, egress)
     return [shared[u] for u in urls]
 
 
-def _gather_origins(futs: list):
-    """An origin group's decoded images, their indices, per-index errors and measures, and the first failed
-    tile's redacted url (None when every tile decoded)."""
+@dataclass
+class _FailTrail:
+    """What an origin group's progress line says about its failures: the first failed tile's redacted url, the
+    cause heads and the per-host failed/attempted counts. Hosts and heads only — never a query or a token."""
+    first: str | None = None
+    causes: Counter = field(default_factory=Counter)
+    failed: Counter = field(default_factory=Counter)
+    attempted: Counter = field(default_factory=Counter)
+
+
+def _url_host(redacted_url: str) -> str:
+    try:
+        return urlsplit(redacted_url).hostname or "?"
+    except ValueError:
+        return "?"
+
+
+_CAUSE_STATUS = re.compile(r" HTTP (\d{3})\b")
+_CAUSE_CF = re.compile(r" cf-(\d+)\b")
+
+
+def _cause_head(detail: str) -> str:
+    """`<phase> <exc>[ <status>][ cf-<code>]` from an origin tile detail written by `_origin_tile_error`;
+    a detail with no phase (a guard refusal, a plain timeout) is headed by its exception name alone."""
+    words = detail.split(" ", 2)
+    head = words[0].rstrip(":")
+    if not words[0].endswith(":") and len(words) > 1:
+        head += f" {words[1].rstrip(':')}"
+    if m := _CAUSE_STATUS.search(detail):
+        head += f" {m.group(1)}"
+    if m := _CAUSE_CF.search(detail):
+        head += f" cf-{m.group(1)}"
+    return head
+
+
+def _gather_origins(futs: list, egress: "_RequestEgress | None" = None):
+    """An origin group's decoded images, their indices, per-index errors and measures, and the failure trail
+    (`first` is None when every tile decoded). Raises the request's `OriginEgressFailed` once its egress is dead."""
     images: list = []
     ok: list[int] = []
     errors: list[ClipRankTileError | None] = []
     measures: list[ClipRankTileMeasure | None] = []
-    first_failed: str | None = None
+    first_failed = _FailTrail()
     for i, f in enumerate(futs):
-        img, reason, redacted_url, measure = f.result()
+        try:
+            img, reason, redacted_url, measure = f.result()
+        except cf.CancelledError:
+            if egress is not None and egress.error is not None:
+                raise egress.error from None
+            raise
+        if egress is not None and egress.error is not None:
+            raise egress.error
+        host = _url_host(redacted_url)
+        first_failed.attempted[host] += 1
         if reason is not None:
             print(f"[clip_rank] tile {reason.kind} — {reason.detail}", file=sys.stderr, flush=True)
-            first_failed = first_failed or redacted_url
+            first_failed.first = first_failed.first or redacted_url
+            first_failed.failed[host] += 1
+            first_failed.causes[_cause_head(reason.detail)] += 1
         else:
             images.append(img)
             ok.append(i)
@@ -376,15 +598,18 @@ def _gather_origins(futs: list):
     return images, ok, errors, measures, first_failed
 
 
-def _origin_report(i: int, n: int, result: ClipRankGroupResult, first_failed: str | None) -> str:
+def _origin_report(i: int, n: int, result: ClipRankGroupResult, first_failed: "_FailTrail | None") -> str:
     """The one progress line an origin group earns: its failure count per kind and the first failed tile's
     redacted url — stderr alone never reaches the box, and a failure the box cannot see reads as data."""
     kinds = Counter(e.kind for e in result.errors if e is not None)
     line = f"clip_rank origin group {i + 1}/{n}: {sum(kinds.values())}/{len(result.errors)} tile(s) failed"
     if kinds:
         line += " (" + ", ".join(f"{k}={c}" for k, c in sorted(kinds.items())) + ")"
-    if first_failed is not None:
-        line += f", first {first_failed}"
+    if first_failed is not None and first_failed.first is not None:
+        line += f", first {first_failed.first}"
+        line += " — causes: " + ", ".join(f"{h}×{c}" for h, c in first_failed.causes.most_common(3))
+        line += " — hosts: " + ", ".join(
+            f"{h} {first_failed.failed[h]}/{first_failed.attempted[h]}" for h in sorted(first_failed.attempted))
     return line
 
 
@@ -466,7 +691,8 @@ def _judge_tile(tile, dest: Path) -> _JudgeTileOutcome:
     from PIL import Image
 
     def failed(kind: str, exc: BaseException, url: str, **kw) -> _JudgeTileOutcome:
-        err = _tile_error(kind, exc, _redacted_tile_url(url))
+        err = (_origin_tile_error if getattr(exc, "origin_failure", None) is not None else _tile_error)(
+            kind, exc, _redacted_tile_url(url))
         print(f"[clip_rank] judge tile {err.kind} — {err.detail}", file=sys.stderr, flush=True)
         return _JudgeTileOutcome(ClipRankJudgeTileResult(status="error", error=err), **kw)
 
@@ -607,7 +833,11 @@ class ClipRankService:
                     for g in params.groups]
             unique = list(dict.fromkeys(keys))
             shared_origins: dict = {}
-            pending = {key: (_submit_origins(list(key[0]), Path(td) / "origins", shared_origins) if key[2]
+            phase_deadline = originrule._now() + _ORIGIN_FETCH_PHASE_S
+            egress = _RequestEgress()
+            pending = {key: (_submit_origins(list(key[0]), Path(td) / "origins", shared_origins, phase_deadline,
+                                             egress)
+                             if key[2]
                              else _submit_tiles(list(key[0]), Path(td) / f"g{i}"))
                        for i, key in enumerate(unique)}
             origin_extra: dict = {}
@@ -617,7 +847,7 @@ class ClipRankService:
             def prepare(key):
                 tg = time.monotonic()
                 if key[2]:
-                    images, ok, errors, measures, first_failed = _gather_origins(pending[key])
+                    images, ok, errors, measures, first_failed = _gather_origins(pending[key], egress)
                     origin_extra[key] = (measures, first_failed)
                 else:
                     images, ok, errors = _gather(pending[key], key[1])
@@ -639,6 +869,9 @@ class ClipRankService:
                     ready[key], gs, fs = prepared[key].result()
                     gather_s += gs
                     forward_s += fs
+
+            if (dead := _phase_verdict(shared_origins)) is not None:
+                raise dead
 
             groups = []
             for i, (g, key) in enumerate(zip(params.groups, keys)):

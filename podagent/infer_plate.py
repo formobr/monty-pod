@@ -14,7 +14,7 @@ window, from the person matte the pod already made for the same video.
               `refused`, the engine drops that layer by name and the other windows are unaffected; a plate is never a
               hallucination of most of the picture, and never a copy of the speaker
 
-Settings and their sources: docs/research/clean-plate-lama.md (receipt). Placement is absolute: CUDA or refuse, never CPU.
+Settings and their sources: the clean-plate research receipt. Placement is absolute: CUDA or refuse, never CPU.
 The median runs on the card too (the same device LaMa uses), in row bands so the working set stays a few hundred MiB.
 """
 from __future__ import annotations

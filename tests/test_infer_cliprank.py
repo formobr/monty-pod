@@ -321,3 +321,319 @@ def test_forward_rounds_to_four_places(intent: str) -> None:
     """4dp is the wire convention (cosine error ~1e-3) — it must hold on both branches."""
     _, embeds = _svc()._forward(intent, ["img", "img"])
     assert all(len(str(x).split(".")[-1]) <= 4 for row in embeds for x in row)
+
+
+def _origin_error(monkeypatch, tmp_path, outcome, dest=None):
+    """Run ONE origin tile through the real `_fetch_origin_tile` with the guard's fetch faked."""
+    import podagent.infer_cliprank as m
+
+    def fake(url, deadline=None):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(m, "_origin_fetch", fake)
+    url = "https://images.pexels.com/photos/1/x.jpg?token=SIGNEDTOKEN"
+    _, err, _, measure = m._fetch_origin_tile(url, dest or tmp_path / "w" / "0.img")
+    assert measure is None and err is not None
+    assert "SIGNEDTOKEN" not in err.detail and "?" not in err.detail and len(err.detail) <= 300
+    return err
+
+
+def test_a_cloudflare_403_reaches_the_tile_detail_with_status_and_code(monkeypatch, tmp_path) -> None:
+    """PROD 2026-10-28 job 20168ee1: 538/538 origin tiles failed and no detail carried the HTTP status."""
+    import http.client
+    import urllib.error
+
+    from podagent import originrule
+
+    exc = urllib.error.HTTPError("https://images.pexels.com/photos/1/x.jpg", 403, "Forbidden",
+                                 http.client.HTTPMessage(), None)
+    exc.origin_failure = originrule.OriginFailure(
+        phase="http", host="images.pexels.com", addr="104.18.1.1", family="v4", status=403,
+        cf_mitigated="challenge", retry_after="30", cf_code="1020", exc="HTTPError")
+    err = _origin_error(monkeypatch, tmp_path, exc)
+    assert err.kind == "fetch_failed"
+    assert err.detail.startswith("http HTTPError")
+    for part in ("HTTP 403", "cf-1020", "mitigated=challenge", "retry-after=30", "via 104.18.1.1/v4"):
+        assert part in err.detail
+    assert err.detail.endswith("— https://images.pexels.com/photos/1/x.jpg")
+
+
+def test_an_html_body_is_content_and_an_unwritable_dest_is_write(monkeypatch, tmp_path) -> None:
+    from podagent import originrule
+
+    html = originrule.OriginBody(b"<html>Just a moment...</html>")
+    err = _origin_error(monkeypatch, tmp_path, html)
+    assert err.kind == "decode_error" and err.detail.startswith("content ")
+    # the same bytes without the flag are plain undecodable data
+    err = _origin_error(monkeypatch, tmp_path, b"junk")
+    assert err.kind == "decode_error" and err.detail.startswith("decode ")
+    blocker = tmp_path / "file"
+    blocker.write_bytes(b"")
+    err = _origin_error(monkeypatch, tmp_path, b"junk", dest=blocker / "sub" / "0.img")
+    assert err.kind == "decode_error" and err.detail.startswith("write ")
+
+
+def test_an_exception_without_a_failure_record_keeps_the_old_detail(monkeypatch, tmp_path) -> None:
+    err = _origin_error(monkeypatch, tmp_path, TimeoutError("slow"))
+    assert err.kind == "fetch_timeout"
+    assert err.detail == "TimeoutError: slow — https://images.pexels.com/photos/1/x.jpg"
+
+
+def _phase_rig(monkeypatch, tmp_path):
+    """An inline pool, an injected clock the origin fetch advances, stub towers scoring every image 0.5, and a
+    captured PUT. Returns (run(urls) -> parsed result, clock cell)."""
+    import io
+    import json
+
+    from PIL import Image
+
+    import podagent.infer_cliprank as m
+    from podagent import originrule
+    from podagent.models import ClipRankParams
+
+    class _Inline:
+        def submit(self, fn, *args, **kwargs):
+            fut = cf.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except Exception as exc:  # noqa: BLE001 — mirror a real Future
+                fut.set_exception(exc)
+            return fut
+
+    class _Clock(list):
+        png = b""
+
+    clock = _Clock([0.0])
+    monkeypatch.setattr(originrule, "_now", lambda: clock[0])
+    monkeypatch.setattr(m, "_FETCH_POOL", _Inline())
+    monkeypatch.setattr(m, "_ORIGIN_CACHE", m._OriginCache(m._ORIGIN_CACHE_BYTES))
+    put = tmp_path / "out.json"
+    monkeypatch.setattr(m, "upload", lambda src, url, ct=None: put.write_bytes(src.read_bytes()))
+    svc = _svc()
+    svc._prepare = lambda images, ok: ((None, [], ok) if not images
+                                       else (list(images), [[0.6, 0.8] for _ in images], ok))
+    svc._text_scores = lambda intent, ie: [0.5] * len(ie)
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 3)).save(buf, "PNG")
+    clock.png = buf.getvalue()
+
+    def run(urls):
+        svc.run(ClipRankParams(groups=[ClipRankGroup(intent="chart", origin_urls=urls)]), "put")
+        return json.loads(put.read_text())["groups"][0]
+
+    run.svc = svc
+    return run, clock
+
+
+def test_a_fetch_phase_whose_host_answers_after_the_deadline_ends_at_120s_and_is_judged_dead(
+        monkeypatch, tmp_path) -> None:
+    """PROD 2026-10-28: a preview fetched 500-1657 origin tiles with nothing bounding the phase as a whole."""
+    import podagent.infer_cliprank as m
+    from podagent import originrule
+
+    run, clock = _phase_rig(monkeypatch, tmp_path)
+    urls = [f"https://images.pexels.com/p/{i}.jpg" for i in range(600)]
+    fetched: list[str] = []
+    deadlines: list[float] = []
+
+    def fake(url, deadline=None):
+        fetched.append(url)
+        deadlines.append(deadline)
+        if len(fetched) <= 2:
+            clock[0] += 10.0                    # two tiles arrive
+            return clock.png
+        clock[0] = deadline                     # the third's host answers only after the phase is over:
+        raise originrule.DeadlineExceeded("deadline")   # the bounded fetch gives up exactly at the deadline
+
+    monkeypatch.setattr(m, "_origin_fetch", fake)
+    with pytest.raises(m.OriginEgressFailed, match="2/600"):
+        run(urls)
+    assert m._ORIGIN_FETCH_PHASE_S == 120 and set(deadlines) == {120.0}
+    assert clock[0] == 120.0, "the phase ended at 120 s on the injected clock"
+    assert len(fetched) == 3, "the 597 queued fetches were cancelled, not started"
+
+
+def _deadline_phase(monkeypatch, tmp_path, *, ok: int, cut: int, not_found: int = 0):
+    """A phase of `not_found` HTTP 404s, then `ok` arrivals, then `cut` tiles the 120 s deadline ends, over both
+    CDN hosts. Returns (run, urls, scored) where `scored` lists every text-scoring call."""
+    import podagent.infer_cliprank as m
+    from podagent import originrule
+
+    run, clock = _phase_rig(monkeypatch, tmp_path)
+    monkeypatch.setattr(originrule, "_EGRESS", {})
+    scored: list = []
+    inner = run.svc._text_scores
+    run.svc._text_scores = lambda intent, ie: scored.append(intent) or inner(intent, ie)
+    urls = [f"https://{(_PEXELS, _PIXABAY)[i % 2]}/p/{i}.jpg" for i in range(not_found + ok + cut)]
+    seen: list[str] = []
+
+    def fake(url, deadline=None):
+        seen.append(url)
+        if len(seen) <= not_found:
+            raise _failure_of("404", url.split("/")[2])
+        if len(seen) <= not_found + ok:
+            clock[0] += 0.1
+            return clock.png
+        clock[0] = deadline
+        raise originrule.DeadlineExceeded("deadline")
+
+    monkeypatch.setattr(m, "_origin_fetch", fake)
+    return run, urls, scored
+
+
+def test_067b75a6_a_phase_of_404s_and_deadline_cuts_with_nothing_fetched_is_a_dead_egress(
+        monkeypatch, tmp_path) -> None:
+    """PROD 2026-10-28 preview 067b75a6: 0/450 tiles, the pod scored an empty success and claimed on."""
+    import podagent.infer_cliprank as m
+
+    run, urls, scored = _deadline_phase(monkeypatch, tmp_path, ok=0, cut=365, not_found=85)
+    with pytest.raises(m.OriginEgressFailed) as info:
+        run(urls)
+    msg = str(info.value)
+    assert "0/450" in msg and "365 egress-failed" in msg and "85 origin verdicts" in msg
+    assert "deadline 120s×365" in msg and _PEXELS in msg and _PIXABAY in msg
+    assert scored == [], "nothing is scored from a dead phase"
+
+
+def test_a_phase_of_only_404s_is_not_a_network(monkeypatch, tmp_path) -> None:
+    run, urls, _ = _deadline_phase(monkeypatch, tmp_path, ok=0, cut=0, not_found=450)
+    g = run(urls)
+    # no raise: the group is scored as today, an error group carrying every tile's named 404
+    assert g["status"] == "error" and set(g["scores"]) == {None} and len(g["errors"]) == 450
+
+
+def test_a_healthy_843_tile_phase_does_not_raise(monkeypatch, tmp_path) -> None:
+    run, urls, _ = _deadline_phase(monkeypatch, tmp_path, ok=843, cut=0)
+    assert run(urls)["scores"] == [0.5] * 843
+
+
+def test_the_phase_is_dead_at_ten_percent_ok_and_alive_above_it(monkeypatch, tmp_path) -> None:
+    import podagent.infer_cliprank as m
+
+    run, urls, _ = _deadline_phase(monkeypatch, tmp_path, ok=30, cut=300)
+    with pytest.raises(m.OriginEgressFailed, match="30/330"):
+        run(urls)
+    run, urls, _ = _deadline_phase(monkeypatch, tmp_path, ok=60, cut=300)
+    g = run(urls)
+    assert g["status"] == "ok" and g["scores"][:60] == [0.5] * 60 and set(g["scores"][60:]) == {None}
+    assert g["errors"][:60] == [None] * 60
+    assert {e["kind"] for e in g["errors"][60:]} == {"fetch_timeout"}
+    assert all(e["detail"].startswith("deadline ") for e in g["errors"][60:]) and len(g["errors"][60:]) == 300
+
+
+def test_a_few_deadline_cuts_alone_are_under_the_verdict_minimum(monkeypatch, tmp_path) -> None:
+    run, urls, _ = _deadline_phase(monkeypatch, tmp_path, ok=0, cut=15)
+    assert set(run(urls)["scores"]) == {None}
+
+
+def test_a_healthy_fetch_phase_is_unchanged(monkeypatch, tmp_path) -> None:
+    import podagent.infer_cliprank as m
+
+    run, clock = _phase_rig(monkeypatch, tmp_path)
+    urls = [f"https://images.pexels.com/p/{i}.jpg" for i in range(600)]
+
+    def fake(url, deadline=None):
+        clock[0] += 0.01
+        return clock.png
+
+    monkeypatch.setattr(m, "_origin_fetch", fake)
+    g = run(urls)
+    assert g["status"] == "ok" and g["errors"] == [None] * 600 and g["scores"] == [0.5] * 600
+
+
+# --- the pod's egress verdict (PROD 2026-10-28 job 20168ee1) ------------------------------------------------
+
+_PEXELS, _PIXABAY = "images.pexels.com", "cdn.pixabay.com"
+
+
+def _failure_of(kind: str, host: str):
+    """The exception originrule would raise for one tile, carrying the record `egress_failed` reads."""
+    import http.client
+    import urllib.error
+
+    from podagent import originrule
+
+    if kind == "reset":
+        return originrule._attach(ConnectionResetError("reset by peer"), phase="read", host=host, addr="1.2.3.4")
+    if kind == "dns":
+        return originrule._attach(originrule.OriginRefused(f"REFUSED: {host} does not resolve"),
+                                  phase="dns", host=host)
+    status, cf = {"404": (404, None), "plain403": (403, None)}[kind]
+    exc = urllib.error.HTTPError(f"https://{host}/x", status, "no", http.client.HTTPMessage(), None)
+    exc.origin_failure = originrule.OriginFailure(phase="http", host=host, status=status, cf_code=cf,
+                                                  exc="HTTPError")
+    return exc
+
+
+def _egress_rig(monkeypatch, tmp_path, behave):
+    """The phase rig with the REAL originrule.fetch on top of a faked `_fetch_once`: `behave(host)` is None for
+    a good tile or the kind of failure. Returns (run(groups_of_urls), urls fetched)."""
+    from podagent import originrule
+    from podagent.models import ClipRankParams
+
+    rig, _clock = _phase_rig(monkeypatch, tmp_path)
+    monkeypatch.setattr(originrule, "_EGRESS", {})
+    fetched: list[str] = []
+
+    def fake_once(url, **_kw):
+        fetched.append(url)
+        host = url.split("/")[2]
+        kind = behave(host)
+        if kind is not None:
+            raise _failure_of(kind, host)
+        return _clock.png
+
+    monkeypatch.setattr(originrule, "_fetch_once", fake_once)
+
+    def run(groups):
+        return rig.svc.run(ClipRankParams(groups=[ClipRankGroup(intent="chart", origin_urls=g) for g in groups]),
+                           "put")
+
+    return run, fetched
+
+
+def _two_host_groups(n_groups: int, per_group: int) -> list[list[str]]:
+    return [[f"https://{(_PEXELS, _PIXABAY)[i % 2]}/p/{g}/{i}.jpg" for i in range(per_group)]
+            for g in range(n_groups)]
+
+
+@pytest.mark.parametrize("kind", ["reset", "dns"])
+def test_a_request_whose_every_host_is_dead_raises_and_names_causes_and_hosts(monkeypatch, tmp_path, kind) -> None:
+    import podagent.infer_cliprank as m
+
+    run, fetched = _egress_rig(monkeypatch, tmp_path, lambda host: kind)
+    with pytest.raises(m.OriginEgressFailed) as e:
+        run(_two_host_groups(5, 12))
+    text = str(e.value)
+    assert text.startswith("0/40 origin tiles fetched — causes: ")
+    assert f"{_PEXELS} 20/20" in text and f"{_PIXABAY} 20/20" in text
+    assert ("read ConnectionResetError×40" if kind == "reset" else "dns OriginRefused×40") in text
+    assert len(set(fetched)) == 40, "the 20 tiles still queued after both hosts reached the minimum were never fetched"
+
+
+@pytest.mark.parametrize("kind", ["404", "plain403"])
+def test_an_origin_verdict_on_every_tile_is_not_an_egress_failure(monkeypatch, tmp_path, kind) -> None:
+    run, fetched = _egress_rig(monkeypatch, tmp_path, lambda host: kind)
+    run(_two_host_groups(5, 12))             # no raise: the network answered, the links are just bad
+    assert len(fetched) == 60
+
+
+def test_one_healthy_host_means_the_network_works(monkeypatch, tmp_path) -> None:
+    run, fetched = _egress_rig(monkeypatch, tmp_path, lambda host: "reset" if host == _PEXELS else None)
+    run(_two_host_groups(5, 12))
+    assert len(set(fetched)) == 60      # a dropped connection is retried, so urls are counted, not calls
+
+
+def test_the_verdict_is_per_process_so_small_requests_cannot_slip_under_it(monkeypatch, tmp_path) -> None:
+    """10 tiles a request is under the per-host minimum of 20 every time; the window spans requests."""
+    import podagent.infer_cliprank as m
+
+    run, _ = _egress_rig(monkeypatch, tmp_path, lambda host: "reset")
+    small = [[f"https://{_PEXELS}/p/{i}.jpg" for i in range(10)]]
+    run(small)                               # 10 attempts: below the minimum, an ordinary empty-scored result
+    small2 = [[f"https://{_PEXELS}/q/{i}.jpg" for i in range(10)]]
+    with pytest.raises(m.OriginEgressFailed) as e:
+        run(small2)                          # the 20th attempt in the process-wide window
+    assert f"{_PEXELS} 10/10" in str(e.value)

@@ -14,8 +14,10 @@ before any socket), and the towers are stubs.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import http.client
 import io
 import json
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -81,7 +83,7 @@ def _fake_fetch(monkeypatch, bodies: dict):
     """originrule.fetch stand-in: a body, or an exception to raise, per url; records every call."""
     calls: list[tuple[str, int, float]] = []
 
-    def fetch(url, *, max_bytes, timeout_s):
+    def fetch(url, *, max_bytes, timeout_s, deadline=None):
         calls.append((url, max_bytes, timeout_s))
         out = bodies[url]
         if isinstance(out, BaseException):
@@ -153,9 +155,33 @@ def test_failure_counts_reach_progress_without_query_strings(monkeypatch, rig) -
     assert lines == [
         "clip_rank origin group 1/2: 0/1 tile(s) failed",
         "clip_rank origin group 2/2: 2/3 tile(s) failed (fetch_timeout=1, origin_refused=1), "
-        "first https://images.stock.example/photo/1/thumb.jpg",
+        "first https://images.stock.example/photo/1/thumb.jpg"
+        " — causes: OriginRefused×1, TimeoutError×1 — hosts: images.stock.example 2/3",
     ]
     assert not any("XYZSECRET" in p or "?" in p for p in rig.progress)
+
+
+def test_the_progress_line_names_causes_and_hosts_without_a_query_or_token(monkeypatch, rig) -> None:
+    """PROD 2026-10-28 job 20168ee1: 538 tiles failed and the box could not say why."""
+    def blocked(host: str, code: int, ray: str) -> urllib.error.HTTPError:
+        err = urllib.error.HTTPError(f"https://{host}/x", 403, "Forbidden", http.client.HTTPMessage(), None)
+        err.origin_failure = originrule.OriginFailure(
+            phase="http", host=host, addr="104.18.1.1", family="v4", status=403, cf_ray=ray,
+            cf_code=str(code), exc="HTTPError")
+        return err
+
+    pexels = [f"https://images.pexels.com/p/{i}.jpg?token=SIGNEDTOKEN{i}" for i in range(3)]
+    pixabay = "https://cdn.pixabay.com/q.jpg?Signature=SIGNEDTOKEN9"
+    good = "https://cdn.pixabay.com/ok.jpg"
+    bodies: dict = {u: blocked("images.pexels.com", 1020, "r") for u in pexels}
+    bodies[pixabay] = blocked("cdn.pixabay.com", 1010, "r")
+    bodies[good] = _png(4, 3)
+    _fake_fetch(monkeypatch, bodies)
+    rig([ClipRankGroup(intent="chart", origin_urls=[*pexels, pixabay, good])])
+    (line,) = [p for p in rig.progress if p.startswith("clip_rank origin group")]
+    assert "causes: http HTTPError 403 cf-1020×3, http HTTPError 403 cf-1010×1" in line
+    assert "hosts: cdn.pixabay.com 1/2, images.pexels.com 3/3" in line
+    assert "SIGNEDTOKEN" not in line and "?" not in line
 
 
 def test_an_image_urls_group_carries_no_measures_and_no_origin_line(monkeypatch, rig, tmp_path) -> None:
@@ -177,10 +203,10 @@ def test_no_env_lever_is_read_for_width_or_lanes(monkeypatch) -> None:
     monkeypatch.setattr(m, "_free_vram_mb", lambda: 3254.0)   # the dev 2060: one lane by VRAM
     monkeypatch.setattr(m, "_host_threads", lambda: 12)
     assert m.lane_width() == 1
-    assert m.fetch_width() == 8
+    assert m.fetch_width() == 32
     monkeypatch.setattr(m, "_FETCH_POOL", None)
     pool = m._fetch_pool()
     try:
-        assert pool._max_workers == 8
+        assert pool._max_workers == 32
     finally:
         pool.shutdown(wait=False)

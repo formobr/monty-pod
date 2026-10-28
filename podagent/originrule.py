@@ -9,7 +9,7 @@ the credential half from the engine's origin-binding guard (userinfo, credential
 box's secret-scanner shapes over every parameter value, path and fragment — a pre-signed url's own signing fields
 exempt, exactly as the box exempts them), and the redirect
 + retry shape from montyops.media_fetch.resolve (every hop checked BEFORE it is followed; 408/429/5xx
-retried once).
+retried, paced per host by the limiter below).
 
 FETCH CONNECTS TO THE EXACT ADDRESS check() JUST VETTED, NEVER ASKING THE RESOLVER AGAIN. A DNS answer with a
 short TTL can legitimately change between `check()`'s lookup and whatever `requests`/`urllib` would resolve a
@@ -25,17 +25,22 @@ Its caller is infer_cliprank, for every tile of a clip_rank origin_urls group.
 """
 from __future__ import annotations
 
+import email.utils
 import http.client
 import ipaddress
 import math
+import random
 import re
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, Final
 from urllib.parse import unquote_plus, urljoin, urlsplit
 
@@ -119,11 +124,24 @@ def _secret_shape(text: str) -> str | None:
     return None
 
 
-# Copied verbatim from the engine's montyops.media_fetch (_RETRYABLE_STATUS, _ORIGIN_RETRY_PAUSE_S,
-# _ORIGIN_ATTEMPTS): two attempts, not three — the observed transient failure does not repeat.
+# The engine's montyops.media_fetch status set. Three attempts (PROD 2026-10-28: two attempts 0.5 s apart
+# hammered a throttling CDN and gave up inside the same second); the pause between them is the host limiter's
+# hold below, never a fixed sleep.
 _RETRYABLE_STATUS: Final[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
-_ORIGIN_RETRY_PAUSE_S: Final[float] = 0.5
-_ORIGIN_ATTEMPTS: Final[int] = 2
+_ORIGIN_ATTEMPTS: Final[int] = 3
+
+# PER-HOST PACING. One state per origin host for the whole process, shared by every fetch: AIMD on the number of
+# fetches in flight to that host (a throttle or a dead connection halves it, a success adds one), and a 429/503
+# also holds NEW fetches to that host. Neither pexels nor pixabay publishes CDN pacing numbers, so the limiter
+# finds the rate instead of guessing one. Every wait is capped: an uncapped Retry-After would rebuild the endless
+# wait this replaces.
+_POOL_WIDTH: Final[int] = 32       # the ceiling: infer_cliprank._FETCH_WORKERS, the widest the pod ever fetches
+_HOLD_MIN_S: Final[float] = 0.5
+_HOLD_MAX_S: Final[float] = 8.0
+_BACKOFF_BASE_S: Final[float] = 1.0   # 1, 2, 4, 8 s when the host names no Retry-After
+_JITTER: Final[float] = 0.25
+_SLOT_POLL_S: Final[float] = 0.25     # a fetch waiting for a free slot re-checks its deadline this often
+_MAX_IDLE_PER_HOST: Final[int] = 8    # persistent connections kept per host
 
 # Standard HTTP redirect statuses — a protocol literal, not a tunable; the same set urllib's own
 # HTTPRedirectHandler special-cases by name (http_error_301/302/303/307/308).
@@ -139,9 +157,166 @@ _FIX: Final[str] = (
     "This url came from a third party's search response, and a KEYLESS RENTED pod may dereference the public "
     "internet but nothing that is only reachable from where it happens to sit, and never a url that IS a key.")
 
-# Seams: the tests fake them, nothing else touches them. `_sleep` so a retry test never waits on the clock;
+# Seams: the tests fake them, nothing else touches them. `_sleep` and `_now` (monotonic) / `_wall` (epoch, for an
+# HTTP-date Retry-After) so a pacing test never waits on the clock; `_jitter` so a backoff is exact;
 # `_connect` so a test can stand in for the TLS socket where the real one would open a connection.
 _sleep = time.sleep
+_now = time.monotonic
+_wall = time.time
+
+
+def _jitter() -> float:
+    return random.uniform(-_JITTER, _JITTER)
+
+
+class DeadlineExceeded(TimeoutError):
+    """The caller's overall deadline passed before this fetch could start or finish pacing. Never retried."""
+
+
+def _retry_after_s(value: str | None) -> float | None:
+    """Retry-After as seconds from now: delta-seconds or an HTTP-date; None when absent or unreadable."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return when.timestamp() - _wall()
+
+
+class _Host:
+    """One origin host's pacing state and idle connections, shared by every fetch of the process."""
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.limit = _POOL_WIDTH
+        self.inflight = 0
+        self.hold_until = 0.0
+        self.backoff_n = 0
+        self.idle: list[tuple[str, Any]] = []
+
+    def acquire(self, deadline: float | None) -> None:
+        """Wait out the host's hold and for a free slot, then take it. Raises DeadlineExceeded instead of
+        waiting past `deadline`."""
+        while True:
+            with self.cond:
+                now = _now()
+                if deadline is not None and now >= deadline:
+                    raise DeadlineExceeded("deadline reached before the host would take another fetch")
+                hold = self.hold_until - now
+                if hold <= 0:
+                    if self.inflight < self.limit:
+                        self.inflight += 1
+                        return
+                    self.cond.wait(_SLOT_POLL_S)
+                    continue
+                if deadline is not None and now + hold > deadline:
+                    raise DeadlineExceeded(f"deadline reached before the {hold:.1f}s hold on this host ended")
+            _sleep(hold)
+
+    def release(self, outcome: str, retry_after: str | None = None) -> None:
+        """Give the slot back and learn from how the fetch went: ok | throttle | block | conn_error | neutral."""
+        with self.cond:
+            self.inflight -= 1
+            if outcome == "ok":
+                self.limit = min(_POOL_WIDTH, self.limit + 1)
+                self.backoff_n = 0
+            elif outcome in ("throttle", "block", "conn_error"):
+                self.limit = max(1, self.limit // 2)
+            if outcome == "throttle":
+                named = _retry_after_s(retry_after)
+                if named is not None:
+                    hold = min(max(named, _HOLD_MIN_S), _HOLD_MAX_S)
+                else:
+                    hold = min(_BACKOFF_BASE_S * 2 ** self.backoff_n * (1 + _jitter()), _HOLD_MAX_S)
+                    self.backoff_n = min(self.backoff_n + 1, 4)     # 2**4 is already past the cap
+                self.hold_until = max(self.hold_until, _now() + hold)
+            self.cond.notify_all()
+
+    def take_idle(self, addrs: tuple[str, ...]) -> tuple[str, Any] | None:
+        """A persistent connection pinned to one of the addresses just vetted; one to any other is closed."""
+        with self.cond:
+            while self.idle:
+                addr, conn = self.idle.pop()
+                if addr in addrs:
+                    return addr, conn
+                conn.close()
+        return None
+
+    def put_idle(self, addr: str, conn: Any) -> None:
+        with self.cond:
+            if len(self.idle) < _MAX_IDLE_PER_HOST:
+                self.idle.append((addr, conn))
+                return
+        conn.close()
+
+
+_HOSTS: dict[str, _Host] = {}
+_hosts_lock = threading.Lock()
+
+
+def _host_state(host: str) -> _Host:
+    with _hosts_lock:
+        return _HOSTS.setdefault(host, _Host())
+
+
+@dataclass(frozen=True)
+class OriginFailure:
+    """Where and why ONE origin fetch failed — diagnostics only, attached to the exception as `origin_failure`
+    and never read by a retry decision. `phase` is dns | connect | tls | http | read; `host` is the final hop's;
+    `cf_code` is the first `error code: 1xxx` of the first 2 KB of an error body (Cloudflare's own verdict)."""
+    phase: str
+    host: str
+    addr: str | None = None
+    family: str | None = None       # "v4" | "v6" of `addr`
+    status: int | None = None
+    retry_after: str | None = None
+    cf_mitigated: str | None = None
+    cf_ray: str | None = None
+    cf_code: str | None = None
+    exc: str = ""
+
+
+_BODY_PEEK: Final[int] = 2048
+_HEADER_CAP: Final[int] = 64
+_CF_CODE: Final = re.compile(r"error code: (1\d{3})")
+
+
+def _family(addr: str | None) -> str | None:
+    return None if addr is None else ("v6" if ":" in addr else "v4")
+
+
+def _attach(exc: BaseException, **fields: Any) -> BaseException:
+    """Record `exc`'s failure on itself, once: the innermost site knows the most."""
+    if getattr(exc, "origin_failure", None) is None:
+        fields.setdefault("family", _family(fields.get("addr")))
+        exc.origin_failure = OriginFailure(exc=type(exc).__name__, **fields)  # type: ignore[attr-defined]
+    return exc
+
+
+class OriginBody(bytes):
+    """A 2xx body whose Content-Type said text/html: returned as today, flagged so the caller can name it."""
+    html = True
+
+
+def _http_failure(resp: Any, host: str, addr: str, status: int, exc_name: str) -> OriginFailure:
+    """The record of an error status: selected headers and the first 2 KB of the body, both best effort."""
+    def header(name: str) -> str | None:
+        value = resp.getheader(name)
+        return str(value)[:_HEADER_CAP] if value is not None else None
+    try:
+        peek = resp.read(_BODY_PEEK)
+    except (OSError, http.client.HTTPException):
+        peek = b""
+    m = _CF_CODE.search(peek.decode("utf-8", "replace"))
+    return OriginFailure(phase="http", host=host, addr=addr, family=_family(addr), status=status,
+                         retry_after=header("Retry-After"), cf_mitigated=header("cf-mitigated"),
+                         cf_ray=header("cf-ray"), cf_code=m.group(1) if m else None, exc=exc_name)
 
 
 class OriginRefused(ValueError):
@@ -156,10 +331,11 @@ class OriginRefused(ValueError):
 class _Transient(Exception):
     """Internal: the origin answered THIS hop with a status `fetch()`'s outer retry loop should retry."""
 
-    def __init__(self, status: int, reason: str) -> None:
+    def __init__(self, status: int, reason: str, failure: OriginFailure | None = None) -> None:
         super().__init__(status)
         self.status = status
         self.reason = reason
+        self.failure = failure
 
 
 def _safe(parts: Any) -> str:
@@ -175,8 +351,10 @@ def resolve_addrs(host: str) -> tuple[str, ...]:
     try:
         infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
     except OSError as e:
-        raise OriginRefused(f"REFUSED: {host} does not resolve ({e}). A host we cannot place is a host we "
-                            f"cannot clear. {_FIX}") from e
+        refused = OriginRefused(f"REFUSED: {host} does not resolve ({e}). A host we cannot place is a host we "
+                                f"cannot clear. {_FIX}")
+        _attach(refused, phase="dns", host=host)
+        raise refused from e
     return tuple(dict.fromkeys(str(info[4][0]) for info in infos))
 
 
@@ -310,8 +488,16 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self._pinned_addr = addr
 
     def connect(self) -> None:
-        sock = socket.create_connection((self._pinned_addr, self.port), timeout=self.timeout)
-        self.sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.host)
+        try:
+            sock = socket.create_connection((self._pinned_addr, self.port), timeout=self.timeout)
+        except OSError as e:
+            _attach(e, phase="connect", host=self.host, addr=self._pinned_addr)
+            raise
+        try:
+            self.sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.host)
+        except OSError as e:     # ssl.SSLError is one
+            _attach(e, phase="tls", host=self.host, addr=self._pinned_addr)
+            raise
 
 
 def _connect(host: str, addr: str, *, timeout_s: float) -> Any:
@@ -320,26 +506,69 @@ def _connect(host: str, addr: str, *, timeout_s: float) -> Any:
     return conn
 
 
-def _fetch_once(url: str, *, max_bytes: int, timeout_s: float) -> bytes:
-    """Follow redirects, re-checking (and re-resolving) every hop before connecting to it, and connect to the
-    exact address just resolved — never a second lookup. `max_hops` borrows urllib's own redirect bound
-    rather than authoring a new number."""
+def _open(state: _Host, host: str, addrs: tuple[str, ...], timeout_s: float, *, fresh: bool) -> tuple[str, Any, bool]:
+    """A connection to `host` pinned to a vetted address: an idle one when there is one, else a new one, trying
+    each vetted address in turn (v4 first, then v6) — only when ALL fail does the attempt fail, naming the
+    address that failed last. Returns (addr, connection, reused)."""
+    ordered = sorted(addrs, key=lambda a: ":" in a)
+    if not fresh and (idle := state.take_idle(tuple(ordered))) is not None:
+        return idle[0], idle[1], True
+    last: OSError | None = None
+    for addr in ordered:
+        try:
+            return addr, _connect(host, addr, timeout_s=timeout_s), False
+        except OSError as e:
+            _attach(e, phase="connect", host=host, addr=addr)
+            last = e
+    assert last is not None
+    raise last
+
+
+def _send(state: _Host, host: str, addrs: tuple[str, ...], path: str, timeout_s: float) -> tuple[str, Any, Any]:
+    """Open (or reuse) a connection and send the GET. A REUSED connection the server closed while it sat idle
+    is not a failure: it is dropped and the request goes once more on a fresh one."""
+    fresh = False
+    while True:
+        addr, conn, reused = _open(state, host, addrs, timeout_s, fresh=fresh)
+        try:
+            conn.request("GET", path, headers={"User-Agent": "monty-pod-originrule/1"})
+            return addr, conn, conn.getresponse()
+        except (OSError, http.client.HTTPException) as e:
+            conn.close()
+            if reused:
+                fresh = True
+                continue
+            _attach(e, phase="read", host=host, addr=addr)
+            raise
+
+
+def _fetch_once(url: str, *, max_bytes: int, timeout_s: float, deadline: float | None = None) -> bytes:
+    """Follow redirects, re-checking (and re-resolving) every hop before connecting to it, and connect to an
+    address just resolved — never a second lookup. Every hop goes through its host's limiter. `max_hops`
+    borrows urllib's own redirect bound rather than authoring a new number."""
     nxt = url
     max_hops = urllib.request.HTTPRedirectHandler.max_redirections
     for hop in range(max_hops):
         checked, addrs = _check_and_resolve(nxt)
         parts = urlsplit(checked)
         host = (parts.hostname or "").lower().rstrip(".")
-        addr = next((a for a in addrs if ":" not in a), addrs[0])
         path = parts.path or "/"
         if parts.query:
             path = f"{path}?{parts.query}"
-        conn = _connect(host, addr, timeout_s=timeout_s)
+        state = _host_state(host)
+        state.acquire(deadline)
+        outcome, retry_after = "neutral", None
+        conn = None
+        keep = False
         try:
-            conn.request("GET", path, headers={"User-Agent": "monty-pod-originrule/1", "Connection": "close"})
-            resp = conn.getresponse()
+            try:
+                addr, conn, resp = _send(state, host, addrs, path, timeout_s)
+            except (OSError, http.client.HTTPException):
+                outcome = "conn_error"
+                raise
             status = resp.status
             if status in _REDIRECT_STATUSES:
+                outcome = "ok"
                 location = resp.getheader("Location")
                 if not location:
                     raise OriginRefused(
@@ -348,31 +577,126 @@ def _fetch_once(url: str, *, max_bytes: int, timeout_s: float) -> bytes:
                 # applies here because none is needed — nothing is buffered.
                 nxt = urljoin(checked, location)
                 continue
+            if status in (429, 503):
+                outcome, retry_after = "throttle", resp.getheader("Retry-After")
+            elif status == 403:
+                outcome = "block"      # halves the host's width, and is never retried (it is not in _RETRYABLE)
             if status in _RETRYABLE_STATUS:
-                raise _Transient(status, resp.reason)
+                raise _Transient(status, resp.reason, _http_failure(resp, host, addr, status, "HTTPError"))
             if status >= 400:
-                raise urllib.error.HTTPError(checked, status, resp.reason, http.client.HTTPMessage(), None)
-            data = resp.read(max_bytes + 1)
+                err = urllib.error.HTTPError(checked, status, resp.reason, http.client.HTTPMessage(), None)
+                err.origin_failure = _http_failure(resp, host, addr, status, "HTTPError")  # type: ignore[attr-defined]
+                raise err
+            try:
+                data = resp.read(max_bytes + 1)
+            except (OSError, http.client.HTTPException) as e:
+                outcome = "conn_error"
+                _attach(e, phase="read", host=host, addr=addr)
+                raise
+            outcome = "ok"
+            html = str(resp.getheader("Content-Type") or "").lstrip().lower().startswith("text/html")
+            # Back to the pool only when the body was read to its end on a connection the server keeps open.
+            keep = (len(data) <= max_bytes and not getattr(resp, "will_close", False)
+                    and getattr(resp, "isclosed", lambda: True)())
         finally:
-            conn.close()
+            if conn is not None:
+                if keep:
+                    state.put_idle(addr, conn)
+                else:
+                    conn.close()
+            state.release(outcome, retry_after)
         if len(data) > max_bytes:
             raise OriginRefused(
                 f"REFUSED: the body from {_safe(urlsplit(checked))} is over the {max_bytes}-byte cap.")
-        return data
+        return OriginBody(data) if html else data
     raise OriginRefused(f"REFUSED: more than {max_hops} redirect hops fetching {urlsplit(url).hostname or ''}")
 
 
-def fetch(url: str, *, max_bytes: int, timeout_s: float) -> bytes:
+# EGRESS VERDICT. PROD 2026-10-28 (MISC-836 / MISC-842): two rented pods failed 100 % of their origin tiles
+# (433/433, 538/538) and still claimed work, because a broken tile is data and nothing looked across requests.
+# The verdict is per HOST and per PROCESS, never per request: a small batch must not slip under it. WHY 40:
+# long enough that a CDN's occasional 429 cannot fill it, short enough that a dead network is judged within a
+# few requests. WHY 20: a host tried fewer times than this has not been tried enough to be condemned. WHY 0.9:
+# a dead link fails every time; one in ten succeeding is noise, not a working network.
+_EGRESS_WINDOW_N: Final[int] = 40
+_EGRESS_MIN_N: Final[int] = 20
+_EGRESS_DEAD_FRACTION: Final[float] = 0.9
+
+_EGRESS: dict[str, deque] = {}
+_egress_lock = threading.Lock()
+
+
+def egress_failed(exc: BaseException) -> bool | None:
+    """Does this fetch failure say the pod's NETWORK is broken? True: dns / connect / tls / read, http 429/503,
+    or a 403 carrying Cloudflare evidence. False: an origin verdict on the request (404/410, a plain 403,
+    a body that is not an image). None: not an attempt at all (a policy refusal, a deadline)."""
+    if isinstance(exc, DeadlineExceeded):
+        return None
+    failure = getattr(exc, "origin_failure", None)
+    if isinstance(exc, OriginRefused):
+        return True if failure is not None and failure.phase == "dns" else None
+    if failure is None:
+        return False
+    if failure.phase in ("dns", "connect", "tls", "read"):
+        return True
+    status = failure.status if failure.status is not None else getattr(exc, "code", None)
+    if status in (429, 503):
+        return True
+    return status == 403 and bool(failure.cf_code or failure.cf_mitigated)
+
+
+def _record_egress(host: str, failed: bool | None) -> None:
+    if failed is None or not host:
+        return
+    with _egress_lock:
+        _EGRESS.setdefault(host, deque(maxlen=_EGRESS_WINDOW_N)).append(failed)
+
+
+def host_dead(host: str) -> bool:
+    with _egress_lock:
+        window = list(_EGRESS.get(host, ()))
+    return len(window) >= _EGRESS_MIN_N and sum(window) >= _EGRESS_DEAD_FRACTION * len(window)
+
+
+def egress_dead(hosts: Iterable[str]) -> bool:
+    """The pod's egress is DEAD when every host attempted (those with any record) is dead; one healthy host
+    means the network works."""
+    with _egress_lock:
+        seen = [h for h in hosts if _EGRESS.get(h)]
+    return bool(seen) and all(host_dead(h) for h in seen)
+
+
+def fetch(url: str, *, max_bytes: int, timeout_s: float, deadline: float | None = None) -> bytes:
+    """Record the outcome in the host's egress window; the fetch itself is `_fetch_retrying`."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    try:
+        data = _fetch_retrying(url, max_bytes=max_bytes, timeout_s=timeout_s, deadline=deadline)
+    except BaseException as e:
+        failure = getattr(e, "origin_failure", None)
+        _record_egress(getattr(failure, "host", None) or host, egress_failed(e))
+        raise
+    _record_egress(host, False)
+    return data
+
+
+def _fetch_retrying(url: str, *, max_bytes: int, timeout_s: float, deadline: float | None = None) -> bytes:
     """GET a checked url, refusing every unsafe hop before it is followed and any body over `max_bytes`.
 
-    A connection that dies is retried once, and so is a status that says the origin could NOT answer —
-    408, 429, 5xx. An origin that delivers a verdict on the request (403, 404) is not, and a refusal never is."""
+    A connection that dies is retried, and so is a status that says the origin could NOT answer — 408, 429,
+    5xx — up to `_ORIGIN_ATTEMPTS` in all, each one paced by the host's limiter. An origin that delivers a
+    verdict on the request (403, 404) is not, and a refusal never is. `deadline` is an absolute `_now()` time:
+    no attempt starts, and no pacing wait runs, past it (DeadlineExceeded)."""
     last: BaseException | None = None
     for attempt in range(_ORIGIN_ATTEMPTS):
+        if deadline is not None and _now() >= deadline:
+            raise DeadlineExceeded("deadline reached before the next attempt")
         try:
-            return _fetch_once(url, max_bytes=max_bytes, timeout_s=timeout_s)
+            return _fetch_once(url, max_bytes=max_bytes, timeout_s=timeout_s, deadline=deadline)
+        except DeadlineExceeded:
+            raise                       # caught ahead of OSError below: TimeoutError is one
         except _Transient as e:
             last = urllib.error.HTTPError(url, e.status, e.reason, http.client.HTTPMessage(), None)
+            last.origin_failure = e.failure  # type: ignore[attr-defined]
             why = f"origin could not answer ({e.status})"
         except urllib.error.HTTPError:
             raise                       # the origin's verdict on THIS request — a second one reads the
@@ -382,7 +706,5 @@ def fetch(url: str, *, max_bytes: int, timeout_s: float) -> bytes:
             why = f"origin connection died ({type(e).__name__})"
         print(f"[originrule] {why} on attempt {attempt + 1}/{_ORIGIN_ATTEMPTS} for {_safe(urlsplit(url))}",
               file=sys.stderr, flush=True)
-        if attempt + 1 < _ORIGIN_ATTEMPTS:
-            _sleep(_ORIGIN_RETRY_PAUSE_S)
     assert last is not None
     raise last

@@ -23,8 +23,8 @@ def test_sd_face_props_is_identity_without_the_request():
 
 
 def test_sd_face_props_swaps_the_request_for_the_staged_plate():
-    out = mograph.sd_face_props({"sdFace": "base", "src": "_photo/a.mp4"}, 6.5, "_sd/base.mp4")
-    assert out == {"src": "_photo/a.mp4", "faceSrc": "_sd/base.mp4", "faceStart": 6.5}
+    out = mograph.sd_face_props({"sdFace": "base", "src": "a.mp4"}, 6.5, "plate.mp4")
+    assert out == {"src": "a.mp4", "faceSrc": "plate.mp4", "faceStart": 6.5}
 
 
 def test_a_face_request_with_no_plate_is_refused_by_name():
@@ -37,13 +37,14 @@ def test_render_layers_stages_the_plate_once_for_every_layout(tmp_path, monkeypa
     base = tmp_path / "head_dyn.mp4"
     base.write_bytes(b"plate")
     secs = [SimpleNamespace(comp="SdLayer", start=s, glass=False,
-                            props={"sdFace": "base", "src": "_photo/a.mp4", "durationInSeconds": 2.0})
+                            props={"sdFace": "base", "src": "a.mp4", "durationInSeconds": 2.0})
             for s in (1.0, 5.0)]
     mograph._render_layers(secs, None, {}, tmp_path, base_path=base)
-    staged = tmp_path / "rd" / "public" / "_sd" / "base.mp4"
+    staged = tmp_path / "rd" / "public" / mograph._SD_FACE_DIR / "base.mp4"
     assert staged.read_bytes() == b"plate"
+    face = f"{mograph._SD_FACE_DIR}/base.mp4"
     assert [(i["props"]["faceSrc"], i["props"]["faceStart"]) for i in got["items"]] == [
-        ("_sd/base.mp4", 1.0), ("_sd/base.mp4", 5.0)]
+        (face, 1.0), (face, 5.0)]
     assert all("sdFace" not in i["props"] for i in got["items"])
 
 
@@ -158,7 +159,7 @@ def test_only_a_layout_video_panel_is_normalised(tmp_path):
     assert mograph.normalise_panel_clip({"src": "a.jpg", "layer": lay}, tmp_path, 0) == {"src": "a.jpg", "layer": lay}
     lib = {"id": "y", "kind": "library", "props": {}}
     assert mograph.normalise_panel_clip({"layer": lib}, tmp_path, 0) == {"layer": lib}
-    missing = {"src": "media/none.mp4", "layer": {"id": "z", "kind": "layout", "props": {"kind": "video"}}}
+    missing = {"src": "none.mp4", "layer": {"id": "z", "kind": "layout", "props": {"kind": "video"}}}
     assert mograph.normalise_panel_clip(missing, tmp_path, 0) == missing   # the comp names its own media error
 
 

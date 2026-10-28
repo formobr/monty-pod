@@ -90,6 +90,9 @@ unfenced and never claiming — the very latch MISC-200 forbids. Change these ro
 _INFRA_CLASSES: Final = (
     ("gpu_admission_timeout", (re.compile(r"\bGpuAdmissionTimeout\b"),)),
     ("vulkan_false", (re.compile(r"\bvulkan_false\b"),)),
+    # The engine's pod-defect class registry row for this class lands in the paired engine slice (MISC-843)
+    # before this image is pinned; until then a stopped pod would be an unknown class to the pool.
+    ("origin_egress_failed", (re.compile(r"\bOriginEgressFailed\b"),)),
 )
 
 # Installed by main's ops lane for the chain it runs (contextvars reach every step thread: run_chain submits

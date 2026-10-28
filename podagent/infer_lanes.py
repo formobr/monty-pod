@@ -55,7 +55,7 @@ PERSON_MATTE_RESIDENT_MIB = 228.0
 # clean_plate (big-lama fp32 TorchScript + the masked median, podagent/infer_plate.py), MEASURED 2026-10-24 in the pod image
 # (torch 2.11+cu128) on the dev RTX 2060, nvidia-smi card-wide every 50 ms, two 3 s windows of the 1080x1920 head plate, LaMa at
 # the 1024 long-side cap: +1276 MiB over the idle card (torch: 677 allocated, 1040 reserved, + the CUDA context); 204 MiB of
-# weights stay resident once the service empties its allocator cache after each request (docs/research/clean-plate-lama.md).
+# weights stay resident once the service empties its allocator cache after each request (the clean-plate research receipt).
 CLEAN_PLATE_PEAK_MIB = 1300.0
 CLEAN_PLATE_RESIDENT_MIB = 210.0
 

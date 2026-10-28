@@ -49,6 +49,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
+# The NVIDIA EGL vendor manifest: libglvnd's libEGL finds libEGL_nvidia (which the injected Vulkan ICD loads)
+# only through this file, and nvidia-container-toolkit has been reported not to inject it on the 595 driver
+# branch (VK_ERROR_INCOMPATIBLE_DRIVER with CUDA working) — see docs/research/pod-image-egl-vendor-manifest.md.
+# Soname only, no driver version; an injected copy at the same path hides this one, one under /etc coexists.
+COPY docker/10_nvidia.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
 # ── builder: resolve the python stack ONCE, then park it in per-bucket staging roots ──────────────────
 # pip resolves the dependency graph (no hand-pinned nvidia wheel list to drift from torch's own requirements),
 # but every version it may pick is fixed by constraints.txt (`-c`): the full freeze of the last image that
@@ -177,7 +183,7 @@ ENV MODEL_RVM=/opt/models/rvm_mobilenetv3_fp16.torchscript
 # original advimman/lama «big-lama» checkpoint (Apache-2.0; weights card huggingface.co/smartywu/big-lama), loaded by the
 # same torch.jit path as RVM — no new runtime in the image. Pinned by sha256 here (the build FAILS on a mismatch) AND in
 # podagent/infer_plate.py, which reads the file once, checks it and hands torch.jit.load those very bytes. The sha256 is our own
-# measurement of the release asset; IOPaint's independent md5 e3aa4aaa15225a33ec84f9f4bc47e500 agrees (docs/research/clean-plate-lama.md).
+# measurement of the release asset; IOPaint's independent md5 e3aa4aaa15225a33ec84f9f4bc47e500 agrees (the clean-plate research receipt).
 RUN curl -fL -o /opt/models/big-lama.pt \
         https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt \
     && echo "344c77bbcb158f17dd143070d1e789f38a66c04202311ae3a258ef66667a9ea9  /opt/models/big-lama.pt" \

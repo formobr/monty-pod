@@ -600,10 +600,10 @@ def _log_vulkan_rank(rank: str, ok: bool, brief: str, raw_stderr: bytes) -> None
         _log(f"vulkan rank {rank} FAILED: {brief}")
 
 
-def _vulkan_preflight(cp: "ControlPlane", *, capacity: dict[str, Any] | None = None) -> bool:
+def _vulkan_preflight(cp: "ControlPlane") -> bool:
     """3-rank ladder: default loader discovery -> our EGL manifest at 1.3.0 -> 1.2.0 on INCOMPATIBLE_DRIVER
-    only. First green rank wins. A FALSE verdict writes its evidence into capacity["vulkan_detail"], so an
-    eviction built on it names a cause — an absent GPU stays a routable fact, never a boot refusal."""
+    only. First green rank wins and returns True. An exhausted ladder refuses work before ready, exactly as a
+    pod without NVDEC does (owner ruling 2026-10-27): the refusal event carries the evidence, then exit 3."""
     preset_icd = os.environ.get("VK_ICD_FILENAMES")   # every LOSING rank must leave this exactly as found
     ranks_tried = ["default"]
     ok, brief, raw_stderr = _run_vulkan_probe()
@@ -647,16 +647,15 @@ def _vulkan_preflight(cp: "ControlPlane", *, capacity: dict[str, Any] | None = N
     if summary := _vulkaninfo_summary():
         detail = f"{detail} · {summary}"
     detail = safe_text(detail)
-    warning = f"WARNING VULKAN UNAVAILABLE: {detail}"
-    _log(warning)
-    if capacity is not None:
-        capacity["vulkan_detail"] = detail
+    msg = f"REFUSING work: vulkan_false — Vulkan/libplacebo device will not open on this pod — {detail}"
+    _log(msg)
     try:
-        cp.send_event({"stage": "boot", "status": "step", "phase": "work_finished", "step": warning},
+        cp.send_event({"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
                       wait=True)
     except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
-        _log(f"Vulkan warning delivery failed: {safe_error(e)}")
-    return False
+        _log(f"Vulkan refusal delivery failed: {safe_error(e)}")
+    _mark_stopped()
+    sys.exit(3)
 
 
 def _vulkaninfo_summary() -> str:
@@ -731,8 +730,10 @@ def _run_infer(
     served: "frozenset[str] | None" = None,
     matte_cache: "dict[str, MatteService] | None" = None,
     plate_cache: "dict[str, PlateService] | None" = None,
+    coordinator: "RestartCoordinator | None" = None,
 ) -> bool:
-    """Runs one infer job, reports the result, and returns the updated boot_reported flag.
+    """Runs one infer job, reports the result, and returns the updated boot_reported flag. An error whose text
+    names an infra class (runner._INFRA_CLASSES) is reported FIRST and only then latches `coordinator`.
 
     corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
@@ -951,6 +952,13 @@ def _run_infer(
         wire_error = error_result.model_dump(exclude_none=True)
         wire_error["session_id"] = session_id
         cp.report_infer_result(wire_error)
+        # After the terminal: a latched pod may be discarded with its results, so the error goes out first.
+        if coordinator is not None:
+            from .ops.runner import infra_class
+
+            klass = infra_class(e)
+            if klass is not None:
+                _infra_fault_reporter(cp, coordinator)(klass)
         if not isinstance(e, Exception):
             raise
         return boot_reported
@@ -1211,10 +1219,9 @@ def _capability_preflight(cp: ControlPlane, *, capacity: dict[str, Any] | None =
     _nvenc_or_refuse(cp)
     _free_vram_or_refuse(cp)
     _nvdec_or_refuse(cp)
+    vulkan = _vulkan_preflight(cp)
     if capacity is not None:
-        capacity["vulkan"] = _vulkan_preflight(cp, capacity=capacity)
-    else:
-        _vulkan_preflight(cp)
+        capacity["vulkan"] = vulkan
     _report_ready(cp, capacity=capacity)
 
 
@@ -1527,7 +1534,7 @@ def main() -> None:
                                  yunet_path, not mine, corr_id=pod_job.corr_id,
                                  session_id=pod_job.session_id, rank_parallel=rank_width,
                                  rank_slots=rank_slots, one_kind_resident=not kinds_coexist,
-                                 served=served)
+                                 served=served, coordinator=coordinator)
             if not ran and mine:
                 _claim_boot(taken=False)
         else:
@@ -1578,7 +1585,7 @@ face_probe (yunet ONNX on the CPU, 0 MiB of card) rode the one-wide heavy lane b
 matte: 056 v13 r8 run.log — person_matte claimed at +319.7 s, face_probe claimed at +358.0 s and ran 0.044 s,
 head_segments 55 s on the preview's critical path. It gets its own one-wide lane here (a yunet instance is not
 shared across threads). The control plane admits face_probe under the `heavy` class credit too
-(api internal/queue/redis.go podEnvelopeClass), so the wait ends only when that class moves; this lane is the
+(the api's pod envelope class), so the wait ends only when that class moves; this lane is the
 pod's half and is a no-op until then.
 """
 

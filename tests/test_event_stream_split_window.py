@@ -83,10 +83,22 @@ class _FakeClock:
         self._now = 0.0
         self._lock = threading.Lock()
         self._conditions: list[threading.Condition] = []
+        self._read_cv = threading.Condition(self._lock)
+        self._readers_since_advance: set[str] = set()
 
     def __call__(self) -> float:
         with self._lock:
+            self._readers_since_advance.add(threading.current_thread().name)
+            self._read_cv.notify_all()
             return self._now
+
+    def wait_read_by(self, thread_name: str) -> None:
+        """Returns once `thread_name` has read the clock at the time set by the latest `advance()` — i.e.
+        that thread has demonstrably looked at the new time. The bound is only a hang net."""
+        with self._read_cv:
+            if not self._read_cv.wait_for(
+                    lambda: thread_name in self._readers_since_advance, timeout=_BACKSTOP_S):
+                pytest.fail(f"{thread_name} never read the advanced clock")
 
     def attach(self, condition: threading.Condition) -> None:
         """Wires this clock to a stream condition: `advance()` then notifies it, so a caller parked in
@@ -99,6 +111,7 @@ class _FakeClock:
     def advance(self, delta: float) -> None:
         with self._lock:
             self._now += delta
+            self._readers_since_advance.clear()
             conditions = list(self._conditions)
         for condition in conditions:
             with condition:
@@ -130,7 +143,9 @@ class _FakeConn:
         return item
 
     def wait_recv_calls(self, n: int) -> None:
-        """Returns once the reader has come back for its `n`th frame, i.e. fully handled the first n-1."""
+        """Returns once the reader has come back for its `n`th frame, i.e. fully handled the first n-1.
+        The bound is only a hang net for a reader stuck behind an earlier frame; a reader that gets there
+        never depends on it."""
         with self._recv_cv:
             if not self._recv_cv.wait_for(lambda: self._recv_calls >= n, timeout=_BACKSTOP_S):
                 pytest.fail(f"the reader never came back for frame {n} — it is stuck handling an earlier one")
@@ -321,7 +336,7 @@ def test_a_caller_behind_a_never_acked_head_is_told_false_within_one_wall(
 
 
 def _open_stream(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, attach_work: bool = True,
 ) -> "tuple[EventStream, _FakeClock, list[_FakeConn], queue.Queue[dict[str, Any]], queue.Queue[Any]]":
     """A stream on a fake peer whose dispatches are gated (ACK_WINDOW 0) until the test opens them."""
     monkeypatch.setattr(event_stream, "ACK_WINDOW", 0)
@@ -338,7 +353,8 @@ def _open_stream(
     clock = _FakeClock()
     stream = EventStream(
         "http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json", clock=clock)
-    clock.attach(stream._work)
+    if attach_work:
+        clock.attach(stream._work)
     clock.attach(stream._ack_cv)
     return stream, clock, conns, written, incoming
 
@@ -354,13 +370,16 @@ def test_acks_are_registered_while_the_outbox_fsync_is_stuck(
     """Prod 2026-10-24 ack_wall loop: a job frame arriving mid-window makes the pod write its inbox and
     job_ack durably. With the disk busy, that write must not hold back the registration of the acks that
     arrive behind it — the socket stays open and the window completes the moment the disk answers."""
-    stream, clock, conns, written, incoming = _open_stream(tmp_path, monkeypatch)
-    armed, release = threading.Event(), threading.Event()
+    # `advance()` must not take `_work`: the stuck durable write holds it, and the window watchdog under
+    # test parks on `_ack_cv` alone, so that is the only condition this clock needs to wake.
+    stream, clock, conns, written, incoming = _open_stream(tmp_path, monkeypatch, attach_work=False)
+    armed, release, stuck = threading.Event(), threading.Event(), threading.Event()
     real_fsync = event_stream.os.fsync
 
     def slow_fsync(fd: int) -> None:
         if armed.is_set():
-            assert release.wait(_BACKSTOP_S), "the injected slow disk was never released"
+            stuck.set()  # a durable write is now parked on the disk
+            release.wait()  # the disk answers only when the test says so, never after some elapsed time
         real_fsync(fd)
 
     monkeypatch.setattr(event_stream.os, "fsync", slow_fsync)
@@ -377,8 +396,37 @@ def test_acks_are_registered_while_the_outbox_fsync_is_stuck(
         # The reader must get all the way through the job frame AND both acks (4th recv = back for more)
         # although the job's durable write is stuck.
         conns[0].wait_recv_calls(4)
+        # Any parked fsync holds `_work`, and the job's own persist is itself armed, so the job's receipt
+        # cannot be appended before `release.set()`: no receipt window can be open at the jump below.
+        # `stuck` just proves the disk is wedged before the clock moves.
+        assert stuck.wait(_BACKSTOP_S), "the job's durable write never started — the intake is stuck"
         clock.advance(10 * event_stream.FRAME_WALL_S)
-        assert not conns[0].closed.is_set(), "the socket was closed although every ack had arrived"
+        # The watchdog decides on its own thread. The window has been judged once it has released its ack
+        # waiters (all after its stall check, and before any failure it would report for missing acks), so
+        # wait for exactly that, on the lock the ack path uses (`_state` is held by the stuck write).
+        with stream._ack_cv:
+            assert stream._ack_cv.wait_for(lambda: not stream._ack_waiters, timeout=_BACKSTOP_S), (
+                "the window was never judged — the watchdog appears stuck")
+        # A close needs `_state`, which the stuck write holds, so the verdict is read once it is free: the
+        # disk answers, and the next frame must go out on the SAME socket (a window that stalled would
+        # have closed it and replayed a/b on a second one instead).
+        release.set()
+        # The receipt is appended only once the stuck write is through. Wait on that state of the stream
+        # (not on time) before appending "after", so the receipt provably leaves first; whether the two
+        # share a window is the sender's own slicing, so every frame read is acked rather than assumed to
+        # ride in a window with the next.
+        with stream._work:
+            assert stream._work.wait_for(
+                lambda: any(f["type"] == "job_ack" for f in stream._outbox), timeout=_BACKSTOP_S), (
+                "the job's receipt was never appended once the disk answered")
+        stream.send_event({"stage": "test", "status": "step", "step": "after"}, wait=False)
+        receipt = _bounded_get(written, "the job's receipt")
+        incoming.put(_ack(receipt))
+        nxt = _bounded_get(written, "the frame after the window")
+        incoming.put(_ack(nxt))
+        assert receipt["type"] == "job_ack" and nxt["event"]["step"] == "after"
+        assert len(conns) == 1 and not conns[0].closed.is_set(), (
+            "the socket was closed although every ack had arrived")
     finally:
         release.set()
         stream.close()
@@ -412,6 +460,9 @@ def test_a_window_whose_acks_keep_arriving_is_not_closed_by_the_stall_bound(
         incoming.put(_ack(frames[0]))
         conns[0].wait_recv_calls(2)
         clock.advance(part)  # 1.2 walls since the window opened, 0.6 since its last sign of life
+        # The window watchdog runs on the sender thread; ack 2 must not be registered before it has
+        # judged the stall bound at the new time, or a total-wall regression would go unseen.
+        clock.wait_read_by("pod-stream-sender")
         assert not conns[0].closed.is_set()
         incoming.put(_ack(frames[1]))
         _bounded_join(threads)
