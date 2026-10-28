@@ -3,6 +3,7 @@ single-pass composite via build_command; every non-goal (trims/opener/cover) is 
 fires before any subprocess."""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,28 +229,67 @@ def test_onepass_defects_reach_the_terminal_result_and_the_degraded_event(monkey
     assert puts, "the PUT must still happen despite the mismatch"
 
 
-def test_a_long_render_phase_ticks_so_the_pool_never_reads_it_as_a_silent_pod(monkeypatch):
-    """PHASE_SILENCE_WHY: a prepare that outlives the heartbeat says `prepare_progress` while it works, and
-    every tick stops before the phase's own terminal event."""
-    import time as _time
+class _BeatCP(_CP):
+    """`ticked` is set once `want` progress frames arrived, so a phase blocks on the heartbeat itself rather
+    than on a clock. `fail_progress` makes every progress send raise."""
+
+    def __init__(self, want: int, fail_progress: bool = False) -> None:
+        super().__init__()
+        self.want, self.fail_progress = want, fail_progress
+        self.ticked = threading.Event()
+        self._lock = threading.Lock()
+
+    def send_event(self, payload, *, wait=False):
+        is_beat = str(payload.get("phase", "")).endswith("_progress")
+        with self._lock:
+            self.events.append(payload)
+            if sum(str(e.get("phase", "")).endswith("_progress") for e in self.events) >= self.want:
+                self.ticked.set()
+        if is_beat and self.fail_progress:
+            raise RuntimeError("queue full")
+        return True
+
+
+def test_a_long_phase_says_it_is_alive_between_started_and_finished(monkeypatch):
+    """A phase silent for minutes gets the pod retired mid-render (RUN_SILENCE_WHY, render lane)."""
+    cp = _BeatCP(want=3)
     _wire(monkeypatch)
-    monkeypatch.setattr(render, "_PHASE_HEARTBEAT_S", 0.05)
-    real_arms = op._run_arms
-
-    def slow_arms(arms):                     # the arms run INSIDE the `prepare` phase (render_onepass.prepare)
-        _time.sleep(0.3)                     # ~6 ticks of the shrunk heartbeat
-        return real_arms(arms)
-
-    monkeypatch.setattr(op, "_run_arms", slow_arms)
-    monkeypatch.setattr(finalize, "apply_loudnorm",
-                        lambda _fin, src, out: (Path(out).write_bytes(b"v"), out)[1])
-    cp = _CP()
+    monkeypatch.setattr(render, "_phase_heartbeat_s", lambda: 0.001)
+    # the phase lasts as long as it takes the heartbeat to tick three times
+    monkeypatch.setattr(render, "_gpu_available", lambda: cp.ticked.wait(30) and False)
     render.render_spec(_spec(), cp)
 
-    phases = [e.get("phase") for e in cp.events if e.get("stage") == "render"]
-    beats = [e for e in cp.events if e.get("phase") == "prepare_progress"]
-    assert len(beats) >= 2, phases
-    assert all(e["status"] == "step" and e["op"] == "prepare" and e["timings"]["phase_s"] > 0 for e in beats)
-    first = phases.index("prepare_started")
-    last = max(i for i, p in enumerate(phases) if p == "prepare_progress")
-    assert first < last < phases.index("prepare_finished"), "no heartbeat may land after its phase's terminal event"
+    phases = [e["phase"] for e in cp.events if e.get("op") == "gpu_probe"]
+    assert phases[0] == "gpu_probe_started" and phases[-1] == "gpu_probe_finished"
+    assert set(phases[1:-1]) == {"gpu_probe_progress"} and len(phases[1:-1]) >= 3
+    beats = [e for e in cp.events if e.get("phase") == "gpu_probe_progress"]
+    assert all(e["status"] == "step" and e["timings"]["elapsed_s"] >= 0 for e in beats)
+    assert cp.results and cp.results[0]["status"] == "ok"
+
+
+def test_a_failing_heartbeat_send_never_fails_the_render(monkeypatch):
+    cp = _BeatCP(want=2, fail_progress=True)
+    _wire(monkeypatch)
+    monkeypatch.setattr(render, "_phase_heartbeat_s", lambda: 0.001)
+    monkeypatch.setattr(render, "_gpu_available", lambda: cp.ticked.wait(30) and False)
+    render.render_spec(_spec(), cp)
+
+    assert cp.results and cp.results[0]["status"] == "ok"
+    assert [e["phase"] for e in cp.events if e.get("op") == "gpu_probe"][-1] == "gpu_probe_finished"
+
+
+def test_the_heartbeat_dies_with_a_failing_phase_before_its_error_event(monkeypatch):
+    cp = _BeatCP(want=2)
+    _wire(monkeypatch)
+    monkeypatch.setattr(render, "_phase_heartbeat_s", lambda: 0.001)
+
+    def boom():
+        cp.ticked.wait(30)
+        raise RuntimeError("probe died")
+    monkeypatch.setattr(render, "_gpu_available", boom)
+    with pytest.raises(RuntimeError, match="probe died"):
+        render.render_spec(_spec(), cp)
+
+    phases = [e["phase"] for e in cp.events if e.get("op") == "gpu_probe"]
+    assert phases[-1] == "gpu_probe_error" and "gpu_probe_progress" in phases
+    assert not [t for t in threading.enumerate() if t.name.startswith("render-heartbeat")]

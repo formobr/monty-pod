@@ -179,6 +179,13 @@ class EventStream:
         # `_ack_progress` and is NEVER held across disk I/O or while taking `_state`, so the reader registers
         # an incoming ack without ever queueing behind a durable write (those hold `_state` through two fsyncs).
         self._ack_cv = threading.Condition(threading.Lock())
+        # Server jobs handed to the intake thread vs. finished by it. A job's receipt is a frame made at the
+        # moment the job arrived, so the sender never creates a frame for an ack that arrived LATER on the
+        # wire (a result's `result_acked`) before the intake has made the receipts of every job received
+        # before that ack. Its own lock: never held with `_state`, `_ack_cv` or across disk I/O.
+        self._intake_cv = threading.Condition(threading.Lock())
+        self._intake_received = 0
+        self._intake_done = 0
         self._ack_waiters: dict[tuple[str, int], threading.Event] = {}
         self._acks: dict[tuple[str, int], dict[str, Any]] = {}
         self._window_frames: dict[tuple[str, int], dict[str, Any]] = {}
@@ -740,6 +747,8 @@ class EventStream:
                     if verdict is None:
                         break
                     disposition, ack, delivery_s = verdict
+                    if ack is not None:
+                        self._await_intake(int(ack.pop("intake_mark", 0)))
                     self._settle(frame, disposition, ack, delivery_s)
                     known.pop(key, None)
 
@@ -1100,6 +1109,7 @@ class EventStream:
             for key in keys:
                 self._ack_waiters.pop(key, None)
                 self._window_frames.pop(key, None)
+            self._ack_cv.notify_all()   # the window is judged: whoever watches its waiters re-reads them
         if len(acks) != len(keys):
             missing = len(keys) - len(acks)
             _log(f"frame window has {missing}/{len(keys)} unacknowledged, none arriving for {FRAME_WALL_S}s")
@@ -1214,8 +1224,12 @@ class EventStream:
         return False
 
     def _accept_job(
-            self, frame: dict[str, Any], *, client_recv_mono_ns: int | None = None,
+            self, frame: dict[str, Any], *, client_recv_mono_ns: int | None = None, ack: bool = False,
     ) -> dict[str, Any] | None:
+        """`ack=True` appends the job's receipt (job_ack) to the outbox inside the SAME `_work` hold that
+        makes the job claimable (or records its replay), so the receipt's seq is fixed before any later
+        frame for that job can exist. Appending it after this returns would let a claimer's first event
+        take an earlier seq than the receipt."""
         try:
             checked = StreamJob.model_validate(frame)
         except BaseException as e:
@@ -1246,6 +1260,8 @@ class EventStream:
         with self._work:
             if delivery_id in self._result_corrs_locked():
                 _log(f"job delivery={delivery_id} deduplicated: durable result already exists")
+                if ack:
+                    self._emit_job_ack(delivery)
                 return delivery
             if delivery_id in self._inbox:
                 if self._inbox[delivery_id] != job:
@@ -1270,6 +1286,8 @@ class EventStream:
                     error = TransportUnhealthy(f"durable replay receipt failed: {safe_error(e)}")
                     self._latch_locked(error, storage=True)
                     raise error from e
+                if ack:
+                    self._emit_job_ack(delivery)
                 return delivery
             # Go replays retained inflight jobs before ACKing our replayed terminal. Ambiguous delivery
             # closes claim admission, not the reader: accepting/deduping the replay keeps the socket alive.
@@ -1286,9 +1304,15 @@ class EventStream:
                 error = TransportUnhealthy(f"durable job inbox append failed: {safe_error(e)}")
                 self._latch_locked(error, storage=True)
                 raise error from e
-            self._queued_ids.add(delivery_id)
-            self._jobs.put(delivery_id)
-            self._work.notify_all()
+            try:
+                if ack:
+                    self._emit_job_ack(delivery)
+            finally:
+                # The job is durable in the inbox either way; it must stay claimable even if its receipt
+                # could not be persisted (that failure latches admission and fails the connection).
+                self._queued_ids.add(delivery_id)
+                self._jobs.put(delivery_id)
+                self._work.notify_all()
         return delivery
 
     def _read_loop(self, conn: Any) -> None:
@@ -1298,33 +1322,61 @@ class EventStream:
         deterministic verdict) is handed in arrival order to `_deferred_loop`, so a slow fsync delays those,
         never the registration of an ack the peer already sent."""
         deferred: "queue.Queue[tuple[str, Any, Any] | None]" = queue.Queue()
+        dead = threading.Event()
         threading.Thread(
-            target=self._deferred_loop, args=(conn, deferred), name="pod-stream-intake", daemon=True).start()
+            target=self._deferred_loop, args=(conn, deferred, dead), name="pod-stream-intake",
+            daemon=True).start()
         try:
-            self._read_frames(conn, deferred)
+            self._read_frames(conn, deferred, dead)
         finally:
             deferred.put(None)
 
-    def _deferred_loop(self, conn: Any, deferred: "queue.Queue[tuple[str, Any, Any] | None]") -> None:
-        while True:
-            item = deferred.get()
-            if item is None:
-                return
-            kind, first, second = item
-            try:
-                if kind == "job":
-                    delivery = self._accept_job(first, client_recv_mono_ns=second)
-                    if delivery is not None:
-                        self._emit_job_ack(delivery)
-                else:
-                    with self._work:
-                        self._latch_locked(FrameRejected(dict(first), second))
-            except Exception as e:  # noqa: BLE001 - same fail-closed verdict the reader itself gives
-                _log(f"reader rejected server frame ({safe_error(e)})")
-                self._fail_connection(conn, safe_error(e), "reader_error")
-                return
+    def _deferred_loop(
+            self, conn: Any, deferred: "queue.Queue[tuple[str, Any, Any] | None]",
+            dead: threading.Event) -> None:
+        try:
+            while True:
+                item = deferred.get()
+                if item is None:
+                    return
+                kind, first, second = item
+                try:
+                    if kind == "job":
+                        try:
+                            self._accept_job(first, client_recv_mono_ns=second, ack=True)
+                        finally:
+                            with self._intake_cv:
+                                self._intake_done += 1
+                                self._intake_cv.notify_all()
+                    else:
+                        with self._work:
+                            self._latch_locked(FrameRejected(dict(first), second))
+                except Exception as e:  # noqa: BLE001 - same fail-closed verdict the reader itself gives
+                    _log(f"reader rejected server frame ({safe_error(e)})")
+                    self._fail_connection(conn, safe_error(e), "reader_error")
+                    return
+        finally:
+            # Jobs this intake will never handle must not hold the sender behind them forever.
+            with self._intake_cv:
+                dead.set()
+                while True:
+                    try:
+                        item = deferred.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not None and item[0] == "job":
+                        self._intake_done += 1
+                self._intake_cv.notify_all()
 
-    def _read_frames(self, conn: Any, deferred: "queue.Queue[tuple[str, Any, Any] | None]") -> None:
+    def _await_intake(self, mark: int) -> None:
+        """Blocks until the intake has made the receipt of every job received before `mark`."""
+        with self._intake_cv:
+            self._intake_cv.wait_for(
+                lambda: self._stop or self._conn is None or self._intake_done >= mark)
+
+    def _read_frames(
+            self, conn: Any, deferred: "queue.Queue[tuple[str, Any, Any] | None]",
+            dead: threading.Event) -> None:
         while True:
             try:
                 raw = conn.recv()
@@ -1334,13 +1386,19 @@ class EventStream:
                     raise ProtocolError("server frame is not an object")
                 kind = decoded.get("type")
                 if kind == "job":
-                    deferred.put(("job", decoded, client_recv_mono_ns))
+                    with self._intake_cv:
+                        if not dead.is_set():
+                            self._intake_received += 1
+                            deferred.put(("job", decoded, client_recv_mono_ns))
                     continue
                 if kind != "ack":
                     raise ProtocolError(f"unknown server frame type {kind!r}")
                 if self._conn is not conn:
                     return
                 ack = self._validate_ack(decoded)
+                with self._intake_cv:
+                    # Every job read before this ack; the sender pops it before settling (`_sender_loop`).
+                    ack["intake_mark"] = self._intake_received
                 seq = int(ack["seq"])
                 key = (str(ack["stream_id"]), seq)
                 status = int(ack["status"])
@@ -1516,6 +1574,8 @@ class EventStream:
             self._ack_cv.notify_all()
         with self._work:
             self._work.notify_all()
+        with self._intake_cv:
+            self._intake_cv.notify_all()   # a sender parked in `_await_intake` re-reads `_conn`
         self._shutdown_conn(conn)
         _log(f"socket closed ({safe_text(why)}); {self.pending_count()} durable frame(s) pending")
 
@@ -1565,6 +1625,8 @@ class EventStream:
             self._conn = None
             pending = len(self._outbox)
             self._work.notify_all()
+        with self._intake_cv:
+            self._intake_cv.notify_all()
         if conn is not None:
             self._shutdown_conn(conn)     # bounded — see _shutdown_conn's WHY; never conn.close() here
         self._sender.join(timeout=2.0)

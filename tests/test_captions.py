@@ -23,8 +23,10 @@ _WORDS = [
 def _real_font():
     """A real TTF: every style measures glyph width via PIL (oneword too — its safe-width shrink)."""
     import glob
-    for pat in ("/usr/share/fonts/**/*.ttf", "/usr/share/fonts/**/DejaVuSans*.ttf"):
-        found = glob.glob(pat, recursive=True)
+    # One NAMED font, never filesystem order: CI run 40737030325 measured a narrower first-listed TTF (766.8 < 839).
+    for pat in ("/usr/share/fonts/**/DejaVuSans.ttf", "/usr/share/fonts/**/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/**/*.ttf"):
+        found = sorted(glob.glob(pat, recursive=True))
         if found:
             return Path(found[0])
     pytest.skip("no system TTF available to measure caption widths")

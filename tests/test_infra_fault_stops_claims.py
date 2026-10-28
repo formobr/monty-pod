@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -131,6 +132,69 @@ def test_ops_lane_installs_the_infra_fault_sink(monkeypatch):
     assert coordinator.infra_class == "vulkan_false"
     assert cp.interrupted == 1, "the claim the loop is blocked in must be woken, not waited out"
     assert runner.infra_fault_sink.get() is None, "the sink must not leak past the chain it was set for"
+
+
+_RANK_REQ = {"infer_version": 7, "job_id": "j", "kind": "clip_rank", "model": "siglip",
+             "put_url": "https://x/o/r.json", "weights": {"url": "https://x/w.tar", "sha256": "b" * 64},
+             "clip_rank": {"groups": [{"intent": "chart", "origin_urls": ["https://images.pexels.com/p/1.jpg"]}]}}
+
+
+class _InferCP:
+    """Records the order of the wire calls a failed infer job makes."""
+
+    def __init__(self) -> None:
+        self.order: list[str] = []
+        self.results: list[dict] = []
+
+    def note(self, payload):
+        pass
+
+    def send_event(self, payload, *, wait=False):
+        return True
+
+    def report_infer_result(self, payload, wake=None):
+        self.order.append("result")
+        self.results.append(payload)
+        return True
+
+    def interrupt_claim(self):
+        self.order.append("interrupt_claim")
+
+
+def _run_rank_raising(exc: BaseException, coordinator):
+    """Drive main._run_infer on a clip_rank request whose service raises `exc`."""
+    cp = _InferCP()
+
+    class _Svc:
+        def run(self, params, put_url, progress=None):
+            raise exc
+
+    original = coordinator.report_infra_fault
+    coordinator.report_infra_fault = lambda klass: (cp.order.append("report_infra_fault"), original(klass))
+    agent_main._run_infer(dict(_RANK_REQ), cp, {}, {}, {"b" * 64: _Svc()}, Path("/opt/models/yunet.onnx"), True,
+                          corr_id="c", session_id="s", coordinator=coordinator)
+    return cp
+
+
+def test_an_origin_egress_failure_posts_its_error_then_latches_the_pod():
+    """PROD 2026-10-28: the infer lane had no infra latch, so a pod with a dead CDN egress kept claiming. The
+    error terminal goes out FIRST — a latched pod's results may be discarded."""
+    from podagent.infer_cliprank import OriginEgressFailed
+
+    coordinator = agent_main.RestartCoordinator()
+    cp = _run_rank_raising(OriginEgressFailed("0/40 origin tiles fetched — causes: read ConnectionResetError×40"),
+                           coordinator)
+    assert cp.order == ["result", "report_infra_fault", "interrupt_claim"]
+    assert cp.results[0]["status"] == "error"
+    assert cp.results[0]["error"].startswith("OriginEgressFailed: 0/40 origin tiles fetched")
+    assert coordinator.infra_fault() and coordinator.infra_class == "origin_egress_failed"
+
+
+def test_a_non_infra_infer_error_posts_its_error_and_does_not_latch():
+    coordinator = agent_main.RestartCoordinator()
+    cp = _run_rank_raising(RuntimeError("boom: handler bug"), coordinator)
+    assert cp.order == ["result"]
+    assert not coordinator.infra_fault()
 
 
 def test_storage_error_clears_and_delivery_pending_is_bounded(tmp_path, monkeypatch):

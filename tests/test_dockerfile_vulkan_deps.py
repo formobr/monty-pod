@@ -7,10 +7,14 @@ of the Dockerfile; no docker build here. See docs/research/pod-image-headless-vu
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
-DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
+ROOT = Path(__file__).resolve().parents[1]
+DOCKERFILE = ROOT / "Dockerfile"
+EGL_MANIFEST = ROOT / "docker" / "10_nvidia.json"
+EGL_MANIFEST_IN_IMAGE = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
 
 
 def _apt_installs() -> list[tuple[list[str], set[str]]]:
@@ -30,3 +34,17 @@ def test_the_image_ships_libegl_next_to_the_vulkan_loader():
     flags, pkgs = with_loader[0]
     assert "libegl1" in pkgs, "libegl1 must be installed in the same apt line as libvulkan1"
     assert "--no-install-recommends" in flags
+
+
+def test_the_repo_manifest_is_exactly_the_soname_only_nvidia_egl_vendor_file():
+    assert json.loads(EGL_MANIFEST.read_text()) == {
+        "file_format_version": "1.0.0",
+        "ICD": {"library_path": "libEGL_nvidia.so.0"},
+    }
+
+
+def test_the_dockerfile_installs_the_manifest_into_the_glvnd_vendor_dir():
+    copies = [
+        ln.split()[1:] for ln in DOCKERFILE.read_text().splitlines() if ln.startswith("COPY ") and "--from" not in ln
+    ]
+    assert ["docker/10_nvidia.json", EGL_MANIFEST_IN_IMAGE] in copies

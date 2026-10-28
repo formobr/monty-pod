@@ -74,7 +74,7 @@ def rig(monkeypatch):
     puts: dict[str, tuple[bytes, str | None]] = {}
     lock = threading.Lock()
 
-    def fetch(url, *, max_bytes, timeout_s):
+    def fetch(url, *, max_bytes, timeout_s, deadline=None):
         with lock:
             fetches.append((url, max_bytes, timeout_s))
         out = bodies[url]

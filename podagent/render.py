@@ -774,25 +774,11 @@ at +260 s, +549 s, +831 s of assemble_master; pm2 pod-pool log: "fleet reaped ..
 committed for 243s").
 
 The ops lane already solved this shape (ops/runner.py RUN_SILENCE_WHY): a heartbeat BESIDE the call, never
-inside it. The render phases now do the same: every _PHASE_HEARTBEAT_S a `<op>_progress` step event with the
+inside it. The render phases now do the same: every _phase_heartbeat_s() a `<op>_progress` step event with the
 elapsed seconds. It changes nothing the pod renders or when it gives up — it only stops a live render from
 looking like a dead one. Sent through the swallowing sender: a heartbeat that fails to enqueue must never
 be the thing that fails a render.
 """
-# Same knob and default as the ops lane's run heartbeat (ops/runner.py _RUN_HEARTBEAT_S): 30 s is 8 ticks
-# inside the pool's 240 s silence bound and 4 inside the api's 120 s busy-mark lifetime.
-_PHASE_HEARTBEAT_S = float(os.environ.get("POD_RUN_HEARTBEAT_S") or 30.0)
-_PHASE_HEARTBEAT_JOIN_S = 5.0  # an enqueue is a local durable append; this only bounds a wedged one
-
-
-def _phase_heartbeat(cp: ControlPlane, base: dict, t0: float, stop: threading.Event, tick: float) -> None:
-    """Beside the phase, never inside it (PHASE_SILENCE_WHY); `stop` is set in the phase's `finally`."""
-    while not stop.wait(tick):
-        _safe_send_event(cp, {k: v for k, v in {
-            **base, "phase": f"{base['op']}_progress",
-            "timings": {"phase_s": round(time.monotonic() - t0, 3)}}.items() if v is not None})
-
-
 def _safe_send_event(cp: ControlPlane, event: dict) -> None:
     """Swallow+log, never raise: past this seam the master is already encoded (~20 GPU-min paid)."""
     try:
@@ -800,6 +786,20 @@ def _safe_send_event(cp: ControlPlane, event: dict) -> None:
     except Exception as exc:
         label = event.get("phase") or event.get("op") or "event"
         print(f"[render] {label}: event send failed, swallowed: {safe_error(exc)}", file=sys.stderr)
+
+
+def _phase_heartbeat_s() -> float:
+    """Same knob and default as the ops lane (ops/runner.py _RUN_HEARTBEAT_S)."""
+    return float(os.environ.get("POD_RUN_HEARTBEAT_S") or 30.0)
+
+
+def _phase_heartbeat(cp: ControlPlane, base: dict, t0: float, stop: threading.Event, tick: float) -> None:
+    """Every `tick` until `stop`: an `<op>_progress` step carrying the phase's elapsed seconds. Sent through
+    the swallowing sender — a heartbeat that fails to enqueue must never fail a render."""
+    while not stop.wait(tick):
+        ev = {**base, "phase": f"{base['op']}_progress",
+              "timings": {"elapsed_s": round(time.monotonic() - t0, 3)}}
+        _safe_send_event(cp, {k: v for k, v in ev.items() if v is not None})
 
 
 _GPU: bool | None = None
@@ -980,20 +980,22 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
         send = (lambda ev: _safe_send_event(cp, ev)) if guarded else cp.send_event
         send({k: v for k, v in {**base, "phase": f"{op}_started"}.items() if v is not None})
         started = time.monotonic()
+        # Beside the phase, never inside it (ops/runner.py RUN_SILENCE_WHY): a phase that blocks for minutes
+        # (prepare = the mograph arm) must still say it is alive, or the pool retires a pod that owns a claim.
         beat_stop = threading.Event()
-        beat = threading.Thread(target=_phase_heartbeat, args=(cp, base, started, beat_stop, _PHASE_HEARTBEAT_S),
-                                name=f"render-{op}-heartbeat", daemon=True)
+        beat = threading.Thread(
+            target=_phase_heartbeat, args=(cp, base, started, beat_stop, _phase_heartbeat_s()),
+            name=f"render-heartbeat-{op}", daemon=True)
         beat.start()
 
-        def quiet() -> None:
-            # the terminal event is the LAST word of the phase: no progress frame may land after it
+        def stop_beat() -> None:
+            # joined before any terminal event, so no progress frame can land after it
             beat_stop.set()
-            beat.join(timeout=_PHASE_HEARTBEAT_JOIN_S)
-
+            beat.join()
         try:
             yield
         except BaseException as exc:
-            quiet()
+            stop_beat()
             send({
                 k: v for k, v in {
                     **base,
@@ -1008,7 +1010,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
             })
             raise
         else:
-            quiet()
+            stop_beat()
             send({
                 k: v for k, v in {
                     **base,
@@ -1018,7 +1020,7 @@ def render_spec(spec: RenderSpec, cp: ControlPlane, corr_id: str | None = None,
                 }.items() if v is not None
             })
         finally:
-            beat_stop.set()
+            stop_beat()  # idempotent; covers an exit path that skipped both branches above
     # function-local: render_onepass imports this module, so a top-level import would cycle.
     from . import render_onepass as _onepass
     if spec.mode == "final":
