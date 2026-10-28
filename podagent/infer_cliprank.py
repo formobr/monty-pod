@@ -48,7 +48,8 @@ _ORIGIN_MAX_BYTES = 8_000_000
 # One request's WHOLE origin-tile fetch phase ends here. WHY 120: far under the box's 1200 s infer wall
 # (the control plane's default infer timeout) and ~10x the measured healthy phase of 801 tiles; at the deadline queued
 # fetches never start, in-flight ones get at most their socket timeout, and each tile not fetched is a named
-# `fetch_timeout` whose detail starts `deadline` — scoring proceeds on what arrived.
+# `fetch_timeout` whose detail starts `deadline`; scoring proceeds on what arrived unless the phase verdict
+# (`_phase_verdict`) finds the phase dead.
 _ORIGIN_FETCH_PHASE_S = 120
 # The origin bytes a rank request fetched outlive it, so the judge-tiles request that follows on the same warm pod
 # reads them instead of paying the provider fetch twice. Keyed by the EXACT url; bounded by total bytes, least
@@ -402,6 +403,62 @@ class _RequestEgress:
             # a snapshot: the request thread is still adding to `futures` while submitting later groups
             for f in list(self.futures.values()):
                 f.cancel()
+
+
+_NETWORK_PHASES = ("dns", "connect", "tls", "read")
+
+
+def _tile_egress_failed(error: ClipRankTileError) -> bool | None:
+    """`originrule.egress_failed`'s rules read off a tile's error text, plus the phase deadline: True for a
+    dns/connect/tls/read failure, 429/503, a Cloudflare-evidenced 403 or a tile the deadline cut; None for an
+    origin verdict that says nothing about the network (404/410, plain 403, refused, content/decode/write)."""
+    if error.kind == "fetch_timeout" and error.detail.startswith("deadline"):
+        return True
+    if error.kind not in ("fetch_failed", "fetch_timeout"):
+        return None
+    if error.detail.split(" ", 1)[0] in _NETWORK_PHASES:
+        return True
+    m = _CAUSE_STATUS.search(error.detail)
+    status = int(m.group(1)) if m else None
+    if status in (429, 503):
+        return True
+    return status == 403 and (_CAUSE_CF.search(error.detail) is not None or " mitigated=" in error.detail)
+
+
+def _phase_verdict(shared: dict) -> OriginEgressFailed | None:
+    """Judge the request's WHOLE origin fetch phase once, every url once. WHY: PROD 2026-10-28 (preview 067b75a6,
+    MISC-849) got 0/450 tiles from a network that throttles Cloudflare to nothing — 404s and tiles cut by the
+    120 s deadline never fill a per-host window to 90 % failed, so the pod scored nothing and claimed on. A
+    phase with too few ok tiles among those that say anything about the network (ok + egress-failed, the
+    deadline's cuts included) is dead, by the same two constants as the host window."""
+    ok = failed = neutral = 0
+    causes: Counter = Counter()
+    hosts: Counter = Counter()
+    host_failed: Counter = Counter()
+    for f in shared.values():
+        if not f.done() or f.cancelled() or f.exception() is not None:
+            continue
+        _, error, redacted_url, _ = f.result()
+        host = _url_host(redacted_url)
+        hosts[host] += 1
+        if error is None:
+            ok += 1
+            continue
+        verdict = _tile_egress_failed(error)
+        if verdict:
+            failed += 1
+            host_failed[host] += 1
+            causes[_cause_head(error.detail)] += 1
+        else:
+            neutral += 1
+    judged = ok + failed
+    if judged < originrule._EGRESS_MIN_N or ok > (1 - originrule._EGRESS_DEAD_FRACTION) * judged:
+        return None
+    return OriginEgressFailed(
+        f"{ok}/{ok + failed + neutral} origin tiles fetched in the {_ORIGIN_FETCH_PHASE_S:g}s phase — "
+        f"{failed} egress-failed or not fetched before the deadline, {neutral} origin verdicts (404/403/decode)"
+        " — causes: " + ", ".join(f"{h}×{c}" for h, c in causes.most_common(3))
+        + " — hosts: " + ", ".join(f"{h} {host_failed[h]}/{hosts[h]}" for h in sorted(hosts)))
 
 
 def _fetch_origin_tile(url: str, dest: Path, deadline: float | None = None, egress: "_RequestEgress | None" = None):
@@ -806,6 +863,9 @@ class ClipRankService:
                     ready[key], gs, fs = prepared[key].result()
                     gather_s += gs
                     forward_s += fs
+
+            if (dead := _phase_verdict(shared_origins)) is not None:
+                raise dead
 
             groups = []
             for i, (g, key) in enumerate(zip(params.groups, keys)):
