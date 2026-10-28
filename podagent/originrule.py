@@ -36,6 +36,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Final
 from urllib.parse import unquote_plus, urljoin, urlsplit
 
@@ -144,6 +145,60 @@ _FIX: Final[str] = (
 _sleep = time.sleep
 
 
+@dataclass(frozen=True)
+class OriginFailure:
+    """Where and why ONE origin fetch failed — diagnostics only, attached to the exception as `origin_failure`
+    and never read by a retry decision. `phase` is dns | connect | tls | http | read; `host` is the final hop's;
+    `cf_code` is the first `error code: 1xxx` of the first 2 KB of an error body (Cloudflare's own verdict)."""
+    phase: str
+    host: str
+    addr: str | None = None
+    family: str | None = None       # "v4" | "v6" of `addr`
+    status: int | None = None
+    retry_after: str | None = None
+    cf_mitigated: str | None = None
+    cf_ray: str | None = None
+    cf_code: str | None = None
+    exc: str = ""
+
+
+_BODY_PEEK: Final[int] = 2048
+_HEADER_CAP: Final[int] = 64
+_CF_CODE: Final = re.compile(r"error code: (1\d{3})")
+
+
+def _family(addr: str | None) -> str | None:
+    return None if addr is None else ("v6" if ":" in addr else "v4")
+
+
+def _attach(exc: BaseException, **fields: Any) -> BaseException:
+    """Record `exc`'s failure on itself, once: the innermost site knows the most."""
+    if getattr(exc, "origin_failure", None) is None:
+        fields.setdefault("family", _family(fields.get("addr")))
+        exc.origin_failure = OriginFailure(exc=type(exc).__name__, **fields)  # type: ignore[attr-defined]
+    return exc
+
+
+class OriginBody(bytes):
+    """A 2xx body whose Content-Type said text/html: returned as today, flagged so the caller can name it."""
+    html = True
+
+
+def _http_failure(resp: Any, host: str, addr: str, status: int, exc_name: str) -> OriginFailure:
+    """The record of an error status: selected headers and the first 2 KB of the body, both best effort."""
+    def header(name: str) -> str | None:
+        value = resp.getheader(name)
+        return str(value)[:_HEADER_CAP] if value is not None else None
+    try:
+        peek = resp.read(_BODY_PEEK)
+    except (OSError, http.client.HTTPException):
+        peek = b""
+    m = _CF_CODE.search(peek.decode("utf-8", "replace"))
+    return OriginFailure(phase="http", host=host, addr=addr, family=_family(addr), status=status,
+                         retry_after=header("Retry-After"), cf_mitigated=header("cf-mitigated"),
+                         cf_ray=header("cf-ray"), cf_code=m.group(1) if m else None, exc=exc_name)
+
+
 class OriginRefused(ValueError):
     """A url the pod may not dereference, or a response it may not accept. `reason` never echoes a query
     string or userinfo — a refusal that prints the credential is the leak it prevents."""
@@ -156,10 +211,11 @@ class OriginRefused(ValueError):
 class _Transient(Exception):
     """Internal: the origin answered THIS hop with a status `fetch()`'s outer retry loop should retry."""
 
-    def __init__(self, status: int, reason: str) -> None:
+    def __init__(self, status: int, reason: str, failure: OriginFailure | None = None) -> None:
         super().__init__(status)
         self.status = status
         self.reason = reason
+        self.failure = failure
 
 
 def _safe(parts: Any) -> str:
@@ -175,8 +231,10 @@ def resolve_addrs(host: str) -> tuple[str, ...]:
     try:
         infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
     except OSError as e:
-        raise OriginRefused(f"REFUSED: {host} does not resolve ({e}). A host we cannot place is a host we "
-                            f"cannot clear. {_FIX}") from e
+        refused = OriginRefused(f"REFUSED: {host} does not resolve ({e}). A host we cannot place is a host we "
+                                f"cannot clear. {_FIX}")
+        _attach(refused, phase="dns", host=host)
+        raise refused from e
     return tuple(dict.fromkeys(str(info[4][0]) for info in infos))
 
 
@@ -310,8 +368,16 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self._pinned_addr = addr
 
     def connect(self) -> None:
-        sock = socket.create_connection((self._pinned_addr, self.port), timeout=self.timeout)
-        self.sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.host)
+        try:
+            sock = socket.create_connection((self._pinned_addr, self.port), timeout=self.timeout)
+        except OSError as e:
+            _attach(e, phase="connect", host=self.host, addr=self._pinned_addr)
+            raise
+        try:
+            self.sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.host)
+        except OSError as e:     # ssl.SSLError is one
+            _attach(e, phase="tls", host=self.host, addr=self._pinned_addr)
+            raise
 
 
 def _connect(host: str, addr: str, *, timeout_s: float) -> Any:
@@ -336,8 +402,12 @@ def _fetch_once(url: str, *, max_bytes: int, timeout_s: float) -> bytes:
             path = f"{path}?{parts.query}"
         conn = _connect(host, addr, timeout_s=timeout_s)
         try:
-            conn.request("GET", path, headers={"User-Agent": "monty-pod-originrule/1", "Connection": "close"})
-            resp = conn.getresponse()
+            try:
+                conn.request("GET", path, headers={"User-Agent": "monty-pod-originrule/1", "Connection": "close"})
+                resp = conn.getresponse()
+            except (OSError, http.client.HTTPException) as e:
+                _attach(e, phase="read", host=host, addr=addr)
+                raise
             status = resp.status
             if status in _REDIRECT_STATUSES:
                 location = resp.getheader("Location")
@@ -349,16 +419,23 @@ def _fetch_once(url: str, *, max_bytes: int, timeout_s: float) -> bytes:
                 nxt = urljoin(checked, location)
                 continue
             if status in _RETRYABLE_STATUS:
-                raise _Transient(status, resp.reason)
+                raise _Transient(status, resp.reason, _http_failure(resp, host, addr, status, "HTTPError"))
             if status >= 400:
-                raise urllib.error.HTTPError(checked, status, resp.reason, http.client.HTTPMessage(), None)
-            data = resp.read(max_bytes + 1)
+                err = urllib.error.HTTPError(checked, status, resp.reason, http.client.HTTPMessage(), None)
+                err.origin_failure = _http_failure(resp, host, addr, status, "HTTPError")  # type: ignore[attr-defined]
+                raise err
+            try:
+                data = resp.read(max_bytes + 1)
+            except (OSError, http.client.HTTPException) as e:
+                _attach(e, phase="read", host=host, addr=addr)
+                raise
+            html = str(resp.getheader("Content-Type") or "").lstrip().lower().startswith("text/html")
         finally:
             conn.close()
         if len(data) > max_bytes:
             raise OriginRefused(
                 f"REFUSED: the body from {_safe(urlsplit(checked))} is over the {max_bytes}-byte cap.")
-        return data
+        return OriginBody(data) if html else data
     raise OriginRefused(f"REFUSED: more than {max_hops} redirect hops fetching {urlsplit(url).hostname or ''}")
 
 
@@ -373,6 +450,7 @@ def fetch(url: str, *, max_bytes: int, timeout_s: float) -> bytes:
             return _fetch_once(url, max_bytes=max_bytes, timeout_s=timeout_s)
         except _Transient as e:
             last = urllib.error.HTTPError(url, e.status, e.reason, http.client.HTTPMessage(), None)
+            last.origin_failure = e.failure  # type: ignore[attr-defined]
             why = f"origin could not answer ({e.status})"
         except urllib.error.HTTPError:
             raise                       # the origin's verdict on THIS request — a second one reads the

@@ -14,13 +14,14 @@ import concurrent.futures as cf
 import io
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -235,6 +236,8 @@ def _http_status(exc: BaseException) -> int | None:
     status = getattr(response, "status_code", None) if response is not None else None
     if status is None:
         status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)     # urllib.error.HTTPError, which originrule raises
     try:
         return int(status) if status is not None else None
     except (TypeError, ValueError):
@@ -257,6 +260,27 @@ def _tile_error(kind: str, exc: BaseException, redacted_url: str) -> ClipRankTil
     status = _http_status(exc)
     head = safe_error(exc, 300) + (f" (HTTP {status})" if status is not None else "")
     return ClipRankTileError(kind=kind, detail=f"{head} — {redacted_url}")
+
+
+def _origin_tile_error(kind: str, exc: BaseException, redacted_url: str, phase: str | None = None) -> ClipRankTileError:
+    """An origin tile's error naming WHERE it failed and, for a refused HTTP answer, what the CDN said:
+    `<phase> <exc>[ HTTP n][ cf-code][ mitigated=v][ retry-after=v] via <addr>/<family> — <url>`, ≤ 300 chars.
+    An exception with no `origin_failure` and no explicit phase (a guard refusal) keeps `_tile_error`'s text."""
+    failure = getattr(exc, "origin_failure", None)
+    phase = phase or (failure.phase if failure is not None else None)
+    if phase is None:
+        return _tile_error(kind, exc, redacted_url)
+    tail = ""
+    if failure is not None:
+        status = failure.status if failure.status is not None else _http_status(exc)
+        tail += f" HTTP {status}" if status is not None else ""
+        tail += f" cf-{failure.cf_code}" if failure.cf_code else ""
+        tail += f" mitigated={failure.cf_mitigated}" if failure.cf_mitigated else ""
+        tail += f" retry-after={failure.retry_after}" if failure.retry_after else ""
+        tail += f" via {failure.addr}/{failure.family}" if failure.addr else ""
+    tail += f" — {redacted_url}"
+    budget = max(300 - len(phase) - 1 - len(tail), 0)
+    return ClipRankTileError(kind=kind, detail=f"{phase} {safe_error(exc, budget)}{tail}"[:300])
 
 
 def _fetch_tile(url: str, dest: Path):
@@ -334,15 +358,19 @@ def _fetch_origin_tile(url: str, dest: Path):
     try:
         data = _origin_fetch(url)
     except originrule.OriginRefused as exc:
-        return None, _tile_error("origin_refused", exc, redacted_url), redacted_url, None
+        return None, _origin_tile_error("origin_refused", exc, redacted_url), redacted_url, None
     except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault; it is NAMED below
-        return None, _tile_error(_fetch_kind(exc), exc, redacted_url), redacted_url, None
+        return None, _origin_tile_error(_fetch_kind(exc), exc, redacted_url), redacted_url, None
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
+    except Exception as exc:  # noqa: BLE001 — a local write failure is this tile's error, not the batch's
+        return None, _origin_tile_error("decode_error", exc, redacted_url, "write"), redacted_url, None
+    try:
         img = Image.open(dest).convert("RGB")
     except Exception as exc:  # noqa: BLE001 — undecodable bytes are this tile's error, not the batch's
-        return None, _tile_error("decode_error", exc, redacted_url), redacted_url, None
+        phase = "content" if getattr(data, "html", False) else "decode"
+        return None, _origin_tile_error("decode_error", exc, redacted_url, phase), redacted_url, None
     return img, None, redacted_url, ClipRankTileMeasure(bytes=len(data), w=img.width, h=img.height)
 
 
@@ -356,19 +384,58 @@ def _submit_origins(urls: list[str], workdir: Path, shared: dict) -> list:
     return [shared[u] for u in urls]
 
 
+@dataclass
+class _FailTrail:
+    """What an origin group's progress line says about its failures: the first failed tile's redacted url, the
+    cause heads and the per-host failed/attempted counts. Hosts and heads only — never a query or a token."""
+    first: str | None = None
+    causes: Counter = field(default_factory=Counter)
+    failed: Counter = field(default_factory=Counter)
+    attempted: Counter = field(default_factory=Counter)
+
+
+def _url_host(redacted_url: str) -> str:
+    try:
+        return urlsplit(redacted_url).hostname or "?"
+    except ValueError:
+        return "?"
+
+
+_CAUSE_STATUS = re.compile(r" HTTP (\d{3})\b")
+_CAUSE_CF = re.compile(r" cf-(\d+)\b")
+
+
+def _cause_head(detail: str) -> str:
+    """`<phase> <exc>[ <status>][ cf-<code>]` from an origin tile detail written by `_origin_tile_error`;
+    a detail with no phase (a guard refusal, a plain timeout) is headed by its exception name alone."""
+    words = detail.split(" ", 2)
+    head = words[0].rstrip(":")
+    if not words[0].endswith(":") and len(words) > 1:
+        head += f" {words[1].rstrip(':')}"
+    if m := _CAUSE_STATUS.search(detail):
+        head += f" {m.group(1)}"
+    if m := _CAUSE_CF.search(detail):
+        head += f" cf-{m.group(1)}"
+    return head
+
+
 def _gather_origins(futs: list):
-    """An origin group's decoded images, their indices, per-index errors and measures, and the first failed
-    tile's redacted url (None when every tile decoded)."""
+    """An origin group's decoded images, their indices, per-index errors and measures, and the failure trail
+    (`first` is None when every tile decoded)."""
     images: list = []
     ok: list[int] = []
     errors: list[ClipRankTileError | None] = []
     measures: list[ClipRankTileMeasure | None] = []
-    first_failed: str | None = None
+    first_failed = _FailTrail()
     for i, f in enumerate(futs):
         img, reason, redacted_url, measure = f.result()
+        host = _url_host(redacted_url)
+        first_failed.attempted[host] += 1
         if reason is not None:
             print(f"[clip_rank] tile {reason.kind} — {reason.detail}", file=sys.stderr, flush=True)
-            first_failed = first_failed or redacted_url
+            first_failed.first = first_failed.first or redacted_url
+            first_failed.failed[host] += 1
+            first_failed.causes[_cause_head(reason.detail)] += 1
         else:
             images.append(img)
             ok.append(i)
@@ -377,15 +444,18 @@ def _gather_origins(futs: list):
     return images, ok, errors, measures, first_failed
 
 
-def _origin_report(i: int, n: int, result: ClipRankGroupResult, first_failed: str | None) -> str:
+def _origin_report(i: int, n: int, result: ClipRankGroupResult, first_failed: "_FailTrail | None") -> str:
     """The one progress line an origin group earns: its failure count per kind and the first failed tile's
     redacted url — stderr alone never reaches the box, and a failure the box cannot see reads as data."""
     kinds = Counter(e.kind for e in result.errors if e is not None)
     line = f"clip_rank origin group {i + 1}/{n}: {sum(kinds.values())}/{len(result.errors)} tile(s) failed"
     if kinds:
         line += " (" + ", ".join(f"{k}={c}" for k, c in sorted(kinds.items())) + ")"
-    if first_failed is not None:
-        line += f", first {first_failed}"
+    if first_failed is not None and first_failed.first is not None:
+        line += f", first {first_failed.first}"
+        line += " — causes: " + ", ".join(f"{h}×{c}" for h, c in first_failed.causes.most_common(3))
+        line += " — hosts: " + ", ".join(
+            f"{h} {first_failed.failed[h]}/{first_failed.attempted[h]}" for h in sorted(first_failed.attempted))
     return line
 
 
@@ -467,7 +537,8 @@ def _judge_tile(tile, dest: Path) -> _JudgeTileOutcome:
     from PIL import Image
 
     def failed(kind: str, exc: BaseException, url: str, **kw) -> _JudgeTileOutcome:
-        err = _tile_error(kind, exc, _redacted_tile_url(url))
+        err = (_origin_tile_error if getattr(exc, "origin_failure", None) is not None else _tile_error)(
+            kind, exc, _redacted_tile_url(url))
         print(f"[clip_rank] judge tile {err.kind} — {err.detail}", file=sys.stderr, flush=True)
         return _JudgeTileOutcome(ClipRankJudgeTileResult(status="error", error=err), **kw)
 

@@ -321,3 +321,61 @@ def test_forward_rounds_to_four_places(intent: str) -> None:
     """4dp is the wire convention (cosine error ~1e-3) — it must hold on both branches."""
     _, embeds = _svc()._forward(intent, ["img", "img"])
     assert all(len(str(x).split(".")[-1]) <= 4 for row in embeds for x in row)
+
+
+def _origin_error(monkeypatch, tmp_path, outcome, dest=None):
+    """Run ONE origin tile through the real `_fetch_origin_tile` with the guard's fetch faked."""
+    import podagent.infer_cliprank as m
+
+    def fake(url):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(m, "_origin_fetch", fake)
+    url = "https://images.pexels.com/photos/1/x.jpg?token=SIGNEDTOKEN"
+    _, err, _, measure = m._fetch_origin_tile(url, dest or tmp_path / "w" / "0.img")
+    assert measure is None and err is not None
+    assert "SIGNEDTOKEN" not in err.detail and "?" not in err.detail and len(err.detail) <= 300
+    return err
+
+
+def test_a_cloudflare_403_reaches_the_tile_detail_with_status_and_code(monkeypatch, tmp_path) -> None:
+    """PROD 2026-10-28 job 20168ee1: 538/538 origin tiles failed and no detail carried the HTTP status."""
+    import http.client
+    import urllib.error
+
+    from podagent import originrule
+
+    exc = urllib.error.HTTPError("https://images.pexels.com/photos/1/x.jpg", 403, "Forbidden",
+                                 http.client.HTTPMessage(), None)
+    exc.origin_failure = originrule.OriginFailure(
+        phase="http", host="images.pexels.com", addr="104.18.1.1", family="v4", status=403,
+        cf_mitigated="challenge", retry_after="30", cf_code="1020", exc="HTTPError")
+    err = _origin_error(monkeypatch, tmp_path, exc)
+    assert err.kind == "fetch_failed"
+    assert err.detail.startswith("http HTTPError")
+    for part in ("HTTP 403", "cf-1020", "mitigated=challenge", "retry-after=30", "via 104.18.1.1/v4"):
+        assert part in err.detail
+    assert err.detail.endswith("— https://images.pexels.com/photos/1/x.jpg")
+
+
+def test_an_html_body_is_content_and_an_unwritable_dest_is_write(monkeypatch, tmp_path) -> None:
+    from podagent import originrule
+
+    html = originrule.OriginBody(b"<html>Just a moment...</html>")
+    err = _origin_error(monkeypatch, tmp_path, html)
+    assert err.kind == "decode_error" and err.detail.startswith("content ")
+    # the same bytes without the flag are plain undecodable data
+    err = _origin_error(monkeypatch, tmp_path, b"junk")
+    assert err.kind == "decode_error" and err.detail.startswith("decode ")
+    blocker = tmp_path / "file"
+    blocker.write_bytes(b"")
+    err = _origin_error(monkeypatch, tmp_path, b"junk", dest=blocker / "sub" / "0.img")
+    assert err.kind == "decode_error" and err.detail.startswith("write ")
+
+
+def test_an_exception_without_a_failure_record_keeps_the_old_detail(monkeypatch, tmp_path) -> None:
+    err = _origin_error(monkeypatch, tmp_path, TimeoutError("slow"))
+    assert err.kind == "fetch_timeout"
+    assert err.detail == "TimeoutError: slow — https://images.pexels.com/photos/1/x.jpg"

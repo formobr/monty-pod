@@ -15,6 +15,8 @@ import pytest
 
 from podagent import originrule
 
+_REAL_RESOLVE = originrule.resolve_addrs    # the autouse fixture below replaces the module attribute
+
 PUBLIC = "93.184.215.14"
 DNS = {
     "cdn.example.com": (PUBLIC, "2606:2800:21f:cb07:6820:80da:af6b:8b2c"),
@@ -214,6 +216,84 @@ def test_a_transient_status_is_retried_once(origin, status):
     with pytest.raises(urllib.error.HTTPError):
         originrule.fetch("https://cdn.example.com/404.jpg", max_bytes=100, timeout_s=5)
     assert o.opened.count("https://cdn.example.com/404.jpg") == 1
+
+
+def test_a_cloudflare_403_keeps_its_type_and_records_why(origin):
+    o = origin({"https://cdn.example.com/cf.jpg": [
+        (403, {"cf-mitigated": "challenge", "cf-ray": "8a1b-FRA", "Retry-After": "x" * 100},
+         b"<html>error code: 1020</html>"),
+        (200, {}, b"never")]})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        originrule.fetch("https://cdn.example.com/cf.jpg", max_bytes=100, timeout_s=5)
+    assert e.value.code == 403
+    f = e.value.origin_failure
+    assert (f.phase, f.status, f.cf_code, f.cf_mitigated, f.cf_ray) == ("http", 403, "1020", "challenge", "8a1b-FRA")
+    assert (f.host, f.addr, f.family, f.exc) == ("cdn.example.com", PUBLIC, "v4", "HTTPError")
+    assert f.retry_after == "x" * 64
+    # a verdict is still not retried: one attempt, no pause
+    assert o.opened == ["https://cdn.example.com/cf.jpg"] and o.sleeps == []
+
+
+def test_a_429_records_retry_after_and_is_retried_as_before(origin):
+    o = origin({"https://cdn.example.com/slow.jpg": [
+        (429, {"Retry-After": "30"}, b""), (429, {"Retry-After": "30"}, b"")]})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        originrule.fetch("https://cdn.example.com/slow.jpg", max_bytes=100, timeout_s=5)
+    assert e.value.code == 429 and e.value.origin_failure.retry_after == "30"
+    assert e.value.origin_failure.phase == "http" and e.value.origin_failure.cf_code is None
+    assert len(o.opened) == originrule._ORIGIN_ATTEMPTS and o.sleeps == [originrule._ORIGIN_RETRY_PAUSE_S]
+
+
+def test_a_2xx_html_body_is_returned_and_flagged(origin):
+    origin({"https://cdn.example.com/h.jpg": [(200, {"Content-Type": "text/html; charset=utf-8"}, b"<html>")],
+            "https://cdn.example.com/i.jpg": [(200, {"Content-Type": "image/jpeg"}, b"JPEG")]})
+    html = originrule.fetch("https://cdn.example.com/h.jpg", max_bytes=100, timeout_s=5)
+    assert html == b"<html>" and getattr(html, "html", False)
+    assert not getattr(originrule.fetch("https://cdn.example.com/i.jpg", max_bytes=100, timeout_s=5), "html", False)
+
+
+def test_a_refused_connect_and_a_tls_failure_record_their_phase_and_address(monkeypatch):
+    import ssl
+    import types
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(originrule, "_sleep", sleeps.append)
+    attempts: list[tuple] = []
+
+    def refuse(address, timeout=None):
+        attempts.append(address)
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(originrule.socket, "create_connection", refuse)
+    with pytest.raises(ConnectionRefusedError) as e:
+        originrule.fetch("https://cdn.example.com/c.jpg", max_bytes=100, timeout_s=5)
+    f = e.value.origin_failure
+    assert (f.phase, f.host, f.addr, f.family, f.exc) == ("connect", "cdn.example.com", PUBLIC, "v4",
+                                                         "ConnectionRefusedError")
+    assert len(attempts) == originrule._ORIGIN_ATTEMPTS and sleeps == [originrule._ORIGIN_RETRY_PAUSE_S]
+
+    def bad_handshake(*a, **k):
+        raise ssl.SSLError("handshake failure")
+
+    monkeypatch.setattr(originrule.socket, "create_connection", lambda address, timeout=None: object())
+    monkeypatch.setattr(originrule.ssl, "create_default_context",
+                        lambda: types.SimpleNamespace(wrap_socket=bad_handshake))
+    with pytest.raises(ssl.SSLError) as e:
+        originrule.fetch("https://cdn.example.com/t.jpg", max_bytes=100, timeout_s=5)
+    assert e.value.origin_failure.phase == "tls" and e.value.origin_failure.addr == PUBLIC
+
+
+def test_an_unresolvable_host_records_the_dns_phase(monkeypatch):
+    import socket
+
+    def nxdomain(*a, **k):
+        raise socket.gaierror("no such host")
+
+    monkeypatch.setattr(originrule.socket, "getaddrinfo", nxdomain)
+    with pytest.raises(originrule.OriginRefused) as e:
+        _REAL_RESOLVE("gone.example.com")
+    f = e.value.origin_failure
+    assert (f.phase, f.host, f.addr, f.family, f.exc) == ("dns", "gone.example.com", None, None, "OriginRefused")
 
 
 def test_the_module_imports_only_the_standard_library():
