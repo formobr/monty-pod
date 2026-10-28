@@ -30,7 +30,9 @@ DNS = {
     "zero.example.com": ("0.0.0.0",),
     "cgnat.example.com": ("100.100.100.200",),
     "nat64.example.com": ("64:ff9b::a9fe:a9fe",),  # NAT64-embedded 169.254.169.254
+    "other.example.com": ("93.184.215.15",),
 }
+V6 = DNS["cdn.example.com"][1]
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +42,36 @@ def _fake_dns(monkeypatch):
             raise originrule.OriginRefused(f"REFUSED: {host} does not resolve")
         return DNS[host]
     monkeypatch.setattr(originrule, "resolve_addrs", resolve)
+
+
+class _Clock:
+    """The injected time: `sleep` advances it, so a hold is a number in `sleeps`, never a wait."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.sleeps: list[float] = []
+
+    def now(self) -> float:
+        return self.t
+
+    def wall(self) -> float:
+        return 1_800_000_000.0 + self.t
+
+    def sleep(self, s: float) -> None:
+        self.sleeps.append(s)
+        self.t += s
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    """A fresh clock, no jitter and no host state carried over from another test."""
+    c = _Clock()
+    monkeypatch.setattr(originrule, "_now", c.now)
+    monkeypatch.setattr(originrule, "_wall", c.wall)
+    monkeypatch.setattr(originrule, "_sleep", c.sleep)
+    monkeypatch.setattr(originrule, "_jitter", lambda: 0.0)
+    monkeypatch.setattr(originrule, "_HOSTS", {})
+    return c
 
 
 class _FakeResponse:
@@ -65,38 +97,48 @@ class _Origin:
     and checked for itself (the fake records `host` AND `addr` on every connect)."""
 
     def __init__(self, script):
-        self.script = {u: list(v) for u, v in script.items()}
+        self.script = {u: list(v) for u, v in script.items()}   # an entry may be an exception to raise instead
         self.opened: list[str] = []
         self.connected: list[tuple[str, str]] = []
+        self.refuse: set[str] = set()      # addresses whose connect is refused
+        self.conns: list = []
+        self.headers: list = []
 
     def connect(self, host: str, addr: str, *, timeout_s: float):
         self.connected.append((host, addr))
+        if addr in self.refuse:
+            raise ConnectionRefusedError(f"refused {addr}")
         origin, origin_host = self, host
 
         class _FakeConnection:
+            closed = False
+
             def request(self, method, path, headers=None):
                 url = f"https://{origin_host}{path}"
                 origin.opened.append(url)
-                status, headers_, body = origin.script[url].pop(0)
+                origin.headers.append(headers)
+                entry = origin.script[url].pop(0)
+                if isinstance(entry, BaseException):
+                    raise entry
+                status, headers_, body = entry
                 self._resp = _FakeResponse(status, headers_, body)
 
             def getresponse(self):
                 return self._resp
 
             def close(self):
-                pass
+                self.closed = True
 
-        return _FakeConnection()
+        conn = _FakeConnection()
+        self.conns.append(conn)
+        return conn
 
 
 @pytest.fixture
-def origin(monkeypatch):
-    sleeps: list[float] = []
-    monkeypatch.setattr(originrule, "_sleep", sleeps.append)
-
+def origin(monkeypatch, clock):
     def install(script):
         o = _Origin(script)
-        o.sleeps = sleeps
+        o.sleeps = clock.sleeps
         monkeypatch.setattr(originrule, "_connect", o.connect)
         return o
     return install
@@ -199,19 +241,18 @@ def test_a_body_over_the_cap_is_refused(origin):
 
 
 @pytest.mark.parametrize("status", sorted(originrule._RETRYABLE_STATUS))
-def test_a_transient_status_is_retried_once(origin, status):
+def test_a_transient_status_is_retried_up_to_three_attempts(origin, status):
     o = origin({
-        "https://cdn.example.com/t.jpg": [(status, {}, b""), (200, {}, b"JPEG")],
-        "https://cdn.example.com/twice.jpg": [(status, {}, b""), (status, {}, b""), (200, {}, b"never")],
+        "https://cdn.example.com/t.jpg": [(status, {}, b""), (status, {}, b""), (200, {}, b"JPEG")],
+        "https://cdn.example.com/thrice.jpg": [(status, {}, b"")] * 3 + [(200, {}, b"never")],
         "https://cdn.example.com/404.jpg": [(404, {}, b""), (200, {}, b"never")],
     })
     assert originrule.fetch("https://cdn.example.com/t.jpg", max_bytes=100, timeout_s=5) == b"JPEG"
-    assert o.sleeps == [originrule._ORIGIN_RETRY_PAUSE_S]
-    # Once, not more: a second transient status is the answer.
+    # Three in all, not more: a third transient status is the answer.
     with pytest.raises(urllib.error.HTTPError) as e:
-        originrule.fetch("https://cdn.example.com/twice.jpg", max_bytes=100, timeout_s=5)
+        originrule.fetch("https://cdn.example.com/thrice.jpg", max_bytes=100, timeout_s=5)
     assert e.value.code == status
-    assert o.opened.count("https://cdn.example.com/twice.jpg") == 2
+    assert o.opened.count("https://cdn.example.com/thrice.jpg") == originrule._ORIGIN_ATTEMPTS == 3
     # A verdict on the request is not retried.
     with pytest.raises(urllib.error.HTTPError):
         originrule.fetch("https://cdn.example.com/404.jpg", max_bytes=100, timeout_s=5)
@@ -234,14 +275,14 @@ def test_a_cloudflare_403_keeps_its_type_and_records_why(origin):
     assert o.opened == ["https://cdn.example.com/cf.jpg"] and o.sleeps == []
 
 
-def test_a_429_records_retry_after_and_is_retried_as_before(origin):
-    o = origin({"https://cdn.example.com/slow.jpg": [
-        (429, {"Retry-After": "30"}, b""), (429, {"Retry-After": "30"}, b"")]})
+def test_a_429_records_retry_after_and_is_retried_under_the_cap(origin):
+    o = origin({"https://cdn.example.com/slow.jpg": [(429, {"Retry-After": "30"}, b"")] * 3})
     with pytest.raises(urllib.error.HTTPError) as e:
         originrule.fetch("https://cdn.example.com/slow.jpg", max_bytes=100, timeout_s=5)
     assert e.value.code == 429 and e.value.origin_failure.retry_after == "30"
     assert e.value.origin_failure.phase == "http" and e.value.origin_failure.cf_code is None
-    assert len(o.opened) == originrule._ORIGIN_ATTEMPTS and o.sleeps == [originrule._ORIGIN_RETRY_PAUSE_S]
+    # the host said 30 s; the pod waits the 8 s cap between attempts, and not after the last one
+    assert len(o.opened) == originrule._ORIGIN_ATTEMPTS and o.sleeps == [8.0, 8.0]
 
 
 def test_a_2xx_html_body_is_returned_and_flagged(origin):
@@ -256,8 +297,6 @@ def test_a_refused_connect_and_a_tls_failure_record_their_phase_and_address(monk
     import ssl
     import types
 
-    sleeps: list[float] = []
-    monkeypatch.setattr(originrule, "_sleep", sleeps.append)
     attempts: list[tuple] = []
 
     def refuse(address, timeout=None):
@@ -268,9 +307,10 @@ def test_a_refused_connect_and_a_tls_failure_record_their_phase_and_address(monk
     with pytest.raises(ConnectionRefusedError) as e:
         originrule.fetch("https://cdn.example.com/c.jpg", max_bytes=100, timeout_s=5)
     f = e.value.origin_failure
-    assert (f.phase, f.host, f.addr, f.family, f.exc) == ("connect", "cdn.example.com", PUBLIC, "v4",
+    # the record names the address that failed LAST: v4 was tried first, v6 after it
+    assert (f.phase, f.host, f.addr, f.family, f.exc) == ("connect", "cdn.example.com", V6, "v6",
                                                          "ConnectionRefusedError")
-    assert len(attempts) == originrule._ORIGIN_ATTEMPTS and sleeps == [originrule._ORIGIN_RETRY_PAUSE_S]
+    assert attempts == [(PUBLIC, 443), (V6, 443)] * originrule._ORIGIN_ATTEMPTS
 
     def bad_handshake(*a, **k):
         raise ssl.SSLError("handshake failure")
@@ -280,7 +320,169 @@ def test_a_refused_connect_and_a_tls_failure_record_their_phase_and_address(monk
                         lambda: types.SimpleNamespace(wrap_socket=bad_handshake))
     with pytest.raises(ssl.SSLError) as e:
         originrule.fetch("https://cdn.example.com/t.jpg", max_bytes=100, timeout_s=5)
-    assert e.value.origin_failure.phase == "tls" and e.value.origin_failure.addr == PUBLIC
+    assert e.value.origin_failure.phase == "tls" and e.value.origin_failure.addr == V6
+
+
+def _get(path: str, **kw):
+    return originrule.fetch(f"https://cdn.example.com/{path}", max_bytes=100, timeout_s=5, **kw)
+
+
+def _width(host: str = "cdn.example.com") -> int:
+    return originrule._host_state(host).limit
+
+
+def test_a_429_holds_the_host_for_retry_after_halves_its_width_and_a_success_adds_one_back(origin, clock):
+    o = origin({"https://cdn.example.com/t.jpg": [(429, {"Retry-After": "3"}, b""), (200, {}, b"JPEG")],
+                "https://cdn.example.com/u.jpg": [(200, {}, b"JPEG")] * 2})
+    assert _width() == originrule._POOL_WIDTH == 32
+    assert _get("t.jpg") == b"JPEG"
+    assert o.sleeps == [3.0], "the retry waited out the host's Retry-After, and nothing else"
+    assert _width() == 17, "32 halved to 16 by the 429, one added back by the success"
+    _get("u.jpg")
+    _get("u.jpg")
+    assert _width() == 19 and o.sleeps == [3.0]
+
+
+@pytest.mark.parametrize("retry_after, held", [
+    ("3600", 8.0),
+    ("0", 0.5),
+    ("-5", 0.5),
+    ("Wed, 21 Oct 2037 07:28:00 GMT", 8.0),
+    ("nonsense", 1.0),                      # unreadable: the exponential backoff's first step
+])
+def test_retry_after_is_clamped_to_half_a_second_to_eight(origin, retry_after, held):
+    o = origin({"https://cdn.example.com/t.jpg": [(503, {"Retry-After": retry_after}, b""), (200, {}, b"JPEG")]})
+    assert _get("t.jpg") == b"JPEG"
+    assert o.sleeps == [held]
+
+
+def test_an_http_date_retry_after_is_read_against_the_wall_clock(origin, clock):
+    import email.utils
+
+    date = email.utils.formatdate(clock.wall() + 4, usegmt=True)
+    o = origin({"https://cdn.example.com/t.jpg": [(429, {"Retry-After": date}, b""), (200, {}, b"JPEG")]})
+    _get("t.jpg")
+    assert o.sleeps == [pytest.approx(4.0, abs=1.0)]
+
+
+def test_without_retry_after_the_hold_backs_off_1_2_4_8_and_resets_on_success(origin, monkeypatch):
+    o = origin({"https://cdn.example.com/x.jpg": [(429, {}, b"")] * 3,
+                "https://cdn.example.com/y.jpg": [(429, {}, b""), (200, {}, b"Y")],
+                "https://cdn.example.com/z.jpg": [(429, {}, b"")] * 3,
+                "https://cdn.example.com/j.jpg": [(429, {}, b""), (200, {}, b"J")]})
+    with pytest.raises(urllib.error.HTTPError):
+        _get("x.jpg")
+    assert o.sleeps == [1.0, 2.0]       # the third 429 set a 4 s hold that no attempt of x.jpg was left to wait out
+    assert _get("y.jpg") == b"Y"
+    assert o.sleeps == [1.0, 2.0, 4.0, 8.0], "y.jpg waited the 4 s left, then its own 429's 8 s"
+    with pytest.raises(urllib.error.HTTPError):
+        _get("z.jpg")                   # the success reset the backoff
+    assert o.sleeps[4:] == [1.0, 2.0]
+
+
+def test_the_backoff_hold_is_jittered_down_by_a_quarter(origin, monkeypatch):
+    monkeypatch.setattr(originrule, "_jitter", lambda: -0.25)
+    o = origin({"https://cdn.example.com/j.jpg": [(429, {}, b""), (200, {}, b"J")]})
+    assert _get("j.jpg") == b"J"
+    assert o.sleeps == [0.75]
+
+
+def test_the_jittered_backoff_hold_never_passes_the_cap(origin, monkeypatch):
+    monkeypatch.setattr(originrule, "_jitter", lambda: 0.25)
+    o = origin({"https://cdn.example.com/x.jpg": [(429, {}, b"")] * 3,
+                "https://cdn.example.com/y.jpg": [(429, {}, b""), (200, {}, b"Y")]})
+    with pytest.raises(urllib.error.HTTPError):
+        _get("x.jpg")
+    assert _get("y.jpg") == b"Y"
+    # 1.25, 2.5 inside x; then y waits x's 5.0, and its own 429 is the 4th step: 8 * 1.25 = 10 clamped to 8
+    assert o.sleeps == [1.25, 2.5, 5.0, 8.0]
+    assert max(o.sleeps) <= originrule._HOLD_MAX_S
+
+
+def test_a_403_is_never_retried_and_halves_the_width(origin):
+    o = origin({"https://cdn.example.com/cf.jpg": [(403, {}, b"error code: 1020"), (200, {}, b"never")]})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _get("cf.jpg")
+    assert e.value.code == 403 and o.opened == ["https://cdn.example.com/cf.jpg"] and o.sleeps == []
+    assert _width() == 16
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_a_404_or_410_is_never_retried_and_leaves_the_width_alone(origin, status):
+    o = origin({"https://cdn.example.com/gone.jpg": [(status, {}, b""), (200, {}, b"never")]})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _get("gone.jpg")
+    assert e.value.code == status and len(o.opened) == 1 and o.sleeps == []
+    assert _width() == 32
+
+
+def test_a_dead_connection_halves_the_width(origin):
+    origin({"https://cdn.example.com/r.jpg": [ConnectionResetError("reset")] * 3})
+    with pytest.raises(ConnectionResetError):
+        _get("r.jpg")
+    assert _width() == 4, "each of the three failed attempts halved it: 32 -> 16 -> 8 -> 4"
+
+
+def test_one_hosts_429_never_slows_another_host(origin, clock):
+    o = origin({"https://cdn.example.com/t.jpg": [(429, {"Retry-After": "5"}, b""), (200, {}, b"JPEG")],
+                "https://other.example.com/o.jpg": [(200, {}, b"OTHER")]})
+    _get("t.jpg")
+    assert o.sleeps == [5.0]
+    hold_a = originrule._host_state("cdn.example.com").hold_until
+    clock.t = hold_a - 4.0                       # A is still held for 4 s
+    assert originrule.fetch("https://other.example.com/o.jpg", max_bytes=100, timeout_s=5) == b"OTHER"
+    assert o.sleeps == [5.0], "host B waited for nothing"
+    assert _width("other.example.com") == 32 and originrule._host_state("other.example.com").hold_until == 0.0
+
+
+def test_a_refused_address_is_followed_by_the_next_vetted_address_of_the_host(origin):
+    o = origin({"https://cdn.example.com/t.jpg": [(200, {}, b"JPEG")]})
+    o.refuse = {PUBLIC}
+    assert _get("t.jpg") == b"JPEG"
+    assert o.connected == [("cdn.example.com", PUBLIC), ("cdn.example.com", V6)]
+
+
+def test_two_tiles_to_one_host_reuse_one_connection_and_an_error_closes_it(origin):
+    o = origin({"https://cdn.example.com/a.jpg": [(200, {}, b"A")],
+                "https://cdn.example.com/b.jpg": [(200, {}, b"B")],
+                "https://cdn.example.com/c.jpg": [(404, {}, b"")],
+                "https://cdn.example.com/d.jpg": [(200, {}, b"D")]})
+    assert (_get("a.jpg"), _get("b.jpg")) == (b"A", b"B")
+    assert len(o.connected) == 1 and not o.conns[0].closed, "the second tile rode the first one's connection"
+    with pytest.raises(urllib.error.HTTPError):
+        _get("c.jpg")
+    assert o.conns[0].closed and len(o.connected) == 1
+    assert _get("d.jpg") == b"D"
+    assert len(o.connected) == 2, "the connection that saw an error was not offered again"
+
+
+def test_a_server_that_dropped_an_idle_connection_costs_a_reconnect_not_an_attempt(origin):
+    o = origin({"https://cdn.example.com/a.jpg": [(200, {}, b"A")],
+                "https://cdn.example.com/b.jpg": [ConnectionResetError("idle drop"), (200, {}, b"B")]})
+    _get("a.jpg")
+    assert _get("b.jpg") == b"B"
+    assert len(o.connected) == 2 and o.conns[0].closed and _width() == 32
+
+
+def test_a_request_keeps_the_connection_open_and_names_the_pod(origin):
+    o = origin({"https://cdn.example.com/a.jpg": [(200, {}, b"A")]})
+    _get("a.jpg")
+    (headers,) = o.headers
+    assert headers == {"User-Agent": "monty-pod-originrule/1"}
+
+
+def test_a_hold_that_outlasts_the_deadline_raises_instead_of_waiting(origin, clock):
+    o = origin({"https://cdn.example.com/t.jpg": [(429, {"Retry-After": "8"}, b"")] * 3})
+    with pytest.raises(originrule.DeadlineExceeded):
+        _get("t.jpg", deadline=clock.t + 5)
+    assert o.sleeps == [] and len(o.opened) == 1
+
+
+def test_a_deadline_already_passed_starts_no_attempt(origin, clock):
+    o = origin({"https://cdn.example.com/t.jpg": [(200, {}, b"x")]})
+    with pytest.raises(originrule.DeadlineExceeded):
+        _get("t.jpg", deadline=clock.t)
+    assert o.opened == [] and o.connected == []
 
 
 def test_an_unresolvable_host_records_the_dns_phase(monkeypatch):

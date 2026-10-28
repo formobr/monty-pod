@@ -45,6 +45,11 @@ _EMPTY_INTENT = ClipRankTileError(kind="empty_intent",
 # provider-thumbnail cap (THUMB_MAX_BYTES, in its preview-link resolver) — what the box accepts off a
 # provider; its per-read timeout is the same `cp._TIMEOUT` an image_urls tile's download runs under.
 _ORIGIN_MAX_BYTES = 8_000_000
+# One request's WHOLE origin-tile fetch phase ends here. WHY 120: far under the box's 1200 s infer wall
+# (the control plane's default infer timeout) and ~10x the measured healthy phase of 801 tiles; at the deadline queued
+# fetches never start, in-flight ones get at most their socket timeout, and each tile not fetched is a named
+# `fetch_timeout` whose detail starts `deadline` — scoring proceeds on what arrived.
+_ORIGIN_FETCH_PHASE_S = 120
 # The origin bytes a rank request fetched outlive it, so the judge-tiles request that follows on the same warm pod
 # reads them instead of paying the provider fetch twice. Keyed by the EXACT url; bounded by total bytes, least
 # recently used out first — ~32 provider thumbnails at the body cap, hundreds at a thumbnail's usual size.
@@ -341,22 +346,35 @@ class _OriginCache:
 _ORIGIN_CACHE = _OriginCache(_ORIGIN_CACHE_BYTES)
 
 
-def _origin_fetch(url: str) -> bytes:
-    """One origin GET through the guard under the rank's caps; a successful body is kept for a later request."""
-    data = originrule.fetch(url, max_bytes=_ORIGIN_MAX_BYTES, timeout_s=_TILE_TIMEOUT_S)
+def _origin_fetch(url: str, deadline: float | None = None) -> bytes:
+    """One origin GET through the guard under the rank's caps; a successful body is kept for a later request.
+    `deadline` is an absolute `originrule._now()` time (None: unbounded, the judge-tiles refetch)."""
+    data = originrule.fetch(url, max_bytes=_ORIGIN_MAX_BYTES, timeout_s=_TILE_TIMEOUT_S, deadline=deadline)
     _ORIGIN_CACHE.put(url, data)
     return data
 
 
-def _fetch_origin_tile(url: str, dest: Path):
+def _deadline_error(redacted_url: str) -> ClipRankTileError:
+    return ClipRankTileError(
+        kind="fetch_timeout",
+        detail=f"deadline {_ORIGIN_FETCH_PHASE_S:g}s for the origin fetch phase passed before this tile "
+               f"was fetched — {redacted_url}")
+
+
+def _fetch_origin_tile(url: str, dest: Path, deadline: float | None = None):
     """One stock-provider tile: GET through the origin guard → workdir file → decode, exactly like an image_urls
     tile after its download. Returns (image, error, redacted url, measure); the measure is the fetched bytes
-    and decoded size, None for a tile that did not decode. A guard refusal is `origin_refused`."""
+    and decoded size, None for a tile that did not decode. A guard refusal is `origin_refused`. A tile still
+    queued when the request's fetch-phase `deadline` has passed is never started: it is `fetch_timeout`."""
     from PIL import Image
 
     redacted_url = _redacted_tile_url(url)
+    if deadline is not None and originrule._now() >= deadline:
+        return None, _deadline_error(redacted_url), redacted_url, None
     try:
-        data = _origin_fetch(url)
+        data = _origin_fetch(url, deadline)
+    except originrule.DeadlineExceeded:
+        return None, _deadline_error(redacted_url), redacted_url, None
     except originrule.OriginRefused as exc:
         return None, _origin_tile_error("origin_refused", exc, redacted_url), redacted_url, None
     except Exception as exc:  # noqa: BLE001 — a broken tile is data, not a pipeline fault; it is NAMED below
@@ -374,13 +392,14 @@ def _fetch_origin_tile(url: str, dest: Path):
     return img, None, redacted_url, ClipRankTileMeasure(bytes=len(data), w=img.width, h=img.height)
 
 
-def _submit_origins(urls: list[str], workdir: Path, shared: dict) -> list:
+def _submit_origins(urls: list[str], workdir: Path, shared: dict, deadline: float | None = None) -> list:
     """Put every origin tile on the wire, ONE fetch per url per REQUEST: `shared` (url → future) spans every
-    origin group of the request, so a thumbnail two beats both shortlisted is fetched once."""
+    origin group of the request, so a thumbnail two beats both shortlisted is fetched once. `deadline` ends
+    the request's whole fetch phase."""
     pool = _fetch_pool()
     for u in urls:
         if u not in shared:
-            shared[u] = pool.submit(_fetch_origin_tile, u, workdir / f"{len(shared)}.img")
+            shared[u] = pool.submit(_fetch_origin_tile, u, workdir / f"{len(shared)}.img", deadline)
     return [shared[u] for u in urls]
 
 
@@ -679,7 +698,9 @@ class ClipRankService:
                     for g in params.groups]
             unique = list(dict.fromkeys(keys))
             shared_origins: dict = {}
-            pending = {key: (_submit_origins(list(key[0]), Path(td) / "origins", shared_origins) if key[2]
+            phase_deadline = originrule._now() + _ORIGIN_FETCH_PHASE_S
+            pending = {key: (_submit_origins(list(key[0]), Path(td) / "origins", shared_origins, phase_deadline)
+                             if key[2]
                              else _submit_tiles(list(key[0]), Path(td) / f"g{i}"))
                        for i, key in enumerate(unique)}
             origin_extra: dict = {}

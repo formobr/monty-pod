@@ -130,7 +130,7 @@ def test_an_origin_group_never_goes_through_the_presigned_download(monkeypatch, 
         dest.write_bytes(b"img")
         return dest
 
-    def refuse(url, *, max_bytes, timeout_s):
+    def refuse(url, *, max_bytes, timeout_s, deadline=None):
         raise originrule.OriginRefused("REFUSED: test")
 
     monkeypatch.setattr(m, "download", fake_download)

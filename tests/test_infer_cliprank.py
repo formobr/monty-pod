@@ -327,7 +327,7 @@ def _origin_error(monkeypatch, tmp_path, outcome, dest=None):
     """Run ONE origin tile through the real `_fetch_origin_tile` with the guard's fetch faked."""
     import podagent.infer_cliprank as m
 
-    def fake(url):
+    def fake(url, deadline=None):
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -379,3 +379,94 @@ def test_an_exception_without_a_failure_record_keeps_the_old_detail(monkeypatch,
     err = _origin_error(monkeypatch, tmp_path, TimeoutError("slow"))
     assert err.kind == "fetch_timeout"
     assert err.detail == "TimeoutError: slow — https://images.pexels.com/photos/1/x.jpg"
+
+
+def _phase_rig(monkeypatch, tmp_path):
+    """An inline pool, an injected clock the origin fetch advances, stub towers scoring every image 0.5, and a
+    captured PUT. Returns (run(urls) -> parsed result, clock cell)."""
+    import io
+    import json
+
+    from PIL import Image
+
+    import podagent.infer_cliprank as m
+    from podagent import originrule
+    from podagent.models import ClipRankParams
+
+    class _Inline:
+        def submit(self, fn, *args, **kwargs):
+            fut = cf.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except Exception as exc:  # noqa: BLE001 — mirror a real Future
+                fut.set_exception(exc)
+            return fut
+
+    class _Clock(list):
+        png = b""
+
+    clock = _Clock([0.0])
+    monkeypatch.setattr(originrule, "_now", lambda: clock[0])
+    monkeypatch.setattr(m, "_FETCH_POOL", _Inline())
+    monkeypatch.setattr(m, "_ORIGIN_CACHE", m._OriginCache(m._ORIGIN_CACHE_BYTES))
+    put = tmp_path / "out.json"
+    monkeypatch.setattr(m, "upload", lambda src, url, ct=None: put.write_bytes(src.read_bytes()))
+    svc = _svc()
+    svc._prepare = lambda images, ok: ((None, [], ok) if not images
+                                       else (list(images), [[0.6, 0.8] for _ in images], ok))
+    svc._text_scores = lambda intent, ie: [0.5] * len(ie)
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 3)).save(buf, "PNG")
+    clock.png = buf.getvalue()
+
+    def run(urls):
+        svc.run(ClipRankParams(groups=[ClipRankGroup(intent="chart", origin_urls=urls)]), "put")
+        return json.loads(put.read_text())["groups"][0]
+
+    return run, clock
+
+
+def test_a_fetch_phase_whose_host_answers_after_the_deadline_ends_at_120s_and_names_every_unfetched_tile(
+        monkeypatch, tmp_path) -> None:
+    """PROD 2026-10-28: a preview fetched 500-1657 origin tiles with nothing bounding the phase as a whole."""
+    import podagent.infer_cliprank as m
+    from podagent import originrule
+
+    run, clock = _phase_rig(monkeypatch, tmp_path)
+    urls = [f"https://images.pexels.com/p/{i}.jpg" for i in range(600)]
+    fetched: list[str] = []
+    deadlines: list[float] = []
+
+    def fake(url, deadline=None):
+        fetched.append(url)
+        deadlines.append(deadline)
+        if len(fetched) <= 2:
+            clock[0] += 10.0                    # two tiles arrive
+            return clock.png
+        clock[0] = deadline                     # the third's host answers only after the phase is over:
+        raise originrule.DeadlineExceeded("deadline")   # the bounded fetch gives up exactly at the deadline
+
+    monkeypatch.setattr(m, "_origin_fetch", fake)
+    g = run(urls)
+    assert m._ORIGIN_FETCH_PHASE_S == 120 and set(deadlines) == {120.0}
+    assert clock[0] == 120.0, "the phase ended at 120 s on the injected clock"
+    assert len(fetched) == 3, "the 597 queued fetches were cancelled, not started"
+    assert g["status"] == "ok" and g["scores"][:2] == [0.5, 0.5] and set(g["scores"][2:]) == {None}
+    assert g["errors"][:2] == [None, None]
+    assert {e["kind"] for e in g["errors"][2:]} == {"fetch_timeout"}
+    assert all(e["detail"].startswith("deadline ") for e in g["errors"][2:]) and len(g["errors"][2:]) == 598
+
+
+def test_a_healthy_fetch_phase_is_unchanged(monkeypatch, tmp_path) -> None:
+    import podagent.infer_cliprank as m
+
+    run, clock = _phase_rig(monkeypatch, tmp_path)
+    urls = [f"https://images.pexels.com/p/{i}.jpg" for i in range(600)]
+
+    def fake(url, deadline=None):
+        clock[0] += 0.01
+        return clock.png
+
+    monkeypatch.setattr(m, "_origin_fetch", fake)
+    g = run(urls)
+    assert g["status"] == "ok" and g["errors"] == [None] * 600 and g["scores"] == [0.5] * 600

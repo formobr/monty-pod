@@ -83,7 +83,7 @@ def _fake_fetch(monkeypatch, bodies: dict):
     """originrule.fetch stand-in: a body, or an exception to raise, per url; records every call."""
     calls: list[tuple[str, int, float]] = []
 
-    def fetch(url, *, max_bytes, timeout_s):
+    def fetch(url, *, max_bytes, timeout_s, deadline=None):
         calls.append((url, max_bytes, timeout_s))
         out = bodies[url]
         if isinstance(out, BaseException):
