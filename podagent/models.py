@@ -343,11 +343,22 @@ class SpecWatermark(BaseModel):
     delay: float = Field(default=0.0, ge=0)
     chime: bool = True
     chime_volume: float = Field(default=1.0, gt=0, le=2)
+    ref_text: str | None = Field(default=None, pattern=r"^monty\.fast/r/[a-z0-9][a-z0-9_-]{2,39}$")
+    ref_font: str | None = Field(default=None, min_length=1)
+    ref_size: int = Field(default=28, ge=8, le=200)
+    ref_color: str = Field(default="#FFFFFF", pattern=r"^#[0-9a-fA-F]{6}$")
+    ref_gap: int = Field(default=0, ge=-400, le=400)
 
     @model_validator(mode="after")
     def _xy_together(self) -> "SpecWatermark":
         if (self.x is None) != (self.y is None):
             raise ValueError("watermark x and y are one placement — pass both or neither")
+        return self
+
+    @model_validator(mode="after")
+    def _ref_text_needs_font_and_xy(self) -> "SpecWatermark":
+        if self.ref_text is not None and (self.ref_font is None or self.x is None or self.y is None):
+            raise ValueError("watermark ref_text needs ref_font and a numeric x/y placement")
         return self
 
 

@@ -187,13 +187,26 @@ def body_logo_filter(corner: str, width: int, opacity: float, margin: int, body_
 
 # --- 2. animated watermark ----------------------------------------------------
 
+def _dt_escape(s: str) -> str:
+    """Escape a value for a single-quoted drawtext option inside a filtergraph."""
+    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
 def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, overlay_xy: str,
                      base_a: str | None, chime_a: str | None, chime_vol: float, delay: float,
                      grid: str, sample_rate: int,
-                     out_v: str = "wmv", out_a: str = "wma") -> tuple[str, str, str | None]:
+                     out_v: str = "wmv", out_a: str = "wma",
+                     ref_text: str | None = None, ref_font_path: str | None = None,
+                     ref_size: int = 28, ref_color: str = "#FFFFFF", ref_gap: int = 0,
+                     ref_xy: tuple[float, float] | None = None) -> tuple[str, str, str | None]:
     """The watermark filtergraph, parameterised by input LABELS so it composes into any filter_complex.
     The sting uses the original 1200x600 canvas so the spring overshoot is not clipped; the shorter
-    idle is padded, anchored left. `grid`/`sample_rate` conform the 60fps/44.1kHz brand assets."""
+    idle is padded, anchored left. `grid`/`sample_rate` conform the 60fps/44.1kHz brand assets.
+    `ref_text` (the partner's referral link) is drawn centred UNDER the scaled watermark canvas, on the
+    overlay's own enable window; `ref_xy` is the numeric overlay placement it is positioned from."""
+    if ref_text is not None and (ref_font_path is None or ref_xy is None):
+        raise ValueError("ref_text needs ref_font_path and ref_xy")
+    ov_out = "wmref" if ref_text is not None else out_v
     normalize = f"pad={WM_CANVAS_W}:{WM_CANVAS_H}:0:(oh-ih)/2:color=black@0,fps={grid}"
     f = (f"[{sting_v}]{normalize},setpts=PTS-STARTPTS[i];"
          f"[{idle_v}]{normalize},setpts=PTS-STARTPTS[d];"
@@ -203,9 +216,15 @@ def watermark_filter(*, base_v: str, sting_v: str, idle_v: str, width: int, over
         # The video entry is a grid frame (frames.py), not a float second; the chime stays in ms.
         d = _frames.frame_at(delay, grid)
         f += f";[wm]setpts=PTS+{_frames.pts_at(d, grid)}[wmd]"
-        f += f";[{base_v}][wmd]overlay={overlay_xy}:enable='gte({_frames.index(grid)},{d})':shortest=1:format=auto[{out_v}]"
+        f += f";[{base_v}][wmd]overlay={overlay_xy}:enable='gte({_frames.index(grid)},{d})':shortest=1:format=auto[{ov_out}]"
     else:
-        f += f";[{base_v}][wm]overlay={overlay_xy}:shortest=1:format=auto[{out_v}]"
+        f += f";[{base_v}][wm]overlay={overlay_xy}:shortest=1:format=auto[{ov_out}]"
+    if ref_text is not None:
+        enable = f":enable='gte({_frames.index(grid)},{d})'" if delay > 0 else ""
+        rx, ry = ref_xy
+        f += (f";[{ov_out}]drawtext=fontfile='{_dt_escape(ref_font_path)}':text='{_dt_escape(ref_text)}'"
+              f":fontsize={ref_size}:fontcolor={ref_color}"
+              f":x={rx}+({width}-text_w)/2:y={ry}+{width}*{WM_CANVAS_H}/{WM_CANVAS_W}+({ref_gap}){enable}[{out_v}]")
     ret_a: str | None = None
     if chime_a is not None:
         ops = [f"aresample={sample_rate}"]

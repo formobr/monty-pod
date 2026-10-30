@@ -946,7 +946,7 @@
       }
     },
     "watermark": {
-      "description": "The animated brand watermark. `sting`/`idle` are inputs[].id of the two alpha .webm clips; the chime is the sting's own audio. `x`/`y` are NUMBERS in pixels (pass both or neither) — never an ffmpeg expression, which would be a filtergraph fragment crossing the seam.",
+      "description": "The animated brand watermark. `sting`/`idle` are inputs[].id of the two alpha .webm clips; the chime is the sting's own audio. `x`/`y` are NUMBERS in pixels (pass both or neither) — never an ffmpeg expression, which would be a filtergraph fragment crossing the seam. `ref_text` (only `monty.fast/r/<slug>`, needs `ref_font` = an inputs[].id and numeric x/y) is drawn as small text under the mascot, appearing with it.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1001,6 +1001,28 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 2
+        },
+        "ref_text": {
+          "type": "string",
+          "pattern": "^monty\\.fast/r/[a-z0-9][a-z0-9_-]{2,39}$"
+        },
+        "ref_font": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ref_size": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 200
+        },
+        "ref_color": {
+          "type": "string",
+          "pattern": "^#[0-9a-fA-F]{6}$"
+        },
+        "ref_gap": {
+          "type": "integer",
+          "minimum": -400,
+          "maximum": 400
         }
       },
       "dependentRequired": {
@@ -1009,6 +1031,11 @@
         ],
         "y": [
           "x"
+        ],
+        "ref_text": [
+          "ref_font",
+          "x",
+          "y"
         ]
       }
     },

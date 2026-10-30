@@ -191,6 +191,9 @@ def _check_assets(spec: RenderSpec, input_paths: dict) -> None:
         for ref in (fin.watermark.sting, fin.watermark.idle):
             if ref not in input_paths:
                 raise RuntimeError(f"finalize.watermark asset {ref!r} is not a resolved inputs[] id")
+        wm_font = fin.watermark.ref_font
+        if fin.watermark.ref_text is not None and (wm_font is None or wm_font not in input_paths):
+            raise RuntimeError(f"finalize.watermark.ref_font {wm_font!r} is not a resolved inputs[] id")
 
 
 # Demuxer names ffprobe reports for a single-frame image — the declared kind can lie, this cannot.
@@ -641,10 +644,13 @@ def assemble(p: Prepared) -> tuple[str, list[str]]:
         xy = (f"{wm.x}:{wm.y}" if wm.x is not None and wm.y is not None
               else _finalize._POS[wm.position].format(m=wm.margin))
         chime_a = f"{sting}:a" if wm.chime else None
+        ref = ({"ref_text": wm.ref_text, "ref_font_path": str(p.input_paths[wm.ref_font]),
+                "ref_size": wm.ref_size, "ref_color": wm.ref_color, "ref_gap": wm.ref_gap,
+                "ref_xy": (wm.x, wm.y)} if wm.ref_text is not None else {})
         frag, _out_v, out_a = _finalize.watermark_filter(
             base_v=vlink, sting_v=f"{sting}:v", idle_v=f"{idle}:v", width=wm.width, overlay_xy=xy,
             base_a=alink, chime_a=chime_a, chime_vol=wm.chime_volume, delay=wm.delay,
-            grid=grid, sample_rate=48000, out_v=V_WATERMARK, out_a=A_WATERMARK)
+            grid=grid, sample_rate=48000, out_v=V_WATERMARK, out_a=A_WATERMARK, **ref)
         subst = {vlink: vlink, alink: alink, f"{sting}:v": f"{sting}:v", f"{idle}:v": f"{idle}:v",
                  V_WATERMARK: V_WATERMARK, A_WATERMARK: A_WATERMARK}
         if chime_a is not None:
