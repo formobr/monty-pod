@@ -95,6 +95,84 @@ def _no_real_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cp.time, "sleep", lambda _s: None)
 
 
+# PROD 2026-10-30 (MISC-924): the first request after hours idle reused a dead pooled socket and stalled 30 s.
+
+class _FakeAdapter:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def close(self) -> None:
+        self._events.append("pool-reset")
+
+
+@pytest.fixture
+def idle_session(monkeypatch: pytest.MonkeyPatch):
+    """A real `_StoreSession` on an injected clock, fake adapters, and a recorded base `request` (no network)."""
+    events: list[str] = []
+    now = [1000.0]
+    monkeypatch.setattr(cp, "_store_adapters",
+                        lambda: {"https://": _FakeAdapter(events), "http://": _FakeAdapter(events)})
+
+    def fake_request(self: Any, method: str, url: str, **kw: Any) -> str:
+        events.append("request")
+        return "ok"
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    return cp._StoreSession(clock=lambda: now[0]), events, now
+
+
+def test_request_after_long_idle_drops_pool_before_sending(idle_session: Any, capsys: Any) -> None:
+    session, events, now = idle_session
+    session.get("https://store.example/a")
+    now[0] += 5 * 3600
+
+    assert session.get("https://store.example/b") == "ok"
+
+    assert events == ["request", "pool-reset", "pool-reset", "request"]
+    out = capsys.readouterr().out
+    assert out.count("[cp] store pool idle 18000s — reconnecting fresh before reuse") == 1
+
+
+def test_busy_session_never_resets(idle_session: Any, capsys: Any) -> None:
+    session, events, now = idle_session
+    for _ in range(4):
+        session.get("https://store.example/a")
+        now[0] += 2
+
+    assert events == ["request"] * 4
+    assert "reconnecting" not in capsys.readouterr().out
+
+
+def test_threads_right_after_idle_reset_both_complete(idle_session: Any, capsys: Any) -> None:
+    session, events, now = idle_session
+    session.get("https://store.example/a")
+    now[0] += 5 * 3600
+    results: list[str] = []
+
+    threads = [threading.Thread(target=lambda: results.append(session.get("https://store.example/x")))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == ["ok", "ok"]
+    assert events.count("pool-reset") == 2, "one reset (two schemes), not one per thread"
+    assert events.index("pool-reset") < events.index("request", 1), "reset precedes the first post-idle send"
+    assert capsys.readouterr().out.count("reconnecting fresh") == 1
+
+
+def test_range_probe_connection_error_prints_named_line_and_returns_none(
+        monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise requests.exceptions.ConnectionError("stalled")
+
+    monkeypatch.setattr(cp, "_fetch", boom)
+
+    assert cp._range_probe("https://store.example/o") is None
+    assert "[cp] range probe failed (ConnectionError)" in capsys.readouterr().out
+
+
 # Characterization: today's single-stream path, exercised over a fake origin for the first time ever.
 
 def test_single_stream_full_download_matches_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

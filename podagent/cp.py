@@ -231,10 +231,56 @@ class _StoreAdapter(HTTPAdapter):
 # OPS_MAX_TRANSFERS change can move neither, so the floor always names the width it was split by.
 _STORE_POOL_WIDTH: Final[int] = _store_pool()
 
-_store = requests.Session()
-for _scheme in ("http://", "https://"):
-    _store.mount(_scheme, _StoreAdapter(pool_connections=_STORE_POOL_WIDTH, pool_maxsize=_STORE_POOL_WIDTH,
-                                        pool_block=False))
+# WHY: PROD 2026-10-29/30 (MISC-924) — after hours idle (quiet ~19 500 s) the FIRST R2 exchange of a job hung
+# ~30 s (`measure.audio bind 30.3s`, `media.audio put 31.3s`) then succeeded: the pooled keep-alive socket's
+# NAT/conntrack mapping had died silently, so the request waited the whole `_TIMEOUT` read window. Pooled
+# sockets idle this long are not trusted; a fresh TCP+TLS handshake costs ~0.2 s against a 30 s stall. Well
+# under the hours observed and under common NAT idle timeouts.
+_STORE_IDLE_RESET_S = 60.0
+
+
+def _store_adapters() -> dict[str, _StoreAdapter]:
+    return {scheme: _StoreAdapter(pool_connections=_STORE_POOL_WIDTH, pool_maxsize=_STORE_POOL_WIDTH,
+                                  pool_block=False) for scheme in ("https://", "http://")}
+
+
+class _StoreSession(requests.Session):
+    """The store session, remembering when it last finished a request. A request that starts after more than
+    `_STORE_IDLE_RESET_S` with nothing in flight first swaps in fresh adapters (see `_STORE_IDLE_RESET_S`)."""
+
+    def __init__(self, clock: Any = time.monotonic) -> None:
+        super().__init__()
+        self._clock = clock
+        self._idle_lock = threading.Lock()
+        self._inflight = 0
+        self._last_done: float | None = None
+        self.adapters.clear()
+        self.adapters.update(_store_adapters())
+
+    def _reset_if_idle(self) -> None:
+        with self._idle_lock:
+            now = self._clock()
+            idle = None if self._last_done is None else now - self._last_done
+            if self._inflight == 0 and idle is not None and idle > _STORE_IDLE_RESET_S:
+                old = list(self.adapters.values())
+                # Assigned whole, never mutated in place: a concurrent get_adapter sees the old or the new set.
+                self.adapters = type(self.adapters)(_store_adapters())
+                for adapter in old:
+                    adapter.close()
+                print(f"[cp] store pool idle {int(idle)}s — reconnecting fresh before reuse", flush=True)
+            self._inflight += 1
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        self._reset_if_idle()
+        try:
+            return super().request(*args, **kwargs)
+        finally:
+            with self._idle_lock:
+                self._inflight -= 1
+                self._last_done = self._clock()
+
+
+_store = _StoreSession()
 
 # A PUT's per-attempt deadline is sized to the OBJECT and to the uplink it actually shares, not a flat 30 s:
 # measured 2026-10-01, three concurrent previews spent 680/811/460 s in `put` (155-320 s alone) because every
@@ -623,7 +669,8 @@ def _range_probe(url: str) -> tuple[int, str] | None:
     honors ranges and hands us an identity to pin; anything else is None (download() falls back unchanged)."""
     try:
         resp = _fetch(url, headers={"Range": "bytes=0-1"}, timeout=_TIMEOUT)
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        print(f"[cp] range probe failed ({type(exc).__name__}) — falling back to a single stream", flush=True)
         return None
     with resp:
         if resp.status_code != 206:
