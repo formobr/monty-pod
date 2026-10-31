@@ -40,10 +40,14 @@ def _isolated_restart_state(tmp_path, monkeypatch):
 
 
 class _CP:
-    def __init__(self) -> None:
+    def __init__(self, order: list[str] | None = None) -> None:
         self.events: list[dict] = []
         self.results: list[dict] = []
         self.closed = False
+        self.order = order if order is not None else []
+
+    def interrupt_claim(self) -> None:
+        self.order.append("interrupt_claim")
 
     def send_event(self, payload, *, wait=False):
         self.events.append(payload)
@@ -116,6 +120,35 @@ def test_run_ops_on_mismatch_requests_a_restart_and_sends_no_terminal(monkeypatc
     assert cp.results == [], "a non-terminal sentinel must never produce a result frame"
     assert not [e for e in cp.events if e.get("status") == "error"], (
         "a generation flip is not the chain's own failure")
+
+
+def test_a_pack_flip_wakes_the_blocked_claim_after_latching(monkeypatch):
+    order: list[str] = []
+
+    class _RecordingCoordinator(agent_main.RestartCoordinator):
+        def request_restart(self, reason, *, target_pack=""):
+            order.append("request_restart")
+            super().request_restart(reason, target_pack=target_pack)
+
+    monkeypatch.setattr(runner, "run_chain", lambda *_a, **_kw: runner.RESTART_REQUIRED)
+    cp = _CP(order)
+
+    agent_main._run_ops(_chain(_PACK_NEW), cp, corr_id="c", session_id="s",
+                        coordinator=_RecordingCoordinator())
+
+    assert order == ["request_restart", "interrupt_claim"], "latch first, then wake the claim"
+    assert cp.results == []
+
+
+def test_a_matched_chain_never_wakes_the_claim(monkeypatch):
+    monkeypatch.setattr(runner, "run_chain", lambda *_a, **_kw: {"a": {"dst": "/x"}})
+    order: list[str] = []
+    cp = _CP(order)
+
+    agent_main._run_ops(_chain(_PACK_OLD), cp, corr_id="c", session_id="s",
+                        coordinator=agent_main.RestartCoordinator())
+
+    assert order == []
 
 
 def test_run_ops_on_mismatch_with_no_coordinator_fails_loudly(monkeypatch):

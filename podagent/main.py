@@ -980,6 +980,9 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str,
             if coordinator is None:
                 raise RuntimeError(f"pack generation change with no restart coordinator to tell: {reason}")
             coordinator.request_restart(reason, target_pack=chain.pack.sha256)
+            # Latch first, THEN wake the claim the dispatch loop is blocked in (same order as the infra
+            # reporter) — otherwise the restart waits out the whole claim wall.
+            cp.interrupt_claim()
             _log(f"restart requested: {reason}")
         return
     except BaseException as e:
