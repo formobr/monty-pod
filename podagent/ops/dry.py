@@ -163,6 +163,25 @@ def _has_audio_stream(path: Path) -> bool:
     return bool(proc.stdout.strip())
 
 
+def _video_frame_rate(path: Path) -> str | None:
+    """The first video stream's `r_frame_rate` as ffprobe's exact rational ("30000/1001"), or None when the
+    file has no video stream or the rate is unreadable / not a positive rational."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+             "-of", "csv=p=0", str(path)],
+            check=True, capture_output=True, text=True, timeout=_LAVFI_BUDGET_S)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    text = proc.stdout.strip().splitlines()[0].strip().rstrip(",") if proc.stdout.strip() else ""
+    num, sep, den = text.partition("/")
+    try:
+        n, d = int(num), int(den) if sep else 1
+    except ValueError:
+        return None
+    return f"{n}/{d}" if n > 0 and d > 0 else None
+
+
 # Only a VIDEO-kind bound input is a candidate — the one file whose real audio a placeholder must reflect.
 def _content_input(op: registry.Op, inputs: dict[str, Path]) -> Path | None:
     for port in op.inputs:
@@ -183,12 +202,15 @@ def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None, dur:
     if dst.suffix.lower() not in _VIDEO_EXT_ARGS:
         raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "video")
     secs = f"{dur:.6f}" if dur is not None else "1"
-    # At r=1 a colour source's last frame carries a full 1s duration, so e.g. d=5.656 rounds the
-    # container's reported length UP to 6.0 regardless of a trailing -t — a dry replay would then probe
-    # a length the live run never recorded. r=30 keeps that rounding under one 1/30s frame (the tolerance
-    # every caller of a `dur`-pinned placeholder checks against); d=None (no cut length to pin) keeps the
-    # pre-existing r=1:d=1 one-second placeholder untouched.
-    rate = 30 if dur is not None else 1
+    # The placeholder keeps the frame rate of the bound real video input (exact rational, e.g. 30000/1001):
+    # the engine frame-snaps every b-roll start to the cut's fps, so a literal 30 or 25 here moves a beat by
+    # a frame and a dry replay realizes different placements than the live run. Without a readable source
+    # rate the fallback is r=30 when `dur` is pinned — at r=1 a colour source's last frame carries a full 1s,
+    # so d=5.656 would round the container's length UP to 6.0 regardless of a trailing -t; 30 keeps that
+    # rounding under one 1/30s frame (the tolerance callers of a `dur`-pinned placeholder check against) —
+    # and r=1:d=1 when `dur` is None (no cut length to pin).
+    source_rate = _video_frame_rate(audio_src) if audio_src is not None else None
+    rate = source_rate or (30 if dur is not None else 1)
     if audio_src is None:
         # No video-kind input bound at all — nothing real to reflect, stays fully synthetic.
         args = _VIDEO_EXT_ARGS[dst.suffix.lower()]
@@ -206,7 +228,7 @@ def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None, dur:
         # `-shortest` against an infinite colour source sizes the output to the real audio's own duration.
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-i", str(audio_src),
-               "-f", "lavfi", "-i", "color=c=black:s=64x64",
+               "-f", "lavfi", "-i", "color=c=black:s=64x64" + (f":r={source_rate}" if source_rate else ""),
                "-map", "1:v", "-map", "0:a",
                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                "-c:a", "copy", "-shortest", str(dst)]
