@@ -103,6 +103,17 @@ echoes `keep_ids`; the caller scatters them back (or re-indexes its targets) and
 unchanged — the values at the columns it reads are the same floats. Absent → full vocab width, exactly as
 before. `keep_ids` is a sorted, de-duplicated **set**: an alphabet, never text.
 
+**Targets mode (`align.targets` + `align.blank`).** Owner decision 2026-11-01: the heavy step lives on the
+pod, so an ordered id sequence (the transcript as vocab ids) crosses. Mutually exclusive with `keep_ids`;
+`blank` is required. The pod runs the same per-window forward + log_softmax (full vocab), concatenates the
+windows along frames, and on CPU/float32 calls `torchaudio.functional.forced_align` then `merge_tokens` —
+the same call the box made. If `len(targets) + (count of equal adjacent targets) > frames` no DP runs. The
+PUT is **JSON** (`application/json`, `align_spans.schema.json`), never an npz:
+`{"model", "sr": 16000, "frame_stride_s": 0.02, "frames": <int>, "vocab_sha256": <sha256 of json.dumps(vocab)>,
+"overflow": <bool>, "spans": [[start_frame, end_frame, score], ...] | null}` — one span per target index in
+order (end exclusive; score = mean log-prob), `null` on overflow. Frames, not words: grouping and seconds
+stay on the planner. Absent `targets` → the npz above, unchanged.
+
 ## clip_rank payload (JSON, `clip_rank.schema.json`)
 
 `groups[i]` answers `clip_rank.groups[i]` of the request, and within a group `scores[j]`/`embeds[j]`

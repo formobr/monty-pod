@@ -1,5 +1,5 @@
 """align inference: pure wav2vec2 forward over requested windows → log-softmax emission
-matrices, packed as one .npz and PUT to the request's presigned URL. Nothing is aligned here —
+matrices, packed as one .npz and PUT to the request's (targets mode: forced-alignment frame spans as JSON, see align_spans) presigned URL. Nothing is aligned here —
 the emissions are the whole product of this call."""
 from __future__ import annotations
 
@@ -26,6 +26,40 @@ def pack_npz(arrays: dict[str, Any], meta: dict[str, Any]) -> bytes:
     buf = io.BytesIO()
     np.savez(buf, **arrays, meta_json=np.frombuffer(json.dumps(meta).encode(), dtype="uint8"))
     return buf.getvalue()
+
+
+def align_spans(emis, targets: list[int], blank: int):
+    """CTC forced alignment of `targets` against `emis` ([frames, vocab] float32 CPU log-softmax) — the exact
+    call the control-plane box's aligner made before this moved to the pod. Returns (overflow, spans); spans is one
+    [start_frame, end_frame, score] per target index (end exclusive), or None on overflow."""
+    import torch
+    import torchaudio.functional as AF
+
+    frames = int(emis.shape[0])
+    repeats = sum(1 for a, b in zip(targets, targets[1:]) if a == b)
+    if len(targets) + repeats > frames:        # CTC capacity: the audio cannot carry the transcript → no DP
+        return True, None
+    al, sc = AF.forced_align(emis[None], torch.tensor([targets], dtype=torch.int32), blank=blank)
+    merged = AF.merge_tokens(al[0], sc[0], blank=blank)
+    if len(merged) != len(targets):
+        raise RuntimeError(f"forced_align merged {len(merged)} spans for {len(targets)} targets")
+    return False, [[int(s.start), int(s.end), float(s.score)] for s in merged]
+
+
+def pack_spans_json(model_id: str, vocab: list[str], emis, targets: list[int], blank: int) -> bytes:
+    import hashlib
+
+    overflow, spans = align_spans(emis, targets, blank)
+    doc = {
+        "model": model_id,
+        "sr": _SR,
+        "frame_stride_s": 0.02,
+        "frames": int(emis.shape[0]),
+        "vocab_sha256": hashlib.sha256(json.dumps(vocab).encode()).hexdigest(),
+        "overflow": overflow,
+        "spans": spans,
+    }
+    return json.dumps(doc).encode()
 
 
 class AlignService:
@@ -82,6 +116,21 @@ class AlignService:
                 wave = wave.mean(0, keepdim=True)
             if sr != _SR:
                 wave = torchaudio.functional.resample(wave, sr, _SR)
+
+            if params.targets is not None:
+                with self.torch.inference_mode():
+                    # full vocab width, no projection; float32 on CPU is the exact input the box's call took
+                    emis = self.torch.cat(
+                        [self._emit(wave[:, int(w[0] * _SR): int(w[1] * _SR)]).float().cpu()
+                         for w in params.windows], dim=0)
+                    payload = pack_spans_json(self.model_id, self._vocab(), emis, params.targets, params.blank)
+                out = Path(td) / "align_spans.json"
+                out.write_bytes(payload)
+                infer_s = time.monotonic() - t0
+                say(f"align {len(params.windows)} window(s) → {len(params.targets)} target span(s) "
+                    f"in {infer_s:.0f}s")
+                upload(out, put_url, "application/json")
+                return infer_s
 
             keep = params.keep_ids
             # index on DEVICE: slicing after .cpu() would still materialise the full-vocab matrix we are here
