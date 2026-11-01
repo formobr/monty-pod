@@ -11,9 +11,11 @@ import os
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from . import pack, registry
 
@@ -174,12 +176,80 @@ def _video_frame_rate(path: Path) -> str | None:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return None
     text = proc.stdout.strip().splitlines()[0].strip().rstrip(",") if proc.stdout.strip() else ""
-    num, sep, den = text.partition("/")
+    return _positive_rational(text)
+
+
+def _positive_rational(text: str) -> str | None:
+    """ffprobe's "30000/1001" (or a bare "25") as the exact "n/d" string, None when not a positive rational."""
+    num, sep, den = text.strip().partition("/")
     try:
         n, d = int(num), int(den) if sep else 1
     except ValueError:
         return None
     return f"{n}/{d}" if n > 0 and d > 0 else None
+
+
+class DryStubUnreadableShape(RuntimeError):
+    """A probed field of a video placeholder (width, height, SAR, rotation, rate) has no readable value —
+    the op is refused by name, never given a default (the placeholder would diverge from its live record)."""
+
+    def __init__(self, op_name: str, field: str, *, why: str) -> None:
+        self.op_name, self.field = op_name, field
+        super().__init__(
+            f"contour-dry: {op_name!r} stub cannot resolve video field {field!r} ({why}) per "
+            f"podagent/ops/dry.py::_VIDEO_SHAPE — never defaulted")
+
+
+class _Probed(NamedTuple):
+    """What the engine's media_clock reads off a rendered video: stored dims, SAR, rotation, exact rate."""
+    width: int
+    height: int
+    sar: Fraction
+    rotation: int
+    rate: str
+
+    @property
+    def display(self) -> tuple[int, int]:
+        """The decoded (displayed) w/h: stored dims swapped for a 90/270 display matrix (media_clock's rule)."""
+        return (self.height, self.width) if abs(self.rotation) % 180 == 90 else (self.width, self.height)
+
+
+def _probe_video(path: Path, *, op_name: str) -> _Probed | None:
+    """The first video stream's probed fields, None when the file has NO video stream at all (audio-only);
+    a video stream with an unreadable field is a named refusal."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height,sample_aspect_ratio,r_frame_rate:stream_tags=rotate:stream_side_data=rotation",
+             "-of", "json", str(path)],
+            check=True, capture_output=True, text=True, timeout=_LAVFI_BUDGET_S)
+        streams = json.loads(proc.stdout or "{}").get("streams") or []
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        raise DryStubUnreadableShape(op_name, "probe", why=f"ffprobe failed on {path.name}: {exc}") from exc
+    if not streams:
+        return None
+    st = streams[0]
+    w, h = st.get("width"), st.get("height")
+    if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
+        raise DryStubUnreadableShape(op_name, "width/height", why=f"unreadable dims on {path.name}")
+    rate = _positive_rational(str(st.get("r_frame_rate") or ""))
+    if rate is None:
+        raise DryStubUnreadableShape(op_name, "r_frame_rate", why=f"unreadable rate on {path.name}")
+    sn, _, sd = str(st.get("sample_aspect_ratio") or "").partition(":")
+    sar = Fraction(1)   # an absent / 0:1 SAR decodes as square pixels
+    if sn.isdigit() and sd.isdigit() and int(sn) > 0 and int(sd) > 0:
+        sar = Fraction(int(sn), int(sd))
+    rot_raw: Any = None
+    for sd_item in st.get("side_data_list") or []:
+        if isinstance(sd_item, dict) and "rotation" in sd_item:
+            rot_raw = sd_item["rotation"]
+    if rot_raw is None:
+        rot_raw = (st.get("tags") or {}).get("rotate", 0)
+    try:
+        rotation = int(round(float(rot_raw)))
+    except (TypeError, ValueError) as exc:
+        raise DryStubUnreadableShape(op_name, "rotation", why=f"unreadable rotation on {path.name}") from exc
+    return _Probed(w, h, sar, rotation, rate)
 
 
 # Only a VIDEO-kind bound input is a candidate — the one file whose real audio a placeholder must reflect.
@@ -196,39 +266,216 @@ def _content_input(op: registry.Op, inputs: dict[str, Path]) -> Path | None:
     return None
 
 
-def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None, dur: float | None = None) -> None:
+@dataclass(frozen=True)
+class Shape:
+    """Where each probed field of a STUB video op's LIVE output comes from (the engine's media_clock Clock
+    probes duration, fps, width, height, rotation of every rendered video and plans on them). Tokens:
+      source          the bound video input's own probed value (display w/h, SAR, r_frame_rate)
+      param:NAME      the op param that sets it (required)
+      param?:NAME     the param when present, else the source's value (rate only)
+      cap:NAME        height only: min(source height, param NAME), never upscaling; absent param = source
+      scale:NAME      height only: param NAME, or min(source, NAME) when params["height_mode"] == "at_most"
+      follow_height   width only: source aspect at the resolved height, nearest even (scale=-2:H)
+      square          sar only: 1:1 (the live op squares the pixels)
+      baked           rotation only: the live op decodes upright (autorotate), so the output carries no
+                      display matrix and its decoded w/h are the source's displayed w/h
+      fallback        nothing in params/inputs carries it: the synthetic 64 (w/h) / the legacy rate rule
+    The duration is `_VIDEO_DUR`'s rule. `source_port` names the bound video input to read when it is not
+    the first one."""
+    width: str
+    height: str
+    sar: str
+    rotation: str
+    rate: str
+    source_port: str | None = None
+
+
+_ALL_SOURCE = Shape("source", "source", "source", "baked", "source")
+
+# One row per STUB op whose output is a video; a row's comment cites the live op contract it mirrors
+# (contracts/ops/<op>.json — the handler code itself lives in the external ops pack). An op missing here is
+# refused at resolve() (`_check_video_shape`).
+_VIDEO_SHAPE: dict[str, Shape] = {
+    # cut.apply: per-segment `fps=fps_grid` of the source's own rate; `scale=-2:max_h` caps height, aspect
+    # (so SAR) kept, never upscaling; max_h absent = native. rate is the source's: fps_grid is by contract
+    # "the source video frame rate the keep boundaries were snapped to", so the two are the same number.
+    # SAR stays the source's (ffmpeg's -2 rounding nudges it by <0.5%; cutgrid.cut_scale_vf, which could
+    # square it, is in the external ops pack and was not readable here).
+    "cut.apply": Shape("follow_height", "cap:max_h", "source", "baked", "source"),
+    # camera.apply: crop trajectory rendered to out_w x out_h; "camera.apply never emits an fps filter".
+    "camera.apply": Shape("param:out_w", "param:out_h", "source", "baked", "source"),
+    # edit.splice: trim+concat re-encode of the baked video — geometry and clock untouched.
+    "edit.splice": _ALL_SOURCE,
+    # edit.weld: the cold-open is welded onto the FRONT of the finished `main` master; the output is the
+    # master's picture.
+    "edit.weld": Shape("source", "source", "source", "baked", "source", source_port="main"),
+    # media.cut_proxy: "max_h ... aspect kept, never upscaling" (cut_scale_vf, the same string cut.apply caps
+    # with); "timing passthrough".
+    "media.cut_proxy": Shape("follow_height", "cap:max_h", "source", "baked", "source"),
+    # media.fetch: a bare origin GET with no bound input; nothing declares its geometry or rate.
+    "media.fetch": Shape("fallback", "fallback", "square", "baked", "fallback"),
+    # media.normalize: width/height are the TRUE displayed dims (rotation baked), pixels squared, CFR `fps`.
+    "media.normalize": Shape("param:width", "param:height", "square", "baked", "param:fps"),
+    # media.scale: height exact (or at_most), width follows the source aspect (-2), `fps` resamples when given.
+    "media.scale": Shape("follow_height", "scale:height", "source", "baked", "param?:fps"),
+    # mograph.render: renders at `fps`; the canvas size comes from the bundled composition, not a param.
+    "mograph.render": Shape("fallback", "fallback", "square", "baked", "param:fps"),
+    # motion.kenburns: a 9:16 clip from a still; neither pixel size nor rate is a param.
+    "motion.kenburns": Shape("fallback", "fallback", "square", "baked", "fallback"),
+    # opener.build: the clip is w x h at `fps` (a rational string).
+    "opener.build": Shape("param:w", "param:h", "square", "baked", "param:fps"),
+}
+
+_TOKEN_KINDS: dict[str, frozenset[str]] = {
+    "width": frozenset({"source", "param", "follow_height", "fallback"}),
+    "height": frozenset({"source", "param", "cap", "scale", "fallback"}),
+    "sar": frozenset({"source", "square"}),
+    "rotation": frozenset({"baked"}),
+    "rate": frozenset({"source", "param", "param?", "fallback"}),
+}
+for _op, _shape in _VIDEO_SHAPE.items():
+    for _field, _kinds in _TOKEN_KINDS.items():
+        if getattr(_shape, _field).partition(":")[0] not in _kinds:
+            raise registry.OpError(f"podagent/ops/dry.py::_VIDEO_SHAPE[{_op!r}].{_field} = "
+                                   f"{getattr(_shape, _field)!r} is not one of {sorted(_kinds)}")
+
+
+class VideoFields(NamedTuple):
+    """The resolved probed fields a placeholder is built with (rate None = the legacy rate rule)."""
+    width: int
+    height: int
+    sar: Fraction
+    rotation: int
+    rate: str | None
+
+
+def _needs_source(shape: Shape) -> bool:
+    return any(getattr(shape, f).partition(":")[0] in ("source", "cap", "scale", "follow_height", "param?")
+               for f in ("width", "height", "sar", "rate"))
+
+
+def _rational_param(op_name: str, name: str, value: Any) -> str:
+    try:
+        frac = Fraction(value) if isinstance(value, str) else Fraction(str(value)).limit_denominator(1001)
+    except (ValueError, ZeroDivisionError) as exc:
+        raise DryStubUnreadableShape(op_name, "rate", why=f"param {name!r}={value!r} is not a rate") from exc
+    if frac <= 0:
+        raise DryStubUnreadableShape(op_name, "rate", why=f"param {name!r}={value!r} is not positive")
+    return f"{frac.numerator}/{frac.denominator}"
+
+
+def resolve_video_fields(op_name: str, shape: Shape, params: dict[str, Any],
+                         probed: _Probed | None) -> VideoFields | None:
+    """The row's tokens resolved against the params and the probed source; None = a source-derived field with
+    no video source bound (the synthetic 64x64 fallback). An unreadable field raises, never defaults."""
+    if probed is None and _needs_source(shape):
+        return None
+    if probed is None and any(
+            getattr(shape, f).partition(":")[0] == "param" and params.get(getattr(shape, f).partition(":")[2]) is None
+            for f in ("width", "height", "rate")):
+        # No video source is bound AND a param-set field was not sent: nothing real to mirror, so the whole
+        # placeholder stays synthetic (with a bound source the same absence is a named refusal below).
+        return None
+
+    def param(name: str, field: str) -> Any:
+        if params.get(name) is None:
+            raise DryStubUnreadableShape(op_name, field, why=f"param {name!r} is absent")
+        return params[name]
+
+    disp_w, disp_h = probed.display if probed is not None else (0, 0)
+    kind, _, arg = shape.height.partition(":")
+    if kind == "cap":
+        height = min(disp_h, int(params[arg])) if params.get(arg) is not None else disp_h
+    elif kind == "scale":
+        height = int(param(arg, "height"))
+        if params.get("height_mode") == "at_most":
+            height = min(height, disp_h)
+    elif kind == "param":
+        height = int(param(arg, "height"))
+    elif kind == "source":
+        height = disp_h
+    else:
+        height = 64
+    wkind, _, warg = shape.width.partition(":")
+    if wkind == "follow_height":
+        # scale=-2:H rounds the width to the nearest even, halves UP (av_rescale), not Python's banker's round.
+        width = disp_w if height == disp_h else 2 * ((disp_w * height + disp_h) // (2 * disp_h))
+    elif wkind == "param":
+        width = int(param(warg, "width"))
+    elif wkind == "source":
+        width = disp_w
+    else:
+        width = 64
+    # A baked 90/270 rotation is a transpose, which inverts the pixel aspect (out SAR = 1/in SAR).
+    sar = Fraction(1)
+    if shape.sar == "source" and probed is not None:
+        sar = 1 / probed.sar if abs(probed.rotation) % 180 == 90 else probed.sar
+    rkind, _, rarg = shape.rate.partition(":")
+    rate: str | None
+    if rkind == "source":
+        rate = probed.rate if probed is not None else None
+    elif rkind == "param":
+        rate = _rational_param(op_name, rarg, param(rarg, "rate"))
+    elif rkind == "param?":
+        rate = _rational_param(op_name, rarg, params[rarg]) if params.get(rarg) is not None else (
+            probed.rate if probed is not None else None)
+    else:
+        rate = None
+    return VideoFields(width, height, sar, 0, rate)
+
+
+def _check_video_shape(op: registry.Op) -> None:
+    """A STUB op that writes a video must say, in `_VIDEO_SHAPE`, where each probed field comes from."""
+    if op.op in _VIDEO_SHAPE or op.op in _OP_SYNTH:
+        return
+    if any(p.kind == "video" for p in op.outputs):
+        raise registry.OpError(
+            f"contour-dry: {op.op!r} is a STUB that writes a video but has no shape row — add one to "
+            f"podagent/ops/dry.py::_VIDEO_SHAPE (where its width, height, SAR, rotation and frame rate come "
+            f"from) before it can run under {ARM_ENV}")
+
+
+def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None, dur: float | None = None,
+                 params: dict[str, Any] | None = None, shape_src: Path | None = None) -> None:
     # `dur` (a cut's own reported length) pins the placeholder's length; None keeps each branch's own length.
+    # `audio_src` supplies the real audio; the probed fields come from `shape_src` (default: `audio_src`).
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.suffix.lower() not in _VIDEO_EXT_ARGS:
         raise DryStubUnsupportedOutput(op_name, dst.suffix.lower(), "video")
     secs = f"{dur:.6f}" if dur is not None else "1"
-    # The placeholder keeps the frame rate of the bound real video input (exact rational, e.g. 30000/1001):
-    # the engine frame-snaps every b-roll start to the cut's fps, so a literal 30 or 25 here moves a beat by
-    # a frame and a dry replay realizes different placements than the live run. Without a readable source
-    # rate the fallback is r=30 when `dur` is pinned — at r=1 a colour source's last frame carries a full 1s,
-    # so d=5.656 would round the container's length UP to 6.0 regardless of a trailing -t; 30 keeps that
-    # rounding under one 1/30s frame (the tolerance callers of a `dur`-pinned placeholder check against) —
-    # and r=1:d=1 when `dur` is None (no cut length to pin).
-    source_rate = _video_frame_rate(audio_src) if audio_src is not None else None
+    # EVERY probed field mirrors the live op's output (`_VIDEO_SHAPE`): the engine plans on the rendered
+    # video's clock (duration, fps, width, height, rotation), so a literal 30 fps or 64x64 here moves a beat
+    # or a crop and a dry replay realizes different placements than the live run. Without a video source
+    # the fallback is 64x64, and r=30 when `dur` is pinned — at r=1 a colour source's last frame carries a
+    # full 1s, so d=5.656 would round the container's length UP to 6.0 regardless of a trailing -t; 30 keeps
+    # that rounding under one 1/30s frame (the tolerance callers of a `dur`-pinned placeholder check
+    # against) — and r=1:d=1 when `dur` is None (no cut length to pin).
+    shape = _VIDEO_SHAPE.get(op_name, _ALL_SOURCE)   # a missing row was refused at resolve()
+    probe_src = shape_src if shape_src is not None else audio_src
+    probed = _probe_video(probe_src, op_name=op_name) if probe_src is not None and _needs_source(shape) else None
+    fields = resolve_video_fields(op_name, shape, params or {}, probed)
+    size = f"{fields.width}x{fields.height}" if fields is not None else "64x64"
+    sar = f",setsar={fields.sar.numerator}/{fields.sar.denominator}" if fields is not None else ""
+    source_rate = fields.rate if fields is not None else None
     rate = source_rate or (30 if dur is not None else 1)
     if audio_src is None:
-        # No video-kind input bound at all — nothing real to reflect, stays fully synthetic.
+        # No video-kind input bound at all — nothing real to reflect, stays synthetic (params-set fields aside).
         args = _VIDEO_EXT_ARGS[dst.suffix.lower()]
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}:d={secs}",
+               "-f", "lavfi", "-i", f"color=c=black:s={size}:r={rate}:d={secs}{sar}",
                "-f", "lavfi", "-i", dry_tone_lavfi(dur=float(secs)), "-t", secs, *args, str(dst)]
     elif _has_audio_stream(audio_src) and dur is not None:
         # The real audio trimmed (or silence-padded) to the cut's length, so audio and video both end there.
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-i", str(audio_src),
-               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}",
+               "-f", "lavfi", "-i", f"color=c=black:s={size}:r={rate}{sar}",
                "-map", "1:v", "-map", "0:a", "-af", "apad",
                *_VIDEO_EXT_ARGS[dst.suffix.lower()], "-t", secs, str(dst)]
     elif _has_audio_stream(audio_src):
         # `-shortest` against an infinite colour source sizes the output to the real audio's own duration.
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-i", str(audio_src),
-               "-f", "lavfi", "-i", "color=c=black:s=64x64" + (f":r={source_rate}" if source_rate else ""),
+               "-f", "lavfi", "-i", f"color=c=black:s={size}" + (f":r={source_rate}" if source_rate else "") + sar,
                "-map", "1:v", "-map", "0:a",
                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                "-c:a", "copy", "-shortest", str(dst)]
@@ -237,7 +484,7 @@ def _write_video(dst: Path, *, op_name: str, audio_src: Path | None = None, dur:
         # `-t` must also cap THIS branch (the previous fix missed it): without it the lavfi colour
         # source's own `d=` is the only cap, which at r=1 rounds up (see `rate` above).
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", f"color=c=black:s=64x64:r={rate}:d={secs}",
+               "-f", "lavfi", "-i", f"color=c=black:s={size}:r={rate}:d={secs}{sar}",
                "-t", secs,
                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=_LAVFI_BUDGET_S)
@@ -404,7 +651,14 @@ def _fill_one(dst: Path, kind: str, *, op_name: str, params: dict[str, Any], inp
     resolved = _resolve_media_class(kind, dst.suffix.lower())
     if resolved == "video":
         dur_of = _VIDEO_DUR.get(op_name)
-        _write_video(dst, op_name=op_name, audio_src=audio_src,
+        shape_src = audio_src
+        port = _VIDEO_SHAPE.get(op_name, _ALL_SOURCE).source_port
+        if port is not None and audio_src is not None:
+            raw = inputs.get(port)
+            if raw is None or not Path(raw).exists():
+                raise DryStubUnreadableShape(op_name, "source", why=f"input {port!r} is not bound")
+            shape_src = Path(raw)
+        _write_video(dst, op_name=op_name, audio_src=audio_src, params=params, shape_src=shape_src,
                      dur=dur_of(params) if dur_of is not None else None)
         return
     if resolved == "image" and (image_synth := _IMAGE_SYNTH.get(op_name)) is not None:
@@ -554,6 +808,7 @@ def resolve(op: registry.Op) -> Callable[..., None]:
     if mode == REAL:
         # `runner.py` activates the ops pack before it ever picks this seam, dry or not — safe to call.
         return pack.resolve(op.handler)
+    _check_video_shape(op)
     return _handler(op)
 
 
