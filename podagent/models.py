@@ -510,20 +510,15 @@ class AlignParams(BaseModel):
     windows: list[SpanT] = Field(min_length=1)
     # Emission COLUMNS to ship back; a sorted id SET is an alphabet, never text (no word/order/count crosses).
     keep_ids: list[int] | None = Field(default=None, min_length=1)
-    # Targets mode (owner 2026-11-01): the ORDERED CTC target ids (the transcript as vocab ids) cross to the pod and
-    # the pod returns the forced alignment as frame spans. Exclusive with keep_ids; `blank` is required with it.
-    targets: list[Annotated[int, Field(ge=0)]] | None = Field(default=None, min_length=1)
-    blank: int | None = Field(default=None, ge=0)
+    # Words mode (owner 2026-11-01): the align words, in order, cross to the pod; the pod maps them to its own
+    # checkpoint's vocab ids and returns per-word frame spans. Exclusive with keep_ids.
+    words: list[Annotated[str, Field(min_length=1)]] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _windows_ok(self) -> "AlignParams":
         _spans_ok(self.windows, "windows")
-        if self.targets is not None and self.keep_ids is not None:
-            raise ValueError("targets and keep_ids are mutually exclusive")
-        if self.targets is not None and self.blank is None:
-            raise ValueError("blank is required with targets")
-        if self.targets is None and self.blank is not None:
-            raise ValueError("blank is only meaningful with targets")
+        if self.words is not None and self.keep_ids is not None:
+            raise ValueError("words and keep_ids are mutually exclusive")
         if self.keep_ids is not None:
             if any(b <= a for a, b in zip(self.keep_ids, self.keep_ids[1:])):
                 raise ValueError("keep_ids must be sorted and unique (it is a column SET, not a sequence)")

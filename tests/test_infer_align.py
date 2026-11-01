@@ -131,7 +131,7 @@ def test_run_without_keep_ids_still_ships_the_full_vocab(tmp_path, monkeypatch):
         assert "keep_ids" not in json.loads(z["meta_json"].tobytes().decode())
 
 
-# ───────────────────────── targets mode: the pod returns the alignment ─────────────────────────
+# ───────────────────────── words mode: the pod returns the alignment ─────────────────────────
 import hashlib
 from pathlib import Path
 
@@ -237,8 +237,78 @@ def test_capacity_overflow_never_runs_the_dp(monkeypatch):
     emis = _log_softmax_emis(9, 6, 32)
     # 5 targets + 2 repeats = 7 > 6 frames, though 5 <= 6: the repeat term is what overflows
     assert infer_align.align_spans(emis, [1, 1, 2, 3, 3], blank=0) == (True, None)
-    doc = json.loads(infer_align.pack_spans_json("m", ["a"], emis, [1, 1, 2, 3, 3], 0))
-    assert doc["overflow"] is True and doc["spans"] is None and doc["frames"] == 6
+    vocab = {"<pad>": 0, "a": 1, "b": 2, "c": 3}
+    doc = json.loads(infer_align.pack_spans_json("m", ["a"], vocab, 0, emis, ["aa", "b", "cc"]))
+    assert doc["overflow"] is True and doc["words"] is None and doc["frames"] == 6 and doc["chars"] == 5
+
+
+# fake checkpoint: pad is NOT id 0 (blank must come from the tokenizer, never a literal 0)
+FAKE_VOCAB = {"a": 0, "b": 1, "c": 2, "d": 3, "<pad>": 4, "e": 5, "f": 6}
+PAD = FAKE_VOCAB["<pad>"]
+
+
+def _reference_words(emis, words, vocab, blank):
+    """Pure-python box semantics (cut_v3 :786-825): char→id per word, forced alignment, first-start/last-end."""
+    targets, owner = [], []
+    for wi, w in enumerate(words):
+        for c in w:
+            if c in vocab:
+                targets.append(vocab[c])
+                owner.append(wi)
+    T = emis.shape[0]
+    if len(targets) + sum(1 for a, b in zip(targets, targets[1:]) if a == b) > T:
+        return None, len(targets)
+    spans = _reference_spans(emis, targets, blank) if targets else []
+    out = [None] * len(words)
+    for (s, e, _), wi in zip(spans, owner):
+        out[wi] = [s, e] if out[wi] is None else [out[wi][0], e]
+    return out, len(targets)
+
+
+def _fake_service(torch, per_window, vocab=FAKE_VOCAB, pad=PAD):
+    svc = AlignService.__new__(AlignService)
+    svc.torch, svc.device, svc.model_id = torch, "cpu", "m"
+    it = iter(per_window)
+    svc._emit = lambda seg: next(it)
+    ordered = [t for t, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
+    svc._vocab = lambda: ordered
+    svc.processor = types.SimpleNamespace(
+        tokenizer=types.SimpleNamespace(get_vocab=lambda: dict(vocab), pad_token_id=pad))
+    return svc
+
+
+WORD_CASES = [
+    dict(seed=31, T=120, words=["abc", "dd", "ef"]),
+    dict(seed=32, T=90, words=["ab", "zzz", "cd", "q"]),            # no-vocab-char words → null
+    dict(seed=33, T=100, words=["abb", "bcc", "cd"]),               # b|b and c|c repeat across a word boundary
+    dict(seed=34, T=60, words=["a", "a", "a", "b"]),                # one-char words, all-adjacent repeats
+    dict(seed=35, T=200, words=["a<", "ed", "fe"]),                 # '<' is no vocab char; '<pad>' never typed
+]
+
+
+@pytest.mark.parametrize("case", WORD_CASES, ids=["plain", "no-vocab-char", "boundary-repeat", "single-chars", "partial"])
+def test_pod_word_spans_equal_the_reference(case):
+    """pack_spans_json on seeded emissions must give exactly the reference's per-word spans (frames exact)."""
+    pytest.importorskip("torchaudio")
+    emis = _log_softmax_emis(case["seed"], case["T"], len(FAKE_VOCAB))
+    want, chars = _reference_words(emis, case["words"], FAKE_VOCAB, PAD)
+    doc = json.loads(infer_align.pack_spans_json("m", ["x"], FAKE_VOCAB, PAD, emis, case["words"]))
+    assert want is not None and doc["overflow"] is False
+    assert doc["words"] == want and doc["chars"] == chars and doc["frames"] == case["T"]
+    assert len(doc["words"]) == len(case["words"])
+
+
+def test_word_with_no_vocab_char_is_null_and_others_survive():
+    pytest.importorskip("torchaudio")
+    emis = _log_softmax_emis(41, 50, len(FAKE_VOCAB))
+    doc = json.loads(infer_align.pack_spans_json("m", ["x"], FAKE_VOCAB, PAD, emis, ["ab", "zz", "cd"]))
+    assert doc["words"][1] is None and doc["words"][0] and doc["words"][2]
+
+
+def test_all_words_without_vocab_chars_is_not_overflow():
+    emis = _log_softmax_emis(42, 10, len(FAKE_VOCAB))
+    doc = json.loads(infer_align.pack_spans_json("m", ["x"], FAKE_VOCAB, PAD, emis, ["zz", "yy"]))
+    assert doc["overflow"] is False and doc["chars"] == 0 and doc["words"] == [None, None]
 
 
 def _run_targets(tmp_path, monkeypatch, params_kw, windows=((0.0, 1.0), (1.0, 2.0)), vocab_w=40):
@@ -261,34 +331,49 @@ def _run_targets(tmp_path, monkeypatch, params_kw, windows=((0.0, 1.0), (1.0, 2.
     return put, vocab
 
 
-def test_run_with_targets_puts_schema_valid_json(tmp_path, monkeypatch):
-    """The targets path PUTs application/json (never an npz) valid against align_spans.schema.json, one span per
-    target, frames = the windows concatenated, vocab pinned by hash."""
+def _run_words(tmp_path, monkeypatch, words):
+    np = pytest.importorskip("numpy")
+    torch = pytest.importorskip("torch")
+    sf = pytest.importorskip("soundfile")
+    wav = tmp_path / "a.wav"
+    sf.write(str(wav), np.zeros(32000, dtype="float32"), 16000)
+    monkeypatch.setattr(infer_align, "download", lambda url, dest: wav)
+    put = {}
+    monkeypatch.setattr(infer_align, "upload",
+                        lambda src, url, ct: put.update(blob=src.read_bytes(), ct=ct))
+    n = len(FAKE_VOCAB)
+    e1, e2 = _log_softmax_emis(21, 150, n), _log_softmax_emis(22, 150, n)
+    svc = _fake_service(torch, [e1, e2])
+    svc.run(AlignParams(audio_url="u", windows=[[0.0, 1.0], [1.0, 2.0]], words=words), "https://r2/put/x")
+    return put, torch.cat([e1, e2]), svc
+
+
+def test_run_with_words_puts_schema_valid_json(tmp_path, monkeypatch):
+    """The words path PUTs application/json (never an npz) valid against align_spans.schema.json, one entry per
+    request word, frames = the windows concatenated, vocab pinned by hash, spans equal to the reference."""
     jsonschema = pytest.importorskip("jsonschema")
     pytest.importorskip("torchaudio")
-    targets = [3, 3, 8, 9, 10]
-    put, vocab = _run_targets(tmp_path, monkeypatch, dict(targets=targets, blank=0))
+    words = ["abc", "zz", "cdd", "ef"]
+    put, emis, svc = _run_words(tmp_path, monkeypatch, words)
     assert put["ct"] == "application/json"
     doc = json.loads(put["blob"])
     jsonschema.Draft202012Validator(SPANS_SCHEMA).validate(doc)
     assert doc["overflow"] is False and doc["frames"] == 300
-    assert len(doc["spans"]) == len(targets)
-    assert doc["vocab_sha256"] == hashlib.sha256(json.dumps(vocab).encode()).hexdigest()
-    ref = _reference_spans(
-        __import__("torch").cat([_log_softmax_emis(21, 150, 40), _log_softmax_emis(22, 150, 40)]), targets, 0)
-    assert [s[:2] for s in doc["spans"]] == [s[:2] for s in ref]
+    assert len(doc["words"]) == len(words) and doc["words"][1] is None
+    assert doc["vocab_sha256"] == hashlib.sha256(json.dumps(svc._vocab()).encode()).hexdigest()
+    assert doc["words"] == _reference_words(emis, words, FAKE_VOCAB, PAD)[0]
 
 
-def test_run_with_targets_overflow_json_is_schema_valid(tmp_path, monkeypatch):
+def test_run_with_words_overflow_json_is_schema_valid(tmp_path, monkeypatch):
     jsonschema = pytest.importorskip("jsonschema")
-    put, _ = _run_targets(tmp_path, monkeypatch, dict(targets=[1] * 301, blank=0))
+    put, _, _ = _run_words(tmp_path, monkeypatch, ["a" * 301])
     doc = json.loads(put["blob"])
     jsonschema.Draft202012Validator(SPANS_SCHEMA).validate(doc)
-    assert doc["overflow"] is True and doc["spans"] is None and doc["frames"] == 300
+    assert doc["overflow"] is True and doc["words"] is None and doc["frames"] == 300 and doc["chars"] == 301
 
 
-def test_run_without_targets_still_puts_the_npz(tmp_path, monkeypatch):
-    """Absent targets = today's behaviour: octet-stream npz, keep_ids projection applied."""
+def test_run_without_words_still_puts_the_npz(tmp_path, monkeypatch):
+    """Absent words = today's behaviour: octet-stream npz, keep_ids projection applied."""
     np = pytest.importorskip("numpy")
     put, _ = _run_targets(tmp_path, monkeypatch, dict(keep_ids=[2, 5, 7]))
     assert put["ct"] == "application/octet-stream"
@@ -297,12 +382,12 @@ def test_run_without_targets_still_puts_the_npz(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("kw", [
-    dict(targets=[1, 2], blank=0, keep_ids=[1, 2]),
+    dict(words=["a"], keep_ids=[1, 2]),
+    dict(words=[]),
+    dict(words=["a", ""]),
     dict(targets=[1, 2]),
-    dict(targets=[], blank=0),
-    dict(targets=[1, -2], blank=0),
-    dict(targets=[1, 2], blank=-1),
-], ids=["with-keep-ids", "no-blank", "empty", "negative-id", "negative-blank"])
-def test_align_params_refuses_bad_targets(kw):
+    dict(blank=0),
+], ids=["with-keep-ids", "empty-list", "empty-word", "targets-removed", "blank-removed"])
+def test_align_params_refuses_bad_words(kw):
     with pytest.raises(ValidationError):
         AlignParams(audio_url="u", windows=[[0.0, 1.0]], **kw)

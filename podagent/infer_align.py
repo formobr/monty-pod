@@ -1,5 +1,5 @@
 """align inference: pure wav2vec2 forward over requested windows → log-softmax emission
-matrices, packed as one .npz and PUT to the request's (targets mode: forced-alignment frame spans as JSON, see align_spans) presigned URL. Nothing is aligned here —
+matrices, packed as one .npz and PUT to the request's (words mode: per-word frame spans as JSON, see align_spans) presigned URL. Nothing is aligned here —
 the emissions are the whole product of this call."""
 from __future__ import annotations
 
@@ -46,18 +46,38 @@ def align_spans(emis, targets: list[int], blank: int):
     return False, [[int(s.start), int(s.end), float(s.score)] for s in merged]
 
 
-def pack_spans_json(model_id: str, vocab: list[str], emis, targets: list[int], blank: int) -> bytes:
+def word_targets(words: list[str], vocab: dict[str, int]) -> tuple[list[int], list[tuple[int, int]]]:
+    """The box's char→id mapping (cut_v3 :786-797): per word, the ids of its chars present in `vocab`; a word with
+    none contributes nothing. Returns (targets, per-word (first, last+1) target index range; empty range = none)."""
+    targets: list[int] = []
+    ranges: list[tuple[int, int]] = []
+    for w in words:
+        a = len(targets)
+        targets.extend(vocab[c] for c in w if c in vocab)
+        ranges.append((a, len(targets)))
+    return targets, ranges
+
+
+def pack_spans_json(model_id: str, vocab_list: list[str], vocab: dict[str, int], blank: int, emis,
+                    words: list[str]) -> bytes:
     import hashlib
 
-    overflow, spans = align_spans(emis, targets, blank)
+    targets, ranges = word_targets(words, vocab)
+    if not targets:
+        overflow, spans = False, []
+    else:
+        overflow, spans = align_spans(emis, targets, blank)
+    out_words = None if overflow else [
+        [spans[a][0], spans[b - 1][1]] if b > a else None for a, b in ranges]
     doc = {
         "model": model_id,
         "sr": _SR,
         "frame_stride_s": 0.02,
         "frames": int(emis.shape[0]),
-        "vocab_sha256": hashlib.sha256(json.dumps(vocab).encode()).hexdigest(),
+        "vocab_sha256": hashlib.sha256(json.dumps(vocab_list).encode()).hexdigest(),
         "overflow": overflow,
-        "spans": spans,
+        "chars": len(targets),
+        "words": out_words,
     }
     return json.dumps(doc).encode()
 
@@ -117,17 +137,19 @@ class AlignService:
             if sr != _SR:
                 wave = torchaudio.functional.resample(wave, sr, _SR)
 
-            if params.targets is not None:
+            if params.words is not None:
                 with self.torch.inference_mode():
                     # full vocab width, no projection; float32 on CPU is the exact input the box's call took
                     emis = self.torch.cat(
                         [self._emit(wave[:, int(w[0] * _SR): int(w[1] * _SR)]).float().cpu()
                          for w in params.windows], dim=0)
-                    payload = pack_spans_json(self.model_id, self._vocab(), emis, params.targets, params.blank)
+                    tok = self.processor.tokenizer   # vocab and blank are the checkpoint's own, never the request's
+                    payload = pack_spans_json(self.model_id, self._vocab(), tok.get_vocab(),
+                                              int(tok.pad_token_id), emis, params.words)
                 out = Path(td) / "align_spans.json"
                 out.write_bytes(payload)
                 infer_s = time.monotonic() - t0
-                say(f"align {len(params.windows)} window(s) → {len(params.targets)} target span(s) "
+                say(f"align {len(params.windows)} window(s) → {len(params.words)} word(s) "
                     f"in {infer_s:.0f}s")
                 upload(out, put_url, "application/json")
                 return infer_s

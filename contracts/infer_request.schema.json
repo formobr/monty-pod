@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/infer_request.schema.json",
   "title": "InferRequest — planner→pod inference task (CP-mediated; the pod polls, nothing dials in)",
-  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.targets (owner decision 2026-11-01): then an ordered id sequence (the transcript as vocab ids) crosses, the pod runs the CTC forced alignment itself and PUTs frame spans as JSON (align_spans.schema.json) instead — words, grouping and seconds still stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction.",
+  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.words (owner decision 2026-11-01): then the align words cross, the pod runs the CTC forced alignment itself and PUTs per-word frame spans as JSON (align_spans.schema.json) instead — still no decision crosses, and seconds stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction.",
   "type": "object",
   "additionalProperties": false,
   "required": ["infer_version", "job_id", "kind", "model", "put_url"],
@@ -41,16 +41,14 @@
           "uniqueItems": true,
           "items": { "type": "integer", "minimum": 0 }
         },
-        "targets": {
-          "description": "OPTIONAL targets mode: the ORDERED CTC target ids (the transcript as vocab ids). Present → the pod runs the same forward, concatenates the windows along frames and runs the CTC forced alignment itself (CPU, float32), PUTting frame spans as JSON (align_spans.schema.json) instead of an npz. Mutually exclusive with keep_ids; requires blank. An ordered id sequence crosses here by owner decision 2026-11-01; words, grouping and seconds stay on the planner.",
+        "words": {
+          "description": "OPTIONAL words mode: the align words, in order. Present → the pod maps each word's characters to its own checkpoint's vocab ids (blank = the tokenizer's pad id; the vocab never leaves the pod), runs the same forward, concatenates the windows along frames and runs the CTC forced alignment itself (CPU, float32), PUTting per-word frame spans as JSON (align_spans.schema.json) instead of an npz. Mutually exclusive with keep_ids. The words cross here by owner decision 2026-11-01; no decision does.",
           "type": "array",
           "minItems": 1,
-          "items": { "type": "integer", "minimum": 0 }
-        },
-        "blank": { "description": "CTC blank id; required with targets, meaningless without.", "type": "integer", "minimum": 0 }
+          "items": { "type": "string", "minLength": 1 }
+        }
       },
-      "dependentRequired": { "targets": ["blank"], "blank": ["targets"] },
-      "not": { "required": ["targets", "keep_ids"] }
+      "not": { "required": ["words", "keep_ids"] }
     },
     "face_probe": {
       "type": "object",
