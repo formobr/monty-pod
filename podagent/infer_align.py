@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import io
 import json
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -16,6 +15,10 @@ from .models import AlignParams
 from .sanitize import safe_error
 
 _SR = 16000
+
+
+class AlignGpuUnavailable(RuntimeError):
+    """The GPU align was placed on is absent or failed. Align never degrades to CPU."""
 
 
 def pack_npz(arrays: dict[str, Any], meta: dict[str, Any]) -> bytes:
@@ -93,26 +96,22 @@ class AlignService:
         import torch
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
+        if not torch.cuda.is_available():
+            raise AlignGpuUnavailable("align needs CUDA; torch.cuda.is_available() is False")
         self.torch = torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.model_id = model_id
         self.processor = Wav2Vec2Processor.from_pretrained(str(weights_dir), local_files_only=True)
         self.model = Wav2Vec2ForCTC.from_pretrained(
             str(weights_dir), local_files_only=True).to(self.device).eval()
 
     def _emit(self, seg):
-        # one window → log-softmax emission. A CUDA runtime error (e.g. an arch this torch build has no kernels
-        # for) degrades LOUDLY to CPU once — a rented GPU that can't run is a visible fault, not a silent crawl.
+        # one window → log-softmax emission. Placement is absolute: a CUDA runtime error refuses the job naming
+        # the cause; the model stays on its GPU and never moves to CPU.
         try:
             logits = self.model(seg.to(self.device)).logits[0]
         except RuntimeError as e:
-            if self.device == "cpu":
-                raise
-            print(f"[podagent] WARNING align CUDA failed ({safe_error(e, 120)}) → CPU fallback (SLOW)",
-                  file=sys.stderr, flush=True)
-            self.device = "cpu"
-            self.model = self.model.to("cpu")
-            logits = self.model(seg.to("cpu")).logits[0]
+            raise AlignGpuUnavailable(f"align CUDA failed: {safe_error(e, 200)}") from e
         return self.torch.log_softmax(logits, dim=-1)
 
     def _vocab(self) -> list[str]:

@@ -1,62 +1,61 @@
-"""AlignService — the CPU fallback, and what the emissions npz actually costs on the wire."""
+"""AlignService — it refuses instead of degrading to CPU, and what the emissions npz actually costs on the wire."""
 import io
 import json
+import sys
 import types
 import zipfile
+from pathlib import Path
 
 import pytest
 
-from podagent.infer_align import AlignService, pack_npz
+from podagent.infer_align import AlignGpuUnavailable, AlignService, pack_npz
 
 
-def test_emit_falls_back_to_cpu_loudly_on_cuda_runtime_error(capsys):
-    """A CUDA RuntimeError (e.g. an arch this torch build lacks kernels for) degrades to CPU ONCE, warns loudly,
-    and still returns an emission. Reddens if the fallback silently swallows or crashes."""
+def test_a_cuda_failure_in_align_refuses_and_never_moves_to_cpu():
+    """MISC-998 (placement absolute, no silent CPU): a CUDA RuntimeError in the forward refuses with the typed
+    error carrying the CUDA text; the model is never moved and the device stays 'cuda'."""
     svc = AlignService.__new__(AlignService)          # bypass __init__ (no real model load)
     svc.device = "cuda"
     svc.torch = types.SimpleNamespace(log_softmax=lambda logits, dim=-1: logits)
-
-    class _Model:
-        calls = 0
-
-        def to(self, d):
-            return self
-
-        def __call__(self, seg):
-            _Model.calls += 1
-            if _Model.calls == 1:
-                raise RuntimeError("CUDA error: no kernel image is available for execution")
-            return types.SimpleNamespace(logits=[[0.1, 0.9]])
-
-    svc.model = _Model()
-    seg = types.SimpleNamespace(to=lambda d: seg)      # .to(device) → itself
-    out = svc._emit(seg)
-
-    assert svc.device == "cpu"                          # degraded once
-    assert out == [0.1, 0.9]                            # still produced an emission
-    assert "CPU fallback" in capsys.readouterr().err    # LOUD, not silent
-
-
-def test_emit_reraises_if_cpu_also_fails():
-    """If we are ALREADY on CPU and the forward still errors, don't loop — re-raise (a real fault)."""
-    svc = AlignService.__new__(AlignService)
-    svc.device = "cpu"
-    svc.torch = types.SimpleNamespace(log_softmax=lambda logits, dim=-1: logits)
+    moves = []
 
     class _Model:
         def to(self, d):
+            moves.append(d)
             return self
 
         def __call__(self, seg):
-            raise RuntimeError("genuinely broken")
+            raise RuntimeError("CUDA error: the launch timed out and was terminated")
 
     svc.model = _Model()
     seg = types.SimpleNamespace(to=lambda d: seg)
-    try:
+
+    with pytest.raises(AlignGpuUnavailable, match="the launch timed out and was terminated"):
         svc._emit(seg)
-        assert False, "expected RuntimeError"
-    except RuntimeError:
-        pass
+
+    assert svc.device == "cuda"
+    assert moves == []
+
+
+def test_align_without_cuda_refuses_at_init(monkeypatch):
+    """MISC-998: no CUDA at init → typed refusal naming the cause; no checkpoint is loaded onto any device."""
+    loaded = []
+    fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
+
+    class _Never:
+        @staticmethod
+        def from_pretrained(*a, **k):
+            loaded.append(a)
+            raise AssertionError("no model may be loaded without CUDA")
+
+    fake_tf = types.SimpleNamespace(Wav2Vec2ForCTC=_Never, Wav2Vec2Processor=_Never)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", fake_tf)
+
+    with pytest.raises(AlignGpuUnavailable, match=r"align needs CUDA; torch\.cuda\.is_available\(\) is False"):
+        AlignService("m", Path("/nonexistent"))
+
+    assert loaded == []
 
 
 VOCAB_W = 9913          # voidful multi56's union vocab — the width that makes this payload 316.9 MB
@@ -133,7 +132,6 @@ def test_run_without_keep_ids_still_ships_the_full_vocab(tmp_path, monkeypatch):
 
 # ───────────────────────── words mode: the pod returns the alignment ─────────────────────────
 import hashlib
-from pathlib import Path
 
 from pydantic import ValidationError
 
