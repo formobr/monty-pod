@@ -7,6 +7,7 @@ import threading
 
 from podagent import infer_lanes as m
 from podagent import main as agent_main
+from podagent.ops.gpu_admission import NVENC_SESSION_MIB
 
 _W = {"url": "https://x/w.tar", "sha256": "b" * 64}
 _RANK_REQ = {"infer_version": 7, "job_id": "j", "kind": "clip_rank", "model": "siglip",
@@ -36,10 +37,20 @@ class _CP:
 
 
 def test_the_dev_2060_cannot_hold_both_kinds_and_says_which_numbers_say_so():
-    """The measured wall: 3254 MiB free against 1500 align + 2736 clip_rank + 512 reserve."""
+    """The measured wall: 3254 MiB free against align + clip_rank + encode session + reserve."""
     fits, why = m.kinds_fit_together(3254.0)
     assert fits is False
-    assert "4748" in why and "3254" in why
+    assert f"{m.coresident_mib():.0f}" in why and "3254" in why
+
+
+def test_a_6gb_card_with_desktop_apps_serves_one_kind_at_a_time():
+    """Release v0.20.323 contour_smoke OOM 2026-11-04: 5694 MiB free at boot kept align+clip_rank resident and
+    a heavy op's encode session beside them ran the card out. Reverting the session term turns this red."""
+    fits, why = m.kinds_fit_together(5694.0)
+    assert fits is False
+    assert "encode session" in why
+    assert m.coresident_mib() == (m.KIND_VRAM_MIB["align"] + m.KIND_VRAM_MIB["clip_rank"]
+                                  + m.RESERVE_MIB + NVENC_SESSION_MIB)
 
 
 def test_a_fleet_card_keeps_todays_parallel_lanes():

@@ -38,9 +38,11 @@ RESERVE_MIB = _VRAM_RESERVE_MB
 
 
 def coresident_mib() -> float:
-    """Free MiB a card must report for both weight-holding kinds to be resident together (4748 here; the
-    engine's own VRAM-budget concurrent-residency figure reads 4752 off its own rounding of the same measurements)."""
-    return KIND_VRAM_MIB["align"] + KIND_VRAM_MIB["clip_rank"] + RESERVE_MIB
+    """Free MiB a card must report for both weight-holding kinds to be resident together: align + clip_rank +
+    reserve + ONE encode session (RENDER_HEADROOM_MIB, the gpu_admission unit), because infer and a heavy op
+    share the card by design (RENDER_HEADROOM_WHY). Without it the dev 2060 kept both kinds at 5694 MiB free
+    and a heavy op beside them ran the card out (MISC-998)."""
+    return KIND_VRAM_MIB["align"] + KIND_VRAM_MIB["clip_rank"] + RESERVE_MIB + RENDER_HEADROOM_MIB
 
 
 def kinds_fit_together(free_mib: float | None) -> tuple[bool, str]:
@@ -51,9 +53,9 @@ def kinds_fit_together(free_mib: float | None) -> tuple[bool, str]:
         return False, ("the card reports no free VRAM — one infer kind resident at a time, still the GPU, "
                        "never the CPU")
     if free_mib >= need:
-        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for align+clip_rank+reserve — both kinds may "
+        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for align+clip_rank+encode session+reserve — both kinds may "
                       f"hold the card, the lanes stay parallel")
-    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for align+clip_rank+reserve — the kinds "
+    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for align+clip_rank+encode session+reserve — the kinds "
                    f"serialise on one lane and the idle kind's weights are dropped")
 
 
