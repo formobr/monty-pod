@@ -483,7 +483,10 @@ def _nvdec_or_refuse(cp: "ControlPlane") -> None:
 # 1.4.0 was "live-verified on driver 595" (ONE driver) and clobbered every other driver's real ICD; 1.2.0 is
 # libplacebo's own floor — never lower (the-gpu-verdict-carries-its-evidence-or-it-is-not-a-verdict).
 _VULKAN_EGL_API_VERSIONS = ("1.3.0", "1.2.0")
-_VULKAN_EGL_ICD_PATH = "/tmp/nvidia_egl_icd.json"
+# The manifest is exported as VK_ICD_FILENAMES for the whole pod life, so it lives in a pod-owned state dir
+# no /tmp sweeper touches (MISC-998: a missing ICD file turns a green Vulkan into -542398533).
+_VULKAN_EGL_ICD_DIR = "/var/lib/monty-pod"
+_VULKAN_EGL_ICD_PATH = f"{_VULKAN_EGL_ICD_DIR}/nvidia_egl_icd.json"
 # Where a loader looks for ICD manifests when VK_ICD_FILENAMES says nothing: listing both separates "the
 # runtime injected nothing" from "it injected a manifest the driver refused".
 _VULKAN_ICD_DIRS = ("/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d")
@@ -550,6 +553,7 @@ def _vulkan_host_evidence(ldconfig_out: str, lib: str | None) -> str:
 
 
 def _write_egl_icd_manifest(lib: str, api_version: str) -> str:
+    Path(_VULKAN_EGL_ICD_PATH).parent.mkdir(parents=True, exist_ok=True)
     Path(_VULKAN_EGL_ICD_PATH).write_text(
         '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"%s"}}\n'
         % (lib, api_version))
@@ -615,9 +619,17 @@ def _vulkan_preflight(cp: "ControlPlane") -> bool:
             if api_version != _VULKAN_EGL_API_VERSIONS[0] and \
                     "INCOMPATIBLE_DRIVER" not in raw_stderr.decode("utf-8", "replace"):
                 break  # rank 2 failed for a reason a lower api_version claim cannot fix
-            os.environ["VK_ICD_FILENAMES"] = _write_egl_icd_manifest(lib, api_version)
             rank = f"egl-{api_version}"
             ranks_tried.append(rank)
+            try:
+                os.environ["VK_ICD_FILENAMES"] = _write_egl_icd_manifest(lib, api_version)
+            except OSError as e:
+                # no fallback to /tmp: a manifest the pod cannot keep is the defect this path exists to end
+                brief = f"cannot write the ICD manifest under {_VULKAN_EGL_ICD_DIR} ({type(e).__name__}: {e})"
+                raw_stderr = b""
+                _log_vulkan_rank(rank, False, brief, raw_stderr)
+                detail = brief
+                break
             ok, brief, raw_stderr = _run_vulkan_probe()
             _log_vulkan_rank(rank, ok, brief, raw_stderr)
             if ok:

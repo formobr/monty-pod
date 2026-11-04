@@ -114,6 +114,62 @@ def test_default_red_egl_1_3_green_writes_the_1_3_manifest_and_stops_there(monke
     assert cp.events == [], "a green verdict carries no failure evidence"
 
 
+_SHIPPED_ICD_PATH = agent_main._VULKAN_EGL_ICD_PATH   # captured before the autouse fixture redirects it
+
+
+def _under(path: str, root: str) -> bool:
+    import os
+    return os.path.commonpath([os.path.realpath(path), os.path.realpath(root)]) == os.path.realpath(root)
+
+
+def test_the_icd_manifest_is_written_outside_tmp():
+    """MISC-998 prod 2026-11-03 a46f02d7: Vulkan green at boot, red later — the ICD file VK_ICD_FILENAMES
+    names vanished. The shipped path must not live where scratch sweepers work."""
+    import tempfile
+    assert _SHIPPED_ICD_PATH.startswith("/")
+    for scratch in ("/tmp", "/var/tmp", tempfile.gettempdir()):
+        assert not _under(_SHIPPED_ICD_PATH, scratch), f"{_SHIPPED_ICD_PATH} is under {scratch}"
+
+
+def test_a_tmp_sweep_after_the_preflight_leaves_the_manifest_in_place(monkeypatch, tmp_path):
+    import os
+    fake_tmp = tmp_path / "faketmp"
+    fake_tmp.mkdir()
+    (fake_tmp / "scratch.bin").write_text("x")
+    state = tmp_path / "state" / "monty-pod"      # not created: the writer must create it with parents
+    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(state / "nvidia_egl_icd.json"))
+    calls = {"ffmpeg": 0}
+
+    def fake_run(cmd, *a, **k):
+        if cmd[0] == "ldconfig":
+            return _ldconfig_ok(cmd)
+        calls["ffmpeg"] += 1
+        return _run(1, b"VK_ERROR_INCOMPATIBLE_DRIVER\n") if calls["ffmpeg"] == 1 else _run(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert agent_main._vulkan_preflight(_CP()) is True
+    icd = os.environ["VK_ICD_FILENAMES"]
+
+    for p in sorted(fake_tmp.rglob("*"), reverse=True):   # the sweep
+        p.unlink() if p.is_file() else p.rmdir()
+
+    assert os.path.exists(icd)
+    assert '"library_path"' in open(icd).read()
+
+
+def test_an_uncreatable_state_dir_fails_the_rank_by_name_and_never_falls_back_to_tmp(monkeypatch, tmp_path):
+    import os
+    blocker = tmp_path / "file"
+    blocker.write_text("not a dir")
+    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(blocker / "sub" / "nvidia_egl_icd.json"))
+    monkeypatch.setattr(subprocess, "run", _all_ranks_lose)
+    monkeypatch.setattr(agent_main.shutil, "which", lambda _name: None)
+    detail = _refused()
+    assert "cannot write the ICD manifest" in detail
+    assert "ranks_tried=default,egl-1.3.0" in detail and "egl-1.2.0" not in detail
+    assert "VK_ICD_FILENAMES" not in os.environ
+
+
 def test_every_rank_red_refuses_with_ranks_and_driver_evidence(monkeypatch):
     def fake_run(cmd, *a, **k):
         if cmd[0] == "ldconfig":
