@@ -89,7 +89,13 @@ unfenced and never claiming — the very latch MISC-200 forbids. Change these ro
 # class (podagent/ops/gpu_admission.py); the second is the boot capability verdict's defect name.
 _INFRA_CLASSES: Final = (
     ("gpu_admission_timeout", (re.compile(r"\bGpuAdmissionTimeout\b"),)),
-    ("vulkan_false", (re.compile(r"\bvulkan_false\b"),)),
+    (
+        "vulkan_false",
+        (
+            re.compile(r"\bvulkan_false\b"),
+            re.compile(r"Instance creation failure: VK_ERROR_INCOMPATIBLE_DRIVER\b"),
+        ),
+    ),
     # The engine's pod-defect class registry row for this class lands in the paired engine slice (MISC-843)
     # before this image is pinned; until then a stopped pod would be an unknown class to the pool.
     ("origin_egress_failed", (re.compile(r"\bOriginEgressFailed\b"),)),
