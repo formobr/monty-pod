@@ -3,11 +3,14 @@ driver's real ICD and denylist a healthy host (the-gpu-verdict-carries-its-evide
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from podagent import main as agent_main
 from test_nvenc_preflight import _CP, _run  # noqa: E402
+
+_ICD_NAME = Path(agent_main._VULKAN_EGL_ICD_PATH).name   # taken from the module, captured before any redirect
 
 
 @pytest.fixture(autouse=True)
@@ -15,7 +18,7 @@ def _isolated_icd_env(monkeypatch, tmp_path):
     monkeypatch.delenv("VK_ICD_FILENAMES", raising=False)
     # the refusal path calls _mark_stopped(), which unlinks the real liveness mark
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
-    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(tmp_path / "nvidia_egl_icd.json"))
+    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(tmp_path / _ICD_NAME))
 
 
 def _ldconfig_ok(cmd, *_a, **_k):
@@ -137,7 +140,7 @@ def test_a_tmp_sweep_after_the_preflight_leaves_the_manifest_in_place(monkeypatc
     fake_tmp.mkdir()
     (fake_tmp / "scratch.bin").write_text("x")
     state = tmp_path / "state" / "monty-pod"      # not created: the writer must create it with parents
-    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(state / "nvidia_egl_icd.json"))
+    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(state / _ICD_NAME))
     calls = {"ffmpeg": 0}
 
     def fake_run(cmd, *a, **k):
@@ -161,7 +164,7 @@ def test_an_uncreatable_state_dir_fails_the_rank_by_name_and_never_falls_back_to
     import os
     blocker = tmp_path / "file"
     blocker.write_text("not a dir")
-    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(blocker / "sub" / "nvidia_egl_icd.json"))
+    monkeypatch.setattr(agent_main, "_VULKAN_EGL_ICD_PATH", str(blocker / "sub" / _ICD_NAME))
     monkeypatch.setattr(subprocess, "run", _all_ranks_lose)
     monkeypatch.setattr(agent_main.shutil, "which", lambda _name: None)
     detail = _refused()
