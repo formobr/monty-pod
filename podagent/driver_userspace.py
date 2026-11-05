@@ -125,15 +125,15 @@ def default_transport(url: str, timeout: float) -> Response:
 
 
 def default_extractor(run_file: str, target: str, timeout: float) -> tuple[int, str]:
-    """(returncode, stderr tail). A missing `sh` raises FileNotFoundError; a timeout raises TimeoutError."""
+    """(returncode, stdout+stderr tail). A missing `sh` raises FileNotFoundError; a timeout raises TimeoutError."""
     if shutil.which("sh") is None:
         raise FileNotFoundError("sh")
     try:
         r = subprocess.run(["sh", run_file, "--extract-only", "--target", target],
-                           capture_output=True, timeout=timeout)
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(f"extract exceeded {timeout:.0f}s") from e
-    return r.returncode, (r.stderr or b"")[-300:].decode("utf-8", "replace")
+    return r.returncode, (r.stdout or b"")[-300:].decode("utf-8", "replace")
 
 
 def _verified(final: Path, version: str) -> bool:
@@ -287,9 +287,8 @@ def _provision(version, base, final, work, transport, extractor, clock, start, c
     if digest.hexdigest() != expected:
         raise _Refusal(CHECKSUM_MISMATCH, f"{name}: got {digest.hexdigest()[:12]}, want {expected[:12]}")
 
-    # 3. only now run the vendor script, into a fresh empty directory
+    # 3. only now run the vendor script; it creates the target itself and refuses one that exists
     target = work / "extract"
-    target.mkdir()
     ext_timeout = min(EXTRACT_TIMEOUT_S, remaining() - AFTER_DOWNLOAD_RESERVE_S / 2)
     if ext_timeout <= 0:
         raise _Refusal(EXTRACTION_FAILED, "wall exhausted before extraction")

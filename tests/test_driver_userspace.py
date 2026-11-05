@@ -71,12 +71,15 @@ class FakeExtractor:
 
     def __call__(self, run_file: str, target: str, timeout: float):
         self.calls.append((run_file, target, timeout))
-        self.target_was_empty = not any(Path(target).iterdir())
+        self.target_was_absent = not Path(target).exists()
         self.archive_fully_read = bool(self.transport) and self.transport.responses[-1].consumed
+        if not self.target_was_absent:
+            return 1, f"The directory '{target}' already exists. Please either move the existing directory out of the way, or specify a different directory with the '--target' option."
         if self.raises:
             raise self.raises
         if self.rc == 0:
             t = Path(target)
+            t.mkdir()
             for name in du.allowlist(V):
                 if name != self.skip:
                     (t / name).write_bytes(b"ELF" + name.encode())
@@ -121,7 +124,7 @@ def test_success_keeps_the_allowlist_alias_and_a_manifest_and_nothing_else(tmp_p
     icd = json.loads((final / "nvidia_icd.json").read_text())["ICD"]
     assert icd == {"library_path": str(final / "libEGL_nvidia.so.0"), "api_version": "1.4.312"}
     assert os.path.isabs(icd["library_path"])
-    assert extractor.target_was_empty and extractor.archive_fully_read
+    assert extractor.target_was_absent and extractor.archive_fully_read
     assert _left_behind(tmp_path) == [f"nvidia-{V}"], "the .run and the extract dir are gone"
 
 
@@ -216,6 +219,23 @@ def test_a_failing_extractor_is_extraction_failed_and_leaves_nothing(tmp_path):
     res = _fetch(tmp_path, FakeTransport(clock, files=_files()), FakeExtractor(rc=1, err="boom"), clock)
     assert (res.ok, res.reason) == (False, du.EXTRACTION_FAILED)
     assert _left_behind(tmp_path) == []
+
+
+def test_the_extract_target_does_not_exist_when_the_extractor_runs(tmp_path):
+    clock = Clock()
+    extractor = FakeExtractor()
+    res = _fetch(tmp_path, FakeTransport(clock, files=_files()), extractor, clock)
+    assert res.ok, "a fresh target is accepted; a pre-created one is refused rc 1 'already exists'"
+    assert extractor.target_was_absent and len(extractor.calls) == 1
+    rc, err = FakeExtractor()(str(tmp_path), str(tmp_path), 1.0)
+    assert rc == 1 and "already exists" in err
+
+
+def test_an_extractor_failure_keeps_its_stdout_tail_in_the_detail(tmp_path):
+    script = tmp_path / "installer.run"
+    script.write_text("echo \"The directory '$3' already exists.\"\nexit 1\n")
+    rc, tail = du.default_extractor(str(script), str(tmp_path / "t"), 30.0)
+    assert rc == 1 and "already exists" in tail
 
 
 def test_an_extractor_timeout_is_extraction_failed_and_still_cleans_up(tmp_path):
