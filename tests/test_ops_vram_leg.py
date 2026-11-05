@@ -136,6 +136,72 @@ def test_an_unreadable_card_books_no_vram_legs_and_the_op_succeeds(monkeypatch, 
     assert step["outputs"], "the op ran as before"
 
 
+class _InferCP:
+    def note(self, ev: dict) -> None:
+        pass
+
+    def report_infer_result(self, payload: dict, wake=None) -> bool:
+        return True
+
+
+def _infer(monkeypatch, tmp_path, kind: str) -> dict:
+    """Drive the real `_run_infer` with a cached fake service; return the work_finished timings."""
+    import json
+
+    from podagent import infer_cliprank
+    from podagent import main as agent_main
+
+    monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
+    monkeypatch.setattr("podagent.ops.dry.armed", lambda: False)
+    # The join returns the moment the sampler finishes; a huge sample interval means only before/after are read.
+    monkeypatch.setattr(runner, "_VRAM_SETTLE_S", 30.0)
+    monkeypatch.setattr(runner, "_VRAM_SAMPLE_S", 3600.0)
+    seen: list[dict] = []
+    monkeypatch.setattr(agent_main, "_lifecycle", lambda cp, **kw: seen.append(kw))
+    example = Path(__file__).resolve().parents[1] / "contracts" / "examples" / f"infer_request.{kind}.json"
+    raw = json.loads(example.read_text())
+    sha = raw["weights"]["sha256"]
+
+    class _Align:
+        def run(self, params, put_url, note):
+            return 0.5
+
+    class _Rank:
+        def run(self, params, put_url, note):
+            return infer_cliprank.ClipRankRun(infer_s=0.5, timings={"infer_s": 0.5})
+
+    align_cache = {sha: _Align()} if kind == "align" else {}
+    rank_cache = {sha: _Rank()} if kind == "clip_rank" else {}
+    agent_main._run_infer(raw, _InferCP(), align_cache, {}, rank_cache, Path("/opt/models/yunet.onnx"), True,
+                          corr_id="c", session_id="s")
+    finished = [kw for kw in seen if kw.get("phase") == "work_finished"]
+    assert len(finished) == 1 and finished[0]["outcome"] == "ok", seen
+    return finished[0]["timings"]
+
+
+@pytest.mark.parametrize("kind", ["align", "clip_rank"])
+def test_an_infer_call_reports_its_vram_legs(monkeypatch, tmp_path, kind):
+    """NEGATIVE: drop the watch from the infer handler and the resident baseline has no data (MISC-998)."""
+    monkeypatch.setattr(runner, "_read_vram_free_mib", _reader([20000.0, 14000.0]))
+    timings = _infer(monkeypatch, tmp_path, kind)
+    assert timings["vram_free_before_mib"] == 20000.0
+    assert timings["vram_free_after_mib"] == 14000.0
+    assert timings["vram_peak_used_mib"] == 6000.0
+    assert timings["infer_s"] == 0.5, "the call's own timings are untouched"
+
+
+@pytest.mark.parametrize("kind", ["align", "clip_rank"])
+def test_an_unreadable_card_books_no_infer_vram_legs_and_the_call_succeeds(monkeypatch, tmp_path, kind):
+    """A failed read is never booked and never fails the call (pins it against a future synchronous read)."""
+    def _boom():
+        raise RuntimeError("nvidia-smi: no devices")
+    monkeypatch.setattr(runner, "_read_vram_free_mib", _boom)
+    monkeypatch.setattr(runner, "log", lambda *a, **k: None)
+    timings = _infer(monkeypatch, tmp_path, kind)
+    assert not (_VRAM_KEYS & set(timings)), timings
+    assert timings["infer_s"] == 0.5
+
+
 def test_a_card_that_reports_nothing_books_no_vram_legs(monkeypatch, tmp_path, op):
     """`_free_vram_mb` answers None (never a coerced 0) on a box without a readable card."""
     monkeypatch.setattr(runner, "_read_vram_free_mib", lambda: None)

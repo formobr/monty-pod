@@ -866,6 +866,7 @@ def _run_infer(
 
     note(f"claimed {kind}")
     work_started = time.monotonic()
+    vram_watch = None
     try:
         req = InferRequest.model_validate(raw)
         if served is not None:
@@ -880,6 +881,12 @@ def _run_infer(
             dropped = release_other_kinds(req.kind, {"align": align_cache, "clip_rank": rank_cache})
             if dropped:
                 note(f"dropped {'+'.join(dropped)} weights: this card holds one infer kind at a time")
+        if req.kind in ("align", "clip_rank") and not judge_tiles:
+            # One watch around this call's fetch, load and run — started AFTER the other kind's release, so
+            # before − after is only the weights this call leaves resident. The runner's sampler, not a second
+            # one (VRAM_LEG_WHY).
+            from .ops.runner import _VramWatch
+            vram_watch = _VramWatch(f"infer-{req.kind}")
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
         # same model but carrying different checkpoints must not share a loaded model, and a warm pod that
         # sees the same hash again skips both the fetch and the (dominant) load.
@@ -952,6 +959,9 @@ def _run_infer(
                 "infer_s": infer_s,
                 "work_s": time.monotonic() - work_started,
             }
+        if vram_watch is not None:
+            vram_watch.stop()
+            work_timings = {**work_timings, **vram_watch.legs()}
 
         boot_s = None if boot_reported else time.monotonic() - BOOT_T0
         _lifecycle(
@@ -981,6 +991,8 @@ def _run_infer(
     # BaseException, not Exception: a CUDA abort, a SystemExit or an interrupted download must still leave a
     # terminal behind — an unreported one strands the brain for INFER_TIMEOUT_S and reads as a dead host.
     except BaseException as e:
+        if vram_watch is not None:
+            vram_watch.stop()
         _log(f"infer job {job_id} failed: {safe_error(e)}")
         print(safe_traceback(e), file=sys.stderr, flush=True)
         if isinstance(e, TransportUnhealthy):
