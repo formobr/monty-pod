@@ -219,7 +219,13 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
     # JUDGE THE FRAMES, NOT THE EXIT CODE: headless Chrome aborts on teardown often enough (SIGABRT after every
     # sequence is already on disk) that a rc check throws away finished work and fails the whole master.
     missing = [str(i.get("comp")) for i in items if not any(Path(i["seqdir"]).glob("*.png"))]
-    if not missing:
+    # The teardown keep is only for a batch that finished its work: a mid-render crash or a comp the batch itself
+    # reports FAILED leaves a sequence short of frames that a "has one png" check cannot see.
+    mid_render = []
+    if r.returncode:
+        mid_render = [ln.strip() for ln in batch_log.splitlines()
+                      if ln.startswith("FAILED ") or "The browser crashed while rendering frame" in ln]
+    if not missing and not mid_render:
         if r.returncode:
             print(f"mograph: render_batch exited {r.returncode} AFTER writing every sequence "
                   f"(Chrome teardown) — keeping the frames", file=sys.stderr)
@@ -227,8 +233,12 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
     full = (batch_log + (r.stdout or b"").decode("utf-8", "replace"))
     # Node error dumps carry message+stack at the TOP; a tail-only slice showed none of it. Head AND tail.
     snippet = full[:800] + ("…⋯…" + full[-400:] if len(full) > 800 else "")
-    raise RuntimeError(f"render_batch exited {r.returncode} with no frames for {', '.join(missing)} "
-                       f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]: {snippet}")
+    facts = _box_facts(oom_before, conc, cache, spec_path.parent)
+    if missing:
+        raise RuntimeError(f"render_batch exited {r.returncode} with no frames for {', '.join(missing)} "
+                           f"[{facts}]: {snippet}")
+    raise RuntimeError(f"render_batch exited {r.returncode} mid-render, frames are incomplete: "
+                       f"{'; '.join(mid_render[:5])} [{facts}]: {snippet}")
 
 
 def _pack(metas: list[dict], tmp: Path) -> list[dict]:

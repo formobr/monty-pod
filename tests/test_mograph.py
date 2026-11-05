@@ -128,6 +128,28 @@ def test_batch_that_aborts_after_writing_every_sequence_is_kept(tmp_path: Path, 
     assert "AFTER writing every sequence" in capsys.readouterr().err
 
 
+def test_a_browser_crash_mid_render_is_not_kept(tmp_path: Path, monkeypatch) -> None:
+    """Every seqdir holds a png, but the batch says the browser died mid-frame: layers are short, not done."""
+    rd = tmp_path / "rd"; rd.mkdir()
+    items = _batch_items(tmp_path, ["Compare", "RingStat"])
+    err = b"[batch] RingStat: 40 frames\nThe browser crashed while rendering frame 41\n"
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, b"", err))
+    with pytest.raises(RuntimeError, match="The browser crashed while rendering frame 41"):
+        mograph._run_batch(rd, items, tmp_path / "spec.json", None)
+
+
+def test_a_comp_the_batch_reports_failed_is_not_kept(tmp_path: Path, monkeypatch) -> None:
+    """A comp the batch itself logs FAILED must not be assembled into the master just because it left a png."""
+    rd = tmp_path / "rd"; rd.mkdir()
+    items = _batch_items(tmp_path, ["Compare", "RingStat"])
+    err = b"FAILED Compare: Error: boom\n[batch] RingStat: 60 frames\n"
+    monkeypatch.setattr(mograph.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, b"", err))
+    with pytest.raises(RuntimeError, match="FAILED Compare"):
+        mograph._run_batch(rd, items, tmp_path / "spec.json", None)
+
+
 def test_batch_with_a_missing_sequence_still_fails_loud(tmp_path: Path, monkeypatch) -> None:
     rd = tmp_path / "rd"; rd.mkdir()
     items = _batch_items(tmp_path, ["Compare", "Bars"], write_frames=False)
