@@ -17,10 +17,12 @@ forbidden is therefore not "two heavy ops at once" but "two heavy ops sizing the
 free-VRAM number": admission is a LEDGER of reservations against ONE budget, and the ledger is the single
 source of sizing — the constraint is the physical card, not cores/RAM step_slots() prices.
 
-The budget is read ONCE, at the first admission, by the reader the pod already has (infer_cliprank.
-_free_vram_mb, nvidia-smi memory.free, bounded) minus the reserve every other VRAM budget on this pod keeps
-(infer_cliprank._VRAM_RESERVE_MB). Once is the point: a re-read while our own heavies run would see their
-allocations as "taken" and double-count them. A card that reports nothing gets exactly ONE session's worth —
+The budget is re-read live whenever the card is idle (no live reservation, empty park queue), by the reader
+the pod already has (infer_cliprank._free_vram_mb, nvidia-smi memory.free, bounded) minus the reserve every
+other VRAM budget on this pod keeps (infer_cliprank._VRAM_RESERVE_MB). Idle is the point: weights loaded
+since the last read (the pod's own infer models) must reach the next admission, while a re-read under our
+own running heavies would see their allocations as "taken" and double-count them, so a busy ledger keeps its
+cached budget. An unreadable re-read keeps the last cached budget. A card that reports nothing gets exactly ONE session's worth —
 today's one-at-a-time exclusivity, never a guess. A measured budget below one session is also floored to
 one session: the ledger may only ever be WIDER than the exclusivity it replaces, never stricter (the boot
 preflight is what refuses a card too full to run at all).
@@ -94,35 +96,59 @@ _queue: deque = deque()
 _live: dict[object, float] = {}   # reservation token -> MiB it holds; the ledger
 _holders: set[int] = set()        # thread idents inside admission() (re-entrancy guard)
 _budget: float | None = None      # MiB; None until the first admission measures it (GPU_ADMISSION_WHY)
+_budget_pinned: bool = False      # True: set by _reset_for_tests(X), never re-read; False: measured by the ledger
 
 
 def _reset_for_tests(budget_mib: float | None = NVENC_SESSION_MIB) -> None:
     """Clear the ledger. The default pins today's exclusivity (one session) so no test reads a real card;
-    pass None to leave the budget unmeasured, so the next admission reads it through _free_vram_mb."""
-    global _budget
+    pass None to leave the budget unmeasured, so the next admission reads it through _free_vram_mb and
+    re-reads it whenever the ledger is idle. A pinned budget is never re-read."""
+    global _budget, _budget_pinned
     with _cond:
         _queue.clear()
         _live.clear()
         _holders.clear()
         _budget = budget_mib
+        _budget_pinned = budget_mib is not None
         _cond.notify_all()
 
 
-def _measure_budget() -> float:
-    free = _free_vram_mb()
+def _measure_budget(free: float | None = None) -> float:
+    free = _free_vram_mb() if free is None else free
     if free is None:
         return NVENC_SESSION_MIB  # unreadable card → exactly one session: today's exclusivity, never a guess
     return max(free - _VRAM_RESERVE_MB, NVENC_SESSION_MIB)
 
 
 def budget_mib() -> float:
-    """The ledger's budget: ONE read of free VRAM at the first admission, minus the pod's reserve."""
+    """The ledger's CACHED budget: the value the current admission was priced against. It measures (free VRAM
+    minus the pod's reserve) only when nothing is cached yet; refresh_budget() is what re-reads it."""
     global _budget
-    if _budget is not None:       # a single global read; once set it only changes through _reset_for_tests
+    if _budget is not None:
         return _budget
     measured = _measure_budget()  # outside _cond: a slow nvidia-smi must not stall release() or waiters
     with _cond:
         if _budget is None:       # a racing first admission may have measured too; the first write wins
+            _budget = measured
+        return _budget
+
+
+def refresh_budget() -> float:
+    """Re-read free VRAM live when the ledger is idle (no live reservation, empty park queue), so weights
+    loaded since the last read are priced in; otherwise return the cached budget without reading. A pinned
+    (test) budget is returned unchanged. An unreadable card keeps the last cached budget."""
+    global _budget
+    with _cond:
+        cached, idle = _budget, not _live and not _queue
+        if cached is not None and (_budget_pinned or not idle):
+            return cached
+    free = _free_vram_mb()        # outside _cond: a slow nvidia-smi must not stall release() or waiters
+    if free is None and cached is not None:
+        return cached
+    measured = _measure_budget(free)
+    with _cond:
+        # a racing admission keeps the value it was priced against: write only if still idle (or unset)
+        if _budget is None or (not _live and not _queue and not _budget_pinned):
             _budget = measured
         return _budget
 
@@ -137,13 +163,15 @@ def park_deadline_s(ahead: int, admitted: int) -> float:
     return min(max(ahead + admitted, 1) * HEAVY_OP_CEILING_S, HEAVY_PARK_CEILING_S)
 
 
-def reserve(op_name: str, need_mib: float = NVENC_SESSION_MIB, deadline_s: float | None = None,
+def reserve(op_name: str, need_mib: float | None =NVENC_SESSION_MIB, deadline_s: float | None = None,
             on_park: Callable[..., None] | None = None) -> object:
     """Park in FIFO order until this waiter leads the queue and `need_mib` fits in what the live reservations
     leave of the budget; return the token release() takes. Refuses or times out, never parks unbounded.
+    `need_mib` None books the WHOLE budget, taken from the same single cached read as the refusal check.
     `deadline_s` None prices the deadline at entry (park_deadline_s); a waiter that must park first calls
     `on_park(position=, ahead=, admitted=, budget_mib=, need_mib=, deadline_s=)` outside the lock."""
     budget = budget_mib()
+    need_mib = budget if need_mib is None else need_mib
     started = time.monotonic()
     with _cond:
         if not 0 < need_mib <= budget:
@@ -215,7 +243,8 @@ def admission(op_name: str, deadline_s: float | None = None, need_mib: float | N
             raise GpuAdmissionRefused(
                 f"op {op_name!r} refused GPU admission: this thread already holds it "
                 f"(queue depth {len(_queue)}, waited 0.0s)")
-    token = reserve(op_name, budget_mib() if need_mib is None else need_mib, deadline_s, on_park)
+    refresh_budget()
+    token = reserve(op_name, need_mib, deadline_s, on_park)
     with _cond:
         _holders.add(me)
     try:

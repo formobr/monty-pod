@@ -42,14 +42,107 @@ def _measured(monkeypatch, free_mib: float | None) -> list[int]:
 
 
 def test_budget_is_one_read_of_free_vram_minus_the_pod_reserve(monkeypatch):
-    """NEGATIVE: a re-read per admission would see our own running heavies as 'taken' and shrink the budget
-    under them; retyping the reserve would let it drift from every other VRAM budget on the pod."""
+    """NEGATIVE: a read that skips an idle admission leaves the budget stale; reserve()/budget_mib() reading
+    again would price one admission against two numbers; retyping the reserve would let it drift from every
+    other VRAM budget on the pod."""
     from podagent.infer_cliprank import _VRAM_RESERVE_MB
     calls = _measured(monkeypatch, 8000.0)
-    assert ga.budget_mib() == 8000.0 - _VRAM_RESERVE_MB
-    ga.release(ga.reserve("cut.apply", deadline_s=1.0))
-    ga.release(ga.reserve("cut.apply", deadline_s=1.0))
-    assert len(calls) == 1, "the budget must be read once, at the first admission"
+    with ga.admission("cut.apply", deadline_s=1.0):
+        assert ga.budget_mib() == 8000.0 - _VRAM_RESERVE_MB
+        assert ga.reserved_mib() == 8000.0 - _VRAM_RESERVE_MB
+    assert len(calls) == 1, "exactly one read per idle admission; reserve() and budget_mib() never re-read"
+    with ga.admission("cut.apply", deadline_s=1.0):
+        pass
+    assert len(calls) == 2
+
+
+def _sequenced(monkeypatch, frees: list[float | None]) -> list[int]:
+    """Unpinned ledger whose card reports each value of `frees` in turn (the last one repeats); returns the
+    list of probe calls."""
+    calls: list[int] = []
+
+    def _probe():
+        calls.append(1)
+        return frees[min(len(calls) - 1, len(frees) - 1)]
+
+    monkeypatch.setattr(ga, "_free_vram_mb", _probe)
+    ga._reset_for_tests(budget_mib=None)
+    return calls
+
+
+def test_a_weights_load_after_the_first_heavy_reaches_the_next_admission(monkeypatch):
+    """NEGATIVE: a budget read once at the first heavy keeps granting VRAM that weights loaded afterwards
+    already took (prod 2026-11-05: 15601 -> 11127 MiB free, the ledger still booked the first number)."""
+    _sequenced(monkeypatch, [15601.0, 11127.0])
+    with ga.admission("cut.apply", deadline_s=1.0):
+        assert ga.reserved_mib() == 15601.0 - 512.0
+    with ga.admission("cut.apply", deadline_s=1.0):
+        assert ga.reserved_mib() == 11127.0 - 512.0
+        assert ga.budget_mib() == 11127.0 - 512.0
+
+
+def test_the_budget_is_not_re_read_while_a_reservation_is_live(monkeypatch):
+    """NEGATIVE: a re-read under a live heavy sees its own allocations as 'taken' and double-counts them; a
+    parked admission must be priced against the cached budget."""
+    calls = _sequenced(monkeypatch, [8000.0, 2000.0])
+    holder_in, leave = threading.Event(), threading.Event()
+    holder = _hold_admission("cut.apply", 8000.0 - 512.0, holder_in, leave)  # the whole budget: the waiter parks
+    assert holder_in.wait(timeout=1)
+    assert len(calls) == 1
+    parked_events: list[dict] = []
+    waiter = threading.Thread(target=lambda: _enter(parked_events))
+    waiter.start()
+    _spin_until(lambda: bool(parked_events))  # on_park fires after the token is queued
+    assert len(calls) == 1, "a read happened while a reservation was live"
+    assert parked_events[0]["budget_mib"] == 8000.0 - 512.0
+    leave.set()
+    holder.join(timeout=2)
+    waiter.join(timeout=2)
+    assert not waiter.is_alive() and ga.reserved_mib() == 0.0
+
+
+def _enter(events: list[dict]) -> None:
+    with ga.admission("media.normalize", deadline_s=5.0, need_mib=SESSION,
+                      on_park=lambda **kw: events.append(kw)):
+        pass
+
+
+def test_an_unreadable_card_on_a_refresh_keeps_the_last_budget(monkeypatch):
+    """NEGATIVE: falling back to one session on a transient unreadable refresh would throttle a card whose
+    last good read was wide."""
+    calls = _sequenced(monkeypatch, [13000.0, None])
+    with ga.admission("cut.apply", deadline_s=1.0):
+        pass
+    assert ga.budget_mib() == 13000.0 - 512.0
+    with ga.admission("cut.apply", deadline_s=1.0):
+        assert ga.reserved_mib() == 13000.0 - 512.0
+    assert len(calls) == 2 and ga.budget_mib() == 13000.0 - 512.0
+
+
+def test_a_racing_idle_refresh_does_not_refuse_a_whole_budget_admission(monkeypatch):
+    """NEGATIVE: a whole-budget need computed from one read and checked against another would refuse itself
+    when an idle refresh on another thread shrinks the budget between the two."""
+    _sequenced(monkeypatch, [15601.0, 11127.0])
+    real_reserve = ga.reserve
+
+    def _racing_reserve(*args, **kwargs):
+        racer = threading.Thread(target=ga.refresh_budget)  # the second read lands after our refresh
+        racer.start()
+        racer.join(timeout=2)
+        return real_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(ga, "reserve", _racing_reserve)
+    with ga.admission("cut.apply", deadline_s=1.0):
+        assert ga.reserved_mib() == ga.budget_mib() == 11127.0 - 512.0
+
+
+def test_a_pinned_budget_is_never_re_read(monkeypatch):
+    """NEGATIVE: re-reading a pinned test budget would reach a real card from every pinned-budget test."""
+    calls = _sequenced(monkeypatch, [8000.0])
+    ga._reset_for_tests()
+    with ga.admission("cut.apply", deadline_s=1.0):
+        assert ga.reserved_mib() == SESSION
+    assert calls == []
 
 
 def test_reservations_never_exceed_the_budget(monkeypatch):
