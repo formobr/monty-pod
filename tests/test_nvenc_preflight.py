@@ -13,6 +13,13 @@ from podagent import main as agent_main
 def _isolated_live_mark(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_main, "_LIVE_MARK", tmp_path / "podagent.alive")
 
+    # the last Vulkan rank downloads from the vendor: no test in this file may ever reach the network
+    def _no_network(*_a, **_k):
+        from podagent import driver_userspace as du
+        return du.FetchResult(ok=False, reason=du.DRIVER_PACKAGE_UNAVAILABLE, detail="no-network stub")
+
+    monkeypatch.setattr(agent_main, "_fetch_driver_userspace", _no_network)
+
 
 class _CP:
     def __init__(self, *, accept: bool = True, identity_reject: bool = False) -> None:

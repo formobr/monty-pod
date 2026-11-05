@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import requests
 from pydantic import ValidationError
 
+from . import driver_userspace
 from .cp import ControlPlane, mark_rented_pod
 from .event_stream import DELIVERY_PENDING_MAX_ATTEMPTS, DeliveryPending, FrameRejected, TransportUnhealthy
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
@@ -595,26 +596,74 @@ def _write_egl_icd_manifest(lib: str, api_version: str) -> str:
     return _VULKAN_EGL_ICD_PATH
 
 
-def _nvidia_driver_version() -> str:
-    """Bare driver_version for evidence — independent of _log_nvidia_runtime's human-formatted log line."""
+def _nvidia_driver_version() -> str | None:
+    """The ONE driver-version query: the single validated version every GPU reports, else None (no GPU line,
+    GPUs on different versions, or a line that is not <major>.<minor>[.<patch>]). It names the userspace the
+    last ladder rank downloads, so a guess is worse than no answer."""
     import subprocess
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
                            capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        return None
     if r.returncode != 0:
-        return "unknown"
-    return safe_text((r.stdout or b"").decode("utf-8", "replace").strip()) or "unknown"
+        return None
+    lines = {ln.strip() for ln in (r.stdout or b"").decode("utf-8", "replace").splitlines() if ln.strip()}
+    if len(lines) != 1:
+        return None
+    version = next(iter(lines))
+    return version if driver_userspace.DRIVER_VERSION_RE.match(version) else None
 
 
-def _run_vulkan_probe() -> tuple[bool, str, bytes]:
+# Swapped by tests: the real one downloads from the vendor.
+_fetch_driver_userspace = driver_userspace.fetch_driver_userspace
+_VULKAN_ENV_KEYS = ("VK_ICD_FILENAMES", "VK_DRIVER_FILES", "LD_LIBRARY_PATH")
+
+
+def _restore_env(saved: dict[str, str | None]) -> None:
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _driver_userspace_rank(version: str) -> tuple[bool, str]:
+    """Last rank: fetch the host driver's own graphics userspace, point the loader at it, re-probe in a fresh
+    subprocess. Green keeps the env (ffmpeg children inherit it); anything else restores all three variables
+    exactly as found. Returns (green, trailer note naming the reason with elapsed and cap)."""
+    t0 = time.monotonic()
+    rank = f"driver-userspace-{version}"
+    saved = {k: os.environ.get(k) for k in _VULKAN_ENV_KEYS}
+    res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent)
+    if not res.ok:
+        _log_vulkan_rank(rank, False, f"{res.reason}: {res.detail}", b"")
+        return False, f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+    try:
+        os.environ["VK_ICD_FILENAMES"] = os.environ["VK_DRIVER_FILES"] = res.manifest
+        old_ld = [p for p in (saved["LD_LIBRARY_PATH"] or "").split(":") if p]
+        os.environ["LD_LIBRARY_PATH"] = ":".join([res.lib_dir, *old_ld])
+        left = res.cap - (time.monotonic() - t0)
+        ok, brief, raw_stderr = _run_vulkan_probe(timeout=int(min(120, max(10, left))))
+    except BaseException:
+        _restore_env(saved)
+        raise
+    _log_vulkan_rank(rank, ok, brief, raw_stderr)
+    elapsed = f"elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+    if ok:
+        _log(f"vulkan rank {rank} OK — motion path opens on the fetched {version} graphics userspace")
+        return True, f"driver_userspace=ok {elapsed}"
+    _restore_env(saved)
+    return False, f"driver_userspace={driver_userspace.VULKAN_REPROBE_FAILED} {elapsed}"
+
+
+def _run_vulkan_probe(timeout: int = 120) -> tuple[bool, str, bytes]:
     """One VULKAN_PROBE run under whatever VK_ICD_FILENAMES is currently set. raw_stderr stays UNTRUNCATED —
     bounding only ever happens on the wire, never on what reaches the pod's own stderr log."""
     # Twin of podagent.render.VULKAN_PROBE and the engine's camera.apply op VULKAN_PROBE.
     import subprocess
     try:
-        r = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=120)
+        r = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"{type(e).__name__}: {e}", b""
     if r.returncode == 0:
@@ -633,8 +682,8 @@ def _log_vulkan_rank(rank: str, ok: bool, brief: str, raw_stderr: bytes) -> None
 
 
 def _vulkan_preflight(cp: "ControlPlane") -> bool:
-    """3-rank ladder: default loader discovery -> our EGL manifest at 1.3.0 -> 1.2.0 on INCOMPATIBLE_DRIVER
-    only. First green rank wins and returns True. An exhausted ladder refuses work before ready, exactly as a
+    """Ladder: default loader discovery -> our EGL manifest at 1.3.0 -> 1.2.0 on INCOMPATIBLE_DRIVER
+    only -> the host driver's own graphics userspace fetched from the vendor. First green rank wins and returns True. An exhausted ladder refuses work before ready, exactly as a
     pod without NVDEC does (owner ruling 2026-10-27): the refusal event carries the evidence, then exit 3."""
     preset_icd = os.environ.get("VK_ICD_FILENAMES")   # every LOSING rank must leave this exactly as found
     ranks_tried = ["default"]
@@ -677,13 +726,22 @@ def _vulkan_preflight(cp: "ControlPlane") -> bool:
         else:
             os.environ["VK_ICD_FILENAMES"] = preset_icd
 
+    driver = _nvidia_driver_version()   # ONE query: it feeds the last rank and the trailer alike
+    if driver is None:
+        rank_note = f"driver_userspace={driver_userspace.DRIVER_VERSION_UNAVAILABLE}"
+    else:
+        ranks_tried.append(f"driver-userspace-{driver}")
+        green, rank_note = _driver_userspace_rank(driver)
+        if green:
+            return True
+
     evidence = _vulkan_host_evidence(ldconfig_out, lib)
     if raw_stderr:
         # The ffmpeg dump yields the budget to the host evidence, never the other way round.
-        edge = max(_VULKAN_STDERR_MIN_EDGE, (_VULKAN_DETAIL_BUDGET - len(evidence)) // 2)
+        edge = max(_VULKAN_STDERR_MIN_EDGE, (_VULKAN_DETAIL_BUDGET - len(evidence) - len(rank_note)) // 2)
         detail = f"{detail}: {_bounded_stderr(raw_stderr, edge=edge)}"
-    driver = _nvidia_driver_version()
-    detail = (f"{detail} · ranks_tried={','.join(ranks_tried)} · driver_version={driver} · {evidence}")
+    detail = (f"{detail} · ranks_tried={','.join(ranks_tried)} · driver_version={driver or 'unknown'}"
+              f" · {rank_note} · {evidence}")
     if summary := _vulkaninfo_summary():
         detail = f"{detail} · {summary}"
     detail = safe_text(detail)
