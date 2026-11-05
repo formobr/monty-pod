@@ -28,6 +28,33 @@ def _apt_installs() -> list[tuple[list[str], set[str]]]:
     return installs
 
 
+def _caps_env_by_stage() -> list[tuple[int, set[str]]]:
+    """(stage index, capability set) of every effective NVIDIA_DRIVER_CAPABILITIES ENV — comments dropped,
+    continuations joined like _apt_installs."""
+    text = "\n".join(ln for ln in DOCKERFILE.read_text().splitlines() if not ln.strip().startswith("#"))
+    text = re.sub(r"\\\n", " ", text)
+    stage = -1
+    found: list[tuple[int, set[str]]] = []
+    for ln in text.splitlines():
+        if re.match(r"\s*FROM\s", ln, re.I):
+            stage += 1
+        elif re.match(r"\s*ENV\s", ln, re.I):
+            m = re.search(r"NVIDIA_DRIVER_CAPABILITIES(?:=|\s+)(\"[^\"]*\"|\S+)", ln)
+            if m:
+                found.append((stage, set(m.group(1).strip('"').split(","))))
+    return found
+
+
+def test_the_image_declares_compute_utility_video_graphics_and_nothing_else():
+    """MISC-998: the CUDA base image's compute,utility left the runtime no reason to inject the graphics and
+    video userspace. A create-time -e overrides this ENV, so it governs only injection paths that consume no
+    create-time value; it is a hypothesis test, not a proven fix."""
+    declared = _caps_env_by_stage()
+    assert declared == [(0, {"compute", "utility", "video", "graphics"})], (
+        "exactly one effective declaration, in the base (first) stage, with exactly these capabilities "
+        "(no display, no all) and no later stage re-setting it")
+
+
 def test_the_image_ships_libegl_next_to_the_vulkan_loader():
     with_loader = [(flags, pkgs) for flags, pkgs in _apt_installs() if "libvulkan1" in pkgs]
     assert len(with_loader) == 1, "expected exactly one apt-get install that ships libvulkan1"

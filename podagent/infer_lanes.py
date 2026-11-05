@@ -91,10 +91,11 @@ def heavy_lane_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
 
 
 def coresident_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
-    """Free MiB a card must report for clip_rank (weights + one lane) to run beside the heavy lane:
-    2736 + heavy_lane_mib + 512 — 6020 with every kind served (2736 + 1244 + max(518 + 228 + 210, 1100 + 210,
-    1300 + 228) + 512)."""
-    return KIND_VRAM_MIB["clip_rank"] + heavy_lane_mib(served) + RESERVE_MIB
+    """Free MiB a card must report for clip_rank (weights + one lane) to run beside the heavy lane AND one encode
+    session (RENDER_HEADROOM_MIB, the gpu_admission unit), because infer and a heavy op share the card by design
+    (RENDER_HEADROOM_WHY; without it the dev 2060 kept both kinds at 5694 MiB free and a heavy op beside them ran
+    the card out, MISC-998): 2736 + heavy_lane_mib + 512 + 960 — 6980 with every kind served."""
+    return KIND_VRAM_MIB["clip_rank"] + heavy_lane_mib(served) + RESERVE_MIB + RENDER_HEADROOM_MIB
 
 
 def kinds_fit_together(free_mib: float | None, served: "frozenset[str] | set[str] | None" = None
@@ -106,9 +107,9 @@ def kinds_fit_together(free_mib: float | None, served: "frozenset[str] | set[str
         return False, ("the card reports no free VRAM — one infer kind resident at a time, still the GPU, "
                        "never the CPU")
     if free_mib >= need:
-        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for clip_rank+heavy lane+reserve — both "
-                      f"kinds may hold the card, the lanes stay parallel")
-    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for clip_rank+heavy lane+reserve — the kinds "
+        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for clip_rank+heavy lane+encode session+reserve — "
+                      f"both kinds may hold the card, the lanes stay parallel")
+    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for clip_rank+heavy lane+encode session+reserve — the kinds "
                    f"serialise on one lane and the idle kind's weights are dropped")
 
 

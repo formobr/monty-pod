@@ -7,6 +7,7 @@ import threading
 
 from podagent import infer_lanes as m
 from podagent import main as agent_main
+from podagent.ops.gpu_admission import NVENC_SESSION_MIB
 
 _W = {"url": "https://x/w.tar", "sha256": "b" * 64}
 _RANK_REQ = {"infer_version": 7, "job_id": "j", "kind": "clip_rank", "model": "siglip",
@@ -36,10 +37,10 @@ class _CP:
 
 
 def test_the_dev_2060_cannot_hold_both_kinds_and_says_which_numbers_say_so():
-    """The measured wall: 3254 MiB free against 2736 clip_rank + 2772 heavy lane + 512 reserve."""
+    """The measured wall: 3254 MiB free against 2736 clip_rank + 2772 heavy lane + 512 reserve + 960 encode session."""
     fits, why = m.kinds_fit_together(3254.0)
     assert fits is False
-    assert "6020" in why and "3254" in why
+    assert "6980" in why and "3254" in why
 
 
 def test_the_056_oom_card_serialises_now():
@@ -48,7 +49,7 @@ def test_the_056_oom_card_serialises_now():
     # + clean_plate (2026-10-24, measured +1276 over the idle card / 204 resident): the lane's transient is the largest of
     # align's forward, RVM's autotune, the plate's peak — each with the OTHER kinds' cached weights beside it
     assert m.heavy_lane_mib() == 1244.0 + max(518.0 + 228.0 + 210.0, 1100.0 + 210.0, 1300.0 + 228.0) == 2772.0
-    assert m.coresident_mib() == 2736.0 + 2772.0 + 512.0
+    assert m.coresident_mib() == 2736.0 + 2772.0 + 512.0 + NVENC_SESSION_MIB
     assert m.kinds_fit_together(4835.0)[0] is False
     # without person_matte the heavy lane is align alone: 1762
     assert m.heavy_lane_mib({"align", "clip_rank"}) == 1762.0
@@ -72,6 +73,16 @@ def test_rank_lanes_are_sized_with_the_heavy_lane_beside_them():
     # a fleet card (min 14848): (14848 − 512 − 2322 − 2772) // 414 = 22 → host-bound
     n, why = ic._width_from(14848.0, 16, m.heavy_lane_mib(), "heavy lane")
     assert n == 16 and "− 2772 heavy lane" in why
+
+
+def test_a_6gb_card_with_desktop_apps_serves_one_kind_at_a_time():
+    """Release v0.20.323 contour_smoke OOM 2026-11-04: 5694 MiB free at boot kept align+clip_rank resident and
+    a heavy op's encode session beside them ran the card out. Reverting the session term turns this red."""
+    fits, why = m.kinds_fit_together(5694.0)
+    assert fits is False
+    assert "encode session" in why
+    assert m.coresident_mib() == (m.KIND_VRAM_MIB["clip_rank"] + m.heavy_lane_mib()
+                                  + m.RESERVE_MIB + NVENC_SESSION_MIB)
 
 
 def test_a_fleet_card_keeps_todays_parallel_lanes():
@@ -174,9 +185,9 @@ def test_face_probe_never_queues_behind_a_weight_holding_kind():
 def test_face_probe_drops_no_resident_weights_on_a_turn_taking_card(monkeypatch):
     """guards INFER_KIND_RESIDENCY_WHY's own scope: only a kind that LOADS onto the card may drop the idle one —
     a face_probe (0 MiB) on the 2060 used to throw SigLIP off the card for nothing, and the next rank reloaded it."""
+    import sys
+    import types
     from pathlib import Path
-
-    from podagent import infer_probe
 
     class _Probe:
         def __init__(self, *_a):
@@ -189,7 +200,10 @@ def test_face_probe_drops_no_resident_weights_on_a_turn_taking_card(monkeypatch)
         def report_infer_result(self, result):
             self.events.append({"result": result})
 
-    monkeypatch.setattr(infer_probe, "ProbeService", _Probe)
+    # a stand-in module: the real one imports cv2, which the handler under test never needs here
+    fake = types.ModuleType("podagent.infer_probe")
+    fake.ProbeService = _Probe
+    monkeypatch.setitem(sys.modules, "podagent.infer_probe", fake)
     rank = {"sha-r": object()}
     cp = _ResultCP([])
     agent_main._run_infer(dict(_PROBE_REQ), cp, {}, {}, rank, Path("/opt/models/yunet.onnx"), True,

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import requests
 from pydantic import ValidationError
 
+from . import driver_userspace
 from .cp import ControlPlane, mark_rented_pod
 from .event_stream import DELIVERY_PENDING_MAX_ATTEMPTS, DeliveryPending, FrameRejected, TransportUnhealthy
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
@@ -490,7 +491,10 @@ def _nvdec_or_refuse(cp: "ControlPlane") -> None:
 # 1.4.0 was "live-verified on driver 595" (ONE driver) and clobbered every other driver's real ICD; 1.2.0 is
 # libplacebo's own floor — never lower (the-gpu-verdict-carries-its-evidence-or-it-is-not-a-verdict).
 _VULKAN_EGL_API_VERSIONS = ("1.3.0", "1.2.0")
-_VULKAN_EGL_ICD_PATH = "/tmp/nvidia_egl_icd.json"
+# The manifest is exported as VK_ICD_FILENAMES for the whole pod life, so it lives in a pod-owned state dir
+# no /tmp sweeper touches (MISC-998: a missing ICD file turns a green Vulkan into -542398533).
+_VULKAN_EGL_ICD_DIR = "/var/lib/monty-pod"
+_VULKAN_EGL_ICD_PATH = f"{_VULKAN_EGL_ICD_DIR}/nvidia_egl_icd.json"
 # Where a loader looks for ICD manifests when VK_ICD_FILENAMES says nothing: listing both separates "the
 # runtime injected nothing" from "it injected a manifest the driver refused".
 _VULKAN_ICD_DIRS = ("/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d")
@@ -540,6 +544,40 @@ def _icd_dir_listing(path: str) -> str:
     return f"{path}: {','.join(entries) if entries else 'empty'}"
 
 
+# The graphics/video userspace the container runtime injects only when the capability is granted
+# (MISC-998): its presence, library by library, settles whether the runtime or the host is what is missing.
+_VULKAN_GRAPHICS_LIBS = ("libGLX_nvidia.so.0", "libnvidia-glcore", "libnvidia-glvkspirv", "libnvidia-eglcore",
+                         "libnvidia-gpucomp", "libnvidia-encode.so.1", "libnvcuvid.so.1")
+
+
+def _graphics_libs_evidence(ldconfig_out: str) -> str:
+    """yes/no per graphics library, matched against the SAME ldconfig output the rest of the evidence reads."""
+    sonames = [ln.strip().split(" ", 1)[0] for ln in ldconfig_out.splitlines() if ln.strip()]
+    return ",".join(f"{lib}={'yes' if any(s.startswith(lib) for s in sonames) else 'no'}"
+                    for lib in _VULKAN_GRAPHICS_LIBS)
+
+
+def _icd_library_paths() -> str:
+    """Every ICD json in the loader's manifest dirs with the ICD.library_path it points at — 'unreadable' when
+    the file cannot be read or parsed, so a broken manifest is a named fact, not a missing one."""
+    import json
+    found: list[str] = []
+    for d in _VULKAN_ICD_DIRS:
+        try:
+            files = sorted(p for p in Path(d).iterdir() if p.name.endswith(".json"))
+        except OSError:
+            continue
+        for p in files:
+            try:
+                target = json.loads(p.read_text())["ICD"]["library_path"]
+                if not isinstance(target, str):
+                    target = "unreadable"
+            except (OSError, ValueError, KeyError, TypeError):
+                target = "unreadable"
+            found.append(f"{p}->{target}")
+    return ",".join(found) or "none"
+
+
 def _vulkan_host_evidence(ldconfig_out: str, lib: str | None) -> str:
     """WHY the ladder could not even start. `ranks_tried=default` alone cannot tell "our image is broken"
     from "this host exposes the GPU without the GL/EGL userspace, so no libEGL_nvidia.so.0 exists and the
@@ -553,36 +591,86 @@ def _vulkan_host_evidence(ldconfig_out: str, lib: str | None) -> str:
     shown = names[:_VULKAN_EVIDENCE_MAX_LIBS]
     libs = ",".join(shown) + (f",+{len(names) - len(shown)} more" if len(names) > len(shown) else "")
     return (f"{head}; icd.d: {icds}; caps={caps if caps is not None else 'UNSET'}; "
+            f"graphics_libs={_graphics_libs_evidence(ldconfig_out)}; icd={_icd_library_paths()}; "
             f"nvidia libs: {libs or 'none'}")
 
 
 def _write_egl_icd_manifest(lib: str, api_version: str) -> str:
+    Path(_VULKAN_EGL_ICD_PATH).parent.mkdir(parents=True, exist_ok=True)
     Path(_VULKAN_EGL_ICD_PATH).write_text(
         '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"%s"}}\n'
         % (lib, api_version))
     return _VULKAN_EGL_ICD_PATH
 
 
-def _nvidia_driver_version() -> str:
-    """Bare driver_version for evidence — independent of _log_nvidia_runtime's human-formatted log line."""
+def _nvidia_driver_version() -> str | None:
+    """The ONE driver-version query: the single validated version every GPU reports, else None (no GPU line,
+    GPUs on different versions, or a line that is not <major>.<minor>[.<patch>]). It names the userspace the
+    last ladder rank downloads, so a guess is worse than no answer."""
     import subprocess
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
                            capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        return None
     if r.returncode != 0:
-        return "unknown"
-    return safe_text((r.stdout or b"").decode("utf-8", "replace").strip()) or "unknown"
+        return None
+    lines = {ln.strip() for ln in (r.stdout or b"").decode("utf-8", "replace").splitlines() if ln.strip()}
+    if len(lines) != 1:
+        return None
+    version = next(iter(lines))
+    return version if driver_userspace.DRIVER_VERSION_RE.match(version) else None
 
 
-def _run_vulkan_probe() -> tuple[bool, str, bytes]:
+# Swapped by tests: the real one downloads from the vendor.
+_fetch_driver_userspace = driver_userspace.fetch_driver_userspace
+_VULKAN_ENV_KEYS = ("VK_ICD_FILENAMES", "VK_DRIVER_FILES", "LD_LIBRARY_PATH")
+
+
+def _restore_env(saved: dict[str, str | None]) -> None:
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _driver_userspace_rank(version: str) -> tuple[bool, str]:
+    """Last rank: fetch the host driver's own graphics userspace, point the loader at it, re-probe in a fresh
+    subprocess. Green keeps the env (ffmpeg children inherit it); anything else restores all three variables
+    exactly as found. Returns (green, trailer note naming the reason with elapsed and cap)."""
+    t0 = time.monotonic()
+    rank = f"driver-userspace-{version}"
+    saved = {k: os.environ.get(k) for k in _VULKAN_ENV_KEYS}
+    res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent)
+    if not res.ok:
+        _log_vulkan_rank(rank, False, f"{res.reason}: {res.detail}", b"")
+        return False, f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+    try:
+        os.environ["VK_ICD_FILENAMES"] = os.environ["VK_DRIVER_FILES"] = res.manifest
+        old_ld = [p for p in (saved["LD_LIBRARY_PATH"] or "").split(":") if p]
+        os.environ["LD_LIBRARY_PATH"] = ":".join([res.lib_dir, *old_ld])
+        left = res.cap - (time.monotonic() - t0)
+        ok, brief, raw_stderr = _run_vulkan_probe(timeout=int(min(120, max(10, left))))
+    except BaseException:
+        _restore_env(saved)
+        raise
+    _log_vulkan_rank(rank, ok, brief, raw_stderr)
+    elapsed = f"elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+    if ok:
+        _log(f"vulkan rank {rank} OK — motion path opens on the fetched {version} graphics userspace")
+        return True, f"driver_userspace=ok {elapsed}"
+    _restore_env(saved)
+    return False, f"driver_userspace={driver_userspace.VULKAN_REPROBE_FAILED} {elapsed}"
+
+
+def _run_vulkan_probe(timeout: int = 120) -> tuple[bool, str, bytes]:
     """One VULKAN_PROBE run under whatever VK_ICD_FILENAMES is currently set. raw_stderr stays UNTRUNCATED —
     bounding only ever happens on the wire, never on what reaches the pod's own stderr log."""
     # Twin of podagent.render.VULKAN_PROBE and the engine's camera.apply op VULKAN_PROBE.
     import subprocess
     try:
-        r = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=120)
+        r = subprocess.run(VULKAN_PROBE, capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"{type(e).__name__}: {e}", b""
     if r.returncode == 0:
@@ -601,8 +689,8 @@ def _log_vulkan_rank(rank: str, ok: bool, brief: str, raw_stderr: bytes) -> None
 
 
 def _vulkan_preflight(cp: "ControlPlane") -> bool:
-    """3-rank ladder: default loader discovery -> our EGL manifest at 1.3.0 -> 1.2.0 on INCOMPATIBLE_DRIVER
-    only. First green rank wins and returns True. An exhausted ladder refuses work before ready, exactly as a
+    """Ladder: default loader discovery -> our EGL manifest at 1.3.0 -> 1.2.0 on INCOMPATIBLE_DRIVER
+    only -> the host driver's own graphics userspace fetched from the vendor. First green rank wins and returns True. An exhausted ladder refuses work before ready, exactly as a
     pod without NVDEC does (owner ruling 2026-10-27): the refusal event carries the evidence, then exit 3."""
     preset_icd = os.environ.get("VK_ICD_FILENAMES")   # every LOSING rank must leave this exactly as found
     ranks_tried = ["default"]
@@ -622,9 +710,17 @@ def _vulkan_preflight(cp: "ControlPlane") -> bool:
             if api_version != _VULKAN_EGL_API_VERSIONS[0] and \
                     "INCOMPATIBLE_DRIVER" not in raw_stderr.decode("utf-8", "replace"):
                 break  # rank 2 failed for a reason a lower api_version claim cannot fix
-            os.environ["VK_ICD_FILENAMES"] = _write_egl_icd_manifest(lib, api_version)
             rank = f"egl-{api_version}"
             ranks_tried.append(rank)
+            try:
+                os.environ["VK_ICD_FILENAMES"] = _write_egl_icd_manifest(lib, api_version)
+            except OSError as e:
+                # no fallback to /tmp: a manifest the pod cannot keep is the defect this path exists to end
+                brief = f"cannot write the ICD manifest under {_VULKAN_EGL_ICD_DIR} ({type(e).__name__}: {e})"
+                raw_stderr = b""
+                _log_vulkan_rank(rank, False, brief, raw_stderr)
+                detail = brief
+                break
             ok, brief, raw_stderr = _run_vulkan_probe()
             _log_vulkan_rank(rank, ok, brief, raw_stderr)
             if ok:
@@ -637,13 +733,22 @@ def _vulkan_preflight(cp: "ControlPlane") -> bool:
         else:
             os.environ["VK_ICD_FILENAMES"] = preset_icd
 
+    driver = _nvidia_driver_version()   # ONE query: it feeds the last rank and the trailer alike
+    if driver is None:
+        rank_note = f"driver_userspace={driver_userspace.DRIVER_VERSION_UNAVAILABLE}"
+    else:
+        ranks_tried.append(f"driver-userspace-{driver}")
+        green, rank_note = _driver_userspace_rank(driver)
+        if green:
+            return True
+
     evidence = _vulkan_host_evidence(ldconfig_out, lib)
     if raw_stderr:
         # The ffmpeg dump yields the budget to the host evidence, never the other way round.
-        edge = max(_VULKAN_STDERR_MIN_EDGE, (_VULKAN_DETAIL_BUDGET - len(evidence)) // 2)
+        edge = max(_VULKAN_STDERR_MIN_EDGE, (_VULKAN_DETAIL_BUDGET - len(evidence) - len(rank_note)) // 2)
         detail = f"{detail}: {_bounded_stderr(raw_stderr, edge=edge)}"
-    driver = _nvidia_driver_version()
-    detail = (f"{detail} · ranks_tried={','.join(ranks_tried)} · driver_version={driver} · {evidence}")
+    detail = (f"{detail} · ranks_tried={','.join(ranks_tried)} · driver_version={driver or 'unknown'}"
+              f" · {rank_note} · {evidence}")
     if summary := _vulkaninfo_summary():
         detail = f"{detail} · {summary}"
     detail = safe_text(detail)
@@ -774,6 +879,7 @@ def _run_infer(
 
     note(f"claimed {kind}")
     work_started = time.monotonic()
+    vram_watch = None
     try:
         req = InferRequest.model_validate(raw)
         if served is not None:
@@ -791,6 +897,12 @@ def _run_infer(
                                                      "person_matte": matte_cache, "clean_plate": plate_cache})
             if dropped:
                 note(f"dropped {'+'.join(dropped)} weights: this card holds one infer kind at a time")
+        if req.kind in ("align", "clip_rank") and not judge_tiles:
+            # One watch around this call's fetch, load and run — started AFTER the other kind's release, so
+            # before − after is only the weights this call leaves resident. The runner's sampler, not a second
+            # one (VRAM_LEG_WHY).
+            from .ops.runner import _VramWatch
+            vram_watch = _VramWatch(f"infer-{req.kind}")
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
         # same model but carrying different checkpoints must not share a loaded model, and a warm pod that
         # sees the same hash again skips both the fetch and the (dominant) load.
@@ -895,6 +1007,9 @@ def _run_infer(
                 "infer_s": infer_s,
                 "work_s": time.monotonic() - work_started,
             }
+        if vram_watch is not None:
+            vram_watch.stop()
+            work_timings = {**work_timings, **vram_watch.legs()}
 
         boot_s = None if boot_reported else time.monotonic() - BOOT_T0
         _lifecycle(
@@ -924,6 +1039,8 @@ def _run_infer(
     # BaseException, not Exception: a CUDA abort, a SystemExit or an interrupted download must still leave a
     # terminal behind — an unreported one strands the brain for INFER_TIMEOUT_S and reads as a dead host.
     except BaseException as e:
+        if vram_watch is not None:
+            vram_watch.stop()
         _log(f"infer job {job_id} failed: {safe_error(e)}")
         print(safe_traceback(e), file=sys.stderr, flush=True)
         if isinstance(e, TransportUnhealthy):
@@ -1028,6 +1145,9 @@ def _run_ops(chain: Any, cp: ControlPlane, corr_id: str, session_id: str,
             if coordinator is None:
                 raise RuntimeError(f"pack generation change with no restart coordinator to tell: {reason}")
             coordinator.request_restart(reason, target_pack=chain.pack.sha256)
+            # Latch first, THEN wake the claim the dispatch loop is blocked in (same order as the infra
+            # reporter) — otherwise the restart waits out the whole claim wall.
+            cp.interrupt_claim()
             _log(f"restart requested: {reason}")
         return
     except BaseException as e:

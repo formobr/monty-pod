@@ -105,6 +105,21 @@ echoes `keep_ids`; the caller scatters them back (or re-indexes its targets) and
 unchanged — the values at the columns it reads are the same floats. Absent → full vocab width, exactly as
 before. `keep_ids` is a sorted, de-duplicated **set**: an alphabet, never text.
 
+**Words mode (`align.words`).** Owner decision 2026-11-01: the heavy step lives on the pod, so the align
+words, in order, cross (the "no text crosses" rule above holds for every other mode; still no decision
+crosses). Mutually exclusive with `keep_ids`. The vocab and blank never leave the pod: for each word the pod
+takes `[vocab[c] for c in word if c in vocab]` from the checkpoint tokenizer's `get_vocab()` (a word with no
+vocab char contributes nothing); blank = the tokenizer's `pad_token_id`. It runs the same per-window forward
++ log_softmax (full vocab), concatenates the windows along frames, and on CPU/float32 calls
+`torchaudio.functional.forced_align` then `merge_tokens` — the same call the box made. If `chars + (count of
+equal adjacent targets) > frames` no DP runs. The PUT is **JSON** (`application/json`,
+`align_spans.schema.json`), never an npz:
+`{"model", "sr": 16000, "frame_stride_s": 0.02, "frames": <int>, "vocab_sha256": <sha256 of json.dumps(ordered vocab)>,
+"overflow": <bool>, "chars": <int, total targets>, "words": [[start_frame, end_frame] | null, ...] | null}` —
+one entry per request word in order (start = its first target's start, end = its last target's end, exclusive;
+`null` = no vocab char), `words` null on overflow. No per-target spans or scores cross back; seconds stay on
+the planner. Absent `words` → the npz above, unchanged.
+
 ## clip_rank payload (JSON, `clip_rank.schema.json`)
 
 `groups[i]` answers `clip_rank.groups[i]` of the request, and within a group `scores[j]`/`embeds[j]`

@@ -27,6 +27,9 @@ ENV PYTHONUNBUFFERED=1
 # carries its own cu128 runtime, minor-version-compatible back to the R525/12.0 driver family), so declare
 # what we actually need. A host too old for the kernels we load fails loudly in the boot beacon instead.
 ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
+# A run-time -e NVIDIA_DRIVER_CAPABILITIES overrides this, so it governs only injection paths that consume no
+# create-time value (MISC-998 hypothesis test, not a proven fix).
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 
 # --- system: python3.11 (via deadsnakes, ubuntu22.04 ships 3.10) + bundled-browser runtime deps
 # (standard Remotion list). fontconfig stays: libass resolves caption fonts through it. librsvg2-bin is

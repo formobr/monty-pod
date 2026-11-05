@@ -940,6 +940,48 @@ def test_python_invalid_but_addressed_job_gets_correlated_terminal_before_latch(
     stream.close()
 
 
+def _outbox_frames(path: Path) -> list[dict[str, Any]]:
+    return json.loads(path.read_text())["frames"]
+
+
+def test_invalid_job_is_acked_before_its_terminal_and_replay_only_reacks(tmp_path: Path) -> None:
+    """LOCAL CONTOUR 2026-10-29 corr clean_plate 0db534c7: the CP commits a result only against a
+    durable job acceptance, so the invalid-job terminal must be preceded by a job_ack."""
+    path = tmp_path / "outbox.json"
+    malformed = _job("bad-python-job")
+    del malformed["job"]["request"]["model"]
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
+    stream._accept_job(malformed, client_recv_mono_ns=777)
+    frames = _outbox_frames(path)
+    assert [f["type"] for f in frames] == ["event", "job_ack", "result"]
+    ack = frames[1]["job_ack"]
+    assert ack["delivery_id"] == ack["corr_id"] == "bad-python-job"
+    assert ack["attempt_id"] == _ATTEMPT_ID
+    assert ack["client_recv_mono_ns"] == 777
+    assert frames[1]["seq"] < frames[2]["seq"]
+
+    # Replay on reconnect: a fresh ack only; no second event or result; nothing latches.
+    stream._accept_job(malformed, client_recv_mono_ns=888)
+    frames = _outbox_frames(path)
+    assert [f["type"] for f in frames] == ["event", "job_ack", "result", "job_ack"]
+    assert frames[3]["job_ack"]["client_recv_mono_ns"] == 888
+    assert stream._admission_error is None
+    stream.close()
+
+
+def test_invalid_job_without_attempt_id_gets_no_ack_and_no_terminal(tmp_path: Path) -> None:
+    path = tmp_path / "outbox.json"
+    malformed = _job("bad-python-job")
+    del malformed["job"]["request"]["model"]
+    del malformed["attempt_id"]
+    stream = EventStream("http://127.0.0.1:1", "token", outbox_path=path)
+    with pytest.raises(TransportUnhealthy):
+        stream._accept_job(malformed)
+    types = [f["type"] for f in _outbox_frames(path)]
+    assert "job_ack" not in types and "result" not in types
+    stream.close()
+
+
 def test_python_invalid_job_is_terminalized_and_next_delivery_is_admitted(tmp_path: Path) -> None:
     """The reader stays up through the terminal ACK, then accepts the next claim credit."""
     malformed = _job("bad-python-job")

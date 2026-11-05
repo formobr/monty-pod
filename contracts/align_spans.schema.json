@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/align_spans.schema.json",
+  "title": "align spans — the pod's answer to an align request that carries words",
+  "description": "One entry per request word, in order: [start_frame, end_frame] (end exclusive) = its first CTC target's start and its last target's end, or null when the word has no character in the checkpoint vocab. words is null exactly when overflow is true (chars + count of equal adjacent targets > frames; no DP ran). chars = total CTC targets. The vocab and blank never leave the pod; vocab_sha256 pins the checkpoint's ordered vocab. Frames, not seconds: seconds = frame * frame_stride_s is the planner's.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["model", "sr", "frame_stride_s", "frames", "vocab_sha256", "overflow", "chars", "words"],
+  "properties": {
+    "model": { "type": "string", "minLength": 1 },
+    "sr": { "const": 16000 },
+    "frame_stride_s": { "const": 0.02 },
+    "frames": { "type": "integer", "minimum": 0 },
+    "vocab_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "overflow": { "type": "boolean" },
+    "chars": { "type": "integer", "minimum": 0 },
+    "words": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              { "type": "null" },
+              {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "prefixItems": [
+                  { "type": "integer", "minimum": 0 },
+                  { "type": "integer", "minimum": 1 }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "overflow": { "const": true } } }, "then": { "properties": { "words": { "type": "null" } } }, "else": { "properties": { "words": { "type": "array" } } } }
+  ]
+}

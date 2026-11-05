@@ -108,6 +108,27 @@ def test_an_infra_class_run_error_stops_claiming_and_reports_it(tmp_path, monkey
         assert cp.calls == 1
 
 
+def test_a_run_time_vulkan_instance_refusal_stops_claiming(tmp_path, monkeypatch):
+    """MISC-998: the driver refusing the Vulkan instance at run time is the boot class, through the same latch."""
+    exc = RuntimeError("GPU probe refused: [AVHWDeviceContext @ 0x55d0c8a1b2c0] "
+                       "Instance creation failure: VK_ERROR_INCOMPATIBLE_DRIVER")
+    assert runner.infra_class(exc) == "vulkan_false"
+    events, coordinator = _run_failing(tmp_path, monkeypatch, exc, "vk")
+    assert [e["phase"] for e in events][-2:] == ["run_error", "infra_fault"]
+    assert events[-1]["timings"]["error_class"] == "vulkan_false"
+    assert coordinator.infra_fault() and coordinator.infra_class == "vulkan_false"
+
+
+def test_device_creation_failed_and_encoder_exits_do_not_latch():
+    for text in (
+        "Device creation failed: -542398533.",
+        "NVENC exited 187: Device creation failed: -542398533.",
+        "libplacebo/NVENC exited 234",
+        "GPU unavailable for op 'x' kind=timeout",
+    ):
+        assert runner.infra_class(RuntimeError(text)) is None, text
+
+
 def test_ops_lane_installs_the_infra_fault_sink(monkeypatch):
     """_run_ops is what hands the coordinator to the runner; without it the classifier reaches no one."""
     seen: list[object] = []

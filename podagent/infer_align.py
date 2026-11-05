@@ -1,11 +1,10 @@
 """align inference: pure wav2vec2 forward over requested windows → log-softmax emission
-matrices, packed as one .npz and PUT to the request's presigned URL. Nothing is aligned here —
+matrices, packed as one .npz and PUT to the request's (words mode: per-word frame spans as JSON, see align_spans) presigned URL. Nothing is aligned here —
 the emissions are the whole product of this call."""
 from __future__ import annotations
 
 import io
 import json
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +17,10 @@ from .sanitize import safe_error
 _SR = 16000
 
 
+class AlignGpuUnavailable(RuntimeError):
+    """The GPU align was placed on is absent or failed. Align never degrades to CPU."""
+
+
 def pack_npz(arrays: dict[str, Any], meta: dict[str, Any]) -> bytes:
     """One .npz: emissions_<i> + meta_json. STORED, not deflated — log-softmax float32 is near-incompressible
     (measured 316.9 MB → 274.8 MB, 13%) and zlib spends ~12s of pod CPU buying it."""
@@ -26,6 +29,60 @@ def pack_npz(arrays: dict[str, Any], meta: dict[str, Any]) -> bytes:
     buf = io.BytesIO()
     np.savez(buf, **arrays, meta_json=np.frombuffer(json.dumps(meta).encode(), dtype="uint8"))
     return buf.getvalue()
+
+
+def align_spans(emis, targets: list[int], blank: int):
+    """CTC forced alignment of `targets` against `emis` ([frames, vocab] float32 CPU log-softmax) — the exact
+    call the control-plane box's aligner made before this moved to the pod. Returns (overflow, spans); spans is one
+    [start_frame, end_frame, score] per target index (end exclusive), or None on overflow."""
+    import torch
+    import torchaudio.functional as AF
+
+    frames = int(emis.shape[0])
+    repeats = sum(1 for a, b in zip(targets, targets[1:]) if a == b)
+    if len(targets) + repeats > frames:        # CTC capacity: the audio cannot carry the transcript → no DP
+        return True, None
+    al, sc = AF.forced_align(emis[None], torch.tensor([targets], dtype=torch.int32), blank=blank)
+    merged = AF.merge_tokens(al[0], sc[0], blank=blank)
+    if len(merged) != len(targets):
+        raise RuntimeError(f"forced_align merged {len(merged)} spans for {len(targets)} targets")
+    return False, [[int(s.start), int(s.end), float(s.score)] for s in merged]
+
+
+def word_targets(words: list[str], vocab: dict[str, int]) -> tuple[list[int], list[tuple[int, int]]]:
+    """The box's char→id mapping (cut_v3 :786-797): per word, the ids of its chars present in `vocab`; a word with
+    none contributes nothing. Returns (targets, per-word (first, last+1) target index range; empty range = none)."""
+    targets: list[int] = []
+    ranges: list[tuple[int, int]] = []
+    for w in words:
+        a = len(targets)
+        targets.extend(vocab[c] for c in w if c in vocab)
+        ranges.append((a, len(targets)))
+    return targets, ranges
+
+
+def pack_spans_json(model_id: str, vocab_list: list[str], vocab: dict[str, int], blank: int, emis,
+                    words: list[str]) -> bytes:
+    import hashlib
+
+    targets, ranges = word_targets(words, vocab)
+    if not targets:
+        overflow, spans = False, []
+    else:
+        overflow, spans = align_spans(emis, targets, blank)
+    out_words = None if overflow else [
+        [spans[a][0], spans[b - 1][1]] if b > a else None for a, b in ranges]
+    doc = {
+        "model": model_id,
+        "sr": _SR,
+        "frame_stride_s": 0.02,
+        "frames": int(emis.shape[0]),
+        "vocab_sha256": hashlib.sha256(json.dumps(vocab_list).encode()).hexdigest(),
+        "overflow": overflow,
+        "chars": len(targets),
+        "words": out_words,
+    }
+    return json.dumps(doc).encode()
 
 
 class AlignService:
@@ -39,26 +96,22 @@ class AlignService:
         import torch
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
+        if not torch.cuda.is_available():
+            raise AlignGpuUnavailable("align needs CUDA; torch.cuda.is_available() is False")
         self.torch = torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.model_id = model_id
         self.processor = Wav2Vec2Processor.from_pretrained(str(weights_dir), local_files_only=True)
         self.model = Wav2Vec2ForCTC.from_pretrained(
             str(weights_dir), local_files_only=True).to(self.device).eval()
 
     def _emit(self, seg):
-        # one window → log-softmax emission. A CUDA runtime error (e.g. an arch this torch build has no kernels
-        # for) degrades LOUDLY to CPU once — a rented GPU that can't run is a visible fault, not a silent crawl.
+        # one window → log-softmax emission. Placement is absolute: a CUDA runtime error refuses the job naming
+        # the cause; the model stays on its GPU and never moves to CPU.
         try:
             logits = self.model(seg.to(self.device)).logits[0]
         except RuntimeError as e:
-            if self.device == "cpu":
-                raise
-            print(f"[podagent] WARNING align CUDA failed ({safe_error(e, 120)}) → CPU fallback (SLOW)",
-                  file=sys.stderr, flush=True)
-            self.device = "cpu"
-            self.model = self.model.to("cpu")
-            logits = self.model(seg.to("cpu")).logits[0]
+            raise AlignGpuUnavailable(f"align CUDA failed: {safe_error(e, 200)}") from e
         return self.torch.log_softmax(logits, dim=-1)
 
     def _vocab(self) -> list[str]:
@@ -82,6 +135,23 @@ class AlignService:
                 wave = wave.mean(0, keepdim=True)
             if sr != _SR:
                 wave = torchaudio.functional.resample(wave, sr, _SR)
+
+            if params.words is not None:
+                with self.torch.inference_mode():
+                    # full vocab width, no projection; float32 on CPU is the exact input the box's call took
+                    emis = self.torch.cat(
+                        [self._emit(wave[:, int(w[0] * _SR): int(w[1] * _SR)]).float().cpu()
+                         for w in params.windows], dim=0)
+                    tok = self.processor.tokenizer   # vocab and blank are the checkpoint's own, never the request's
+                    payload = pack_spans_json(self.model_id, self._vocab(), tok.get_vocab(),
+                                              int(tok.pad_token_id), emis, params.words)
+                out = Path(td) / "align_spans.json"
+                out.write_bytes(payload)
+                infer_s = time.monotonic() - t0
+                say(f"align {len(params.windows)} window(s) → {len(params.words)} word(s) "
+                    f"in {infer_s:.0f}s")
+                upload(out, put_url, "application/json")
+                return infer_s
 
             keep = params.keep_ids
             # index on DEVICE: slicing after .cpu() would still materialise the full-vocab matrix we are here
