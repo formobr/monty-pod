@@ -536,6 +536,40 @@ def _icd_dir_listing(path: str) -> str:
     return f"{path}: {','.join(entries) if entries else 'empty'}"
 
 
+# The graphics/video userspace the container runtime injects only when the capability is granted
+# (MISC-998): its presence, library by library, settles whether the runtime or the host is what is missing.
+_VULKAN_GRAPHICS_LIBS = ("libGLX_nvidia.so.0", "libnvidia-glcore", "libnvidia-glvkspirv", "libnvidia-eglcore",
+                         "libnvidia-gpucomp", "libnvidia-encode.so.1", "libnvcuvid.so.1")
+
+
+def _graphics_libs_evidence(ldconfig_out: str) -> str:
+    """yes/no per graphics library, matched against the SAME ldconfig output the rest of the evidence reads."""
+    sonames = [ln.strip().split(" ", 1)[0] for ln in ldconfig_out.splitlines() if ln.strip()]
+    return ",".join(f"{lib}={'yes' if any(s.startswith(lib) for s in sonames) else 'no'}"
+                    for lib in _VULKAN_GRAPHICS_LIBS)
+
+
+def _icd_library_paths() -> str:
+    """Every ICD json in the loader's manifest dirs with the ICD.library_path it points at — 'unreadable' when
+    the file cannot be read or parsed, so a broken manifest is a named fact, not a missing one."""
+    import json
+    found: list[str] = []
+    for d in _VULKAN_ICD_DIRS:
+        try:
+            files = sorted(p for p in Path(d).iterdir() if p.name.endswith(".json"))
+        except OSError:
+            continue
+        for p in files:
+            try:
+                target = json.loads(p.read_text())["ICD"]["library_path"]
+                if not isinstance(target, str):
+                    target = "unreadable"
+            except (OSError, ValueError, KeyError, TypeError):
+                target = "unreadable"
+            found.append(f"{p}->{target}")
+    return ",".join(found) or "none"
+
+
 def _vulkan_host_evidence(ldconfig_out: str, lib: str | None) -> str:
     """WHY the ladder could not even start. `ranks_tried=default` alone cannot tell "our image is broken"
     from "this host exposes the GPU without the GL/EGL userspace, so no libEGL_nvidia.so.0 exists and the
@@ -549,6 +583,7 @@ def _vulkan_host_evidence(ldconfig_out: str, lib: str | None) -> str:
     shown = names[:_VULKAN_EVIDENCE_MAX_LIBS]
     libs = ",".join(shown) + (f",+{len(names) - len(shown)} more" if len(names) > len(shown) else "")
     return (f"{head}; icd.d: {icds}; caps={caps if caps is not None else 'UNSET'}; "
+            f"graphics_libs={_graphics_libs_evidence(ldconfig_out)}; icd={_icd_library_paths()}; "
             f"nvidia libs: {libs or 'none'}")
 
 

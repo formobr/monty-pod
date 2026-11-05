@@ -193,6 +193,38 @@ def test_every_rank_red_refuses_with_ranks_and_driver_evidence(monkeypatch):
     assert len(detail) < 1800
 
 
+def test_a_refusal_names_each_graphics_library_and_the_icd_library_path(monkeypatch, tmp_path):
+    """MISC-998: the truncated nvidia list and a bare icd.d listing could not settle which graphics userspace
+    the runtime injected nor where the loader's ICD points."""
+    def fake_run(cmd, *a, **k):
+        if cmd[0] == "ldconfig":
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout=("\tlibGLX_nvidia.so.0 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0\n"
+                        "\tlibnvidia-encode.so.1 (libc6,x86-64) => /usr/lib/libnvidia-encode.so.1\n"),
+                stderr="")
+        if cmd[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"580.178.04\n", stderr=b"")
+        assert cmd[0] == "ffmpeg"
+        return _run(1, b"VK_ERROR_INCOMPATIBLE_DRIVER\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(agent_main.shutil, "which", lambda _name: None)
+    icd = tmp_path / "icd.d"
+    icd.mkdir()
+    (icd / "nvidia_icd.json").write_text(
+        '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3.0"}}')
+    monkeypatch.setattr(agent_main, "_VULKAN_ICD_DIRS", (str(icd),))
+
+    detail = _refused()
+
+    assert "graphics_libs=" in detail and "libGLX_nvidia.so.0=yes" in detail
+    assert "libnvidia-glcore=no" in detail and "libnvidia-encode.so.1=yes" in detail
+    assert "libnvcuvid.so.1=no" in detail
+    assert f"icd={icd / 'nvidia_icd.json'}->libGLX_nvidia.so.0" in detail
+    assert detail.index("graphics_libs=") < detail.index("icd=") < detail.index("nvidia libs:")
+
+
 def test_egl_1_3_failing_for_a_non_driver_reason_never_reaches_1_2(monkeypatch):
     calls = {"ffmpeg": 0}
 
