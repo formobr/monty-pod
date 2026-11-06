@@ -312,7 +312,8 @@ def _provide_video_libs(cp: "ControlPlane", version: str, probe: list[str]) -> s
     res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent)
     if not res.ok:
         _log(f"nvenc video-libs fetch refused: {res.reason}: {res.detail}")
-        return f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+        return (f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+                + (f" {res.transfer}" if getattr(res, "transfer", "") else ""))
     try:
         _prepend_ld_library_path(res.lib_dir)
         left = res.cap - (time.monotonic() - t0)
@@ -712,7 +713,8 @@ def _driver_userspace_rank(version: str, cp: "ControlPlane | None" = None) -> tu
     res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent)
     if not res.ok:
         _log_vulkan_rank(rank, False, f"{res.reason}: {res.detail}", b"")
-        return False, f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+        return False, (f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+                       + (f" {res.transfer}" if getattr(res, "transfer", "") else ""))
     try:
         os.environ["VK_ICD_FILENAMES"] = os.environ["VK_DRIVER_FILES"] = res.manifest
         _prepend_ld_library_path(res.lib_dir)

@@ -3,11 +3,16 @@ installer: a fake transport, a fake extractor and a fake clock stand in, so each
 allowlist-only result are pinned deterministically."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from podagent import driver_userspace as du
 
@@ -47,7 +52,7 @@ class FakeTransport:
         self.urls: list[str] = []
         self.responses: list[FakeResponse] = []
 
-    def __call__(self, url: str, timeout: float):
+    def __call__(self, url: str, timeout: float, headers=None):
         self.urls.append(url)
         name = url.rsplit("/", 1)[-1]
         resp = FakeResponse(200 if name in self.files else 404, self.files.get(name, b""),
@@ -303,3 +308,249 @@ def test_a_version_that_is_not_a_version_never_builds_a_url(tmp_path):
     for bad in ("../../etc", "580", "580.178.04; rm", ""):
         res = du.fetch_driver_userspace(bad, tmp_path / "state", transport=no_network, extractor=FakeExtractor())
         assert (res.ok, res.reason) == (False, du.DRIVER_VERSION_UNAVAILABLE)
+
+
+# ---- MISC-1032: the run is fetched as parallel byte ranges --------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _fast_supervisor(monkeypatch):
+    monkeypatch.setattr(du, "POLL_S", 0.01)       # real wake-up cadence only; every verdict uses the fake clock
+
+
+class RangeResponse:
+    """A ranged answer. Its virtual finish time is t0 + chunks*tick, so parallel streams overlap on the fake clock."""
+
+    def __init__(self, status, body, clock, tick, chunk, content_range, length=None):
+        self.status, self.body, self.clock, self.tick, self.chunk = status, body, clock, tick, chunk
+        self.length = len(body) if length is None else length
+        self.content_range, self.content_encoding = content_range, None
+        self.t0 = 0.0                     # every stream starts together on the fake clock, whatever the thread order
+        self.ignore_close = False
+        self.gate = None                 # set -> chunks() blocks until the gate opens (close(), unless ignore_close)
+        self.consumed = self.closed = self.exited = False
+
+    def chunks(self):
+        try:
+            if self.gate is not None:
+                self.gate.wait()          # no real-time bound: the gate opens on close() or the test's teardown
+                return
+            for k, i in enumerate(range(0, len(self.body), self.chunk), 1):
+                self.clock.t = max(self.clock.t, self.t0 + k * self.tick)
+                yield self.body[i:i + self.chunk]
+            self.consumed = True
+        finally:
+            self.exited = True
+
+    def close(self) -> None:
+        self.closed = True
+        if self.gate is not None and not self.ignore_close:
+            self.gate.set()
+
+
+class RangedTransport(FakeTransport):
+    def __init__(self, clock, *, files, tick=0.0, chunk=50, ranges=True, tamper=None, parts=4):
+        super().__init__(clock, files=files, tick=tick, parts=parts)
+        self.chunk, self.ranges, self.tamper = chunk, ranges, tamper
+        self.calls: list[dict | None] = []          # headers of every .run request, in order
+        self.range_responses: list[RangeResponse] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, url, timeout, headers=None):
+        if not url.endswith(".run"):
+            return super().__call__(url, timeout, headers)
+        with self._lock:
+            self.calls.append(headers)
+        m = re.fullmatch(r"bytes=(\d+)-(\d+)", (headers or {}).get("Range", ""))
+        if not (m and self.ranges):
+            return super().__call__(url, timeout, headers)
+        s, e = int(m.group(1)), int(m.group(2))
+        body = self.files[url.rsplit("/", 1)[-1]]
+        resp = RangeResponse(206, body[s:e + 1], self.clock, self.tick, self.chunk, f"bytes {s}-{e}/{len(body)}")
+        if (s, e) != (0, 0):
+            with self._lock:
+                self.range_responses.append(resp)
+            if self.tamper:
+                self.tamper(s, e, resp)
+        return resp
+
+    def ranged_calls(self):
+        return [h["Range"] for h in self.calls if h and "Range" in h]
+
+    def single_calls(self):
+        return [h for h in self.calls if not h or "Range" not in h]
+
+
+def _ranged_fetch(tmp_path, clock, **kw):
+    fetch_kw = {k: kw.pop(k) for k in ("cap", "disk_usage") if k in kw}
+    transport = RangedTransport(clock, files=kw.pop("files", _files()), **kw)
+    extractor = FakeExtractor(transport=None)
+    return transport, extractor, _fetch(tmp_path, transport, extractor, clock, **fetch_kw)
+
+
+def test_ranges_finish_inside_the_wall_where_one_stream_would_not(tmp_path, monkeypatch):
+    monkeypatch.setattr(du, "MIN_BYTES_PER_S", 0)           # this test guards the wall; the stall has its own test
+    parallel_clock = Clock()
+    transport, extractor, res = _ranged_fetch(tmp_path, parallel_clock, tick=15.0)
+    assert res.ok, res.detail
+    assert res.transfer == f"bytes={len(RUN)}/{len(RUN)} streams=4"
+    # probe, then four contiguous ranges covering [0, L) with no gap and no overlap
+    assert transport.calls[0] == {"Range": "bytes=0-0", "Accept-Encoding": "identity"}
+    spans = sorted(tuple(map(int, r[6:].split("-"))) for r in transport.ranged_calls()[1:])
+    assert len(spans) == du.RANGE_STREAMS and spans[0][0] == 0 and spans[-1][1] == len(RUN) - 1
+    assert all(b[0] == a[1] + 1 for a, b in zip(spans, spans[1:]))
+    assert all(h["Accept-Encoding"] == "identity" for h in transport.calls if h)
+    assert transport.single_calls() == [] and all(r.closed for r in transport.range_responses)
+    assert parallel_clock.t > 0 and extractor.calls and _left_behind(tmp_path) == [f"nvidia-{V}"]
+
+    # the same host and speed on ONE stream blows the 110 s download wall
+    one_clock = Clock()
+    _, _, single = _ranged_fetch(tmp_path / "one", one_clock, tick=15.0, ranges=False, parts=20)
+    assert (single.ok, single.reason) == (False, du.DOWNLOAD_TIMEOUT) and "wall hit" in single.detail
+
+
+@pytest.mark.parametrize("kind", ["status-200", "wrong-range", "encoded", "wrong-length", "short", "long", "reset"])
+def test_a_bad_range_fails_then_one_single_stream_into_a_fresh_file_finishes(tmp_path, kind):
+    bad_resp = []
+
+    def tamper(s, e, resp):
+        if s != len(RUN) // 4:                                  # exactly one range misbehaves
+            return
+        bad_resp.append(resp)
+        if kind == "status-200":
+            resp.status, resp.content_range = 200, None
+        elif kind == "wrong-range":
+            resp.content_range = f"bytes {s}-{e}/{len(RUN) + 1}"
+        elif kind == "encoded":
+            resp.content_encoding = "gzip"
+        elif kind == "wrong-length":
+            resp.length += 1
+        elif kind == "short":
+            resp.body = resp.body[:-10]
+        elif kind == "long":
+            resp.body = resp.body + b"x" * 10
+        elif kind == "reset":
+            raise OSError("connection reset")
+
+    clock = Clock()
+    transport = RangedTransport(clock, files=_files(), tamper=tamper)
+    extractor = FakeExtractor()
+    res = _fetch(tmp_path, transport, extractor, clock)
+    assert res.ok, res.detail
+    assert len(transport.single_calls()) == 1, "exactly ONE single-stream fallback"
+    assert extractor.calls[0][0].endswith(".single"), "the fallback writes a fresh file name"
+    assert res.transfer == f"bytes={len(RUN)}/{len(RUN)} streams=1"
+    assert _left_behind(tmp_path) == [f"nvidia-{V}"]
+    if kind in ("status-200", "wrong-range", "encoded", "wrong-length"):
+        assert bad_resp and not bad_resp[0].exited, "refused before its body was read"
+        assert bad_resp[0].closed
+
+
+def test_a_global_stall_refuses_and_does_not_restart_as_one_stream(tmp_path):
+    clock = Clock()
+    transport, extractor, res = _ranged_fetch(tmp_path, clock, tick=3.0, chunk=10, cap=10_000.0)
+    assert (res.ok, res.reason) == (False, du.DOWNLOAD_TIMEOUT) and "stalled" in res.detail
+    assert transport.single_calls() == [] and extractor.calls == [] and _left_behind(tmp_path) == []
+    assert all(r.closed for r in transport.range_responses)
+
+
+def test_the_wall_refuses_without_a_fallback_and_the_trailer_says_what_arrived(tmp_path):
+    clock = Clock()
+    transport, extractor, res = _ranged_fetch(tmp_path, clock, tick=200.0)
+    assert (res.ok, res.reason) == (False, du.DOWNLOAD_TIMEOUT) and "wall hit" in res.detail
+    assert transport.single_calls() == [] and _left_behind(tmp_path) == []
+    assert re.fullmatch(rf"bytes=\d+/{len(RUN)} streams=4", res.transfer)
+    assert res.detail.endswith(res.transfer)
+
+
+def test_a_blocked_worker_is_released_and_joined_before_the_refusal_returns(tmp_path):
+    gated = {}
+
+    def tamper(s, e, resp):
+        if s == len(RUN) // 4:
+            resp.gate = threading.Event()               # a read that never returns until the response is closed
+            gated["resp"] = resp
+        elif s == len(RUN) // 2:
+            resp.tick = 500.0                           # this stream pushes the clock past the wall
+
+    clock = Clock()
+    transport, _, res = _ranged_fetch(tmp_path, clock, tamper=tamper)
+    assert (res.ok, res.reason) == (False, du.DOWNLOAD_TIMEOUT) and "wall hit" in res.detail
+    assert gated["resp"].closed and gated["resp"].exited, "the worker was woken and finished before we returned"
+    assert not [t for t in threading.enumerate() if t.name.startswith("driver-range-")]
+    assert transport.single_calls() == [] and _left_behind(tmp_path) == []
+
+
+def test_a_worker_that_ignores_close_is_given_up_on_after_the_join_deadline(tmp_path, monkeypatch):
+    monkeypatch.setattr(du, "JOIN_DEADLINE_S", 0.05)
+    gated = {}
+
+    def tamper(s, e, resp):
+        if s == len(RUN) // 4:
+            resp.gate, resp.ignore_close = threading.Event(), True
+            gated["resp"] = resp
+        elif s == len(RUN) // 2:
+            resp.tick = 500.0
+
+    clock = Clock()
+    try:
+        transport, _, res = _ranged_fetch(tmp_path, clock, tamper=tamper)
+    finally:
+        gated["resp"].gate.set()                        # let the stuck worker finish after the assertions' subject
+    assert (res.ok, res.reason) == (False, du.DOWNLOAD_TIMEOUT) and "did not stop in time" in res.detail
+    assert gated["resp"].closed and transport.single_calls() == []
+
+
+def test_a_host_that_ignores_ranges_gets_the_single_stream_as_before(tmp_path):
+    clock = Clock()
+    transport, extractor, res = _ranged_fetch(tmp_path, clock, ranges=False)
+    assert res.ok
+    assert transport.ranged_calls() == ["bytes=0-0"] and len(transport.single_calls()) == 1
+    assert not extractor.calls[0][0].endswith(".single")
+    assert res.transfer == f"bytes={len(RUN)}/{len(RUN)} streams=1"
+
+
+def test_a_ranged_download_with_the_wrong_checksum_still_refuses_before_extraction(tmp_path):
+    clock = Clock()
+    transport, extractor, res = _ranged_fetch(tmp_path, clock, files=_files(sha="0" * 64))
+    assert (res.ok, res.reason) == (False, du.CHECKSUM_MISMATCH)
+    assert extractor.calls == [] and transport.single_calls() == [] and _left_behind(tmp_path) == []
+
+
+def test_short_disk_refuses_on_the_probed_length_before_any_range_is_requested(tmp_path):
+    clock = Clock()
+    transport, extractor, res = _ranged_fetch(tmp_path, clock, disk_usage=_disk(free=1000))
+    assert (res.ok, res.reason) == (False, du.INSUFFICIENT_DISK)
+    assert transport.ranged_calls() == ["bytes=0-0"] and transport.range_responses == []
+    assert _left_behind(tmp_path) == []
+
+
+def test_a_full_disk_while_writing_is_insufficient_disk_not_a_fallback(tmp_path, monkeypatch):
+    def full(fd, data, offset):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "pwrite", full)
+    clock = Clock()
+    transport, _, res = _ranged_fetch(tmp_path, clock)
+    assert (res.ok, res.reason) == (False, du.INSUFFICIENT_DISK)
+    assert transport.single_calls() == [] and _left_behind(tmp_path) == []
+
+
+def test_a_short_positional_write_is_continued_at_the_right_offset(tmp_path, monkeypatch):
+    real = os.pwrite
+    monkeypatch.setattr(os, "pwrite", lambda fd, data, offset: real(fd, bytes(data)[:7], offset))
+    clock = Clock()
+    _, extractor, res = _ranged_fetch(tmp_path, clock)
+    assert res.ok, res.detail
+    assert extractor.calls and res.transfer == f"bytes={len(RUN)}/{len(RUN)} streams=4"
+
+
+def test_both_refusal_trailers_carry_bytes_and_streams(monkeypatch):
+    from podagent import main as pod_main
+
+    refused = du.FetchResult(ok=False, reason=du.DOWNLOAD_TIMEOUT, detail="x", cap=150.0,
+                             transfer="bytes=100/316359348 streams=4")
+    monkeypatch.setattr(pod_main, "_fetch_driver_userspace", lambda *a, **k: refused)
+    ok, note = pod_main._driver_userspace_rank("595.112.07")
+    assert not ok and note.endswith("bytes=100/316359348 streams=4") and "DOWNLOAD_TIMEOUT" in note
+    video = pod_main._provide_video_libs(None, "595.112.07", ["true"])
+    assert video.endswith("bytes=100/316359348 streams=4") and "DOWNLOAD_TIMEOUT" in video

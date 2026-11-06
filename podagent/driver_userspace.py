@@ -13,6 +13,7 @@ This module only provisions a directory; wiring it into the environment and re-p
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +41,8 @@ VULKAN_REPROBE_FAILED = "VULKAN_REPROBE_FAILED"
 VIDEO_REPROBE_FAILED = "VIDEO_REPROBE_FAILED"
 
 BASE_URL = "https://download.nvidia.com/XFree86/Linux-x86_64"
-# Whole rank (download + extract + re-probe), well under the engine-declared 316 s boot.
+# Whole rank (download + extract + re-probe). 316 s is the fleet's median cold start, not a boot wall: the
+# unclaimed pod is cancelled at 555 s, so the wall does not grow; the download gets faster instead (ranges).
 RANK_WALL_S = 150.0
 # Time the download must leave for extraction and the fresh re-probe.
 AFTER_DOWNLOAD_RESERVE_S = 40.0
@@ -48,6 +51,9 @@ SHA_FETCH_TIMEOUT_S = 15.0
 MIN_BYTES_PER_S = 1_000_000          # stall floor, measured per window
 STALL_WINDOW_S = 10.0
 CHUNK = 1 << 20
+RANGE_STREAMS = 4
+POLL_S = 0.5                         # supervisor wake-up (real seconds); every decision uses the injected clock
+JOIN_DEADLINE_S = 5.0                # real seconds to wait for every worker after a stop
 # Disk: archive + what --extract-only unpacks (1.2-1.5 GB measured) + the kept set (<= ~160 MB).
 EXTRACT_BYTES = 1_600_000_000
 KEPT_BYTES = 200_000_000
@@ -86,17 +92,19 @@ class FetchResult:
     manifest: str = ""
     elapsed: float = 0.0
     cap: float = RANK_WALL_S
+    transfer: str = ""          # "bytes=<current-attempt completed>/<total> streams=<k>"; empty before any download
 
 
 class Response(Protocol):
     status: int
     length: int | None
+    # optional, read with getattr: content_range, content_encoding
 
     def chunks(self) -> Iterable[bytes]: ...
     def close(self) -> None: ...
 
 
-Transport = Callable[[str, float], Response]
+Transport = Callable[..., Response]      # (url, timeout) or (url, timeout, headers=...)
 Extractor = Callable[[str, str, float], "tuple[int, str]"]
 
 
@@ -115,6 +123,8 @@ class _HttpResponse:
             self.length = int(r.headers["Content-Length"])
         except (KeyError, ValueError):
             self.length = None
+        self.content_range = r.headers.get("Content-Range")
+        self.content_encoding = r.headers.get("Content-Encoding")
 
     def chunks(self) -> Iterable[bytes]:
         import requests
@@ -129,10 +139,11 @@ class _HttpResponse:
         self._r.close()
 
 
-def default_transport(url: str, timeout: float) -> Response:
+def default_transport(url: str, timeout: float, headers: dict | None = None) -> Response:
     import requests
     try:
-        return _HttpResponse(requests.get(url, stream=True, timeout=(min(10.0, timeout), timeout)))
+        return _HttpResponse(requests.get(url, stream=True, headers=headers,
+                                          timeout=(min(10.0, timeout), timeout)))
     except requests.Timeout as e:
         raise TimeoutError(str(e)) from e
     except requests.RequestException as e:
@@ -200,6 +211,263 @@ def _expected_sha(text: str) -> str:
     return token
 
 
+class _Progress:
+    """What the current download attempt completed; the refusal trailer prints it."""
+
+    def __init__(self) -> None:
+        self.done = 0
+        self.total: int | None = None
+        self.streams = 0
+        self._lock = threading.Lock()
+
+    def reset(self, total: int | None, streams: int) -> None:
+        with self._lock:
+            self.done, self.total, self.streams = 0, total, streams
+
+    def add(self, n: int) -> None:
+        with self._lock:
+            self.done += n
+
+    def text(self) -> str:
+        if not self.streams:
+            return ""
+        return f"bytes={self.done}/{self.total if self.total is not None else '?'} streams={self.streams}"
+
+
+def _with_transfer(detail: str, progress: _Progress) -> str:
+    text = progress.text()
+    return f"{detail} {text}" if text and detail else (text or detail)
+
+
+def _check_disk(archive: int, base, disk_usage) -> None:
+    need, free = archive + EXTRACT_BYTES + KEPT_BYTES, disk_usage(str(base)).free
+    if free < need:
+        raise _Refusal(INSUFFICIENT_DISK, f"need {need // 2**20} MiB, free {free // 2**20} MiB")
+
+
+def _probe_ranges(transport: Transport, url: str, timeout: float) -> int | None:
+    """Total length when the host answers a one-byte ranged GET with a proper 206, else None (single stream)."""
+    try:
+        resp = transport(url, timeout, headers={"Range": "bytes=0-0", "Accept-Encoding": "identity"})
+    except (TimeoutError, OSError):
+        return None
+    try:
+        if resp.status != 206 or getattr(resp, "content_encoding", None):
+            return None
+        m = re.fullmatch(r"bytes 0-0/(\d+)", getattr(resp, "content_range", None) or "")
+        length = int(m.group(1)) if m else 0
+        return length if length >= RANGE_STREAMS else None
+    finally:
+        resp.close()
+
+
+def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.pwrite(fd, view, offset)
+        if n <= 0:
+            raise OSError(errno.EIO, "pwrite wrote nothing")
+        view, offset = view[n:], offset + n
+
+
+class _RangeFailure(Exception):
+    """One range went wrong for a reason that is not global: the single-stream fallback may still work."""
+
+
+def _range_worker(transport, url, timeout, fd, length, start, end, progress, stop, responses, lock) -> None:
+    resp = transport(url, timeout, headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"})
+    with lock:
+        responses.append(resp)
+        if stop.is_set():
+            resp.close()
+            return
+    try:
+        # all of this is checked before a single body byte is read or written
+        if resp.status != 206:
+            raise _RangeFailure(f"range {start}-{end}: HTTP {resp.status}")
+        if getattr(resp, "content_encoding", None):
+            raise _RangeFailure(f"range {start}-{end}: content-encoding")
+        if getattr(resp, "content_range", None) != f"bytes {start}-{end}/{length}":
+            raise _RangeFailure(f"range {start}-{end}: wrong Content-Range")
+        if resp.length is not None and resp.length != end - start + 1:
+            raise _RangeFailure(f"range {start}-{end}: wrong Content-Length")
+        off = start
+        try:
+            for chunk in resp.chunks():
+                if stop.is_set():
+                    return
+                if off + len(chunk) > end + 1:
+                    raise _RangeFailure(f"range {start}-{end}: body longer than asked")
+                _pwrite_all(fd, chunk, off)
+                off += len(chunk)
+                progress.add(len(chunk))
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                raise _Refusal(INSUFFICIENT_DISK, "disk full while writing") from e
+            raise
+        if off != end + 1 and not stop.is_set():
+            raise _RangeFailure(f"range {start}-{end}: body short by {end + 1 - off} bytes")
+    finally:
+        resp.close()
+
+
+def _join(threads) -> bool:
+    """True when some worker is still alive after the bounded real-time deadline."""
+    deadline = time.monotonic() + JOIN_DEADLINE_S
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    return any(t.is_alive() for t in threads)
+
+
+def _stop_and_join(stop, responses, lock, threads) -> bool:
+    """Stop every worker, close every response so a blocked read returns, then join."""
+    stop.set()
+    with lock:
+        pending = list(responses)
+    for resp in pending:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001 — closing must not mask the real verdict
+            pass
+    return _join(threads)
+
+
+def _download_ranged(transport, url, run_file, length, base, disk_usage, remaining, clock, progress) -> bool:
+    """True = the whole file is on disk, every byte from a verified range. False = fall back to one stream.
+    Global failures (wall, stall, disk) raise and are never retried."""
+    _check_disk(length, base, disk_usage)                          # on the probed length, before preallocating
+    left = remaining() - AFTER_DOWNLOAD_RESERVE_S
+    if left <= 0:
+        raise _Refusal(DOWNLOAD_TIMEOUT, "wall exhausted before the download")
+    timeout = min(SHA_FETCH_TIMEOUT_S, left)
+    progress.reset(length, RANGE_STREAMS)
+    fd = os.open(run_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    stop, all_done, lock = threading.Event(), threading.Event(), threading.Lock()
+    responses: list = []
+    failures: list[BaseException] = []
+    state = {"left": RANGE_STREAMS}
+    threads: list[threading.Thread] = []
+    verdict = ""
+    stuck = False
+    try:
+        try:
+            os.ftruncate(fd, length)
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                raise _Refusal(INSUFFICIENT_DISK, "disk full while preallocating") from e
+            raise
+
+        def run(start: int, end: int) -> None:
+            try:
+                _range_worker(transport, url, timeout, fd, length, start, end, progress, stop, responses, lock)
+            except BaseException as e:  # noqa: BLE001 — recorded here, judged by the supervisor
+                with lock:
+                    if not stop.is_set():
+                        failures.append(e)
+                        stop.set()
+            finally:
+                with lock:
+                    state["left"] -= 1
+                    if state["left"] == 0:
+                        all_done.set()
+
+        win_start, win_done = clock(), progress.done               # the stall window opens before any worker runs
+        for i in range(RANGE_STREAMS):
+            t = threading.Thread(target=run, daemon=True, name=f"driver-range-{i}",
+                                 args=(i * length // RANGE_STREAMS, (i + 1) * length // RANGE_STREAMS - 1))
+            threads.append(t)
+            t.start()
+
+        # supervisor: wall and stall are judged here on the injected clock, summed over streams, not per chunk
+        while True:
+            all_done.wait(POLL_S)
+            with lock:
+                if failures:
+                    break
+                finished = state["left"] == 0
+            now = clock()
+            if remaining() - AFTER_DOWNLOAD_RESERVE_S <= 0:
+                verdict = f"wall hit after {progress.done} bytes"
+                break
+            if now - win_start >= STALL_WINDOW_S:
+                if progress.done - win_done < MIN_BYTES_PER_S * (now - win_start):
+                    verdict = f"stalled below {MIN_BYTES_PER_S} B/s after {progress.done} bytes"
+                    break
+                win_start, win_done = now, progress.done
+            if finished:
+                break
+        stuck = _stop_and_join(stop, responses, lock, threads) if (verdict or failures) else _join(threads)
+    finally:
+        if not any(t.is_alive() for t in threads):                 # never close an fd a live writer still uses
+            os.close(fd)
+    if stuck:
+        raise _Refusal(DOWNLOAD_TIMEOUT, "download workers did not stop in time")
+    if verdict:
+        raise _Refusal(DOWNLOAD_TIMEOUT, verdict)
+    for exc in failures:
+        if isinstance(exc, _Refusal):
+            raise exc
+    return not failures
+
+
+def _sha_file(path: Path, remaining) -> str:
+    """SHA-256 of the finished file, with a deadline check per block (inside the post-download reserve)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            if remaining() - AFTER_DOWNLOAD_RESERVE_S / 2 <= 0:
+                raise _Refusal(DOWNLOAD_TIMEOUT, "wall exhausted while hashing")
+            block = f.read(CHUNK)
+            if not block:
+                return digest.hexdigest()
+            digest.update(block)
+
+
+def _download_single(transport, url, run_file, base, disk_usage, remaining, clock, progress) -> str:
+    """One stream, hashed as it arrives. Returns the hex digest."""
+    name = url.rsplit("/", 1)[-1]
+    left = remaining() - AFTER_DOWNLOAD_RESERVE_S
+    if left <= 0:
+        raise _Refusal(DOWNLOAD_TIMEOUT, "wall exhausted before the download")
+    try:
+        resp = transport(url, min(SHA_FETCH_TIMEOUT_S, left))
+    except TimeoutError as e:
+        raise _Refusal(DOWNLOAD_TIMEOUT, str(e)) from e
+    except OSError as e:
+        raise _Refusal(DRIVER_PACKAGE_UNAVAILABLE, type(e).__name__) from e
+    try:
+        if resp.status != 200:
+            raise _Refusal(DRIVER_PACKAGE_UNAVAILABLE, f"{name}: HTTP {resp.status}")
+        _check_disk(resp.length or UNKNOWN_ARCHIVE_BYTES, base, disk_usage)
+        progress.reset(resp.length, 1)
+        digest = hashlib.sha256()
+        total = win_bytes = 0
+        win_start = clock()
+        try:
+            with open(run_file, "wb") as out:
+                for chunk in resp.chunks():
+                    out.write(chunk)
+                    digest.update(chunk)
+                    total += len(chunk)
+                    win_bytes += len(chunk)
+                    progress.add(len(chunk))
+                    now = clock()
+                    if remaining() - AFTER_DOWNLOAD_RESERVE_S <= 0:
+                        raise _Refusal(DOWNLOAD_TIMEOUT, f"wall hit after {total} bytes")
+                    if now - win_start >= STALL_WINDOW_S:
+                        if win_bytes < MIN_BYTES_PER_S * (now - win_start):
+                            raise _Refusal(DOWNLOAD_TIMEOUT,
+                                           f"stalled below {MIN_BYTES_PER_S} B/s after {total} bytes")
+                        win_start, win_bytes = now, 0
+        except TimeoutError as e:
+            raise _Refusal(DOWNLOAD_TIMEOUT, f"read stalled after {total} bytes: {e}") from e
+        except OSError as e:
+            raise _Refusal(DOWNLOAD_TIMEOUT, f"transfer broke after {total} bytes: {type(e).__name__}") from e
+    finally:
+        resp.close()
+    return digest.hexdigest()
+
+
 def fetch_driver_userspace(
     version: str,
     base_dir: str | os.PathLike,
@@ -213,9 +481,10 @@ def fetch_driver_userspace(
     """Provision <base_dir>/nvidia-<version>/ and return where. Never raises: every failure is a named
     FetchResult, and nothing but a verified directory is left behind."""
     start = clock()
+    progress = _Progress()
 
     def done(**kw) -> FetchResult:
-        return FetchResult(elapsed=clock() - start, cap=cap, **kw)
+        return FetchResult(elapsed=clock() - start, cap=cap, transfer=progress.text(), **kw)
 
     if not isinstance(version, str) or not DRIVER_VERSION_RE.match(version):
         return done(ok=False, reason=DRIVER_VERSION_UNAVAILABLE, detail="not a driver version")
@@ -232,18 +501,18 @@ def fetch_driver_userspace(
             return done(ok=False, reason=INSUFFICIENT_DISK,
                         detail=f"state dir {base} not writable ({type(e).__name__}: {e})")
         _provision(version, base, final, work, transport or default_transport,
-                   extractor or default_extractor, clock, start, cap, disk_usage)
+                   extractor or default_extractor, clock, start, cap, disk_usage, progress)
     except _Refusal as r:
-        return done(ok=False, reason=r.reason, detail=r.detail)
+        return done(ok=False, reason=r.reason, detail=_with_transfer(r.detail, progress))
     except OSError as e:
-        return done(ok=False, reason=EXTRACTION_FAILED, detail=f"{type(e).__name__}: {e}")
+        return done(ok=False, reason=EXTRACTION_FAILED, detail=_with_transfer(f"{type(e).__name__}: {e}", progress))
     finally:
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
     return done(ok=True, lib_dir=str(final), manifest=str(final / MANIFEST))
 
 
-def _provision(version, base, final, work, transport, extractor, clock, start, cap, disk_usage) -> None:
+def _provision(version, base, final, work, transport, extractor, clock, start, cap, disk_usage, progress) -> None:
     def remaining() -> float:
         return cap - (clock() - start)
 
@@ -260,50 +529,25 @@ def _provision(version, base, final, work, transport, extractor, clock, start, c
     if name is None:
         raise _Refusal(DRIVER_PACKAGE_UNAVAILABLE, f"no .run or .sha256sum published for {version}")
 
-    # 2. stream it, hashing as it arrives
+    # 2. fetch it: parallel byte ranges when the host proves it serves them, else (or when a range fails for a
+    #    non-global reason) one stream. Either way the whole file is hashed and compared exactly.
+    url = f"{BASE_URL}/{version}/{name}"
     run_file = work / name
     left = remaining() - AFTER_DOWNLOAD_RESERVE_S
     if left <= 0:
         raise _Refusal(DOWNLOAD_TIMEOUT, "wall exhausted before the download")
-    try:
-        resp = transport(f"{BASE_URL}/{version}/{name}", min(SHA_FETCH_TIMEOUT_S, left))
-    except TimeoutError as e:
-        raise _Refusal(DOWNLOAD_TIMEOUT, str(e)) from e
-    except OSError as e:
-        raise _Refusal(DRIVER_PACKAGE_UNAVAILABLE, type(e).__name__) from e
-    try:
-        if resp.status != 200:
-            raise _Refusal(DRIVER_PACKAGE_UNAVAILABLE, f"{name}: HTTP {resp.status}")
-        need = (resp.length or UNKNOWN_ARCHIVE_BYTES) + EXTRACT_BYTES + KEPT_BYTES
-        free = disk_usage(str(base)).free
-        if free < need:
-            raise _Refusal(INSUFFICIENT_DISK, f"need {need // 2**20} MiB, free {free // 2**20} MiB")
-        digest = hashlib.sha256()
-        total = win_bytes = 0
-        win_start = clock()
-        try:
-            with open(run_file, "wb") as out:
-                for chunk in resp.chunks():
-                    out.write(chunk)
-                    digest.update(chunk)
-                    total += len(chunk)
-                    win_bytes += len(chunk)
-                    now = clock()
-                    if remaining() - AFTER_DOWNLOAD_RESERVE_S <= 0:
-                        raise _Refusal(DOWNLOAD_TIMEOUT, f"wall hit after {total} bytes")
-                    if now - win_start >= STALL_WINDOW_S:
-                        if win_bytes < MIN_BYTES_PER_S * (now - win_start):
-                            raise _Refusal(DOWNLOAD_TIMEOUT,
-                                           f"stalled below {MIN_BYTES_PER_S} B/s after {total} bytes")
-                        win_start, win_bytes = now, 0
-        except TimeoutError as e:
-            raise _Refusal(DOWNLOAD_TIMEOUT, f"read stalled after {total} bytes: {e}") from e
-        except OSError as e:
-            raise _Refusal(DOWNLOAD_TIMEOUT, f"transfer broke after {total} bytes: {type(e).__name__}") from e
-    finally:
-        resp.close()
-    if digest.hexdigest() != expected:
-        raise _Refusal(CHECKSUM_MISMATCH, f"{name}: got {digest.hexdigest()[:12]}, want {expected[:12]}")
+    got = None
+    length = _probe_ranges(transport, url, min(SHA_FETCH_TIMEOUT_S, left))
+    if length is not None:
+        if _download_ranged(transport, url, run_file, length, base, disk_usage, remaining, clock, progress):
+            got = _sha_file(run_file, remaining)
+        else:
+            run_file.unlink(missing_ok=True)
+            run_file = work / f"{name}.single"            # a FRESH name: nothing of the failed attempt is reused
+    if got is None:
+        got = _download_single(transport, url, run_file, base, disk_usage, remaining, clock, progress)
+    if got != expected:
+        raise _Refusal(CHECKSUM_MISMATCH, f"{name}: got {got[:12]}, want {expected[:12]}")
 
     # 3. only now run the vendor script; it creates the target itself and refuses one that exists
     target = work / "extract"
