@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/infer_request.schema.json",
   "title": "InferRequest — planner→pod inference task (CP-mediated; the pod polls, nothing dials in)",
-  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.words (owner decision 2026-11-01): then the align words cross, the pod runs the CTC forced alignment itself and PUTs per-word frame spans as JSON (align_spans.schema.json) instead — still no decision crosses, and seconds stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction. person_matte: the pod runs RVM (mobilenetv3, fp16 TorchScript baked in the image) over ONE whole video and PUTs the requested outputs to their own presigned URLs (alpha: lossless gray FFV1 Matroska; cutout: the input's pixels under the alpha as VP9-alpha yuva420p WebM) plus a receipt JSON (person_matte.schema.json) to put_url; the downsample_ratio is resolved by the planner. clean_plate (super-director v13 vertigo class): the pod makes the background of ONE video without the person, one PNG per window — a per-pixel temporal median over the frames sampled in the window with the person (the matte person_matte already produced for the SAME video, alpha above person_alpha grown by dilate_px) excluded, then LaMa (big-lama TorchScript baked in the image, CUDA only) for the pixels never uncovered — and PUTs each PNG to its own presigned URL plus a receipt JSON (clean_plate.schema.json) to put_url; every number is resolved by the planner (the engine's clean-plate registry entry).",
+  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.words (owner decision 2026-11-01): then the align words cross, the pod runs the CTC forced alignment itself and PUTs per-word frame spans as JSON (align_spans.schema.json) instead — still no decision crosses, and seconds stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction. person_matte: the pod runs RVM (mobilenetv3, fp16 TorchScript baked in the image) over ONE whole video and PUTs the requested outputs to their own presigned URLs (alpha: lossless gray FFV1 Matroska; cutout: the input's pixels under the alpha as VP9-alpha yuva420p WebM) plus a receipt JSON (person_matte.schema.json) to put_url; the downsample_ratio is resolved by the planner. clean_plate (super-director v13 vertigo class): the pod makes the background of ONE video without the person, one PNG per window — a per-pixel temporal median over the frames sampled in the window with the person (the matte person_matte already produced for the SAME video, alpha above person_alpha grown by dilate_px) excluded, then LaMa (big-lama TorchScript baked in the image, CUDA only) for the pixels never uncovered — and PUTs each PNG to its own presigned URL plus a receipt JSON (clean_plate.schema.json) to put_url; every number is resolved by the planner (the engine's clean-plate registry entry). cutout: the pod cuts the subject out of each of a batch of pictures with BiRefNet_dynamic (traced TorchScript fp16 at 1024 from the weights tar, CUDA only) and PUTs one RGBA PNG per item to its own presigned URL plus a receipt JSON (cutout.schema.json) to put_url; an item the pod will not or need not cut is named in the receipt (already_cut / empty_cut / no_separation), never silently passed through.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -26,7 +26,8 @@
         "face_probe",
         "clip_rank",
         "person_matte",
-        "clean_plate"
+        "clean_plate",
+        "cutout"
       ]
     },
     "model": {
@@ -38,7 +39,7 @@
       "minLength": 1
     },
     "weights": {
-      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align and clip_rank; forbidden on face_probe, person_matte and clean_plate, whose YuNet (227 KB), RVM (7.9 MB) and big-lama (206 MB) stay in the image.",
+      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align, clip_rank and cutout (BiRefNet traced to TorchScript, with its config.json manifest); forbidden on face_probe, person_matte and clean_plate, whose YuNet (227 KB), RVM (7.9 MB) and big-lama (206 MB) stay in the image.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -447,6 +448,47 @@
           "maximum": 1
         }
       }
+    },
+    "cutout": {
+      "description": "A batch of pictures to cut: per item the pod fetches src_url, cuts the subject out with BiRefNet (the traced TorchScript in the weights tar, CUDA only) and PUTs an RGBA PNG to out_url; the per-item outcome (cut / already_cut / empty_cut / no_separation) is in the receipt (cutout.schema.json) at put_url.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "src_url",
+              "out_url"
+            ],
+            "properties": {
+              "id": {
+                "description": "the caller's key for this picture; unique within the request",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "src_url": {
+                "description": "presigned GET of the source picture",
+                "type": "string",
+                "minLength": 1
+              },
+              "out_url": {
+                "description": "presigned PUT of the RGBA PNG",
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
     }
   },
   "allOf": [
@@ -486,6 +528,11 @@
             {
               "required": [
                 "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
               ]
             }
           ]
@@ -533,6 +580,11 @@
               "required": [
                 "clean_plate"
               ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
             }
           ]
         }
@@ -574,6 +626,11 @@
             {
               "required": [
                 "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
               ]
             }
           ]
@@ -621,6 +678,11 @@
               "required": [
                 "clean_plate"
               ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
             }
           ]
         }
@@ -666,6 +728,58 @@
             {
               "required": [
                 "weights"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "cutout"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "cutout",
+          "weights"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
               ]
             }
           ]

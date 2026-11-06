@@ -69,6 +69,7 @@ sympy==1.14.0
 tokenizers==0.22.2
 torch==2.11.0+cu128
 torchaudio==2.11.0+cu128
+torchvision==0.26.0+cu128
 tqdm==4.70.0
 transformers==4.57.6
 triton==3.6.0

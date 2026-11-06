@@ -79,7 +79,10 @@ COPY docker/10_nvidia.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 FROM base AS pydeps
 COPY constraints.txt /tmp/constraints.txt
 RUN set -eux; \
-    python3 -m pip install --no-cache-dir -c /tmp/constraints.txt torch torchaudio --index-url https://download.pytorch.org/whl/cu128; \
+    python3 -m pip install --no-cache-dir -c /tmp/constraints.txt torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu128; \
+    # torchvision rides THIS line (cu128 index, same pin family as torch) and never the PyPI line below: a PyPI wheel is not the cu128
+    # build torch is. It is here only for the `torchvision::deform_conv2d` TorchScript op BiRefNet (the cutout kind) is traced
+    # with (docs/research/pod-cutout-birefnet.md); podagent/infer_cutout.py imports it before torch.jit.load.
     # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
     # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
     # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
@@ -173,7 +176,7 @@ RUN mkdir -p /opt/models \
 ENV MODEL_YUNET=/opt/models/yunet.onnx
 
 # RVM mobilenetv3 fp16 TorchScript (person_matte) STAYS baked for the same reason: 7.9 MB, the upstream's own
-# scripted export (the image has no torchvision, which the .pth + model-source route needs). Pinned by sha256 here
+# scripted export (the image's torchvision is there only for cutout's deform_conv2d op; the upstream's scripted export needs no model source). Pinned by sha256 here
 # AND in podagent/infer_matte.py, which refuses any other bytes. GPL-3.0 — owner decision 2026-10-22
 # (the engine's person-matte research receipt).
 RUN curl -fL -o /opt/models/rvm_mobilenetv3_fp16.torchscript \

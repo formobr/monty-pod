@@ -755,6 +755,33 @@ class CleanPlateParams(BaseModel):
         return self
 
 
+class CutoutSrc(BaseModel):
+    """One picture of a cutout batch: where to read it and where to PUT its RGBA PNG. `id` is the caller's key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    src_url: str = Field(min_length=1)      # presigned GET of the source picture
+    out_url: str = Field(min_length=1)      # presigned PUT of the RGBA PNG
+
+
+class CutoutParams(BaseModel):
+    """Background removal (BiRefNet_dynamic, traced TorchScript fp16 at 1024) over a batch of pictures — the engine's
+    sticker / stock cut-out, made on the pod GPU instead of a paid call. The receipt (cutout.schema.json) goes to
+    put_url, each cut picture to its item's out_url. Every number lives in the weights tar's manifest, none here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[CutoutSrc] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _ids_unique(self) -> "CutoutParams":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("cutout item ids must be unique")
+        return self
+
+
 class WeightsRef(BaseModel):
     """Where the pod gets this job's checkpoint. A presigned GET for a tar of the model directory, plus
     that tar's sha256 — which is BOTH the integrity check and the pod's cache key, so a re-exported or
@@ -768,11 +795,12 @@ class WeightsRef(BaseModel):
 
 
 # face_probe's YuNet (227 KB), person_matte's RVM (7.9 MB fp16 TorchScript) and clean_plate's big-lama (206 MB
-# TorchScript) stay baked in the image
-_NEEDS_WEIGHTS = ("align", "clip_rank")
+# TorchScript) stay baked in the image; cutout's BiRefNet (463 MB, traced inside THIS image by the operator's build tool)
+# arrives as a weights tar like align's and clip_rank's
+_NEEDS_WEIGHTS = ("align", "clip_rank", "cutout")
 
 
-InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate"]
+InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate", "cutout"]
 
 
 class InferRequest(BaseModel):
@@ -789,12 +817,13 @@ class InferRequest(BaseModel):
     clip_rank: ClipRankParams | None = None
     person_matte: PersonMatteParams | None = None
     clean_plate: CleanPlateParams | None = None
+    cutout: CutoutParams | None = None
 
     @model_validator(mode="after")
     def _block_matches_kind(self) -> "InferRequest":
         blocks: dict[str, Any] = {"align": self.align, "face_probe": self.face_probe,
                                   "clip_rank": self.clip_rank, "person_matte": self.person_matte,
-                                  "clean_plate": self.clean_plate}
+                                  "clean_plate": self.clean_plate, "cutout": self.cutout}
         if blocks[self.kind] is None:
             raise ValueError(f"kind={self.kind} requires its params block")
         extra = [k for k, v in blocks.items() if k != self.kind and v is not None]
@@ -1191,6 +1220,69 @@ class CleanPlatePayload(BaseModel):
             raise ValueError("a clean_plate receipt names at least one window")
         if len(set(ids)) != len(ids):
             raise ValueError("a clean_plate window is drawn or refused, once")
+        return self
+
+
+CutoutStatus = Literal["cut", "already_cut", "empty_cut", "no_separation", "unreadable"]
+
+
+class CutoutTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_s: float = Field(ge=0)      # preprocess + GPU forward + postprocess, summed over the pictures that ran the model
+    wall_s: float = Field(ge=0)       # download excluded, upload excluded
+
+
+class CutoutOut(BaseModel):
+    """One picture's named outcome. Only `cut` is PUT to its out_url; every other status is a refusal or a
+    pass-through the engine reads by name — never a silent success. `bbox` = [x0, y0, x1, y1] as fractions of the
+    picture, over alpha >= 24/255; `w`/`h` = the size of the cut PNG (the source after exif_transpose and the 2048 cap)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    status: CutoutStatus
+    w: int | None = Field(default=None, ge=1)
+    h: int | None = Field(default=None, ge=1)
+    bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    bytes: int | None = Field(default=None, gt=0)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _shape_by_status(self) -> "CutoutOut":
+        if self.bbox is not None:
+            x0, y0, x1, y1 = self.bbox
+            if not (all(0.0 <= v <= 1.0 for v in self.bbox) and x0 < x1 and y0 < y1):
+                raise ValueError("cutout bbox must be fractions with x0 < x1 and y0 < y1")
+        if self.status == "cut":
+            if None in (self.w, self.h, self.bbox, self.bytes, self.sha256):
+                raise ValueError("a cut item names w, h, bbox, bytes and sha256 of the PNG it PUT")
+        elif self.bytes is not None or self.sha256 is not None:
+            raise ValueError(f"a {self.status} item PUT nothing and names no bytes / sha256")
+        if self.status in ("already_cut", "no_separation") and (self.w is None or self.h is None or self.bbox is None):
+            raise ValueError(f"a {self.status} item names w, h and bbox")
+        if self.status in ("empty_cut", "unreadable") and self.bbox is not None:
+            raise ValueError(f"a {self.status} item has no bbox")
+        return self
+
+
+class CutoutPayload(BaseModel):
+    """cutout.schema.json — the receipt the pod PUTs to put_url. Every requested item is in `items` exactly once."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")     # the weights tar's sha256 (the request's weights.sha256)
+    torch: str = Field(min_length=1)                          # the runtime that ran it (== the manifest's)
+    torchvision: str = Field(min_length=1)
+    items: list[CutoutOut] = Field(min_length=1)
+    timings: CutoutTimings
+
+    @model_validator(mode="after")
+    def _once(self) -> "CutoutPayload":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("a cutout item is named once in the receipt")
         return self
 
 

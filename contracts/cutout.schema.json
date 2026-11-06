@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/cutout.schema.json",
+  "title": "CutoutPayload — the cutout receipt the pod PUTs to put_url",
+  "description": "One row per requested picture, once, with its NAMED outcome. `cut`: the RGBA PNG (source RGB + BiRefNet alpha) was PUT to the item's out_url — bytes+sha256 of it. `already_cut`: the source already carried real transparency, the model did not run and nothing was PUT. `empty_cut`: no pixel reached alpha 24/255, nothing was PUT. `no_separation`: 98% or more of the frame reached alpha 24/255 (the model found no subject apart from the background), nothing was PUT. `unreadable`: the source bytes are not a picture, nothing was PUT. bbox = [x0, y0, x1, y1] as fractions of the picture over alpha >= 24/255; w/h = the size of the cut PNG (the source after exif_transpose and the 2048 long-side cap). torch/torchvision are the runtime that ran it, equal to the weights manifest's.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "model",
+    "model_sha256",
+    "torch",
+    "torchvision",
+    "items",
+    "timings"
+  ],
+  "properties": {
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "torch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "torchvision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_s",
+        "wall_s"
+      ],
+      "properties": {
+        "model_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "enum": [
+              "cut",
+              "already_cut",
+              "empty_cut",
+              "no_separation",
+              "unreadable"
+            ]
+          },
+          "w": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "h": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "bbox": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "cut"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "w",
+                "h",
+                "bbox",
+                "bytes",
+                "sha256"
+              ]
+            },
+            "else": {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "bytes"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "sha256"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "already_cut",
+                    "no_separation"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "w",
+                "h",
+                "bbox"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "empty_cut",
+                    "unreadable"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "not": {
+                "required": [
+                  "bbox"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

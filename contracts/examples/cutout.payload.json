@@ -1,0 +1,39 @@
+{
+  "model": "birefnet_dynamic_ts_fp16",
+  "model_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "torch": "2.11.0+cu128",
+  "torchvision": "0.26.0+cu128",
+  "items": [
+    {
+      "id": "sticker-1",
+      "status": "cut",
+      "w": 1024,
+      "h": 768,
+      "bbox": [0.12, 0.08, 0.91, 0.97],
+      "bytes": 612345,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "id": "sticker-2",
+      "status": "already_cut",
+      "w": 512,
+      "h": 512,
+      "bbox": [0.2, 0.2, 0.8, 0.8]
+    },
+    {
+      "id": "sticker-3",
+      "status": "empty_cut"
+    },
+    {
+      "id": "sticker-4",
+      "status": "no_separation",
+      "w": 640,
+      "h": 480,
+      "bbox": [0.0, 0.0, 1.0, 1.0]
+    }
+  ],
+  "timings": {
+    "model_s": 0.82,
+    "wall_s": 1.05
+  }
+}

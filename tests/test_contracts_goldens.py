@@ -21,6 +21,7 @@ from podagent.models import (
     SPEC_VERSION,
     CleanPlatePayload,
     ClipRankPayload,
+    CutoutPayload,
     FaceProbePayload,
     InferRequest,
     InferResult,
@@ -41,6 +42,7 @@ MODELS = {
     "clip_rank": ClipRankPayload,
     "person_matte": PersonMattePayload,
     "clean_plate": CleanPlatePayload,
+    "cutout": CutoutPayload,
     "pod_job": PodJob,
 }
 

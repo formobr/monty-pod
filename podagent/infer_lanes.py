@@ -58,6 +58,13 @@ PERSON_MATTE_RESIDENT_MIB = 228.0
 # weights stay resident once the service empties its allocator cache after each request (the clean-plate research receipt).
 CLEAN_PLATE_PEAK_MIB = 1300.0
 CLEAN_PLATE_RESIDENT_MIB = 210.0
+# cutout (BiRefNet_dynamic traced TorchScript fp16 at 1024, podagent/infer_cutout.py): the operator's bench 2026-11-06 on the desktop
+# RTX 2060 (torch 2.8 / torchvision 0.23, eager model, NOT the traced .pt): 2670 MiB peak at 1024 (process), 996 MiB resident.
+# PLACEHOLDERS — re-measure the traced .pt in the pod image at the 2048 cap (the cap changes the resize-back and the PNG buffers,
+# not the 1024 forward) with nvidia-smi card-wide, then replace both numbers and the pinned lane tests (the research receipt
+# docs/research/pod-cutout-birefnet.md says the same).
+CUTOUT_PEAK_MIB = 2670.0
+CUTOUT_RESIDENT_MIB = 996.0
 
 KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY_WHY for each number
     "align": ALIGN_RESIDENT_MIB + ALIGN_FORWARD_MIB,
@@ -69,6 +76,8 @@ KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY
     "person_matte": PERSON_MATTE_PEAK_MIB,
     # rides the same one-wide heavy lane (it reads the matte person_matte wrote, so the two never overlap in one job chain)
     "clean_plate": CLEAN_PLATE_PEAK_MIB,
+    # a heavy-lane kind too (one pod job at a time, the BiRefNet forward is the lane's largest transient)
+    "cutout": CUTOUT_PEAK_MIB,
 }
 RESERVE_MIB = _VRAM_RESERVE_MB
 
@@ -81,12 +90,15 @@ def heavy_lane_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
     align = "align" in kinds
     matte = "person_matte" in kinds
     plate = "clean_plate" in kinds
+    cutout = "cutout" in kinds
     matte_res = PERSON_MATTE_RESIDENT_MIB if matte else 0.0
     plate_res = CLEAN_PLATE_RESIDENT_MIB if plate else 0.0
+    cutout_res = CUTOUT_RESIDENT_MIB if cutout else 0.0
     resident = ALIGN_RESIDENT_MIB if align else 0.0
-    transient = max((ALIGN_FORWARD_MIB + matte_res + plate_res) if align else 0.0,
-                    (PERSON_MATTE_PEAK_MIB + plate_res) if matte else 0.0,
-                    (CLEAN_PLATE_PEAK_MIB + matte_res) if plate else 0.0)
+    transient = max((ALIGN_FORWARD_MIB + matte_res + plate_res + cutout_res) if align else 0.0,
+                    (PERSON_MATTE_PEAK_MIB + plate_res + cutout_res) if matte else 0.0,
+                    (CLEAN_PLATE_PEAK_MIB + matte_res + cutout_res) if plate else 0.0,
+                    (CUTOUT_PEAK_MIB + matte_res + plate_res) if cutout else 0.0)
     return resident + transient
 
 
@@ -94,7 +106,7 @@ def coresident_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
     """Free MiB a card must report for clip_rank (weights + one lane) to run beside the heavy lane AND one encode
     session (RENDER_HEADROOM_MIB, the gpu_admission unit), because infer and a heavy op share the card by design
     (RENDER_HEADROOM_WHY; without it the dev 2060 kept both kinds at 5694 MiB free and a heavy op beside them ran
-    the card out, MISC-998): 2736 + heavy_lane_mib + 512 + 960 — 6980 with every kind served."""
+    the card out, MISC-998): 2736 + heavy_lane_mib + 512 + 960 — 8560 with every kind served."""
     return KIND_VRAM_MIB["clip_rank"] + heavy_lane_mib(served) + RESERVE_MIB + RENDER_HEADROOM_MIB
 
 

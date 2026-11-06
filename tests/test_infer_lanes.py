@@ -37,10 +37,10 @@ class _CP:
 
 
 def test_the_dev_2060_cannot_hold_both_kinds_and_says_which_numbers_say_so():
-    """The measured wall: 3254 MiB free against 2736 clip_rank + 2772 heavy lane + 512 reserve + 960 encode session."""
+    """The measured wall: 3254 MiB free against 2736 clip_rank + 4352 heavy lane + 512 reserve + 960 encode session."""
     fits, why = m.kinds_fit_together(3254.0)
     assert fits is False
-    assert "6980" in why and "3254" in why
+    assert "8560" in why and "3254" in why
 
 
 def test_the_056_oom_card_serialises_now():
@@ -48,8 +48,16 @@ def test_the_056_oom_card_serialises_now():
     MEASURED_WHY): align 1244 resident + 518 forward, RVM +1100 autotune / 228 resident, SigLIP 2322 + 414/lane."""
     # + clean_plate (2026-10-24, measured +1276 over the idle card / 204 resident): the lane's transient is the largest of
     # align's forward, RVM's autotune, the plate's peak — each with the OTHER kinds' cached weights beside it
-    assert m.heavy_lane_mib() == 1244.0 + max(518.0 + 228.0 + 210.0, 1100.0 + 210.0, 1300.0 + 228.0) == 2772.0
-    assert m.coresident_mib() == 2736.0 + 2772.0 + 512.0 + NVENC_SESSION_MIB
+    # + cutout (PLACEHOLDER bench figures, 2670 peak / 996 resident, until the traced .pt is re-measured in the pod image)
+    assert m.heavy_lane_mib() == 1244.0 + max(518.0 + 228.0 + 210.0 + 996.0, 1100.0 + 210.0 + 996.0,
+                                              1300.0 + 228.0 + 996.0, 2670.0 + 228.0 + 210.0) == 4352.0
+    assert m.coresident_mib() == 2736.0 + 4352.0 + 512.0 + NVENC_SESSION_MIB
+    # the kinds the lane held before cutout keep their numbers when cutout is not served
+    served_before = {"align", "person_matte", "clean_plate", "clip_rank"}
+    assert m.heavy_lane_mib(served_before) == 1244.0 + max(518.0 + 228.0 + 210.0, 1100.0 + 210.0, 1300.0 + 228.0) == 2772.0
+    # cutout alone beside clip_rank: its peak; with align, align's resident + the larger transient
+    assert m.heavy_lane_mib({"cutout", "clip_rank"}) == 2670.0
+    assert m.heavy_lane_mib({"align", "cutout"}) == 1244.0 + max(518.0 + 996.0, 2670.0) == 3914.0
     assert m.kinds_fit_together(4835.0)[0] is False
     # without person_matte the heavy lane is align alone: 1762
     assert m.heavy_lane_mib({"align", "clip_rank"}) == 1762.0
@@ -70,9 +78,9 @@ def test_rank_lanes_are_sized_with_the_heavy_lane_beside_them():
     # (4835 − 512 − 2322 − 960) // 414 = 2 lanes; measured 2 lanes alone = 2322 + 726 MiB, + 960 = 4008 < 4323
     assert m.RENDER_HEADROOM_MIB == 960.0
     assert ic._width_from(4835.0, 12, m.RENDER_HEADROOM_MIB)[0] == 2
-    # a fleet card (min 14848): (14848 − 512 − 2322 − 2772) // 414 = 22 → host-bound
+    # a fleet card (min 14848): (14848 − 512 − 2322 − 4352) // 414 = 18 → host-bound
     n, why = ic._width_from(14848.0, 16, m.heavy_lane_mib(), "heavy lane")
-    assert n == 16 and "− 2772 heavy lane" in why
+    assert n == 16 and "− 4352 heavy lane" in why
 
 
 def test_a_6gb_card_with_desktop_apps_serves_one_kind_at_a_time():
