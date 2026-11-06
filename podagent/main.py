@@ -302,6 +302,36 @@ def _bounded_stderr(stderr: bytes, *, edge: int = 500) -> str:
     return f"{text[:edge].rstrip()}\n... {omitted} chars omitted ...\n{text[-edge:].lstrip()}"
 
 
+def _provide_video_libs(cp: "ControlPlane", version: str, probe: list[str]) -> str | None:
+    """The host injected no libnvidia-encode: fetch the host-exact driver userspace and re-run the SAME probe once.
+    None = the encoder now opens (LD_LIBRARY_PATH keeps the fetched dir); else the refusal-trailer note, with
+    LD_LIBRARY_PATH restored exactly as found."""
+    import subprocess
+    t0 = time.monotonic()
+    saved = os.environ.get("LD_LIBRARY_PATH")
+    res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent)
+    if not res.ok:
+        _log(f"nvenc video-libs fetch refused: {res.reason}: {res.detail}")
+        return f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+    try:
+        _prepend_ld_library_path(res.lib_dir)
+        left = res.cap - (time.monotonic() - t0)
+        try:
+            r = subprocess.run(probe, capture_output=True, timeout=int(min(120, max(10, left))))
+            green = r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            green = False
+    except BaseException:
+        _restore_env({"LD_LIBRARY_PATH": saved})
+        raise
+    if green:
+        _note_boot_step(cp, f"driver userspace {version}: video libs provided by the pod (host injected none)")
+        return None
+    _restore_env({"LD_LIBRARY_PATH": saved})
+    return (f"driver_userspace={driver_userspace.VIDEO_REPROBE_FAILED} "
+            f"elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s")
+
+
 def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     """Encode ONE frame before claiming anything, and die loudly if the card will not take it. The driver the
     provider boots is not ours to choose, so a working encoder is a per-POD fact, not an image-build one."""
@@ -318,6 +348,13 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
             _log("nvenc probe OK — h264_nvenc opens on this host")
             return
         detail = f"exit {r.returncode}: {_bounded_stderr(r.stderr or b'')}"
+        if b"Cannot load libnvidia-encode.so.1" in (r.stderr or b""):
+            version = _boot_driver_version()
+            if version is not None:
+                note = _provide_video_libs(cp, version, probe)
+                if note is None:
+                    return
+                detail = f"{detail} · {note}"
     # Refused HERE or discovered 157 s into ingest, with b-roll already paid for on the same run.
     msg = f"REFUSING work: h264_nvenc will not open on this pod — {detail}"
     _log(msg)
@@ -596,10 +633,38 @@ def _write_egl_icd_manifest(lib: str, api_version: str) -> str:
     return _VULKAN_EGL_ICD_PATH
 
 
+_DRIVER_VERSION_UNSET = object()
+_driver_version_cache: Any = _DRIVER_VERSION_UNSET
+
+
 def _nvidia_driver_version() -> str | None:
-    """The ONE driver-version query: the single validated version every GPU reports, else None (no GPU line,
-    GPUs on different versions, or a line that is not <major>.<minor>[.<patch>]). It names the userspace the
-    last ladder rank downloads, so a guess is worse than no answer."""
+    """The driver-version query: the single validated version every GPU reports, else None (no GPU line, GPUs
+    on different versions, or a line that is not <major>.<minor>[.<patch>]). It names the userspace that gets
+    downloaded, so a guess is worse than no answer. Boot callers go through `_boot_driver_version` so the NVENC
+    fetch and the Vulkan rank share ONE nvidia-smi query."""
+    return _query_nvidia_driver_version()
+
+
+def _boot_driver_version(*, consume: bool = False) -> str | None:
+    """Boot-time driver version, queried at most once between the NVENC probe (which stores it) and the Vulkan
+    ladder (`consume=True`, which takes it and clears the slot so a later boot step never reads a stale value)."""
+    global _driver_version_cache
+    if _driver_version_cache is _DRIVER_VERSION_UNSET:
+        _driver_version_cache = _nvidia_driver_version()
+    value = _driver_version_cache
+    if consume:
+        _driver_version_cache = _DRIVER_VERSION_UNSET
+    return value
+
+
+def _prepend_ld_library_path(directory: str) -> None:
+    """Put `directory` first in LD_LIBRARY_PATH unless it is already an entry."""
+    entries = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+    if directory not in entries:
+        os.environ["LD_LIBRARY_PATH"] = ":".join([directory, *entries])
+
+
+def _query_nvidia_driver_version() -> str | None:
     import subprocess
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
@@ -628,7 +693,16 @@ def _restore_env(saved: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
-def _driver_userspace_rank(version: str) -> tuple[bool, str]:
+def _note_boot_step(cp: "ControlPlane", step: str) -> None:
+    """A non-gating boot breadcrumb: the pod provided something the host did not."""
+    _log(step)
+    try:
+        cp.note({"stage": "boot", "status": "step", "phase": "started", "step": step})
+    except Exception as e:  # noqa: BLE001 — a breadcrumb must never fail the boot
+        _log(f"boot note failed: {safe_error(e)}")
+
+
+def _driver_userspace_rank(version: str, cp: "ControlPlane | None" = None) -> tuple[bool, str]:
     """Last rank: fetch the host driver's own graphics userspace, point the loader at it, re-probe in a fresh
     subprocess. Green keeps the env (ffmpeg children inherit it); anything else restores all three variables
     exactly as found. Returns (green, trailer note naming the reason with elapsed and cap)."""
@@ -641,8 +715,7 @@ def _driver_userspace_rank(version: str) -> tuple[bool, str]:
         return False, f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
     try:
         os.environ["VK_ICD_FILENAMES"] = os.environ["VK_DRIVER_FILES"] = res.manifest
-        old_ld = [p for p in (saved["LD_LIBRARY_PATH"] or "").split(":") if p]
-        os.environ["LD_LIBRARY_PATH"] = ":".join([res.lib_dir, *old_ld])
+        _prepend_ld_library_path(res.lib_dir)
         left = res.cap - (time.monotonic() - t0)
         ok, brief, raw_stderr = _run_vulkan_probe(timeout=int(min(120, max(10, left))))
     except BaseException:
@@ -652,6 +725,9 @@ def _driver_userspace_rank(version: str) -> tuple[bool, str]:
     elapsed = f"elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
     if ok:
         _log(f"vulkan rank {rank} OK — motion path opens on the fetched {version} graphics userspace")
+        if cp is not None:
+            _note_boot_step(cp, f"driver userspace {version}: vulkan libs provided by the pod "
+                                f"(dir {'reused' if res.detail == 'reused' else 'fetched'})")
         return True, f"driver_userspace=ok {elapsed}"
     _restore_env(saved)
     return False, f"driver_userspace={driver_userspace.VULKAN_REPROBE_FAILED} {elapsed}"
@@ -726,12 +802,12 @@ def _vulkan_preflight(cp: "ControlPlane") -> bool:
         else:
             os.environ["VK_ICD_FILENAMES"] = preset_icd
 
-    driver = _nvidia_driver_version()   # ONE query: it feeds the last rank and the trailer alike
+    driver = _boot_driver_version(consume=True)   # ONE query: feeds NVENC's fetch, the last rank and the trailer
     if driver is None:
         rank_note = f"driver_userspace={driver_userspace.DRIVER_VERSION_UNAVAILABLE}"
     else:
         ranks_tried.append(f"driver-userspace-{driver}")
-        green, rank_note = _driver_userspace_rank(driver)
+        green, rank_note = _driver_userspace_rank(driver, cp)
         if green:
             return True
 

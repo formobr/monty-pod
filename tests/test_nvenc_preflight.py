@@ -19,6 +19,8 @@ def _isolated_live_mark(monkeypatch, tmp_path):
         return du.FetchResult(ok=False, reason=du.DRIVER_PACKAGE_UNAVAILABLE, detail="no-network stub")
 
     monkeypatch.setattr(agent_main, "_fetch_driver_userspace", _no_network)
+    # the boot driver-version slot is process-wide: no test may inherit another's value
+    monkeypatch.setattr(agent_main, "_driver_version_cache", agent_main._DRIVER_VERSION_UNSET)
 
 
 class _CP:
@@ -198,6 +200,113 @@ def test_an_ffmpeg_that_will_not_even_launch_is_a_refusal_too(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _boom)
     with pytest.raises(SystemExit):
         agent_main._nvenc_or_refuse(cp)
+
+
+_NO_ENCODE = (b"[h264_nvenc @ 0x1] Cannot load libnvidia-encode.so.1\n"
+              b"[h264_nvenc @ 0x1] The minimum required Nvidia driver for nvenc is 520.56.06 or newer\n")
+_FETCHED = "/var/lib/monty-pod/nvidia-580.178.04"
+
+
+def _video_host(monkeypatch, *, fetch, reprobe_ok: bool, first_stderr: bytes = _NO_ENCODE):
+    """ffmpeg fails once with `first_stderr`; the re-probe is green only when the fetched dir is on the loader path."""
+    import os
+    calls: list[tuple[str, int | None, str]] = []
+
+    def fake_run(cmd, *a, **k):
+        if cmd[0] == "nvidia-smi":
+            calls.append(("nvidia-smi", None, ""))
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"580.178.04\n", stderr=b"")
+        calls.append(("ffmpeg", k.get("timeout"), os.environ.get("LD_LIBRARY_PATH", "")))
+        if len([c for c in calls if c[0] == "ffmpeg"]) == 1:
+            return _run(255, first_stderr)
+        return _run(0 if reprobe_ok and _FETCHED in os.environ.get("LD_LIBRARY_PATH", "").split(":") else 1,
+                    b"still broken")
+
+    fetches: list[tuple] = []
+
+    def fake_fetch(version, base, **kw):
+        fetches.append((version, str(base)))
+        return fetch
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(agent_main, "_fetch_driver_userspace", fake_fetch)
+    return calls, fetches
+
+
+def test_a_missing_encode_lib_is_provided_from_the_driver_run_and_the_pod_goes_on(monkeypatch):
+    from podagent import driver_userspace as du
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/nvidia/lib64")
+    calls, fetches = _video_host(
+        monkeypatch, fetch=du.FetchResult(ok=True, lib_dir=_FETCHED, manifest=_FETCHED + "/x"), reprobe_ok=True)
+    cp = _CP()
+    agent_main._nvenc_or_refuse(cp)          # must NOT raise
+    assert fetches == [("580.178.04", "/var/lib/monty-pod")]
+    import os
+    assert os.environ["LD_LIBRARY_PATH"] == f"{_FETCHED}:/usr/local/nvidia/lib64"
+    ffmpeg = [c for c in calls if c[0] == "ffmpeg"]
+    assert len(ffmpeg) == 2 and 10 <= ffmpeg[1][1] <= 120
+    assert not [e for e in cp.events if e.get("status") == "error"]
+    assert any(e.get("step") == "driver userspace 580.178.04: video libs provided by the pod (host injected none)"
+               for e in cp.events)
+
+
+def test_a_failed_video_fetch_restores_ld_library_path_and_refuses_with_the_reason(monkeypatch):
+    import os
+    from podagent import driver_userspace as du
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/nvidia/lib64")
+    # (a) the fetch itself is refused
+    _video_host(monkeypatch, fetch=du.FetchResult(ok=False, reason=du.CHECKSUM_MISMATCH, detail="x"),
+                reprobe_ok=False)
+    cp = _CP()
+    with pytest.raises(SystemExit) as e:
+        agent_main._nvenc_or_refuse(cp)
+    assert e.value.code == 3
+    step = [x for x in cp.events if x.get("status") == "error"][0]["step"]
+    assert "Cannot load libnvidia-encode.so.1" in step
+    assert "driver_userspace=CHECKSUM_MISMATCH elapsed=" in step and "cap=150s" in step
+    assert os.environ["LD_LIBRARY_PATH"] == "/usr/local/nvidia/lib64"
+    # (b) fetched, but the SAME probe is still red: path restored, reason names the re-probe
+    agent_main._driver_version_cache = agent_main._DRIVER_VERSION_UNSET
+    _video_host(monkeypatch, fetch=du.FetchResult(ok=True, lib_dir=_FETCHED, manifest=""), reprobe_ok=False)
+    cp = _CP()
+    with pytest.raises(SystemExit):
+        agent_main._nvenc_or_refuse(cp)
+    step = [x for x in cp.events if x.get("status") == "error"][0]["step"]
+    assert "driver_userspace=VIDEO_REPROBE_FAILED" in step
+    assert os.environ["LD_LIBRARY_PATH"] == "/usr/local/nvidia/lib64"
+    monkeypatch.delenv("LD_LIBRARY_PATH")
+    agent_main._driver_version_cache = agent_main._DRIVER_VERSION_UNSET
+    _video_host(monkeypatch, fetch=du.FetchResult(ok=True, lib_dir=_FETCHED, manifest=""), reprobe_ok=False)
+    with pytest.raises(SystemExit):
+        agent_main._nvenc_or_refuse(_CP())
+    assert "LD_LIBRARY_PATH" not in os.environ, "an unset variable must be unset again, not left empty"
+
+
+def test_a_non_load_nvenc_failure_never_fetches(monkeypatch):
+    from podagent import driver_userspace as du
+    calls, fetches = _video_host(
+        monkeypatch, fetch=du.FetchResult(ok=True, lib_dir=_FETCHED, manifest=""), reprobe_ok=True,
+        first_stderr=b"[h264_nvenc @ 0x1] OpenEncodeSessionEx failed: unsupported device (2)\ncuInit failed\n")
+    cp = _CP()
+    with pytest.raises(SystemExit):
+        agent_main._nvenc_or_refuse(cp)
+    assert fetches == []
+    assert [c[0] for c in calls] == ["ffmpeg"], "no second probe and no driver-version query either"
+    step = cp.events[0]["step"]
+    assert "unsupported device" in step and "driver_userspace=" not in step
+
+
+def test_the_ld_library_path_prepend_is_idempotent(monkeypatch):
+    import os
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    agent_main._prepend_ld_library_path("/a")
+    assert os.environ["LD_LIBRARY_PATH"] == "/a"
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/x:/a:/y")
+    agent_main._prepend_ld_library_path("/a")
+    assert os.environ["LD_LIBRARY_PATH"] == "/x:/a:/y", "already an entry: left exactly as found"
+    agent_main._prepend_ld_library_path("/b")
+    agent_main._prepend_ld_library_path("/b")
+    assert os.environ["LD_LIBRARY_PATH"] == "/b:/x:/a:/y"
 
 
 def test_the_probe_actually_asks_for_the_encoder_we_ship_with(monkeypatch):

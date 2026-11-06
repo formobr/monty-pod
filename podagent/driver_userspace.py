@@ -1,10 +1,13 @@
-"""The last Vulkan ladder rank: bring the graphics userspace of the HOST's exact driver version.
+"""Bring the graphics + video userspace of the HOST's exact driver version (Vulkan ladder's last rank, and the
+NVENC probe when libnvidia-encode.so.1 cannot be loaded).
 
-A container toolkit that grants only compute/utility/video injects no libEGL_nvidia and friends, so Vulkan
-answers VK_ERROR_INCOMPATIBLE_DRIVER whatever the image carries (MISC-998). The userspace must match the
+A container toolkit that grants only compute/utility injects no libEGL_nvidia and friends, so Vulkan
+answers VK_ERROR_INCOMPATIBLE_DRIVER whatever the image carries (MISC-998); without the `video` set it also
+injects no libnvidia-encode / libnvcuvid (MISC-1026). The userspace must match the
 host kernel module to the patch level, so it is taken from the vendor's own .run of that very version,
 checksum-verified, extracted without root, and reduced to an explicit allowlist.
-Research receipt: docs/research/pod-driver-userspace-from-nvidia.md.
+Research receipts: docs/research/pod-driver-userspace-from-nvidia.md,
+docs/research/pod-driver-userspace-video-libs.md.
 
 This module only provisions a directory; wiring it into the environment and re-probing is the ladder's job.
 """
@@ -33,6 +36,7 @@ INSUFFICIENT_DISK = "INSUFFICIENT_DISK"
 EXTRACTION_FAILED = "EXTRACTION_FAILED"
 DEPENDENCY_MISSING = "DEPENDENCY_MISSING"
 VULKAN_REPROBE_FAILED = "VULKAN_REPROBE_FAILED"
+VIDEO_REPROBE_FAILED = "VIDEO_REPROBE_FAILED"
 
 BASE_URL = "https://download.nvidia.com/XFree86/Linux-x86_64"
 # Whole rank (download + extract + re-probe), well under the engine-declared 316 s boot.
@@ -51,15 +55,26 @@ UNKNOWN_ARCHIVE_BYTES = 450_000_000
 
 ALIAS = "libEGL_nvidia.so.0"
 MANIFEST = "nvidia_icd.json"
+# The video set a container runtime that grants no `video` capability never injects (receipt
+# docs/research/pod-driver-userspace-video-libs.md). libnvidia-opticalflow stays OUT: nothing in the pod
+# opens it, so keeping it would only widen what we copy for no consumer.
+VIDEO_STEMS = ("libnvidia-encode", "libnvcuvid")
+VIDEO_ALIAS_STEMS = VIDEO_STEMS
 
 
 def allowlist(version: str) -> tuple[str, ...]:
-    return tuple(f"{stem}.so.{version}" for stem in (
+    graphics = tuple(f"{stem}.so.{version}" for stem in (
         "libEGL_nvidia", "libnvidia-eglcore", "libnvidia-glsi", "libnvidia-glvkspirv", "libnvidia-gpucomp"))
+    return graphics + tuple(f"{stem}.so.{version}" for stem in VIDEO_STEMS)
+
+
+def video_aliases(version: str) -> dict[str, str]:
+    """alias name -> the versioned file it must point at (what the loader asks for is the .so.1 name)."""
+    return {f"{stem}.so.1": f"{stem}.so.{version}" for stem in VIDEO_ALIAS_STEMS}
 
 
 def kept_names(version: str) -> set[str]:
-    return {*allowlist(version), ALIAS, MANIFEST}
+    return {*allowlist(version), ALIAS, *video_aliases(version), MANIFEST}
 
 
 @dataclass
@@ -146,6 +161,9 @@ def _verified(final: Path, version: str) -> bool:
                 return False
         if os.readlink(final / ALIAS) != f"libEGL_nvidia.so.{version}":
             return False
+        for alias, target in video_aliases(version).items():
+            if os.readlink(final / alias) != target:
+                return False
         icd = json.loads((final / MANIFEST).read_text())["ICD"]
         return icd["library_path"] == str(final / ALIAS) and isinstance(icd["api_version"], str)
     except (OSError, ValueError, KeyError, TypeError):
@@ -312,6 +330,8 @@ def _provision(version, base, final, work, transport, extractor, clock, start, c
         shutil.copyfile(src, stage / lib)
         (stage / lib).chmod(0o755)
     os.symlink(f"libEGL_nvidia.so.{version}", stage / ALIAS)
+    for alias, tgt in video_aliases(version).items():
+        os.symlink(tgt, stage / alias)
     try:
         api = json.loads((target / "nvidia_icd.json").read_text())["ICD"]["api_version"]
     except (OSError, ValueError, KeyError, TypeError) as e:
