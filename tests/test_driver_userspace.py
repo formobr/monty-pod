@@ -115,8 +115,8 @@ def test_success_keeps_the_allowlist_alias_and_a_manifest_and_nothing_else(tmp_p
     assert res.ok and res.reason == ""
     final = tmp_path / "state" / f"nvidia-{V}"
     assert res.lib_dir == str(final) and res.manifest == str(final / "nvidia_icd.json")
-    # the brief's five libraries, spelled out (the receipt's EGL path), not read back from the code under test
-    assert {p.name for p in final.iterdir()} == {
+    # the graphics libraries, spelled out (the receipt's EGL path), not read back from the code under test
+    assert {p.name for p in final.iterdir() if not p.name.startswith(("libnvidia-encode", "libnvcuvid"))} == {
         f"libEGL_nvidia.so.{V}", f"libnvidia-eglcore.so.{V}", f"libnvidia-glsi.so.{V}",
         f"libnvidia-glvkspirv.so.{V}", f"libnvidia-gpucomp.so.{V}", "libEGL_nvidia.so.0", "nvidia_icd.json"}
     assert os.readlink(final / "libEGL_nvidia.so.0") == f"libEGL_nvidia.so.{V}"
@@ -147,7 +147,39 @@ def test_an_incomplete_directory_is_replaced_not_trusted(tmp_path):
     (stale / f"libEGL_nvidia.so.{V}").write_bytes(b"partial")
     res = _fetch(tmp_path, FakeTransport(clock, files=_files()), FakeExtractor(), clock)
     assert res.ok
-    assert {p.name for p in stale.iterdir()} == {*du.allowlist(V), "libEGL_nvidia.so.0", "nvidia_icd.json"}
+    assert {p.name for p in stale.iterdir()} == {
+        *du.allowlist(V), "libEGL_nvidia.so.0", "libnvidia-encode.so.1", "libnvcuvid.so.1", "nvidia_icd.json"}
+
+
+def test_success_keeps_the_video_libs_and_their_so1_aliases(tmp_path):
+    """The loader asks for libnvidia-encode.so.1; a versioned file alone does not satisfy it."""
+    clock = Clock()
+    transport = FakeTransport(clock, files=_files())
+    res = _fetch(tmp_path, transport, FakeExtractor(transport=transport), clock)
+    assert res.ok
+    final = tmp_path / "state" / f"nvidia-{V}"
+    for stem in ("libnvidia-encode", "libnvcuvid"):
+        real = final / f"{stem}.so.{V}"
+        assert real.is_file() and not real.is_symlink() and real.stat().st_size > 0
+        assert os.readlink(final / f"{stem}.so.1") == f"{stem}.so.{V}"
+    assert not list(final.glob("libnvidia-opticalflow*")), "nothing opens opticalflow: it stays out"
+
+
+def test_a_wrong_video_alias_fails_verification(tmp_path):
+    clock = Clock()
+    first = _fetch(tmp_path, FakeTransport(clock, files=_files()), FakeExtractor(), clock)
+    assert first.ok
+    final = tmp_path / "state" / f"nvidia-{V}"
+    assert du._verified(final, V)
+    (final / "libnvcuvid.so.1").unlink()
+    os.symlink("libnvcuvid.so.0.0.0", final / "libnvcuvid.so.1")
+    assert not du._verified(final, V)
+    # a stale dir without the video aliases is replaced, not reused
+    again_clock = Clock()
+    transport = FakeTransport(again_clock, files=_files())
+    again = _fetch(tmp_path, transport, FakeExtractor(), again_clock)
+    assert again.ok and transport.urls, "a directory failing verification must be fetched again"
+    assert os.readlink(final / "libnvcuvid.so.1") == f"libnvcuvid.so.{V}"
 
 
 def test_a_missing_no_compat32_package_falls_back_to_the_full_run(tmp_path):
