@@ -7,6 +7,7 @@ import concurrent.futures as cf
 import contextlib
 import json
 import os
+import platform
 import shutil
 import signal
 import sys
@@ -1611,8 +1612,12 @@ def main() -> None:
     # which is exactly the signal.
     for _sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(_sig, _stop_and_exit)
+    # First frame on the wire, before any step that can hang: proves the interpreter started.
+    cp.note({"stage": "boot", "status": "step", "phase": "started",
+             "step": f"process started · pre-gpu · py={platform.python_version()} · pid={os.getpid()}"})
     served = _served_kinds_or_refuse(cp)
     if not _dry_pod():
+        cp.note({"stage": "boot", "status": "step", "phase": "started", "step": "gpu init started"})
         _log_gpu_status()
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
