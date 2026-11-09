@@ -1112,7 +1112,8 @@ def _run_infer(
         return boot_reported
 
 
-def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id: str) -> None:
+def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id: str,
+                coordinator: "RestartCoordinator | None" = None) -> None:
     job_id = raw.get("job_id", "unknown")
     try:
         spec = RenderSpec.model_validate(raw)
@@ -1134,6 +1135,13 @@ def _run_render(raw: dict[str, Any], cp: ControlPlane, corr_id: str, session_id:
             "error": safe_error(e),
             **({"session_id": session_id} if session_id is not None else {}),
         })
+        # After the terminal, as in the infer lane: a latched pod may be discarded with its results.
+        if coordinator is not None:
+            from .ops.runner import infra_class
+
+            klass = infra_class(e)
+            if klass is not None:
+                _infra_fault_reporter(cp, coordinator)(klass)
         if not isinstance(e, Exception):
             raise
 
@@ -1673,7 +1681,8 @@ def main() -> None:
         else:
             assert pod_job.spec is not None
             spec_raw = pod_job.spec.model_dump(by_alias=True, exclude_none=True, mode="json")
-            _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id)
+            _run_render(spec_raw, cp, corr_id=pod_job.corr_id, session_id=pod_job.session_id,
+                        coordinator=coordinator)
 
     coordinator = RestartCoordinator()
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \

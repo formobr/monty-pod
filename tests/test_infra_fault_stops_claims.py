@@ -230,6 +230,55 @@ def test_a_non_infra_infer_error_posts_its_error_and_does_not_latch():
     assert not coordinator.infra_fault()
 
 
+class _RenderCP(_InferCP):
+    def send_event(self, payload, *, wait=False):
+        self.order.append("event")
+        return True
+
+    def send_result(self, payload, wait=True):
+        self.order.append("result")
+        self.results.append(payload)
+        return True
+
+
+def _run_render_raising(monkeypatch, exc: BaseException, coordinator):
+    """Drive main._run_render with a render that raises `exc`; record the order of wire calls."""
+    import sys
+    import types
+
+    def _boom(*_a, **_kw):
+        raise exc
+
+    fake = types.ModuleType("podagent.render")
+    fake.render_spec = _boom
+    monkeypatch.setitem(sys.modules, "podagent.render", fake)
+    monkeypatch.setattr(agent_main.RenderSpec, "model_validate", staticmethod(lambda raw: raw))
+    cp = _RenderCP()
+    original = coordinator.report_infra_fault
+    coordinator.report_infra_fault = lambda klass: (cp.order.append("report_infra_fault"), original(klass))
+    agent_main._run_render({"job_id": "j"}, cp, corr_id="c", session_id="s", coordinator=coordinator)
+    return cp
+
+
+def test_a_render_failure_of_an_infra_class_stops_claiming(monkeypatch):
+    """PROD 2026-11-08: a warm pod whose device was lost failed render jobs one after another and kept
+    claiming. The error frames go out FIRST, then the pod latches and the blocked claim is woken."""
+    coordinator = agent_main.RestartCoordinator()
+    exc = RuntimeError("probe refused: [AVHWDeviceContext @ 0x0] Device creation failure: VK_ERROR_DEVICE_LOST")
+    cp = _run_render_raising(monkeypatch, exc, coordinator)
+    assert cp.order == ["event", "result", "report_infra_fault", "interrupt_claim"]
+    assert cp.results[0]["status"] == "error"
+    assert coordinator.infra_fault() and coordinator.infra_class == "vulkan_false"
+
+
+def test_an_ordinary_render_failure_never_latches(monkeypatch):
+    coordinator = agent_main.RestartCoordinator()
+    cp = _run_render_raising(monkeypatch, RuntimeError("boom: handler bug"), coordinator)
+    assert cp.order == ["event", "result"]
+    assert cp.results[0]["status"] == "error"
+    assert not coordinator.infra_fault()
+
+
 def test_storage_error_clears_and_delivery_pending_is_bounded(tmp_path, monkeypatch):
     # ── _storage_error clears once a later durable write succeeds ──
     stream = EventStream("http://127.0.0.1:1", "token", outbox_path=tmp_path / "outbox.json")
