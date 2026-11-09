@@ -119,8 +119,20 @@ def test_a_run_time_vulkan_instance_refusal_stops_claiming(tmp_path, monkeypatch
     assert coordinator.infra_fault() and coordinator.infra_class == "vulkan_false"
 
 
+def test_a_lost_vulkan_device_at_creation_stops_claiming(tmp_path, monkeypatch):
+    """MISC-1035: a device lost at creation is the same latch as a refused instance."""
+    exc = RuntimeError("camera probe refused: probe: stderr=[AVHWDeviceContext @ 0x0] "
+                       "Device creation failure: VK_ERROR_DEVICE_LOST | Device creation failed: -542398533.")
+    assert runner.infra_class(exc) == "vulkan_false"
+    events, coordinator = _run_failing(tmp_path, monkeypatch, exc, "vkdl")
+    assert [e["phase"] for e in events][-2:] == ["run_error", "infra_fault"]
+    assert events[-1]["timings"]["error_class"] == "vulkan_false"
+    assert coordinator.infra_fault() and coordinator.infra_class == "vulkan_false"
+
+
 def test_device_creation_failed_and_encoder_exits_do_not_latch():
     for text in (
+        "render failed: VK_ERROR_DEVICE_LOST",
         "Device creation failed: -542398533.",
         "NVENC exited 187: Device creation failed: -542398533.",
         "libplacebo/NVENC exited 234",
