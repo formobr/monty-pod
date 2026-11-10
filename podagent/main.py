@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from . import driver_userspace
 from .cp import ControlPlane, mark_rented_pod
 from .event_stream import DELIVERY_PENDING_MAX_ATTEMPTS, DeliveryPending, FrameRejected, TransportUnhealthy
+from .identity import worker_identity
 from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 from .sanitize import safe_error, safe_text, safe_traceback
 
@@ -334,6 +335,14 @@ def _provide_video_libs(cp: "ControlPlane", version: str, probe: list[str]) -> s
             f"elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s")
 
 
+def _boot_refusal_frame(msg: str) -> dict:
+    """The boot refusal frame, naming this worker (the JOB_TOKEN `jid` the control plane knows it by) in
+    `timings.worker` — the carrier the pool reads to find the billing pod to fence. Unnamed, it logs
+    «vulkan refusal from worker (unnamed)» and the pod is never evicted."""
+    return {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg,
+            "timings": {"worker": worker_identity()}}
+
+
 def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     """Encode ONE frame before claiming anything, and die loudly if the card will not take it. The driver the
     provider boots is not ours to choose, so a working encoder is a per-POD fact, not an image-build one."""
@@ -361,10 +370,7 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     msg = f"REFUSING work: h264_nvenc will not open on this pod — {detail}"
     _log(msg)
     try:
-        cp.send_event(
-            {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
-            wait=True,
-        )
+        cp.send_event(_boot_refusal_frame(msg), wait=True)
     except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
         _log(f"NVENC refusal delivery failed: {safe_error(e)}")
     _mark_stopped()
@@ -409,10 +415,7 @@ def _served_kinds_or_refuse(cp: "ControlPlane") -> frozenset[str]:
         msg = f"REFUSING work: {safe_error(e)}"
         _log(msg)
         try:
-            cp.send_event(
-                {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
-                wait=True,
-            )
+            cp.send_event(_boot_refusal_frame(msg), wait=True)
         except Exception as send_e:  # noqa: BLE001 — the boot verdict stands even if its report cannot land
             _log(f"infer-kinds refusal delivery failed: {safe_error(send_e)}")
         _mark_stopped()
@@ -450,10 +453,7 @@ def _free_vram_or_refuse(cp: "ControlPlane", *, free_probe: Any = None, total_pr
            f"foreign processes hold this card's VRAM")
     _log(msg)
     try:
-        cp.send_event(
-            {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
-            wait=True,
-        )
+        cp.send_event(_boot_refusal_frame(msg), wait=True)
     except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
         _log(f"VRAM refusal delivery failed: {safe_error(e)}")
     _mark_stopped()
@@ -510,10 +510,7 @@ def _nvdec_or_refuse(cp: "ControlPlane") -> None:
     msg = f"REFUSING work: NVDEC (cuda hwaccel) will not initialise on this pod — {detail}"
     _log(msg)
     try:
-        cp.send_event(
-            {"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
-            wait=True,
-        )
+        cp.send_event(_boot_refusal_frame(msg), wait=True)
     except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
         _log(f"NVDEC refusal delivery failed: {safe_error(e)}")
     _mark_stopped()
@@ -827,8 +824,7 @@ def _vulkan_preflight(cp: "ControlPlane") -> bool:
     msg = f"REFUSING work: vulkan_false — Vulkan/libplacebo device will not open on this pod — {detail}"
     _log(msg)
     try:
-        cp.send_event({"stage": "boot", "status": "error", "phase": "work_finished", "step": msg},
-                      wait=True)
+        cp.send_event(_boot_refusal_frame(msg), wait=True)
     except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
         _log(f"Vulkan refusal delivery failed: {safe_error(e)}")
     _mark_stopped()
