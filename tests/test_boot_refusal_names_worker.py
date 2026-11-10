@@ -13,6 +13,7 @@ from podagent import infer_cliprank
 from podagent import main as agent_main
 
 WORKER = "job-7f3a"
+_REAL_REFUSAL_WAIT = agent_main._refusal_wait  # captured at import, before conftest's autouse no-op
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +95,92 @@ def test_the_vulkan_refusal_names_the_worker(monkeypatch):
     with pytest.raises(SystemExit):
         agent_main._vulkan_preflight(cp)
     _assert_named(cp)
+
+
+WAITS = 1  # the production loop lives inside the seam: one entry into it, ended by a signal
+
+
+def _waiting_until_sigterm(monkeypatch) -> list[str]:
+    """Override the conftest no-op: enter the wait, then deliver SIGTERM through the REAL handler."""
+    waits: list[str] = []
+
+    def seam(msg: str) -> None:
+        waits.append(msg)
+        agent_main._stop_and_exit(15, None)
+
+    monkeypatch.setattr(agent_main, "_refusal_wait", seam)
+    return waits
+
+
+def _vulkan_red(monkeypatch) -> None:
+    monkeypatch.setattr(agent_main, "_run_vulkan_probe", lambda: (False, "no device", b""))
+    monkeypatch.setattr(agent_main, "_log_vulkan_rank", lambda *a, **k: None)
+    monkeypatch.setattr(agent_main, "_ldconfig_p", lambda: "")
+    monkeypatch.setattr(agent_main, "_egl_icd_lib", lambda _out: None)
+    monkeypatch.setattr(agent_main, "_boot_driver_version", lambda **_k: None)
+    monkeypatch.setattr(agent_main, "_vulkan_host_evidence", lambda *_a: "evidence")
+    monkeypatch.setattr(agent_main, "_vulkaninfo_summary", lambda: "")
+
+
+@pytest.mark.parametrize("site", ["nvenc", "nvdec", "vulkan", "vram", "kinds"])
+def test_every_boot_refusal_waits_for_sigterm_then_leaves_by_its_own_code(monkeypatch, site):
+    waits = _waiting_until_sigterm(monkeypatch)
+    cp = _CP()
+    expected = 3
+    if site == "nvenc":
+        _failing_ffmpeg(monkeypatch)
+        call = lambda: agent_main._nvenc_or_refuse(cp)  # noqa: E731
+    elif site == "nvdec":
+        _failing_ffmpeg(monkeypatch)
+        call = lambda: agent_main._nvdec_or_refuse(cp)  # noqa: E731
+    elif site == "vulkan":
+        _vulkan_red(monkeypatch)
+        call = lambda: agent_main._vulkan_preflight(cp)  # noqa: E731
+    elif site == "vram":
+        monkeypatch.setattr(infer_cliprank, "_free_vram_mb", lambda: 19.0)
+        monkeypatch.setattr(infer_cliprank, "vram_total_mb", lambda: 15852.0)
+        expected = agent_main.BOOT_VRAM_REFUSAL_EXIT
+        call = lambda: agent_main._free_vram_or_refuse(cp)  # noqa: E731
+    else:
+        monkeypatch.setenv("MONTY_INFER_KINDS", "no-such-kind")
+        expected = agent_main.BOOT_VRAM_REFUSAL_EXIT
+        call = lambda: agent_main._served_kinds_or_refuse(cp)  # noqa: E731
+    with pytest.raises(SystemExit) as exc:
+        call()
+    assert exc.value.code == expected
+    assert len(waits) == WAITS          # waited, did not exit right after the frame
+    _assert_named(cp)                   # frame sent once, before waiting
+
+
+def test_an_undelivered_frame_still_waits(monkeypatch):
+    waits = _waiting_until_sigterm(monkeypatch)
+    _failing_ffmpeg(monkeypatch)
+
+    class _DeadCP:
+        def send_event(self, ev, *, wait=False):
+            raise OSError("down")
+
+    with pytest.raises(SystemExit) as exc:
+        agent_main._nvenc_or_refuse(_DeadCP())
+    assert exc.value.code == 3
+    assert len(waits) == WAITS
+
+
+def test_the_production_wait_logs_every_300s_until_a_signal(monkeypatch):
+    logs: list[str] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(agent_main, "_log", logs.append)
+
+    def sleep(s: float) -> None:
+        sleeps.append(s)
+        if len(sleeps) == 2:
+            raise SystemExit(143)
+
+    with pytest.raises(SystemExit):
+        _REAL_REFUSAL_WAIT("x" * 500, sleep=sleep)
+    assert sleeps == [300, 300]
+    assert [ln for ln in logs if ln.startswith("refused, waiting to be removed: ")] == \
+        ["refused, waiting to be removed: " + "x" * 120] * 2
 
 
 def test_the_served_kinds_refusal_names_the_worker(monkeypatch):

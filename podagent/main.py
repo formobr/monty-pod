@@ -343,6 +343,35 @@ def _boot_refusal_frame(msg: str) -> dict:
             "timings": {"worker": worker_identity()}}
 
 
+REFUSAL_WAIT_LOG_EVERY_S = 300
+
+
+def _refusal_wait(msg: str, *, sleep: Any = time.sleep) -> None:
+    """Production wait seam: sleep, one log line per REFUSAL_WAIT_LOG_EVERY_S, until a signal's handler
+    (`_stop_and_exit`) raises SystemExit out of the sleep. Never returns on its own."""
+    while True:
+        _log(f"refused, waiting to be removed: {msg[:120]}")
+        sleep(REFUSAL_WAIT_LOG_EVERY_S)
+
+
+def _refuse_and_wait(cp: "ControlPlane", msg: str, exit_code: int) -> None:
+    """A boot capability refusal: send the frame, clear the liveness mark, then WAIT to be removed instead of
+    exiting. An exiting agent makes the provider restart the container; every restart mints a new stream_id and
+    the box pool's crashloop detector bans the host for our own deliberate exit. Never claims, never reports
+    ready, never re-probes. An undelivered frame still waits (the pool's boot deadline removes the pod).
+    A SIGTERM/SIGINT ends the wait and the agent leaves by the refusal's own `exit_code`."""
+    try:
+        cp.send_event(_boot_refusal_frame(msg), wait=True)
+    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
+        _log(f"boot refusal delivery failed: {safe_error(e)}")
+    _mark_stopped()
+    try:
+        _refusal_wait(msg)
+    except SystemExit:
+        pass
+    sys.exit(exit_code)
+
+
 def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     """Encode ONE frame before claiming anything, and die loudly if the card will not take it. The driver the
     provider boots is not ours to choose, so a working encoder is a per-POD fact, not an image-build one."""
@@ -369,12 +398,7 @@ def _nvenc_or_refuse(cp: "ControlPlane") -> None:
     # Refused HERE or discovered 157 s into ingest, with b-roll already paid for on the same run.
     msg = f"REFUSING work: h264_nvenc will not open on this pod — {detail}"
     _log(msg)
-    try:
-        cp.send_event(_boot_refusal_frame(msg), wait=True)
-    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
-        _log(f"NVENC refusal delivery failed: {safe_error(e)}")
-    _mark_stopped()
-    sys.exit(3)
+    _refuse_and_wait(cp, msg, 3)
 
 
 BOOT_FREE_VRAM_WHY = """
@@ -414,12 +438,7 @@ def _served_kinds_or_refuse(cp: "ControlPlane") -> frozenset[str]:
     except ValueError as e:
         msg = f"REFUSING work: {safe_error(e)}"
         _log(msg)
-        try:
-            cp.send_event(_boot_refusal_frame(msg), wait=True)
-        except Exception as send_e:  # noqa: BLE001 — the boot verdict stands even if its report cannot land
-            _log(f"infer-kinds refusal delivery failed: {safe_error(send_e)}")
-        _mark_stopped()
-        sys.exit(BOOT_VRAM_REFUSAL_EXIT)
+        _refuse_and_wait(cp, msg, BOOT_VRAM_REFUSAL_EXIT)
 
 
 def _free_vram_or_refuse(cp: "ControlPlane", *, free_probe: Any = None, total_probe: Any = None) -> None:
@@ -452,12 +471,7 @@ def _free_vram_or_refuse(cp: "ControlPlane", *, free_probe: Any = None, total_pr
     msg = (f"gpu_vram_occupied: free={free:.0f} total={total_s} floor={floor:.0f} — REFUSING work: "
            f"foreign processes hold this card's VRAM")
     _log(msg)
-    try:
-        cp.send_event(_boot_refusal_frame(msg), wait=True)
-    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
-        _log(f"VRAM refusal delivery failed: {safe_error(e)}")
-    _mark_stopped()
-    sys.exit(BOOT_VRAM_REFUSAL_EXIT)
+    _refuse_and_wait(cp, msg, BOOT_VRAM_REFUSAL_EXIT)
 
 
 def _ffmpeg_version_head(edge_lines: int = 2) -> str:
@@ -509,12 +523,7 @@ def _nvdec_or_refuse(cp: "ControlPlane") -> None:
                     detail = f"exit {dec.returncode}: {_bounded_stderr(dec.stderr or b'')}"
     msg = f"REFUSING work: NVDEC (cuda hwaccel) will not initialise on this pod — {detail}"
     _log(msg)
-    try:
-        cp.send_event(_boot_refusal_frame(msg), wait=True)
-    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
-        _log(f"NVDEC refusal delivery failed: {safe_error(e)}")
-    _mark_stopped()
-    sys.exit(3)
+    _refuse_and_wait(cp, msg, 3)
 
 
 # 1.4.0 was "live-verified on driver 595" (ONE driver) and clobbered every other driver's real ICD; 1.2.0 is
@@ -823,12 +832,7 @@ def _vulkan_preflight(cp: "ControlPlane") -> bool:
     detail = safe_text(detail)
     msg = f"REFUSING work: vulkan_false — Vulkan/libplacebo device will not open on this pod — {detail}"
     _log(msg)
-    try:
-        cp.send_event(_boot_refusal_frame(msg), wait=True)
-    except Exception as e:  # noqa: BLE001 — the capability verdict stands even if its report cannot land
-        _log(f"Vulkan refusal delivery failed: {safe_error(e)}")
-    _mark_stopped()
-    sys.exit(3)
+    _refuse_and_wait(cp, msg, 3)
 
 
 def _vulkaninfo_summary() -> str:

@@ -16,6 +16,13 @@ def _fresh_rented_pod_mark():
 
 
 @pytest.fixture(autouse=True)
+def _no_refusal_wait(monkeypatch):
+    # A boot refusal waits for SIGTERM in production; tests asserting the refusal's SystemExit must not hang.
+    from podagent import main as agent_main
+    monkeypatch.setattr(agent_main, "_refusal_wait", lambda _msg: None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ops_pack_state():
     # importlib caches packages by NAME: a later test's montyops.* import would resolve against an
     # earlier test's already-cached package object (and its stale __path__) without this reset.
