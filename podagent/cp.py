@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import contextvars
+import json
 import os
 import re
 import shutil
@@ -397,7 +398,7 @@ class ControlPlane:
                              headers={"Authorization": f"Bearer {self._job_token}"})
             if r.status_code != 200:
                 return None
-            body = r.json()
+            body = json.loads(r.content)
             size = body.get("size")
             return MirrorTarRef(url=str(body["url"]), sha256=str(body["sha256"]),
                                 size=int(size) if size is not None else None,
