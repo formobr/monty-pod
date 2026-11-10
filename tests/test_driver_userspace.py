@@ -554,3 +554,179 @@ def test_both_refusal_trailers_carry_bytes_and_streams(monkeypatch):
     assert not ok and note.endswith("bytes=100/316359348 streams=4") and "DOWNLOAD_TIMEOUT" in note
     video = pod_main._provide_video_libs(None, "595.112.07", ["true"])
     assert video.endswith("bytes=100/316359348 streams=4") and "DOWNLOAD_TIMEOUT" in video
+
+
+# ── MISC-1051: the userspace comes from our mirror first ─────────────────────────────────────────────────
+def _mirror_tar(tmp_path, *, skip: str | None = None, link: str | None = None,
+                icd_path: str = "/not/the/final/dir/libEGL.so") -> Path:
+    import tarfile
+    src = tmp_path / "mirror-src"
+    src.mkdir()
+    names = list(du.allowlist(V))
+    for name in names:
+        if name == link:                       # a link member inside the tar, pointing at a sibling
+            os.symlink(next(n for n in names if n != link), src / name)
+        elif name != skip:
+            (src / name).write_bytes(b"ELF" + name.encode())
+    (src / "nvidia_icd.json").write_text(json.dumps(
+        {"file_format_version": "1.0.1", "ICD": {"library_path": icd_path, "api_version": "1.4.312"}}))
+    out = tmp_path / "userspace.tar.xz"
+    with tarfile.open(out, "w:xz") as tf:
+        for p in sorted(src.iterdir()):
+            tf.add(p, arcname=p.name)
+    return out
+
+
+def _ref(tar: Path, sha: str | None = None):
+    data = tar.read_bytes()
+    return SimpleNamespace(url=tar.as_uri(), sha256=sha or hashlib.sha256(data).hexdigest(), size=len(data))
+
+
+def test_a_mirrored_version_is_provisioned_from_our_store_without_touching_nvidia(tmp_path):
+    clock = Clock()
+    transport = FakeTransport(clock, files=_files())
+    extractor = FakeExtractor()
+    ref = _ref(_mirror_tar(tmp_path))
+    res = _fetch(tmp_path, transport, extractor, clock, mirror=lambda v: ref if v == V else None)
+
+    assert res.ok and res.source == "mirror" and res.mirror == ""
+    assert transport.urls == [] and extractor.calls == []
+    final = tmp_path / "state" / f"nvidia-{V}"
+    icd = json.loads((final / "nvidia_icd.json").read_text())["ICD"]
+    assert icd == {"library_path": str(final / "libEGL_nvidia.so.0"), "api_version": "1.4.312"}
+    assert os.readlink(final / "libEGL_nvidia.so.0") == f"libEGL_nvidia.so.{V}"
+    assert _left_behind(tmp_path) == [f"nvidia-{V}"]
+
+
+def test_a_mirror_miss_falls_back_to_nvidia_and_names_why(tmp_path):
+    clock = Clock()
+    transport = FakeTransport(clock, files=_files())
+    res = _fetch(tmp_path, transport, FakeExtractor(), clock, mirror=lambda v: None)
+    assert res.ok and res.source == "nvidia" and res.mirror == "not_mirrored"
+    assert transport.urls
+
+
+def _broken_ref(tmp_path, broken):
+    if broken == "sha":
+        return _ref(_mirror_tar(tmp_path), sha="0" * 64)
+    if broken == "missing_lib":
+        return _ref(_mirror_tar(tmp_path, skip=du.allowlist(V)[0]))
+    if broken == "symlink_member":
+        return _ref(_mirror_tar(tmp_path, link=du.allowlist(V)[0]))
+    if broken == "corrupt_tar":
+        bad = tmp_path / "userspace.tar.xz"
+        bad.write_bytes(b"not a tar at all")
+        return _ref(bad)
+    if broken == "no_file":
+        return SimpleNamespace(url=(tmp_path / "absent.tar.xz").as_uri(), sha256="0" * 64, size=1)
+    return None
+
+
+_BROKEN = ["sha", "missing_lib", "symlink_member", "corrupt_tar", "no_file", "raises"]
+
+
+@pytest.mark.parametrize("broken", _BROKEN)
+def test_a_broken_mirror_falls_back_to_nvidia(tmp_path, broken):
+    clock = Clock()
+    transport = FakeTransport(clock, files=_files())
+    ref = _broken_ref(tmp_path, broken)
+
+    def mirror(_v):
+        if broken == "raises":
+            raise RuntimeError("cp down")
+        return ref
+
+    res = _fetch(tmp_path, transport, FakeExtractor(), clock, mirror=mirror)
+    assert res.ok and res.source == "nvidia" and res.mirror.startswith("error:")
+    assert transport.urls
+    assert _left_behind(tmp_path) == [f"nvidia-{V}"]
+
+
+@pytest.mark.parametrize("broken", _BROKEN)
+def test_a_mirror_that_burns_the_wall_leaves_nvidia_only_what_is_left(tmp_path, broken):
+    """No double wall: the mirror attempt consumes 120 of the 150 s; the fallback must see 30 s left (below the
+    40 s post-download reserve) and refuse without a single NVIDIA request."""
+    clock = Clock()
+    transport = FakeTransport(clock, files=_files())
+    ref = _broken_ref(tmp_path, broken)
+
+    def mirror(_v):
+        clock.t = 120.0
+        if broken == "raises":
+            raise RuntimeError("cp down")
+        return ref
+
+    res = _fetch(tmp_path, transport, FakeExtractor(), clock, mirror=mirror)
+    assert not res.ok and res.reason == du.DOWNLOAD_TIMEOUT
+    assert res.mirror.startswith("error:") and transport.urls == []
+    assert res.cap == du.RANK_WALL_S and res.elapsed == 120.0
+
+
+def test_a_mirror_download_that_outlasts_the_wall_is_abandoned_not_waited_for(tmp_path, monkeypatch):
+    """The mirror fetch itself is held to the wall: a download still running at t=120 (30 s left, under the
+    40 s reserve) is abandoned as error:wall and the rank ends at that moment, not when the fetch returns."""
+    clock = Clock()
+    release = threading.Event()
+
+    def hung_fetch(ref, dst, *a, **k):
+        clock.t = 120.0
+        release.wait(30)               # only a safety net: the supervisor must not wait for this
+        raise OSError("late")
+
+    monkeypatch.setattr(du.artifact, "fetch_verified", hung_fetch)
+    transport = FakeTransport(clock, files=_files())
+    try:
+        res = _fetch(tmp_path, transport, FakeExtractor(), clock,
+                     mirror=lambda v: SimpleNamespace(url="https://x/y", sha256="0" * 64, size=1))
+    finally:
+        release.set()
+    assert not res.ok and res.reason == du.DOWNLOAD_TIMEOUT and res.mirror == "error:TimeoutError"
+    assert transport.urls == [] and res.elapsed == 120.0 <= res.cap
+
+
+def test_a_mirror_manifest_without_a_valid_api_version_falls_back_to_nvidia(tmp_path):
+    import tarfile
+    clock = Clock()
+    src = tmp_path / "src"
+    src.mkdir()
+    for name in du.allowlist(V):
+        (src / name).write_bytes(b"ELF")
+    (src / "nvidia_icd.json").write_text(json.dumps({"ICD": {"library_path": "x"}}))
+    tar = tmp_path / "userspace.tar.xz"
+    with tarfile.open(tar, "w:xz") as tf:
+        for p in sorted(src.iterdir()):
+            tf.add(p, arcname=p.name)
+    transport = FakeTransport(clock, files=_files())
+    res = _fetch(tmp_path, transport, FakeExtractor(), clock, mirror=lambda v: _ref(tar))
+    assert res.ok and res.source == "nvidia" and res.mirror.startswith("error:")
+
+
+def test_a_failed_mirror_then_failed_nvidia_still_reports_the_mirror_token(tmp_path):
+    clock = Clock()
+    res = _fetch(tmp_path, FakeTransport(clock, files={}), FakeExtractor(), clock, mirror=lambda v: None)
+    assert not res.ok and res.mirror == "not_mirrored"
+
+
+def test_the_trailer_names_the_mirror_failure_only_when_a_mirror_was_asked(monkeypatch):
+    from podagent import main as pod_main
+    refused = du.FetchResult(ok=False, reason=du.DOWNLOAD_TIMEOUT, mirror="not_mirrored")
+    monkeypatch.setattr(pod_main, "_fetch_driver_userspace", lambda *a, **k: refused)
+    ok, note = pod_main._driver_userspace_rank("595.112.07")
+    assert not ok and re.search(r"cap=\d+s mirror=not_mirrored$", note)
+    plain = du.FetchResult(ok=False, reason=du.DOWNLOAD_TIMEOUT)
+    monkeypatch.setattr(pod_main, "_fetch_driver_userspace", lambda *a, **k: plain)
+    assert "mirror=" not in pod_main._driver_userspace_rank("595.112.07")[1]
+
+
+@pytest.mark.parametrize("source", ["mirror", "nvidia"])
+def test_the_ok_trailer_names_the_source(monkeypatch, tmp_path, source):
+    from podagent import main as pod_main
+    fetched = du.FetchResult(ok=True, lib_dir=str(tmp_path), manifest=str(tmp_path / "m.json"), source=source)
+    monkeypatch.setattr(pod_main, "_fetch_driver_userspace", lambda *a, **k: fetched)
+    monkeypatch.setattr(pod_main, "_run_vulkan_probe", lambda timeout=120: (True, "ok", b""))
+    monkeypatch.setattr(pod_main, "_log_vulkan_rank", lambda *a, **k: None)
+    monkeypatch.setattr(pod_main, "_prepend_ld_library_path", lambda _d: None)
+    for key in pod_main._VULKAN_ENV_KEYS:          # the rank writes these on green; monkeypatch restores them
+        monkeypatch.setenv(key, "x")
+    ok, note = pod_main._driver_userspace_rank("595.112.07")
+    assert ok and note.startswith(f"driver_userspace=ok source={source} elapsed=")

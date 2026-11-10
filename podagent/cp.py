@@ -11,6 +11,7 @@ import shutil
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import parse_qsl, urljoin, urlparse
@@ -368,12 +369,41 @@ def _file_path(url: str) -> str | None:
     return url2pathname(urlparse(url).path)
 
 
+@dataclass(frozen=True)
+class MirrorTarRef:
+    """The CP's answer for a mirrored driver userspace tar (satisfies artifact.TarRef)."""
+    url: str
+    sha256: str
+    size: int | None
+    version: str = ""
+
+
+_DRIVER_REF_TIMEOUT_S = 10
+
+
 class ControlPlane:
     def __init__(self, base_url: str, job_token: str) -> None:
         self.base = base_url.rstrip("/")
+        self._job_token = job_token
         # One typed socket carries jobs, progress and terminal results. EventStream persists every client frame
         # before sending, so this layer never invents an HTTP fallback or a second retry policy.
         self._stream = event_stream.EventStream(self.base, job_token)
+
+    def driver_userspace_ref(self, version: str) -> MirrorTarRef | None:
+        """Where our store holds this driver version's userspace tar, or None (404 = not mirrored, or any
+        error). Never raises: the caller falls back to the vendor."""
+        try:
+            r = requests.get(f"{self.base}/pod/driver-userspace/{version}", timeout=_DRIVER_REF_TIMEOUT_S,
+                             headers={"Authorization": f"Bearer {self._job_token}"})
+            if r.status_code != 200:
+                return None
+            body = r.json()
+            size = body.get("size")
+            return MirrorTarRef(url=str(body["url"]), sha256=str(body["sha256"]),
+                                size=int(size) if size is not None else None,
+                                version=str(body.get("version", version)))
+        except Exception:  # noqa: BLE001 — a mirror miss must never fail the boot
+            return None
 
     def poll_job(self) -> dict[str, Any] | None:
         """One envelope of work, or None if none arrived inside the wall.

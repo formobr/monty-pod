@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
+from . import artifact
+
 DRIVER_VERSION_RE = re.compile(r"^\d+\.\d+(\.\d+)?$")
 
 # Named refusal reasons (the ladder prints them in the refusal trailer).
@@ -93,6 +95,8 @@ class FetchResult:
     elapsed: float = 0.0
     cap: float = RANK_WALL_S
     transfer: str = ""          # "bytes=<current-attempt completed>/<total> streams=<k>"; empty before any download
+    source: str = ""            # "mirror" | "nvidia" once provisioning ran; empty for a reused directory
+    mirror: str = ""            # "" = not asked or it worked; else "not_mirrored" | "error:<short>"
 
 
 class Response(Protocol):
@@ -477,14 +481,18 @@ def fetch_driver_userspace(
     clock: Callable[[], float] = time.monotonic,
     disk_usage: Callable[[str], object] = shutil.disk_usage,
     cap: float = RANK_WALL_S,
+    mirror: Callable[[str], "artifact.TarRef | None"] | None = None,
 ) -> FetchResult:
     """Provision <base_dir>/nvidia-<version>/ and return where. Never raises: every failure is a named
-    FetchResult, and nothing but a verified directory is left behind."""
+    FetchResult, and nothing but a verified directory is left behind. `mirror` (our store's userspace tar)
+    replaces only the download/sha/extract; any failure of it falls back to NVIDIA inside the same `cap`."""
     start = clock()
     progress = _Progress()
+    state = {"source": "", "mirror": ""}
 
     def done(**kw) -> FetchResult:
-        return FetchResult(elapsed=clock() - start, cap=cap, transfer=progress.text(), **kw)
+        return FetchResult(elapsed=clock() - start, cap=cap, transfer=progress.text(),
+                           source=state["source"], mirror=state["mirror"], **kw)
 
     if not isinstance(version, str) or not DRIVER_VERSION_RE.match(version):
         return done(ok=False, reason=DRIVER_VERSION_UNAVAILABLE, detail="not a driver version")
@@ -501,7 +509,7 @@ def fetch_driver_userspace(
             return done(ok=False, reason=INSUFFICIENT_DISK,
                         detail=f"state dir {base} not writable ({type(e).__name__}: {e})")
         _provision(version, base, final, work, transport or default_transport,
-                   extractor or default_extractor, clock, start, cap, disk_usage, progress)
+                   extractor or default_extractor, clock, start, cap, disk_usage, progress, mirror, state)
     except _Refusal as r:
         return done(ok=False, reason=r.reason, detail=_with_transfer(r.detail, progress))
     except OSError as e:
@@ -512,10 +520,77 @@ def fetch_driver_userspace(
     return done(ok=True, lib_dir=str(final), manifest=str(final / MANIFEST))
 
 
-def _provision(version, base, final, work, transport, extractor, clock, start, cap, disk_usage, progress) -> None:
+def _provision(version, base, final, work, transport, extractor, clock, start, cap, disk_usage, progress,
+               mirror=None, state=None) -> None:
+    """Records in `state` the source ("mirror"|"nvidia") and mirror note ("" unless the mirror was asked and
+    failed: not_mirrored | error:<short>) — set before any NVIDIA refusal can raise, so the trailer has it."""
+    state = state if state is not None else {}
     def remaining() -> float:
         return cap - (clock() - start)
 
+    target = work / "extract"
+    state["source"], state["mirror"] = "nvidia", ""
+    if mirror is not None:
+        state["mirror"] = _try_mirror(mirror, version, work, target, remaining)
+        if not state["mirror"]:
+            state["source"] = "mirror"
+    if state["source"] == "nvidia":
+        _nvidia_steps(version, base, work, target, transport, extractor, clock, remaining, disk_usage, progress)
+    _finish(version, final, work, target)
+
+
+def _fetch_within_wall(ref, tar_path, remaining) -> None:
+    """artifact.fetch_verified in a daemon thread, supervised on the injected clock: the download is held to
+    `remaining() - AFTER_DOWNLOAD_RESERVE_S`, so a slow or hung mirror costs the wall, never more."""
+    box: list[BaseException] = []
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            artifact.fetch_verified(ref, tar_path)
+        except BaseException as e:  # noqa: BLE001 — handed to the supervisor
+            box.append(e)
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, daemon=True, name="mirror-fetch").start()
+    while not finished.wait(POLL_S):
+        if remaining() - AFTER_DOWNLOAD_RESERVE_S <= 0:
+            raise TimeoutError("wall hit during the mirror download")
+    if box:
+        raise box[0]
+
+
+def _try_mirror(mirror, version, work, target, remaining) -> str:
+    """Steps 1-3 from our store: "" on success, else the trailer token. The extract dir is left empty on any
+    failure so the NVIDIA path starts clean; the wall is the one `remaining()` measures, so a fallback spends
+    only what is left (no second wall)."""
+    try:
+        if remaining() - AFTER_DOWNLOAD_RESERVE_S <= 0:
+            return "error:wall"
+        ref = mirror(version)
+        if ref is None:
+            return "not_mirrored"
+        tar_path = work / "userspace.tar.xz"
+        _fetch_within_wall(ref, tar_path, remaining)
+        if remaining() - AFTER_DOWNLOAD_RESERVE_S / 2 <= 0:
+            raise TimeoutError("wall exhausted after the mirror fetch")
+        artifact.safe_extract(tar_path, target)      # tar symlinks never trusted: a link member is refused below
+        for lib in (*allowlist(version), "nvidia_icd.json"):
+            p = target / lib
+            if not p.is_file() or p.is_symlink():
+                raise ValueError(f"missing {lib}")
+        api = json.loads((target / "nvidia_icd.json").read_text())["ICD"]["api_version"]
+        if not isinstance(api, str) or not DRIVER_VERSION_RE.match(api):
+            raise ValueError("malformed api_version")
+        return ""
+    except Exception as e:  # noqa: BLE001 — any mirror failure means "use NVIDIA"
+        shutil.rmtree(target, ignore_errors=True)
+        (work / "userspace.tar.xz").unlink(missing_ok=True)
+        return f"error:{type(e).__name__}"
+
+
+def _nvidia_steps(version, base, work, target, transport, extractor, clock, remaining, disk_usage, progress) -> None:
     # 1. pick the variant: -no-compat32 first, the full .run when that one is not published (404)
     name = None
     for variant in (f"NVIDIA-Linux-x86_64-{version}-no-compat32.run", f"NVIDIA-Linux-x86_64-{version}.run"):
@@ -550,7 +625,6 @@ def _provision(version, base, final, work, transport, extractor, clock, start, c
         raise _Refusal(CHECKSUM_MISMATCH, f"{name}: got {got[:12]}, want {expected[:12]}")
 
     # 3. only now run the vendor script; it creates the target itself and refuses one that exists
-    target = work / "extract"
     ext_timeout = min(EXTRACT_TIMEOUT_S, remaining() - AFTER_DOWNLOAD_RESERVE_S / 2)
     if ext_timeout <= 0:
         raise _Refusal(EXTRACTION_FAILED, "wall exhausted before extraction")
@@ -564,6 +638,8 @@ def _provision(version, base, final, work, transport, extractor, clock, start, c
         reason = DEPENDENCY_MISSING if "not found" in err else EXTRACTION_FAILED
         raise _Refusal(reason, f"extractor rc={rc}: {err.strip()[-150:]}")
 
+
+def _finish(version, final, work, target) -> None:
     # 4. keep the allowlist only: versioned names, the one alias, a manifest with the shipped api_version
     stage = work / "stage"
     stage.mkdir()

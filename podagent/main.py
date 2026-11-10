@@ -304,6 +304,12 @@ def _bounded_stderr(stderr: bytes, *, edge: int = 500) -> str:
     return f"{text[:edge].rstrip()}\n... {omitted} chars omitted ...\n{text[-edge:].lstrip()}"
 
 
+def _mirror_token(res) -> str:
+    """` mirror=<not_mirrored|error:<short>>` after `cap=…s` when a mirror was asked and failed; else empty."""
+    note = getattr(res, "mirror", "")
+    return f" mirror={note}" if note else ""
+
+
 def _provide_video_libs(cp: "ControlPlane", version: str, probe: list[str]) -> str | None:
     """The host injected no libnvidia-encode: fetch the host-exact driver userspace and re-run the SAME probe once.
     None = the encoder now opens (LD_LIBRARY_PATH keeps the fetched dir); else the refusal-trailer note, with
@@ -311,10 +317,12 @@ def _provide_video_libs(cp: "ControlPlane", version: str, probe: list[str]) -> s
     import subprocess
     t0 = time.monotonic()
     saved = os.environ.get("LD_LIBRARY_PATH")
-    res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent)
+    res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent,
+                                  mirror=cp.driver_userspace_ref if cp is not None else None)
     if not res.ok:
         _log(f"nvenc video-libs fetch refused: {res.reason}: {res.detail}")
         return (f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+                + _mirror_token(res)
                 + (f" {res.transfer}" if getattr(res, "transfer", "") else ""))
     try:
         _prepend_ld_library_path(res.lib_dir)
@@ -717,10 +725,12 @@ def _driver_userspace_rank(version: str, cp: "ControlPlane | None" = None) -> tu
     t0 = time.monotonic()
     rank = f"driver-userspace-{version}"
     saved = {k: os.environ.get(k) for k in _VULKAN_ENV_KEYS}
-    res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent)
+    res = _fetch_driver_userspace(version, Path(_VULKAN_EGL_ICD_PATH).parent,
+                                  mirror=cp.driver_userspace_ref if cp is not None else None)
     if not res.ok:
         _log_vulkan_rank(rank, False, f"{res.reason}: {res.detail}", b"")
         return False, (f"driver_userspace={res.reason} elapsed={time.monotonic() - t0:.0f}s cap={res.cap:.0f}s"
+                       + _mirror_token(res)
                        + (f" {res.transfer}" if getattr(res, "transfer", "") else ""))
     try:
         os.environ["VK_ICD_FILENAMES"] = os.environ["VK_DRIVER_FILES"] = res.manifest
@@ -737,7 +747,8 @@ def _driver_userspace_rank(version: str, cp: "ControlPlane | None" = None) -> tu
         if cp is not None:
             _note_boot_step(cp, f"driver userspace {version}: vulkan libs provided by the pod "
                                 f"(dir {'reused' if res.detail == 'reused' else 'fetched'})")
-        return True, f"driver_userspace=ok {elapsed}"
+        src = getattr(res, "source", "")
+        return True, f"driver_userspace=ok{f' source={src}' if src else ''} {elapsed}"
     _restore_env(saved)
     return False, f"driver_userspace={driver_userspace.VULKAN_REPROBE_FAILED} {elapsed}"
 

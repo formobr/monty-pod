@@ -35,6 +35,9 @@ class _CP:
     def note(self, ev: dict) -> None:
         self.events.append(ev)
 
+    def driver_userspace_ref(self, _v):
+        return None
+
     def send_event(self, ev: dict, *, wait: bool = False) -> bool:
         self.events.append(ev)
         self.waits.append(wait)
