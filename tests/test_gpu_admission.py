@@ -112,6 +112,28 @@ def test_deadline_times_out_and_the_queue_recovers_for_a_fresh_waiter():
     assert admitted.is_set(), "a fresh waiter after the holder released must be admitted, not poisoned"
 
 
+def test_measure_source_is_a_heavy_op():
+    """NEGATIVE (MISC-1056): an HDR measure creates a Vulkan device; outside HEAVY_GPU_OPS it would create one
+    while a normalize holds one and fail VK_ERROR_INITIALIZATION_FAILED."""
+    assert "measure.source" in gpu_admission.HEAVY_GPU_OPS
+    release_holder = threading.Event()
+
+    def _hold() -> None:
+        with gpu_admission.admission("media.normalize", deadline_s=5.0):
+            assert release_holder.wait(timeout=5), "holder was never released"
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    _spin_until(lambda: bool(gpu_admission._live))
+
+    with pytest.raises(gpu_admission.GpuAdmissionTimeout, match="measure.source"):
+        with gpu_admission.admission("measure.source", deadline_s=0.05):
+            pytest.fail("measure.source must park behind a held media.normalize slot")
+
+    release_holder.set()
+    holder.join(timeout=5)
+
+
 # ── d. bounded FIFO ──────────────────────────────────────────────────────────────────────────────
 
 def test_bounded_fifo_refuses_once_the_parked_depth_is_reached(monkeypatch):

@@ -65,7 +65,10 @@ ninth waiter means the box over-drove this pod and must hear that now, as a refu
 """
 
 # Ops whose handler saturates the GPU (GPU_ADMISSION_WHY).
-HEAVY_GPU_OPS = frozenset({"cut.apply", "media.normalize", "camera.apply", "media.cut_proxy"})
+# measure.source (MISC-1056): its HDR tonemap path now creates a Vulkan device (libplacebo); device creation is the
+# contended resource, not VRAM — concurrent creators fail VK_ERROR_INITIALIZATION_FAILED (6/8 rc 187 measured
+# 2026-11-12 on the pinned build), so it must queue behind the other heavies.
+HEAVY_GPU_OPS = frozenset({"cut.apply", "media.normalize", "camera.apply", "media.cut_proxy", "measure.source"})
 
 # The sanctioned per-op ceiling of every heavy op: the box's _OP_BUDGET_S rows for the four heavies sit AT the
 # measured cap, the engine's op backend (_MEASURED_CEILING_S 200.0 − overhead = 140.0 s).

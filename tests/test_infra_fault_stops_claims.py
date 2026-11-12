@@ -130,6 +130,14 @@ def test_a_lost_vulkan_device_at_creation_stops_claiming(tmp_path, monkeypatch):
     assert coordinator.infra_fault() and coordinator.infra_class == "vulkan_false"
 
 
+def test_vulkan_init_failure_is_infra():
+    """MISC-1056: concurrent Vulkan device creation fails with INITIALIZATION_FAILED — pod infra, not a job error."""
+    exc = RuntimeError("measure refused: stderr=[AVHWDeviceContext @ 0x1] "
+                       "Device creation failure: VK_ERROR_INITIALIZATION_FAILED")
+    assert runner.infra_class(exc) == "vulkan_false"
+    assert runner.infra_class(RuntimeError("Device creation failed: -1")) is None
+
+
 def test_device_creation_failed_and_encoder_exits_do_not_latch():
     for text in (
         "render failed: VK_ERROR_DEVICE_LOST",

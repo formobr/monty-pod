@@ -95,6 +95,7 @@ _INFRA_CLASSES: Final = (
             re.compile(r"\bvulkan_false\b"),
             re.compile(r"Instance creation failure: VK_ERROR_INCOMPATIBLE_DRIVER\b"),
             re.compile(r"Device creation failure: VK_ERROR_DEVICE_LOST\b"),
+            re.compile(r"Device creation failure: VK_ERROR_INITIALIZATION_FAILED\b"),
         ),
     ),
     # The engine's pod-defect class registry row for this class lands in the paired engine slice (MISC-843)
