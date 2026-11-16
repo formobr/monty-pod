@@ -14,7 +14,8 @@
       {
         "id": "phone-1",
         "src_url": "https://storage.example/o/50412.jpg?sig=GET",
-        "device": "phone"
+        "device": "phone",
+        "mask_url": "https://storage.example/o/50413.png?sig=PUT"
       },
       {
         "id": "laptop-1",

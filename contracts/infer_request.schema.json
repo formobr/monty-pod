@@ -522,6 +522,11 @@
                 "type": "string",
                 "minLength": 1
               },
+              "mask_url": {
+                "description": "optional presigned PUT of the glass mask: an 8-bit grey PNG of the picture's size, 255 inside the glass, 0 outside; put only when a glass was found",
+                "type": "string",
+                "minLength": 1
+              },
               "device": {
                 "description": "the device whose screen to find; a closed enum, never free text",
                 "enum": [

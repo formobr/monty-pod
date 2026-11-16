@@ -63,6 +63,12 @@ EDGE_RATIO_MIN = 0.05         # a quad whose shortest edge is under this share o
 MANIFEST_KEYS = ("florence", "sam", "transformers", "torch", "torchvision", "dtypes")
 _DTYPES = ("float16", "float32")
 SURFACE = "device_face"
+# the glass inside the device face — docs/research/pod-screen-quad.md, «Amendment 2026-11-16 — the glass inside the device face»
+GLASS_AREA_MIN = 0.30         # a glass candidate covers at least this share of the (rectified) face
+GLASS_IOU_MIN = 0.70          # and has at least this SAM iou_score
+GLASS_SHRINK_STEP = 0.0125    # the box prompt shrinks from 0 to GLASS_SHRINK_MAX of the face in these steps (each side)
+GLASS_SHRINK_MAX = 0.15
+GLASS_HOLE_MAX_SHARE = 0.02   # an interior hole under this share of the glass is filled in the mask PNG; a notch at the border never
 
 
 class ScreenQuadRefused(ValueError):
@@ -307,6 +313,97 @@ def _mask_bbox(mask: Any) -> list[float]:
 class ScreenAnswer:
     quad: list[list[float]] | None
     reasons: list[str] = field(default_factory=list)
+    glass: list[list[float]] | None = None          # the glass inside the face, picture fractions
+    glass_mask: Any = None                          # bool [H, W] of the picture, the glass (holes not yet filled)
+    glass_reasons: list[str] = field(default_factory=list)
+
+
+def _warp_to_face(quad_px: Any) -> tuple[Any, int, int] | None:
+    """The perspective matrix from the picture to an upright face (size = the quad's max opposite edges), or None for a sliver."""
+    import cv2
+    import numpy as np
+
+    q = np.asarray(quad_px, dtype=np.float32).reshape(4, 2)
+    edge = lambda a, b: float(np.hypot(*(q[a] - q[b])))
+    fw, fh = round(max(edge(0, 1), edge(3, 2))), round(max(edge(0, 3), edge(1, 2)))
+    if fw < 2 or fh < 2:
+        return None
+    dst = np.array([[0, 0], [fw - 1, 0], [fw - 1, fh - 1], [0, fh - 1]], dtype=np.float32)
+    return cv2.getPerspectiveTransform(q, dst), fw, fh
+
+
+def _boundary_gradient(mask: Any, grad: Any) -> float:
+    """Mean Sobel magnitude along the mask's 1-px morphological boundary (mask minus its erosion)."""
+    import cv2
+    import numpy as np
+
+    m = np.asarray(mask, dtype=np.uint8)
+    ring = (m - cv2.erode(m, np.ones((3, 3), np.uint8))).astype(bool)
+    return float(grad[ring].mean()) if ring.any() else 0.0
+
+
+def find_glass(segmenter: Any, img: Any, quad_px: Any) -> tuple[list[list[float]] | None, Any, list[str]]:
+    """The glass inside the device face: → (4 picture fractions TL, TR, BR, BL, a bool [H, W] picture-size mask, []) or
+    (None, None, [why]). The picture is warped upright by the face quad, ONE SAM embedding of that face, a box prompt shrunk
+    0 → 15 % in 1.25 % steps (multimask); the kept candidate has the strongest boundary gradient."""
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    w, h = img.size
+    warp = _warp_to_face(quad_px)
+    if warp is None:
+        return None, None, ["glass: face_quad_too_small"]
+    matrix, fw, fh = warp
+    face = cv2.warpPerspective(np.asarray(img), matrix, (fw, fh), flags=cv2.INTER_LINEAR)
+    grey = cv2.cvtColor(face, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    grad = np.hypot(cv2.Sobel(grey, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(grey, cv2.CV_32F, 0, 1, ksize=3))
+    embedding = segmenter.embed(Image.fromarray(face))
+    best: tuple[float, Any] | None = None
+    steps = round(GLASS_SHRINK_MAX / GLASS_SHRINK_STEP)
+    for k in range(steps + 1):
+        s = k * GLASS_SHRINK_STEP
+        masks, ious = segmenter.masks(embedding, [s * fw, s * fh, (1 - s) * fw, (1 - s) * fh])
+        for mask, iou in zip(masks, ious):
+            mask = np.asarray(mask, dtype=bool)
+            if mask.shape != (fh, fw) or iou < GLASS_IOU_MIN or mask.sum() < GLASS_AREA_MIN * fw * fh:
+                continue
+            score = _boundary_gradient(mask, grad)
+            if best is None or score > best[0]:
+                best = (score, mask)
+    if best is None:
+        return None, None, ["glass: no_candidate_over_thresholds"]
+    quad, why = fit_quad(best[1])
+    if quad is None:
+        return None, None, [f"glass: {why}"]
+    back = np.linalg.inv(matrix)
+    in_picture = cv2.perspectiveTransform(quad.astype(np.float32).reshape(-1, 1, 2), back).reshape(4, 2)
+    frac = fractions(in_picture, w, h)
+    if not within_frame_bounds(frac):
+        return None, None, ["glass: glass_cut_by_frame"]
+    mask_pic = cv2.warpPerspective(best[1].astype(np.uint8), back, (w, h), flags=cv2.INTER_NEAREST).astype(bool)
+    return frac, mask_pic, []
+
+
+def fill_small_holes(mask: Any) -> Any:
+    """bool [H, W] → uint8 0/255 with the interior holes under GLASS_HOLE_MAX_SHARE of the glass filled. A hole is background NOT
+    reachable from outside the mask (flood-fill from a padded border): a notch cut at the border, a thumb over the edge stay."""
+    import cv2
+    import numpy as np
+
+    m = np.asarray(mask, dtype=np.uint8)
+    glass = int(m.sum())
+    padded = cv2.copyMakeBorder(m, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    outside = padded.copy()
+    ff = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+    cv2.floodFill(outside, ff, (0, 0), 2)
+    holes = ((outside == 0)[1:-1, 1:-1]).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=4)
+    out = m.copy()
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < GLASS_HOLE_MAX_SHARE * glass:
+            out[labels == i] = 1
+    return out * 255
 
 
 def locate_screen(grounder: Any, segmenter: Any, img: Any, device: str) -> ScreenAnswer:
@@ -357,7 +454,8 @@ def locate_screen(grounder: Any, segmenter: Any, img: Any, device: str) -> Scree
         if not within_frame_bounds(frac):
             reasons.append(f"box {i}: screen_cut_by_frame")
             continue
-        return ScreenAnswer(frac, reasons)
+        glass, glass_mask, glass_reasons = find_glass(segmenter, img, [(x * w, y * h) for x, y in frac])
+        return ScreenAnswer(frac, reasons, glass, glass_mask, glass_reasons)
     return ScreenAnswer(None, reasons)
 
 
@@ -502,9 +600,19 @@ class ScreenQuadService:
                                               reasons=answer.reasons or ["no_screen_found"]))
                     note(f"screen_quad {it.id}: none — {'; '.join(answer.reasons)}")
                 else:
+                    put_mask = False
+                    if answer.glass is not None and it.mask_url:
+                        import cv2
+
+                        png = Path(td) / f"{it.id}.mask.png"
+                        cv2.imwrite(str(png), fill_small_holes(answer.glass_mask))
+                        upload(png, it.mask_url, "image/png")
+                        put_mask = True
                     outs.append(ScreenQuadOut(id=it.id, status="found", device=it.device, quad=answer.quad, w=w, h=h,
-                                              surface=SURFACE))
-                    note(f"screen_quad {it.id}: found")
+                                              surface=SURFACE, glass=answer.glass, mask=True if put_mask else None,
+                                              reasons=answer.glass_reasons or None))
+                    note(f"screen_quad {it.id}: found" + ("" if answer.glass is not None else
+                                                          f" (no glass: {'; '.join(answer.glass_reasons)})"))
             wall_s = time.monotonic() - t_all
             payload = ScreenQuadPayload(
                 model=self.model_name, model_sha256=self.weights_sha256, torch=self.runtime[0],

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/screen_quad.schema.json",
   "title": "ScreenQuadPayload — the screen_quad receipt the pod PUTs to put_url",
-  "description": "One row per requested picture, once, with its NAMED outcome. `found`: the 4 corners of the named device's FACE (screen incl. its bezel, surface = device_face) as [x, y] fractions of the picture, ordered TL, TR, BR, BL, with w/h = the size of the picture the fractions are of (the source after exif_transpose, transparency composited on white, and the 2048 long-side cap). A corner may lie outside the frame by up to a quarter of it (each fraction in [-0.25, 1.25], never clamped — a quad with a corner beyond that is `none`, reason screen_cut_by_frame). `none`: no screen was found — a normal answer, `reasons` names why per box (the caller tries its next picture). `unreadable`: the source bytes are not a picture. torch/torchvision/transformers are the runtime that ran it, equal to the weights manifest's; `generation` is the effective Florence generation config the run used (the snapshot's own generation settings under the call's overrides).",
+  "description": "One row per requested picture, once, with its NAMED outcome. `found`: the 4 corners of the named device's FACE (screen incl. its bezel, surface = device_face) as [x, y] fractions of the picture, ordered TL, TR, BR, BL, with w/h = the size of the picture the fractions are of (the source after exif_transpose, transparency composited on white, and the 2048 long-side cap). A corner may lie outside the frame by up to a quarter of it (each fraction in [-0.25, 1.25], never clamped — a quad with a corner beyond that is `none`, reason screen_cut_by_frame). `none`: no screen was found — a normal answer, `reasons` names why per box (the caller tries its next picture). A `found` row also carries `glass` (the 4 corners of the glass inside the face, same point type as `quad`) and `mask` true when the glass mask PNG was PUT to the item's mask_url; when no glass candidate passes, `glass` is absent and `reasons` names why (the face `quad` is still answered). `unreadable`: the source bytes are not a picture. torch/torchvision/transformers are the runtime that ran it, equal to the weights manifest's; `generation` is the effective Florence generation config the run used (the snapshot's own generation settings under the call's overrides).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -114,6 +114,26 @@
               }
             }
           },
+          "glass": {
+            "description": "found only: the GLASS inside the device face, TL, TR, BR, BL; each [x, y] a fraction of the picture in [-0.25, 1.25]. Absent when no glass candidate passed (`reasons` then names why; `quad` is still the face)",
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "number",
+                "minimum": -0.25,
+                "maximum": 1.25
+              }
+            }
+          },
+          "mask": {
+            "description": "true when the glass mask PNG was PUT to the item's mask_url",
+            "const": true
+          },
           "w": {
             "type": "integer",
             "minimum": 1
@@ -148,12 +168,7 @@
                 "w",
                 "h",
                 "surface"
-              ],
-              "not": {
-                "required": [
-                  "reasons"
-                ]
-              }
+              ]
             },
             "else": {
               "not": {
@@ -161,6 +176,16 @@
                   {
                     "required": [
                       "quad"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "glass"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "mask"
                     ]
                   },
                   {

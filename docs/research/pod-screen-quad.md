@@ -109,3 +109,14 @@ corners as fractions of the picture. This kind finds them on the pod GPU.
 10. One SAM image embedding per picture; ≤ 4 boxes per picture, ≤ 16 items per request; the job deadline from the measured per-item time.
 11. The answer says `surface: "device_face"`: the quad is the device face incl. its bezel. Decision (orchestrator, owner 2026-11-16 «решай
     сам»): the pin covers the face; any inset is the caller's look decision made on rendered frames, not a detector change.
+
+## Amendment 2026-11-16 — the glass inside the device face
+The grounded box + SAM mask is the device FACE (bezel, notch body, case). The glass is found inside it with the same weights: the picture is
+warped upright by the face quad, one SAM image embedding of that face, and a box prompt shrunk from 0 to 15 % of the face in 1.25 % steps
+(multimask); a candidate covers at least 30 % of the face with iou_score at least 0.7; the kept candidate has the strongest mean Sobel
+gradient (3x3, grey) on its 1-px morphological boundary. Measured on 11 device pictures (phones, tablet, iMac, monitors, laptops) on a
+6 GB card: the glass on 8, the whole face on 2 (a dark screen on a dark bezel; a monitor whose face quad was already wrong), a sub-window
+on 1 (a laptop cut by the frame); about 590 ms per picture. Eight other approaches were measured and rejected (Florence grounding on the
+rectified face returns the whole crop; Florence referring segmentation returns slivers; Hough / LSD rectangles lose rounded corners and
+notches; SAM automatic mask generation finds no candidate on 4 of 11 and is 10x slower). The mask is answered as a PNG so a consumer can
+composite inside the glass only; small interior holes are filled, notches at the border are kept.

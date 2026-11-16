@@ -793,6 +793,7 @@ class ScreenQuadSrc(BaseModel):
     id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
     src_url: str = Field(min_length=1)      # presigned GET of the source picture
     device: ScreenDevice                    # a closed enum -> the phrase «<device> screen» (docs/research/pod-screen-quad.md)
+    mask_url: str | None = Field(default=None, min_length=1)   # presigned PUT of the glass mask PNG (the picture's size)
 
 
 class ScreenQuadParams(BaseModel):
@@ -1350,6 +1351,8 @@ class ScreenQuadOut(BaseModel):
     w: int | None = Field(default=None, ge=1)
     h: int | None = Field(default=None, ge=1)
     surface: Literal["device_face"] | None = None
+    glass: QuadT | None = None              # found only: the glass inside the face; absent when no glass candidate passed
+    mask: Literal[True] | None = None       # found only: the glass mask PNG was PUT to mask_url
     reasons: list[str] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
@@ -1357,11 +1360,11 @@ class ScreenQuadOut(BaseModel):
         if self.status == "found":
             if None in (self.quad, self.w, self.h, self.surface):
                 raise ValueError("a found item names quad, w, h and surface")
-            if self.reasons is not None:
-                raise ValueError("a found item names no reasons")
+            if self.mask is not None and self.glass is None:
+                raise ValueError("a mask is put only with its glass")
         else:
-            if self.quad is not None or self.surface is not None:
-                raise ValueError(f"a {self.status} item names no quad and no surface")
+            if self.quad is not None or self.surface is not None or self.glass is not None or self.mask is not None:
+                raise ValueError(f"a {self.status} item names no quad, surface, glass and mask")
             if self.status == "none" and self.reasons is None:
                 raise ValueError("a none item names its reasons")
             if self.status == "unreadable" and (self.reasons is not None or self.w is not None or self.h is not None):

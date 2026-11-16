@@ -45,6 +45,11 @@ def _poly_mask(points, w: int = W, h: int = H):
     return m.astype(bool)
 
 
+def _blank(fw: int, fh: int):
+    np = pytest.importorskip("numpy")
+    return np.zeros((fh, fw), bool)
+
+
 class StubGrounder:
     generation = {"max_new_tokens": 256, "num_beams": 3, "do_sample": False, "no_repeat_ngram_size": 3}
 
@@ -59,14 +64,24 @@ class StubGrounder:
 class StubSegmenter:
     """Returns the same 3 masks (and iou scores) for every prompt; counts the embeddings it was asked for."""
 
-    def __init__(self, mask, ious=(0.95, 0.97, 0.93)):
+    def __init__(self, mask, ious=(0.95, 0.97, 0.93), glass=None):
         self.masks3, self.ious, self.embeds, self.prompts = [mask, mask, mask], list(ious), 0, []
+        self.glass, self.face_embeds, self.face_prompts = glass, 0, []
 
     def embed(self, img):
+        if img.size != (W, H):                        # the upright face the glass step warps out of the picture
+            self.face_embeds += 1
+            return ("face", img.size)
         self.embeds += 1
         return "embedding"
 
     def masks(self, embedding, box, point=None):
+        if isinstance(embedding, tuple):              # a glass-step prompt: `glass(face_w, face_h, box)` -> (3 masks, 3 ious)
+            self.face_prompts.append(list(box))
+            if self.glass is None:
+                empty = _blank(*embedding[1])
+                return [empty] * 3, [0.9] * 3
+            return self.glass(*embedding[1], box)
         assert embedding == "embedding"
         self.prompts.append((list(box), point))
         return self.masks3, self.ious
@@ -288,3 +303,155 @@ def test_the_request_and_the_receipt_validate_against_the_contract_and_a_device_
     assert not list(jsonschema.Draft202012Validator(schema).iter_errors(receipt))
     assert ScreenQuadPayload.model_validate(receipt).items[0].status == "found"
     assert receipt["model_sha256"] == SHA and receipt["torch"] == RUNTIME[0]
+
+
+# ── the glass inside the face (docs/research/pod-screen-quad.md, Amendment 2026-11-16) ──────────────────────────────
+
+INNER = (0.1, 0.15, 0.9, 0.85)          # the glass in FACE fractions (u0, v0, u1, v1)
+
+
+def _face_to_picture(u: float, v: float) -> tuple[float, float]:
+    """TILTED is a parallelogram: face fraction (u, v) → picture px."""
+    (tlx, tly), (trx, try_), _, (blx, bly) = TILTED
+    return tlx + u * (trx - tlx) + v * (blx - tlx), tly + u * (try_ - tly) + v * (bly - tly)
+
+
+def _glass_picture(path: Path) -> None:
+    """A dark picture whose glass (INNER of the TILTED face) is bright: the glass boundary is the sharp edge."""
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    arr = np.full((H, W, 3), 20, np.uint8)
+    u0, v0, u1, v1 = INNER
+    corners = [_face_to_picture(u, v) for u, v in ((u0, v0), (u1, v0), (u1, v1), (u0, v1))]
+    cv2.fillPoly(arr, [np.round(np.array(corners)).astype(np.int32)], (230, 230, 230))
+    Image.fromarray(arr).save(path)
+
+
+def _inner_glass(fw: int, fh: int, box, *, hole: bool = False, notch: bool = False):
+    """The sweep's masks in face px: the whole face at s = 0, the INNER rectangle at s = 0.05, nothing else."""
+    np = pytest.importorskip("numpy")
+    s = box[0] / fw
+    if abs(s) < 1e-9:
+        return [np.ones((fh, fw), bool)] * 3, [0.95] * 3
+    if abs(s - 0.05) > 1e-6:
+        return [_blank(fw, fh)] * 3, [0.95] * 3
+    u0, v0, u1, v1 = INNER
+    x0, y0, x1, y1 = round(u0 * fw), round(v0 * fh), round(u1 * fw), round(v1 * fh)
+    m = _blank(fw, fh)
+    m[y0:y1, x0:x1] = True
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    if hole:
+        m[cy - 2:cy + 2, cx - 2:cx + 2] = False                     # 16 px inside ~14k: far under 2 % of the glass
+    if notch:
+        m[y0:y0 + 8, cx + 20:cx + 26] = False                       # cut in from the top border: open to the outside
+    return [m] * 3, [0.95] * 3
+
+
+def test_the_glass_inside_the_face_is_found_by_the_shrink_sweep_and_the_face_quad_is_still_answered(tmp_path):
+    src = tmp_path / "phone.png"
+    _glass_picture(src)
+    segmenter = StubSegmenter(_poly_mask(TILTED), glass=_inner_glass)
+    receipt = _run(tmp_path, _service(tmp_path, StubGrounder([BOX]), segmenter), phone=(src, "phone"))
+
+    (item,) = receipt["items"]
+    assert item["status"] == "found" and "reasons" not in item
+    for got, (x, y) in zip(item["quad"], TILTED):
+        assert abs(got[0] - x / W) < 0.01 and abs(got[1] - y / H) < 0.01
+    u0, v0, u1, v1 = INNER
+    for got, (u, v) in zip(item["glass"], ((u0, v0), (u1, v0), (u1, v1), (u0, v1))):
+        x, y = _face_to_picture(u, v)
+        assert abs(got[0] - x / W) < 0.01 and abs(got[1] - y / H) < 0.01
+    assert "mask" not in item, "no mask_url, no PNG, no `mask`"
+    assert segmenter.face_embeds == 1, "ONE embedding of the face for the whole sweep"
+    steps = [round(b[0] / (b[2] + b[0]) / 0.0125, 6) for b in segmenter.face_prompts]
+    assert len(segmenter.face_prompts) == 13 and steps[0] == 0 and steps[-1] == 12, "0 .. 15 % in 1.25 % steps"
+
+
+def test_a_mask_url_gets_a_picture_sized_grey_png_with_a_small_hole_filled_and_a_border_notch_kept(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    src = tmp_path / "phone.png"
+    _glass_picture(src)
+    segmenter = StubSegmenter(_poly_mask(TILTED), glass=lambda fw, fh, box: _inner_glass(fw, fh, box, hole=True, notch=True))
+    params = ScreenQuadParams.model_validate({"items": [
+        {"id": "phone", "src_url": src.as_uri(), "device": "phone", "mask_url": (tmp_path / "glass.png").as_uri()}]})
+    receipt_path = tmp_path / "receipt.json"
+    _service(tmp_path, StubGrounder([BOX]), segmenter).run(params, receipt_path.as_uri())
+    (item,) = json.loads(receipt_path.read_text())["items"]
+    assert item["mask"] is True and len(item["glass"]) == 4
+
+    png = Image.open(tmp_path / "glass.png")
+    assert png.mode == "L" and png.size == (W, H)
+    a = np.asarray(png)
+    assert set(np.unique(a)) <= {0, 255}
+    matrix, fw, fh = sq._warp_to_face(np.array(TILTED, np.float32))
+    back = np.linalg.inv(matrix)
+
+    def at(fx: float, fy: float) -> int:
+        x, y = cv2.perspectiveTransform(np.array([[[fx, fy]]], np.float32), back)[0, 0]
+        return int(a[round(y), round(x)])
+
+    u0, v0, u1, v1 = INNER
+    x0, y0, x1, y1 = u0 * fw, v0 * fh, u1 * fw, v1 * fh
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    assert at(cx + 10, cy + 10) == 255, "inside the glass"
+    assert at(cx, cy) == 255, "the small interior hole is filled"
+    assert at(cx + 23, y0 + 3) == 0, "the notch cut in from the border is NOT filled"
+    assert at(x0 / 2, cy) == 0 and at(cx, (y1 + fh) / 2) == 0, "the bezel is outside the glass"
+
+
+@pytest.mark.parametrize("what", ["no_prompt_passes", "iou_under_0_70", "area_under_30_percent"])
+def test_no_glass_candidate_over_the_thresholds_is_no_glass_with_a_reason_and_the_face_quad_still_answered(tmp_path, what):
+    src = tmp_path / "phone.png"
+    _glass_picture(src)
+
+    def glass(fw, fh, box):
+        if what == "no_prompt_passes":
+            return [_blank(fw, fh)] * 3, [0.95] * 3
+        m = _blank(fw, fh)
+        share = 0.29 if what == "area_under_30_percent" else 0.5
+        m[: int(fh * share), :] = True
+        return [m] * 3, [0.69 if what == "iou_under_0_70" else 0.95] * 3
+
+    receipt = _run(tmp_path, _service(tmp_path, StubGrounder([BOX]), StubSegmenter(_poly_mask(TILTED), glass=glass)),
+                   phone=(src, "phone"))
+    (item,) = receipt["items"]
+    assert item["status"] == "found" and len(item["quad"]) == 4
+    assert "glass" not in item and "mask" not in item
+    assert item["reasons"] == ["glass: no_candidate_over_thresholds"]
+
+
+def test_a_request_with_mask_url_and_a_row_with_glass_and_mask_validate_against_the_contracts(tmp_path):
+    jsonschema = pytest.importorskip("jsonschema")
+    req = {"infer_version": 7, "job_id": "j", "kind": "screen_quad", "model": "florence_sam", "put_url": "https://x/o/r.json",
+           "weights": {"url": "https://x/w.tar", "sha256": SHA},
+           "screen_quad": {"items": [{"id": "s1", "src_url": "https://x/s.jpg", "device": "phone",
+                                      "mask_url": "https://x/o/m.png"}]}}
+    req_schema = json.loads((ROOT / "contracts" / "infer_request.schema.json").read_text())
+    assert not list(jsonschema.Draft202012Validator(req_schema).iter_errors(req))
+    assert InferRequest.model_validate(req).screen_quad.items[0].mask_url == "https://x/o/m.png"
+    empty = json.loads(json.dumps(req))
+    empty["screen_quad"]["items"][0]["mask_url"] = ""
+    assert list(jsonschema.Draft202012Validator(req_schema).iter_errors(empty))
+    with pytest.raises(Exception):
+        InferRequest.model_validate(empty)
+
+    src = tmp_path / "phone.png"
+    _glass_picture(src)
+    params = ScreenQuadParams.model_validate({"items": [
+        {"id": "p", "src_url": src.as_uri(), "device": "phone", "mask_url": (tmp_path / "m.png").as_uri()}]})
+    receipt_path = tmp_path / "receipt.json"
+    _service(tmp_path, StubGrounder([BOX]), StubSegmenter(_poly_mask(TILTED), glass=_inner_glass)).run(
+        params, receipt_path.as_uri())
+    receipt = json.loads(receipt_path.read_text())
+    schema = json.loads((ROOT / "contracts" / "screen_quad.schema.json").read_text())
+    assert not list(jsonschema.Draft202012Validator(schema).iter_errors(receipt))
+    row = ScreenQuadPayload.model_validate(receipt).items[0]
+    assert row.glass is not None and row.mask is True
+    bad = json.loads(json.dumps(receipt))
+    bad["items"][0]["glass"][0][0] = 1.5
+    assert list(jsonschema.Draft202012Validator(schema).iter_errors(bad))
+    with pytest.raises(Exception):
+        ScreenQuadPayload.model_validate(bad)

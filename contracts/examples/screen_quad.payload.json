@@ -17,6 +17,8 @@
       "status": "found",
       "device": "phone",
       "quad": [[0.312, 0.118], [0.688, 0.131], [0.671, 0.874], [0.329, 0.861]],
+      "glass": [[0.334, 0.146], [0.666, 0.157], [0.649, 0.846], [0.351, 0.835]],
+      "mask": true,
       "w": 1536,
       "h": 2048,
       "surface": "device_face"
@@ -28,7 +30,8 @@
       "quad": [[-0.04, 0.2], [0.55, 0.18], [0.57, 0.71], [-0.02, 0.74]],
       "w": 2048,
       "h": 1365,
-      "surface": "device_face"
+      "surface": "device_face",
+      "reasons": ["glass: no_candidate_over_thresholds"]
     },
     {
       "id": "monitor-1",
