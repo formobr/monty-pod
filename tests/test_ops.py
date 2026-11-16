@@ -197,8 +197,10 @@ def test_a_new_op_adds_no_model_to_the_envelope():
 
     # the allowed names are INFER-kind params (the infer lane's own typed surface, not ops-registry ops);
     # person_matte and clean_plate are infer kinds of the v13 line, same shape as align / face_probe / clip_rank
-    infer_kind_params = {"ClipRankParams", "AlignParams", "FaceProbeParams", "PersonMatteParams", "CleanPlateParams",
-                         "CutoutParams"}
+    # DERIVED once from the kind list (models.InferKind): a new kind never edits this test
+    import typing
+    infer_kind_params = {typing.get_args(m.InferRequest.model_fields[k].annotation)[0].__name__
+                         for k in typing.get_args(m.InferKind)}
     per_op = [n for n in dir(m) if n.endswith("Params") and n not in infer_kind_params]
     assert per_op == [], f"per-op envelope models appeared: {per_op}"
 

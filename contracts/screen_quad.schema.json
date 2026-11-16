@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/screen_quad.schema.json",
+  "title": "ScreenQuadPayload — the screen_quad receipt the pod PUTs to put_url",
+  "description": "One row per requested picture, once, with its NAMED outcome. `found`: the 4 corners of the named device's FACE (screen incl. its bezel, surface = device_face) as [x, y] fractions of the picture, ordered TL, TR, BR, BL, with w/h = the size of the picture the fractions are of (the source after exif_transpose, transparency composited on white, and the 2048 long-side cap). A corner may lie outside the frame by up to a quarter of it (each fraction in [-0.25, 1.25], never clamped — a quad with a corner beyond that is `none`, reason screen_cut_by_frame). `none`: no screen was found — a normal answer, `reasons` names why per box (the caller tries its next picture). `unreadable`: the source bytes are not a picture. torch/torchvision/transformers are the runtime that ran it, equal to the weights manifest's; `generation` is the effective Florence generation config the run used (the snapshot's own generation settings under the call's overrides).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "model",
+    "model_sha256",
+    "torch",
+    "torchvision",
+    "transformers",
+    "generation",
+    "items",
+    "timings"
+  ],
+  "properties": {
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "torch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "torchvision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "transformers": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "integer",
+          "number",
+          "boolean",
+          "string",
+          "null"
+        ]
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_s",
+        "wall_s"
+      ],
+      "properties": {
+        "model_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "status",
+          "device"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "enum": [
+              "found",
+              "none",
+              "unreadable"
+            ]
+          },
+          "device": {
+            "enum": [
+              "phone",
+              "tablet",
+              "laptop",
+              "monitor",
+              "tv"
+            ]
+          },
+          "quad": {
+            "description": "TL, TR, BR, BL; each [x, y] a fraction of the picture in [-0.25, 1.25]",
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "number",
+                "minimum": -0.25,
+                "maximum": 1.25
+              }
+            }
+          },
+          "w": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "h": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "surface": {
+            "const": "device_face"
+          },
+          "reasons": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "found"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "quad",
+                "w",
+                "h",
+                "surface"
+              ],
+              "not": {
+                "required": [
+                  "reasons"
+                ]
+              }
+            },
+            "else": {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "quad"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "surface"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "none"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "reasons"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "unreadable"
+                }
+              }
+            },
+            "then": {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "reasons"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "w"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "h"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

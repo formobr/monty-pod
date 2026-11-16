@@ -65,6 +65,13 @@ CLEAN_PLATE_RESIDENT_MIB = 210.0
 # docs/research/pod-cutout-birefnet.md says the same).
 CUTOUT_PEAK_MIB = 2670.0
 CUTOUT_RESIDENT_MIB = 996.0
+# screen_quad (Florence-2 base fp16 + SAM 2.1 base-plus fp32, podagent/infer_screen_quad.py): the research receipt's bench 2026-11-16 on
+# the desktop RTX 2060 (torch 2.11 / transformers 4.57.6): 452 + 285 = 737 MiB allocated resident, 1166 MiB allocated peak, ≈ 1.65 GB
+# for the process (nvidia-smi sampled every ~50 ms: a lower bound).
+# PLACEHOLDERS — «re-measure in the pod image» with nvidia-smi card-wide at 16 items x 4 boxes, then replace both numbers and the
+# pinned lane tests (docs/research/pod-screen-quad.md says the same).
+SCREEN_QUAD_PEAK_MIB = 1650.0
+SCREEN_QUAD_RESIDENT_MIB = 737.0
 
 KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY_WHY for each number
     "align": ALIGN_RESIDENT_MIB + ALIGN_FORWARD_MIB,
@@ -78,27 +85,33 @@ KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY
     "clean_plate": CLEAN_PLATE_PEAK_MIB,
     # a heavy-lane kind too (one pod job at a time, the BiRefNet forward is the lane's largest transient)
     "cutout": CUTOUT_PEAK_MIB,
+    # a heavy-lane kind too: two cached HF models, one picture at a time
+    "screen_quad": SCREEN_QUAD_PEAK_MIB,
 }
 RESERVE_MIB = _VRAM_RESERVE_MB
+
+# the heavy kinds other than align: (peak while running, weights that stay resident between jobs). THE owner of which kinds
+# ride the one-wide heavy lane: a kind is routed there exactly when it is sized here
+_HEAVY_PEAK_RESIDENT: Mapping[str, tuple[float, float]] = {
+    "person_matte": (PERSON_MATTE_PEAK_MIB, PERSON_MATTE_RESIDENT_MIB),
+    "clean_plate": (CLEAN_PLATE_PEAK_MIB, CLEAN_PLATE_RESIDENT_MIB),
+    "cutout": (CUTOUT_PEAK_MIB, CUTOUT_RESIDENT_MIB),
+    "screen_quad": (SCREEN_QUAD_PEAK_MIB, SCREEN_QUAD_RESIDENT_MIB),
+}
+# derived, never a second list (heavy_lane_mib sizes it, main.main's `heavy` set routes by it)
+HEAVY_KINDS: "frozenset[str]" = frozenset({"align", *_HEAVY_PEAK_RESIDENT})
 
 
 def heavy_lane_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
     """The peak the one-wide heavy lane can hold beside a clip_rank lane (HEAVY_LANE_MEASURED_WHY): align's weights
-    stay resident once loaded, and the lane's transient is align's forward (+ RVM's cached weights) or RVM's
-    autotune peak, whichever is larger. `served` None = every kind."""
-    kinds = set(KIND_VRAM_MIB) if served is None else set(served)
-    align = "align" in kinds
-    matte = "person_matte" in kinds
-    plate = "clean_plate" in kinds
-    cutout = "cutout" in kinds
-    matte_res = PERSON_MATTE_RESIDENT_MIB if matte else 0.0
-    plate_res = CLEAN_PLATE_RESIDENT_MIB if plate else 0.0
-    cutout_res = CUTOUT_RESIDENT_MIB if cutout else 0.0
-    resident = ALIGN_RESIDENT_MIB if align else 0.0
-    transient = max((ALIGN_FORWARD_MIB + matte_res + plate_res + cutout_res) if align else 0.0,
-                    (PERSON_MATTE_PEAK_MIB + plate_res + cutout_res) if matte else 0.0,
-                    (CLEAN_PLATE_PEAK_MIB + matte_res + cutout_res) if plate else 0.0,
-                    (CUTOUT_PEAK_MIB + matte_res + plate_res) if cutout else 0.0)
+    stay resident once loaded, and the lane's transient is the largest of align's forward and each other heavy kind's
+    peak, each with the OTHER kinds' cached weights beside it. `served` None = every kind."""
+    kinds = (set(KIND_VRAM_MIB) if served is None else set(served)) & HEAVY_KINDS
+    others = {k: _HEAVY_PEAK_RESIDENT[k] for k in kinds if k != "align"}      # a heavy kind with no entry raises KeyError
+    resident_all = sum(res for _, res in others.values())
+    resident = ALIGN_RESIDENT_MIB if "align" in kinds else 0.0
+    transient = max([(ALIGN_FORWARD_MIB + resident_all) if "align" in kinds else 0.0]
+                    + [peak + resident_all - res for peak, res in others.values()])
     return resident + transient
 
 
@@ -106,7 +119,7 @@ def coresident_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
     """Free MiB a card must report for clip_rank (weights + one lane) to run beside the heavy lane AND one encode
     session (RENDER_HEADROOM_MIB, the gpu_admission unit), because infer and a heavy op share the card by design
     (RENDER_HEADROOM_WHY; without it the dev 2060 kept both kinds at 5694 MiB free and a heavy op beside them ran
-    the card out, MISC-998): 2736 + heavy_lane_mib + 512 + 960 — 8560 with every kind served."""
+    the card out, MISC-998): 2736 + heavy_lane_mib + 512 + 960 — 9297 with every kind served."""
     return KIND_VRAM_MIB["clip_rank"] + heavy_lane_mib(served) + RESERVE_MIB + RENDER_HEADROOM_MIB
 
 

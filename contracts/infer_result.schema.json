@@ -26,7 +26,8 @@
         "clip_rank",
         "person_matte",
         "clean_plate",
-        "cutout"
+        "cutout",
+        "screen_quad"
       ]
     },
     "status": {

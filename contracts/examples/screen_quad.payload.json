@@ -1,0 +1,49 @@
+{
+  "model": "florence2_base_sam2_1_base_plus",
+  "model_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "torch": "2.11.0+cu128",
+  "torchvision": "0.26.0+cu128",
+  "transformers": "4.57.6",
+  "generation": {
+    "max_new_tokens": 256,
+    "num_beams": 3,
+    "do_sample": false,
+    "no_repeat_ngram_size": 3,
+    "early_stopping": true
+  },
+  "items": [
+    {
+      "id": "phone-1",
+      "status": "found",
+      "device": "phone",
+      "quad": [[0.312, 0.118], [0.688, 0.131], [0.671, 0.874], [0.329, 0.861]],
+      "w": 1536,
+      "h": 2048,
+      "surface": "device_face"
+    },
+    {
+      "id": "laptop-1",
+      "status": "found",
+      "device": "laptop",
+      "quad": [[-0.04, 0.2], [0.55, 0.18], [0.57, 0.71], [-0.02, 0.74]],
+      "w": 2048,
+      "h": 1365,
+      "surface": "device_face"
+    },
+    {
+      "id": "monitor-1",
+      "status": "none",
+      "device": "monitor",
+      "reasons": ["box 0: sam_iou_below_0.9", "box 1: screen_cut_by_frame"]
+    },
+    {
+      "id": "tv-1",
+      "status": "unreadable",
+      "device": "tv"
+    }
+  ],
+  "timings": {
+    "model_s": 1.62,
+    "wall_s": 1.9
+  }
+}

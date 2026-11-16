@@ -1,0 +1,25 @@
+{
+  "model": "florence2_base_sam2_1_base_plus",
+  "model_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "torch": "2.11.0+cu128",
+  "torchvision": "0.26.0+cu128",
+  "transformers": "4.57.6",
+  "generation": {
+    "max_new_tokens": 256,
+    "num_beams": 3
+  },
+  "items": [
+    {
+      "id": "phone-1",
+      "status": "found",
+      "device": "phone",
+      "w": 1536,
+      "h": 2048,
+      "surface": "device_face"
+    }
+  ],
+  "timings": {
+    "model_s": 0.6,
+    "wall_s": 0.7
+  }
+}

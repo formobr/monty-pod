@@ -3,7 +3,7 @@ tests/test_contracts_goldens.py — every golden must round-trip through both.""
 from __future__ import annotations
 
 import math
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, get_args
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
@@ -782,6 +782,36 @@ class CutoutParams(BaseModel):
         return self
 
 
+ScreenDevice = Literal["phone", "tablet", "laptop", "monitor", "tv"]
+
+
+class ScreenQuadSrc(BaseModel):
+    """One picture of a screen_quad batch: where to read it and which device's screen to find. `id` is the caller's key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    src_url: str = Field(min_length=1)      # presigned GET of the source picture
+    device: ScreenDevice                    # a closed enum -> the phrase «<device> screen» (docs/research/pod-screen-quad.md)
+
+
+class ScreenQuadParams(BaseModel):
+    """A device screen's 4 corners (Florence-2 phrase grounding -> SAM 2.1 box mask -> opencv quad fit) over a batch of
+    pictures. The receipt (screen_quad.schema.json) goes to put_url; nothing else is PUT. Every number lives in the
+    weights tar's manifest and the module's named constants, none here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ScreenQuadSrc] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _ids_unique(self) -> "ScreenQuadParams":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("screen_quad item ids must be unique")
+        return self
+
+
 class WeightsRef(BaseModel):
     """Where the pod gets this job's checkpoint. A presigned GET for a tar of the model directory, plus
     that tar's sha256 — which is BOTH the integrity check and the pod's cache key, so a re-exported or
@@ -796,11 +826,13 @@ class WeightsRef(BaseModel):
 
 # face_probe's YuNet (227 KB), person_matte's RVM (7.9 MB fp16 TorchScript) and clean_plate's big-lama (206 MB
 # TorchScript) stay baked in the image; cutout's BiRefNet (463 MB, traced inside THIS image by the operator's build tool)
-# arrives as a weights tar like align's and clip_rank's
-_NEEDS_WEIGHTS = ("align", "clip_rank", "cutout")
+# arrives as a weights tar like align's and clip_rank's; so does screen_quad's Florence-2 + SAM 2.1 pair (two HF snapshots)
+_NEEDS_WEIGHTS = ("align", "clip_rank", "cutout", "screen_quad")
 
 
-InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate", "cutout"]
+# THE one list of infer kinds: main.INFER_KINDS, the block validator below and the tests derive from it
+# (the two schema enums and infer_lanes.KIND_VRAM_MIB are held equal to it by test_infer_kind_is_one_fact)
+InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate", "cutout", "screen_quad"]
 
 
 class InferRequest(BaseModel):
@@ -818,12 +850,11 @@ class InferRequest(BaseModel):
     person_matte: PersonMatteParams | None = None
     clean_plate: CleanPlateParams | None = None
     cutout: CutoutParams | None = None
+    screen_quad: ScreenQuadParams | None = None
 
     @model_validator(mode="after")
     def _block_matches_kind(self) -> "InferRequest":
-        blocks: dict[str, Any] = {"align": self.align, "face_probe": self.face_probe,
-                                  "clip_rank": self.clip_rank, "person_matte": self.person_matte,
-                                  "clean_plate": self.clean_plate, "cutout": self.cutout}
+        blocks: dict[str, Any] = {k: getattr(self, k) for k in get_args(InferKind)}
         if blocks[self.kind] is None:
             raise ValueError(f"kind={self.kind} requires its params block")
         extra = [k for k, v in blocks.items() if k != self.kind and v is not None]
@@ -1283,6 +1314,81 @@ class CutoutPayload(BaseModel):
         ids = [i.id for i in self.items]
         if len(set(ids)) != len(ids):
             raise ValueError("a cutout item is named once in the receipt")
+        return self
+
+
+ScreenQuadStatus = Literal["found", "none", "unreadable"]
+
+# One corner of a screen quad, [x, y] as fractions of the picture. Its OWN bounded type, never RectT: a screen's corner may lie a
+# little outside the frame (the pin's warp is clipped by the picture box), so [-0.25, 1.25]; a corner beyond that is
+# `screen_cut_by_frame`, a `none` (docs/research/pod-screen-quad.md, Condition 2).
+QUAD_FRACTION_MIN: Final = -0.25
+QUAD_FRACTION_MAX: Final = 1.25
+QuadPointT = Annotated[list[Annotated[float, Field(ge=QUAD_FRACTION_MIN, le=QUAD_FRACTION_MAX)]],
+                       Field(min_length=2, max_length=2)]
+QuadT = Annotated[list[QuadPointT], Field(min_length=4, max_length=4)]
+
+
+class ScreenQuadTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_s: float = Field(ge=0)      # Florence + SAM + quad fit, summed over the pictures that ran the models
+    wall_s: float = Field(ge=0)       # download excluded, upload excluded
+
+
+class ScreenQuadOut(BaseModel):
+    """One picture's named outcome. `found` carries the device face's 4 corners TL, TR, BR, BL as fractions of the picture
+    (the source after exif_transpose and the 2048 cap, `w` x `h`); `none` is a normal answer with its reasons; `unreadable`
+    is a file PIL cannot open. `surface` is always «device_face»: the quad covers the device FACE incl. its bezel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    status: ScreenQuadStatus
+    device: ScreenDevice
+    quad: QuadT | None = None
+    w: int | None = Field(default=None, ge=1)
+    h: int | None = Field(default=None, ge=1)
+    surface: Literal["device_face"] | None = None
+    reasons: list[str] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _shape_by_status(self) -> "ScreenQuadOut":
+        if self.status == "found":
+            if None in (self.quad, self.w, self.h, self.surface):
+                raise ValueError("a found item names quad, w, h and surface")
+            if self.reasons is not None:
+                raise ValueError("a found item names no reasons")
+        else:
+            if self.quad is not None or self.surface is not None:
+                raise ValueError(f"a {self.status} item names no quad and no surface")
+            if self.status == "none" and self.reasons is None:
+                raise ValueError("a none item names its reasons")
+            if self.status == "unreadable" and (self.reasons is not None or self.w is not None or self.h is not None):
+                raise ValueError("an unreadable item names nothing but its id and device")
+        return self
+
+
+class ScreenQuadPayload(BaseModel):
+    """screen_quad.schema.json — the receipt the pod PUTs to put_url. Every requested item is in `items` exactly once."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")     # the weights tar's sha256 (the request's weights.sha256)
+    torch: str = Field(min_length=1)                          # the runtime that ran it (== the manifest's)
+    torchvision: str = Field(min_length=1)
+    transformers: str = Field(min_length=1)
+    # the EFFECTIVE Florence generation config (the snapshot's own generation settings under the call's overrides), Condition 8
+    generation: dict[str, int | float | bool | str | None]
+    items: list[ScreenQuadOut] = Field(min_length=1)
+    timings: ScreenQuadTimings
+
+    @model_validator(mode="after")
+    def _once(self) -> "ScreenQuadPayload":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("a screen_quad item is named once in the receipt")
         return self
 
 
