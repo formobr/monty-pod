@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -106,6 +107,27 @@ def test_qtrle_layer_encode_sets_bt709(monkeypatch, tmp_path: Path) -> None:
 
     assert layers and len(commands) == 1
     assert all(token in commands[0] for token in mograph._BT709)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_a_layer_keeps_its_alpha_after_an_opaque_first_frame(tmp_path: Path) -> None:
+    from PIL import Image
+
+    seqdir = tmp_path / "seq"; seqdir.mkdir()
+    Image.new("RGB", (16, 16), (250, 240, 220)).save(seqdir / "frame_001.png")        # opaque → stored as RGB
+    rgba = Image.new("RGBA", (16, 16), (0, 0, 0, 0))                                  # transparent corners
+    rgba.putpixel((8, 8), (200, 30, 30, 255))                                         # one opaque pixel
+    rgba.save(seqdir / "frame_002.png")
+
+    layers = mograph._pack([{"seqdir": seqdir, "start": 0.0, "glass": False}], tmp_path)
+
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", layers[0]["mov"], "-pix_fmt", "rgba",
+                          "-f", "rawvideo", "-"], check=True, capture_output=True).stdout
+    frame2 = raw[16 * 16 * 4:]
+    assert len(frame2) == 16 * 16 * 4
+    assert frame2[3] == 0                                    # corner pixel alpha 0
+    centre = (8 * 16 + 8) * 4
+    assert tuple(frame2[centre:centre + 4]) == (200, 30, 30, 255)
 
 
 def _batch_items(tmp_path: Path, comps, *, write_frames=True):

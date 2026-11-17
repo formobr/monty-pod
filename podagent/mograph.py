@@ -19,7 +19,11 @@ from . import frames as _frames
 
 FPS = 30
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
-_STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/<rel> (public/ fonts+media, src/ bespoke)
+# qtrle alpha format. `ffmpeg -h encoder=qtrle` lists «Supported pixel formats: rgb24 rgb555be argb gray»; without an
+# explicit format ffmpeg takes it from the first PNG, so a layer whose first frame is opaque (RGB → rgb24) packs
+# every later transparent pixel as opaque black.
+_QTRLE_PIX_FMT = ["-pix_fmt", "argb"]
+_STAGE_PREFIX ="mograph/"  # input id `mograph/<rel>` → staged into <bundle>/<rel> (public/ fonts+media, src/ bespoke)
 
 # HEAD BELOW (any media riding over a slid-down head): the live head slides DOWN so its face clears the top-band
 # picture/video, reversing at the beat end. Closed form of MontagePreview.headSettle (GLIDE spring) → master == preview.
@@ -352,7 +356,7 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
             continue
         mov = tmp / f"{m['seqdir'].name}.mov"
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-framerate", str(FPS), "-pattern_type", "glob",
-                        "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", *_BT709, str(mov)], check=True)
+                        "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", *_QTRLE_PIX_FMT, *_BT709, str(mov)], check=True)
         layers.append({"mov": str(mov), "start": m["start"], "dur": len(pngs) / FPS,
                        "glass": m["glass"], "head_below": m.get("head_below", False),
                        "backing": m.get("backing"), "z": m.get("z")})
