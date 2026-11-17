@@ -1115,14 +1115,14 @@ def _run_infer(
             cutout_run = cutout_svc.run(req.cutout, req.put_url, note)
             infer_s = cutout_run.infer_s
             work_timings = {**cutout_run.timings, "work_s": time.monotonic() - work_started}
-        elif req.kind == "screen_quad":
+        elif req.kind in ("screen_quad", "object_mask"):      # object_mask runs on screen_quad's pair and cache
             from .infer_screen_quad import ScreenQuadRefused, ScreenQuadService
             from .ops import dry as _ops_dry
             from .weights import ensure
 
-            assert req.screen_quad is not None and req.weights is not None
+            assert req.weights is not None
             if _ops_dry.armed():
-                raise ScreenQuadRefused("screen_quad is a real GPU forward and a contour-dry pod does no GPU work "
+                raise ScreenQuadRefused(f"{req.kind} is a real GPU forward and a contour-dry pod does no GPU work "
                                         "(DRY_POD_NO_GPU_WHY) — the engine must not send it to a dry pod")
             sq_svc = screen_quad_cache.get(req.weights.sha256)
             if sq_svc is None:
@@ -1136,7 +1136,12 @@ def _run_infer(
                             note(f"loading {req.model}")
                             sq_svc = screen_quad_cache[req.weights.sha256] = ScreenQuadService(
                                 req.model, wdir, req.weights.sha256)
-            sq_run = sq_svc.run(req.screen_quad, req.put_url, note)
+            if req.kind == "object_mask":
+                assert req.object_mask is not None
+                sq_run: Any = sq_svc.run_object_mask(req.object_mask, req.put_url, note)
+            else:
+                assert req.screen_quad is not None
+                sq_run = sq_svc.run(req.screen_quad, req.put_url, note)
             infer_s = sq_run.infer_s
             work_timings = {**sq_run.timings, "work_s": time.monotonic() - work_started}
         else:

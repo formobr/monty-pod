@@ -813,6 +813,34 @@ class ScreenQuadParams(BaseModel):
         return self
 
 
+class ObjectMaskSrc(BaseModel):
+    """One picture of an object_mask batch: where to read it, the English noun phrase to cut out of it, and where the cut goes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    src_url: str = Field(min_length=1)      # presigned GET of the source picture
+    phrase: str = Field(pattern=r"^[A-Za-z0-9 -]{1,80}$")     # English; letters, digits, spaces, hyphen
+    cut_url: str = Field(min_length=1)      # presigned PUT of the RGBA PNG (the picture's size)
+    mask_url: str | None = Field(default=None, min_length=1)   # presigned PUT of the 8-bit grey mask PNG
+
+
+class ObjectMaskParams(BaseModel):
+    """The object a phrase names, cut out of a batch of pictures (Florence-2 phrase grounding -> SAM 2.1 box mask), on
+    screen_quad's weights. Per item the cut PNG goes to cut_url, the mask PNG to mask_url; the receipt to put_url."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ObjectMaskSrc] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _ids_unique(self) -> "ObjectMaskParams":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("object_mask item ids must be unique")
+        return self
+
+
 class WeightsRef(BaseModel):
     """Where the pod gets this job's checkpoint. A presigned GET for a tar of the model directory, plus
     that tar's sha256 — which is BOTH the integrity check and the pod's cache key, so a re-exported or
@@ -828,12 +856,13 @@ class WeightsRef(BaseModel):
 # face_probe's YuNet (227 KB), person_matte's RVM (7.9 MB fp16 TorchScript) and clean_plate's big-lama (206 MB
 # TorchScript) stay baked in the image; cutout's BiRefNet (463 MB, traced inside THIS image by the operator's build tool)
 # arrives as a weights tar like align's and clip_rank's; so does screen_quad's Florence-2 + SAM 2.1 pair (two HF snapshots)
-_NEEDS_WEIGHTS = ("align", "clip_rank", "cutout", "screen_quad")
+_NEEDS_WEIGHTS = ("align", "clip_rank", "cutout", "screen_quad", "object_mask")
 
 
 # THE one list of infer kinds: main.INFER_KINDS, the block validator below and the tests derive from it
 # (the two schema enums and infer_lanes.KIND_VRAM_MIB are held equal to it by test_infer_kind_is_one_fact)
-InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate", "cutout", "screen_quad"]
+InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate", "cutout", "screen_quad",
+                 "object_mask"]
 
 
 class InferRequest(BaseModel):
@@ -852,6 +881,7 @@ class InferRequest(BaseModel):
     clean_plate: CleanPlateParams | None = None
     cutout: CutoutParams | None = None
     screen_quad: ScreenQuadParams | None = None
+    object_mask: ObjectMaskParams | None = None
 
     @model_validator(mode="after")
     def _block_matches_kind(self) -> "InferRequest":
@@ -1392,6 +1422,61 @@ class ScreenQuadPayload(BaseModel):
         ids = [i.id for i in self.items]
         if len(set(ids)) != len(ids):
             raise ValueError("a screen_quad item is named once in the receipt")
+        return self
+
+
+BBoxFractionsT = Annotated[list[Annotated[float, Field(ge=0, le=1)]], Field(min_length=4, max_length=4)]
+
+
+class ObjectMaskOut(BaseModel):
+    """object_mask.schema.json — one picture's named outcome. `found` carries the mask's bounding box [x, y, w, h] as fractions
+    of the picture (`w` x `h` px: the source after exif_transpose and the 2048 cap); `none` is a normal answer with its
+    reasons; `unreadable` is a file PIL cannot open. The cut PNG (and the mask PNG when asked) were PUT only for `found`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    status: ScreenQuadStatus
+    w: int | None = Field(default=None, ge=1)
+    h: int | None = Field(default=None, ge=1)
+    bbox: BBoxFractionsT | None = None
+    reasons: list[str] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _shape_by_status(self) -> "ObjectMaskOut":
+        if self.status == "found":
+            if None in (self.bbox, self.w, self.h):
+                raise ValueError("a found item names bbox, w and h")
+        else:
+            if self.bbox is not None:
+                raise ValueError(f"a {self.status} item names no bbox")
+            if self.status == "none" and self.reasons is None:
+                raise ValueError("a none item names its reasons")
+            if self.status == "unreadable" and (self.reasons is not None or self.w is not None or self.h is not None):
+                raise ValueError("an unreadable item names nothing but its id")
+        return self
+
+
+class ObjectMaskPayload(BaseModel):
+    """The object_mask receipt the pod PUTs to put_url: the runtime that ran it and every requested item once (its rows are
+    object_mask.schema.json)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    torch: str = Field(min_length=1)
+    torchvision: str = Field(min_length=1)
+    transformers: str = Field(min_length=1)
+    generation: dict[str, int | float | bool | str | None]
+    items: list[ObjectMaskOut] = Field(min_length=1)
+    timings: ScreenQuadTimings
+
+    @model_validator(mode="after")
+    def _once(self) -> "ObjectMaskPayload":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("an object_mask item is named once in the receipt")
         return self
 
 

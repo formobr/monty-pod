@@ -28,6 +28,7 @@ from podagent.models import (
     InferKind,
     InferRequest,
     InferResult,
+    ObjectMaskOut,
     PersonMattePayload,
     PodJob,
     RenderSpec,
@@ -49,6 +50,7 @@ MODELS = {
     "clean_plate": CleanPlatePayload,
     "cutout": CutoutPayload,
     "screen_quad": ScreenQuadPayload,
+    "object_mask": ObjectMaskOut,
     "pod_job": PodJob,
 }
 

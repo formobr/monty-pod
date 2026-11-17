@@ -27,7 +27,8 @@
         "person_matte",
         "clean_plate",
         "cutout",
-        "screen_quad"
+        "screen_quad",
+        "object_mask"
       ]
     },
     "status": {

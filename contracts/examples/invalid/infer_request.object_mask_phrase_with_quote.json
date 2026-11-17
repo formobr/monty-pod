@@ -1,0 +1,21 @@
+{
+  "infer_version": 7,
+  "job_id": "job_8e03b1",
+  "kind": "object_mask",
+  "model": "florence2_base_sam2_1_base_plus",
+  "put_url": "https://storage.example/o/60411.json?sig=PUT",
+  "weights": {
+    "url": "https://storage.example/o/50400.tar?sig=GET",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "object_mask": {
+    "items": [
+      {
+        "id": "tram-1",
+        "src_url": "https://storage.example/o/60412.jpg?sig=GET",
+        "phrase": "the \"red\" tram",
+        "cut_url": "https://storage.example/o/60413.png?sig=PUT"
+      }
+    ]
+  }
+}

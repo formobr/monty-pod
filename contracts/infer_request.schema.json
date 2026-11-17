@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/infer_request.schema.json",
   "title": "InferRequest — planner→pod inference task (CP-mediated; the pod polls, nothing dials in)",
-  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.words (owner decision 2026-11-01): then the align words cross, the pod runs the CTC forced alignment itself and PUTs per-word frame spans as JSON (align_spans.schema.json) instead — still no decision crosses, and seconds stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction. person_matte: the pod runs RVM (mobilenetv3, fp16 TorchScript baked in the image) over ONE whole video and PUTs the requested outputs to their own presigned URLs (alpha: lossless gray FFV1 Matroska; cutout: the input's pixels under the alpha as VP9-alpha yuva420p WebM) plus a receipt JSON (person_matte.schema.json) to put_url; the downsample_ratio is resolved by the planner. clean_plate (super-director v13 vertigo class): the pod makes the background of ONE video without the person, one PNG per window — a per-pixel temporal median over the frames sampled in the window with the person (the matte person_matte already produced for the SAME video, alpha above person_alpha grown by dilate_px) excluded, then LaMa (big-lama TorchScript baked in the image, CUDA only) for the pixels never uncovered — and PUTs each PNG to its own presigned URL plus a receipt JSON (clean_plate.schema.json) to put_url; every number is resolved by the planner (the engine's clean-plate registry entry). cutout: the pod cuts the subject out of each of a batch of pictures with BiRefNet_dynamic (traced TorchScript fp16 at 1024 from the weights tar, CUDA only) and PUTs one RGBA PNG per item to its own presigned URL plus a receipt JSON (cutout.schema.json) to put_url; an item the pod will not or need not cut is named in the receipt (already_cut / empty_cut / no_separation), never silently passed through. screen_quad: the pod finds the 4 corners of a named device's screen (phone / tablet / laptop / monitor / tv) in each of a batch of pictures — Florence-2 phrase grounding, SAM 2.1 box mask, an opencv quad fit, both models from the weights tar, CUDA only — and PUTs one receipt JSON (screen_quad.schema.json) to put_url; a picture with no screen is named `none` with its reasons, an unreadable one `unreadable`, never a fallback.",
+  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.words (owner decision 2026-11-01): then the align words cross, the pod runs the CTC forced alignment itself and PUTs per-word frame spans as JSON (align_spans.schema.json) instead — still no decision crosses, and seconds stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction. person_matte: the pod runs RVM (mobilenetv3, fp16 TorchScript baked in the image) over ONE whole video and PUTs the requested outputs to their own presigned URLs (alpha: lossless gray FFV1 Matroska; cutout: the input's pixels under the alpha as VP9-alpha yuva420p WebM) plus a receipt JSON (person_matte.schema.json) to put_url; the downsample_ratio is resolved by the planner. clean_plate (super-director v13 vertigo class): the pod makes the background of ONE video without the person, one PNG per window — a per-pixel temporal median over the frames sampled in the window with the person (the matte person_matte already produced for the SAME video, alpha above person_alpha grown by dilate_px) excluded, then LaMa (big-lama TorchScript baked in the image, CUDA only) for the pixels never uncovered — and PUTs each PNG to its own presigned URL plus a receipt JSON (clean_plate.schema.json) to put_url; every number is resolved by the planner (the engine's clean-plate registry entry). cutout: the pod cuts the subject out of each of a batch of pictures with BiRefNet_dynamic (traced TorchScript fp16 at 1024 from the weights tar, CUDA only) and PUTs one RGBA PNG per item to its own presigned URL plus a receipt JSON (cutout.schema.json) to put_url; an item the pod will not or need not cut is named in the receipt (already_cut / empty_cut / no_separation), never silently passed through. screen_quad: the pod finds the 4 corners of a named device's screen (phone / tablet / laptop / monitor / tv) in each of a batch of pictures — Florence-2 phrase grounding, SAM 2.1 box mask, an opencv quad fit, both models from the weights tar, CUDA only — and PUTs one receipt JSON (screen_quad.schema.json) to put_url; a picture with no screen is named `none` with its reasons, an unreadable one `unreadable`, never a fallback. object_mask: the pod cuts the object a caller's English noun phrase names out of each of a batch of pictures on screen_quad's weights (Florence-2 phrase grounding, SAM 2.1 mask) and PUTs per item an RGBA PNG to cut_url (and a grey mask PNG to mask_url when given) plus a receipt JSON to put_url; a picture without that object is named `none` with its reasons.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -28,7 +28,8 @@
         "person_matte",
         "clean_plate",
         "cutout",
-        "screen_quad"
+        "screen_quad",
+        "object_mask"
       ]
     },
     "model": {
@@ -40,7 +41,7 @@
       "minLength": 1
     },
     "weights": {
-      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align, clip_rank, cutout (BiRefNet traced to TorchScript, with its config.json manifest) and screen_quad (two HF snapshot dirs florence/ and sam/ with a config.json manifest); forbidden on face_probe, person_matte and clean_plate, whose YuNet (227 KB), RVM (7.9 MB) and big-lama (206 MB) stay in the image.",
+      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align, clip_rank, cutout (BiRefNet traced to TorchScript, with its config.json manifest) screen_quad (two HF snapshot dirs florence/ and sam/ with a config.json manifest) and object_mask (the same tar as screen_quad); forbidden on face_probe, person_matte and clean_plate, whose YuNet (227 KB), RVM (7.9 MB) and big-lama (206 MB) stay in the image.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -541,6 +542,58 @@
           }
         }
       }
+    },
+    "object_mask": {
+      "description": "A batch of pictures whose named object to cut out: per item the pod fetches src_url, grounds the caller's English noun phrase (Florence-2 phrase grounding, the same task as screen_quad) and cuts the object out with SAM 2.1 — screen_quad's weights, no new download, CUDA only. It PUTs to cut_url an RGBA PNG of the picture's size (the picture's pixels, alpha 255 inside the mask, 0 outside) and, when mask_url is given, the 8-bit grey mask PNG; the receipt (object_mask.schema.json rows) goes to put_url. An item with no such object is named `none` with its reasons, nothing PUT for it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "src_url",
+              "phrase",
+              "cut_url"
+            ],
+            "properties": {
+              "id": {
+                "description": "the caller's key for this picture; unique within the request",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "src_url": {
+                "description": "presigned GET of the source picture",
+                "type": "string",
+                "minLength": 1
+              },
+              "phrase": {
+                "description": "the English noun phrase to cut out, 1..80 characters: letters, digits, spaces, hyphen",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9 -]{1,80}$"
+              },
+              "cut_url": {
+                "description": "presigned PUT of the RGBA PNG (the picture's size; alpha 255 inside the object, 0 outside); put only for a found item",
+                "type": "string",
+                "minLength": 1
+              },
+              "mask_url": {
+                "description": "optional presigned PUT of the mask: an 8-bit grey PNG of the picture's size, 255 inside the object, 0 outside; put only for a found item",
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
     }
   },
   "allOf": [
@@ -590,6 +643,11 @@
             {
               "required": [
                 "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
               ]
             }
           ]
@@ -647,6 +705,11 @@
               "required": [
                 "screen_quad"
               ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
             }
           ]
         }
@@ -698,6 +761,11 @@
             {
               "required": [
                 "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
               ]
             }
           ]
@@ -755,6 +823,11 @@
               "required": [
                 "screen_quad"
               ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
             }
           ]
         }
@@ -811,6 +884,11 @@
               "required": [
                 "screen_quad"
               ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
             }
           ]
         }
@@ -863,6 +941,11 @@
               "required": [
                 "screen_quad"
               ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
             }
           ]
         }
@@ -914,6 +997,68 @@
             {
               "required": [
                 "cutout"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "object_mask"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "object_mask",
+          "weights"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
               ]
             }
           ]

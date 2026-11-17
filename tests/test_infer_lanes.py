@@ -130,6 +130,16 @@ def test_only_the_other_kinds_weights_are_dropped():
     assert m.release_other_kinds("clip_rank", {"align": align, "clip_rank": rank}) == []
 
 
+def test_an_object_mask_job_keeps_the_screen_quad_pair():
+    """object_mask runs on screen_quad's cached pair: it drops nobody's weights but the others', and is sized as screen_quad, once."""
+    sq, cutout = {"sha-s": object()}, {"sha-c": object()}
+    assert m.release_other_kinds("object_mask", {"screen_quad": sq, "cutout": cutout}) == ["cutout"]
+    assert list(sq) == ["sha-s"] and cutout == {}
+    assert "object_mask" in m.HEAVY_KINDS
+    assert m.heavy_lane_mib() == 5089.0
+    assert m.coresident_mib() == 9297.0
+
+
 def _pump(cp, ops_pool, heavy_pool, rank_pool, heavy, n, **kw):
     for _ in range(n):
         agent_main._dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, heavy, once=True, **kw)

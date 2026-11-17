@@ -25,6 +25,9 @@ Settings and their sources: the research receipt docs/research/pod-screen-quad.m
   named     per picture: found | none (with reasons — a normal answer) | unreadable. A degenerate mask is a per-item none,
             never a job error (Condition 4).
 
+The object_mask kind runs on the same pair: the caller's English noun phrase instead of `<device> screen`, the same boxes and SAM
+passes, the kept mask the largest-iou candidate under PICTURE_MAX_SHARE (locate_object); no quad fit, no glass.
+
 Placement is absolute: CUDA or refuse. A missing CUDA device, an out-of-memory forward, a manifest that is not this runtime's, a
 checkpoint that loads with missing keys: each ends the job status=error WITH its reason — never a CPU run, never a fallback.
 """
@@ -41,6 +44,9 @@ from .cp import download, upload
 from .models import (
     QUAD_FRACTION_MAX,
     QUAD_FRACTION_MIN,
+    ObjectMaskOut,
+    ObjectMaskParams,
+    ObjectMaskPayload,
     ScreenQuadOut,
     ScreenQuadParams,
     ScreenQuadPayload,
@@ -302,7 +308,7 @@ def _mask_bbox(mask: Any) -> list[float]:
 
 # ── the two model seams ─────────────────────────────────────────────────────────────────────────────────────────────
 #
-#   grounder.boxes(img, device) -> [[x0, y0, x1, y1], ...] in px of `img`      (Florence-2; no score is returned)
+#   grounder.boxes(img, phrase) ->[[x0, y0, x1, y1], ...] in px of `img`      (Florence-2; no score is returned)
 #   segmenter.embed(img) -> an opaque embedding, computed ONCE per picture
 #   segmenter.masks(embedding, box, point=None) -> ([3 bool [H,W] masks], [3 iou scores])      (SAM 2.1)
 #
@@ -409,7 +415,7 @@ def fill_small_holes(mask: Any) -> Any:
 def locate_screen(grounder: Any, segmenter: Any, img: Any, device: str) -> ScreenAnswer:
     """One upright RGB picture + the device's name → its screen's quad (fractions) or the reasons there is none."""
     w, h = img.size
-    raw = grounder.boxes(img, device)
+    raw = grounder.boxes(img, f"{device} screen")
     boxes, reasons = select_boxes(raw, w, h)
     if not raw:
         return ScreenAnswer(None, ["florence_returned_no_box"])
@@ -459,6 +465,55 @@ def locate_screen(grounder: Any, segmenter: Any, img: Any, device: str) -> Scree
     return ScreenAnswer(None, reasons)
 
 
+@dataclass
+class ObjectAnswer:
+    mask: Any                                       # bool [H, W] of the picture, or None
+    bbox: list[float] | None                        # [x, y, w, h] of the mask's bounding box, fractions of the picture
+    reasons: list[str] = field(default_factory=list)
+
+
+def locate_object(grounder: Any, segmenter: Any, img: Any, phrase: str) -> ObjectAnswer:
+    """One upright RGB picture + the caller's English noun phrase → the object's mask and bbox fractions, or the reasons there is
+    none. The same grounding task, box selection, ONE embedding and second pass as locate_screen; per box the kept mask is the
+    candidate with the largest SAM iou_score that covers under PICTURE_MAX_SHARE of the picture."""
+    w, h = img.size
+    raw = grounder.boxes(img, phrase)
+    boxes, reasons = select_boxes(raw, w, h)
+    if not raw:
+        return ObjectAnswer(None, None, ["florence_returned_no_box"])
+    if not boxes:
+        return ObjectAnswer(None, None, reasons)
+    embedding = segmenter.embed(img)
+    for i, box in boxes:
+        masks, ious = segmenter.masks(embedding, box)
+        best = max(range(len(masks)), key=lambda k: ious[k])
+        if ious[best] < SAM_IOU_MIN:
+            reasons.append(f"box {i}: sam_iou_{ious[best]:.2f}_under_{SAM_IOU_MIN:.2f}")
+            continue
+        best_area = int(masks[best].sum())
+        if best_area == 0:
+            reasons.append(f"box {i}: sam_mask_empty")
+            continue
+        second, second_ious = segmenter.masks(embedding, _mask_bbox(masks[best]), _median_pixel(masks[best]))
+        candidates = [(m, s, False) for m, s in zip(masks, ious)] + [(m, s, True) for m, s in zip(second, second_ious)]
+        kept: list[tuple[float, Any]] = []
+        for mask, score, refined in candidates:
+            area = int(mask.sum())
+            if area == 0 or area >= PICTURE_MAX_SHARE * w * h:
+                continue
+            if refined and area > SECOND_PASS_AREA_MAX * best_area:
+                continue
+            kept.append((score, mask))
+        if not kept:
+            reasons.append(f"box {i}: no_mask_under_80_percent_of_picture")
+            continue
+        _, mask = max(kept, key=lambda sm: sm[0])
+        x0, y0, x1, y1 = _mask_bbox(mask)
+        return ObjectAnswer(mask, [round(x0 / w, 6), round(y0 / h, 6), round((x1 - x0) / w, 6), round((y1 - y0) / h, 6)],
+                            reasons)
+    return ObjectAnswer(None, None, reasons)
+
+
 # ── the real models (CUDA only) ─────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -478,10 +533,10 @@ class FlorenceGrounder:
         self.model = model.to(device).eval()
         self.generation = effective_generation(self.model.generation_config.to_dict())
 
-    def boxes(self, img: Any, device: str) -> list[list[float]]:
+    def boxes(self, img: Any, phrase: str) -> list[list[float]]:
         torch = self.torch
         w, h = img.size
-        inputs = self.processor(text=f"{TASK}{device} screen", images=img, return_tensors="pt").to(self.device, self.dtype)
+        inputs = self.processor(text=f"{TASK}{phrase}", images=img, return_tensors="pt").to(self.device, self.dtype)
         try:
             with torch.inference_mode():
                 ids = self.model.generate(**inputs, **GENERATION_OVERRIDES)
@@ -546,6 +601,13 @@ class ScreenQuadRun:
     payload: ScreenQuadPayload | None = None
 
 
+@dataclass
+class ObjectMaskRun:
+    infer_s: float
+    timings: dict[str, float] = field(default_factory=dict)
+    payload: ObjectMaskPayload | None = None
+
+
 class ScreenQuadService:
     """Holds Florence-2 + SAM 2.1 on the card; serves every batch after that. `grounder` / `segmenter` are the two model seams:
     the pod never passes them (the real CUDA models are loaded), the tests inject stand-ins. `runtime` = (torch, torchvision,
@@ -575,6 +637,63 @@ class ScreenQuadService:
             raise ScreenQuadRefused("screen_quad takes both model seams or neither")
         self.torch, self.grounder, self.segmenter = torch, grounder, segmenter
         self.generation: dict[str, Any] = dict(getattr(grounder, "generation", None) or effective_generation({}))
+
+    def run_object_mask(self, params: ObjectMaskParams, put_url: str,
+                        note: Callable[[str], None] = lambda _s: None) -> ObjectMaskRun:
+        """The object_mask kind on this same pair: per item the cut RGBA PNG (the picture's pixels, alpha 255 inside the mask,
+        0 outside) to cut_url, the 8-bit grey mask PNG to mask_url when given, and one receipt to put_url."""
+        import numpy as np
+        from PIL import Image
+
+        outs: list[ObjectMaskOut] = []
+        model_s = 0.0
+        note(f"object_mask generation config: {json.dumps(self.generation, sort_keys=True)}")
+        with tempfile.TemporaryDirectory() as td:
+            t_all = time.monotonic()
+            for it in params.items:
+                src = download(it.src_url, Path(td) / f"{it.id}.src")
+                try:
+                    img = load_picture(src)
+                except UnreadablePicture as e:
+                    outs.append(ObjectMaskOut(id=it.id, status="unreadable"))
+                    note(f"object_mask {it.id}: unreadable — {e}")
+                    continue
+                w, h = img.size
+                s = time.monotonic()
+                answer = locate_object(self.grounder, self.segmenter, img, it.phrase)
+                model_s += time.monotonic() - s
+                if answer.mask is None or answer.bbox is None:
+                    outs.append(ObjectMaskOut(id=it.id, status="none", reasons=answer.reasons or ["no_object_found"]))
+                    note(f"object_mask {it.id}: none — {'; '.join(answer.reasons)}")
+                    continue
+                inside = np.asarray(answer.mask, dtype=bool)
+                alpha = Image.fromarray(inside.astype(np.uint8) * 255)
+                cut = img.convert("RGBA")
+                cut.putalpha(alpha)
+                cut_png = Path(td) / f"{it.id}.cut.png"
+                cut.save(cut_png, format="PNG")
+                upload(cut_png, it.cut_url, "image/png")
+                if it.mask_url:
+                    mask_png = Path(td) / f"{it.id}.mask.png"
+                    alpha.save(mask_png, format="PNG")
+                    upload(mask_png, it.mask_url, "image/png")
+                outs.append(ObjectMaskOut(id=it.id, status="found", w=w, h=h, bbox=answer.bbox))
+                note(f"object_mask {it.id}: found")
+            wall_s = time.monotonic() - t_all
+            payload = ObjectMaskPayload(
+                model=self.model_name, model_sha256=self.weights_sha256, torch=self.runtime[0],
+                torchvision=self.runtime[1], transformers=self.runtime[2], generation=self.generation, items=outs,
+                timings=ScreenQuadTimings(model_s=round(model_s, 3), wall_s=round(wall_s, 3)))
+            receipt = Path(td) / "object_mask.json"
+            receipt.write_text(payload.model_dump_json(exclude_none=True))
+            upload(receipt, put_url, "application/json")
+            found = sum(1 for o in outs if o.status == "found")
+            note(f"object_mask {found}/{len(outs)} found: model {model_s:.1f}s, wall {wall_s:.1f}s")
+            if self.real:
+                self.torch.cuda.empty_cache()
+            return ObjectMaskRun(infer_s=wall_s, payload=payload,
+                                 timings={"infer_s": wall_s, "model_s": model_s, "found": float(found),
+                                          "items": float(len(outs))})
 
     def run(self, params: ScreenQuadParams, put_url: str,
             note: Callable[[str], None] = lambda _s: None) -> ScreenQuadRun:

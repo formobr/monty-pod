@@ -56,8 +56,8 @@ class StubGrounder:
     def __init__(self, boxes):
         self._boxes, self.seen = boxes, []
 
-    def boxes(self, img, device):
-        self.seen.append((img.size, device))
+    def boxes(self, img, phrase):
+        self.seen.append((img.size, phrase))
         return self._boxes
 
 
@@ -116,7 +116,7 @@ def test_a_tilted_screen_is_found_with_its_4_corners_tl_tr_br_bl_as_fractions(tm
     assert (item["w"], item["h"]) == (W, H)
     for got, (x, y) in zip(item["quad"], TILTED):
         assert abs(got[0] - x / W) < 0.01 and abs(got[1] - y / H) < 0.01
-    assert grounder.seen == [((W, H), "phone")]
+    assert grounder.seen == [((W, H), "phone screen")]
     assert segmenter.embeds == 1, "ONE image embedding per picture, reused by the box pass and the refinement pass"
     assert len(segmenter.prompts) == 2 and segmenter.prompts[1][1] is not None, "second pass = bbox + one positive point"
     assert receipt["generation"]["num_beams"] == 3 and receipt["transformers"] == RUNTIME[2]

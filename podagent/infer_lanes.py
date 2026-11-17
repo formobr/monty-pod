@@ -87,6 +87,8 @@ KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY
     "cutout": CUTOUT_PEAK_MIB,
     # a heavy-lane kind too: two cached HF models, one picture at a time
     "screen_quad": SCREEN_QUAD_PEAK_MIB,
+    # runs on screen_quad's pair (SHARES_WEIGHTS_OF): the same peak, never a second set of weights
+    "object_mask": SCREEN_QUAD_PEAK_MIB,
 }
 RESERVE_MIB = _VRAM_RESERVE_MB
 
@@ -98,15 +100,18 @@ _HEAVY_PEAK_RESIDENT: Mapping[str, tuple[float, float]] = {
     "cutout": (CUTOUT_PEAK_MIB, CUTOUT_RESIDENT_MIB),
     "screen_quad": (SCREEN_QUAD_PEAK_MIB, SCREEN_QUAD_RESIDENT_MIB),
 }
+# THE owner of which kind runs on another kind's cached weights: object_mask answers on screen_quad's Florence-2 + SAM 2.1 pair, so
+# it has no cache, no weights and no residency of its own — release_other_kinds and heavy_lane_mib read it through this map
+SHARES_WEIGHTS_OF: Mapping[str, str] = {"object_mask": "screen_quad"}
 # derived, never a second list (heavy_lane_mib sizes it, main.main's `heavy` set routes by it)
-HEAVY_KINDS: "frozenset[str]" = frozenset({"align", *_HEAVY_PEAK_RESIDENT})
+HEAVY_KINDS: "frozenset[str]" = frozenset({"align", *_HEAVY_PEAK_RESIDENT, *SHARES_WEIGHTS_OF})
 
 
 def heavy_lane_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
     """The peak the one-wide heavy lane can hold beside a clip_rank lane (HEAVY_LANE_MEASURED_WHY): align's weights
     stay resident once loaded, and the lane's transient is the largest of align's forward and each other heavy kind's
     peak, each with the OTHER kinds' cached weights beside it. `served` None = every kind."""
-    kinds = (set(KIND_VRAM_MIB) if served is None else set(served)) & HEAVY_KINDS
+    kinds = {SHARES_WEIGHTS_OF.get(k, k) for k in (set(KIND_VRAM_MIB) if served is None else set(served)) & HEAVY_KINDS}
     others = {k: _HEAVY_PEAK_RESIDENT[k] for k in kinds if k != "align"}      # a heavy kind with no entry raises KeyError
     resident_all = sum(res for _, res in others.values())
     resident = ALIGN_RESIDENT_MIB if "align" in kinds else 0.0
@@ -151,7 +156,8 @@ def card_holds_both_kinds(probe: Callable[[], float | None] | None = None,
 def release_other_kinds(kind: str, caches: Mapping[str, dict[Any, Any]]) -> list[str]:
     """Drop every OTHER kind's cached service so only `kind` holds weights; the allocator then recycles those
     blocks for this kind's load. Safe only where no other kind can be mid-forward — the caller serialises the
-    kinds onto one lane first."""
+    kinds onto one lane first. A kind that runs on another's weights (SHARES_WEIGHTS_OF) keeps that kind's cache."""
+    kind = SHARES_WEIGHTS_OF.get(kind, kind)
     freed = [other for other, cache in caches.items() if other != kind and cache]
     for other in freed:
         caches[other].clear()       # the service object holds the only reference to the model
