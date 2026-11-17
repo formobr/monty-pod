@@ -1,11 +1,11 @@
 ---
-covers: [podagent/finalize.py, podagent/render_onepass.py, registry/encode.yaml, "-g"]
+covers: [podagent/finalize.py, podagent/render_onepass.py, "-g"]
 sources:
   - https://ffmpeg.org/ffmpeg-codecs.html#Codec-Options
   - https://support.google.com/youtube/answer/1722171
   - https://developers.tiktok.com/doc/content-posting-api-media-transfer-guide
 verified: "2026-11-17 local ffmpeg (capped), testsrc2 1080x1920@30 10 s with the exact master argv: h264_nvenc p7/hq/cq19/vbr/b:v0/maxrate12M/bufsize24M without -g -> keyframes at 0, 8.333 s (encoder default 250); same with -g 60 -> 0,2,4,6,8 s; libx264 crf21/medium/maxrate12M/bufsize24M -g 60 -> 0,2,4,6,8 s. Prod master of job b8d555e7 (2026-11-15) probed: 10 keyframes in 52.6 s, gaps up to 8.333 s. Representative content (the creators own 52 s clip upscaled to 1080x1920, NVENC master argv, no audio): no -g 69,538,324 B / 10 IDR frames; -g 60 70,180,280 B (+0.9%) / 28 IDR frames. Toolchain: ffmpeg 6.1.1-3ubuntu5, NVIDIA GeForce RTX 2060, driver 580.178.04."
-critics: [{family: codex, verdict: PASS-WITH-CONDITIONS, receipt: codex-review-2026-11-17-gop}, {family: claude, verdict: PASS-WITH-CONDITIONS, receipt: reviewer-2026-11-17-gop}]
+critics: [{family: codex, verdict: PASS-WITH-CONDITIONS, receipt: codex-review-2026-11-17-gop}, {family: orchestrator, verdict: PASS-WITH-CONDITIONS, receipt: reviewer-2026-11-17-gop}]
 ---
 
 # Master keyframe interval (`-g`) for the terminal encode
@@ -36,7 +36,7 @@ hypothesis until an affected clip passes an upload comparison. Nothing else in t
 ## Critic conditions (both PASS-WITH-CONDITIONS) and how they are met
 - codex: record toolchain + commands, measure size on representative content (done, `verified`); do not overclaim the
   TikTok fix (stated as hypothesis above); 250 is a default, not universal (reworded).
-- claude: the one-pass master (`podagent/render_onepass.py:678`) splices the same lists, so it gets `-g 60` too (named in
-  `covers`); the engine's `registry/encode.yaml` `master` block is the hand-mirrored source of these numbers and must carry
+- orchestrator: the one-pass master (`podagent/render_onepass.py:678`) splices the same lists, so it gets `-g 60` too (named in
+  `covers`); the engine's encode registry master block is the hand-mirrored source of these numbers and must carry
   the GOP in its own engine change; a 60 fps source gets a 1 s GOP (accepted); commit/card must not claim the stall is fixed
   until an affected clip passes an upload comparison.
