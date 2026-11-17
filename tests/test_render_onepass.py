@@ -619,6 +619,17 @@ def test_no_chime_still_maps_the_composite_audio() -> None:
     assert_connected(graph, ["vmaster", "atail"] + _REF_MAPS)
 
 
+def test_the_master_encode_bounds_the_keyframe_interval() -> None:
+    """Without -g ffmpeg's 250-frame GOP ships (8.3 s at 30 fps) and platform scrubbers/cover pickers
+    must decode up to 249 frames per seek. Both master rungs carry -g <= 60; the rest is unchanged."""
+    for opts, rate in ((finalize._FINAL_GPU, ["-cq", "19"]), (finalize._FINAL_CPU, ["-crf", "21"])):
+        assert "-g" in opts
+        assert 0 < int(opts[opts.index("-g") + 1]) <= 60
+        assert opts.index("-g") < opts.index("-pix_fmt")
+        assert _has_seq(opts, rate)
+        assert _has_seq(opts, ["-maxrate", "12M", "-bufsize", "24M"])
+
+
 def test_encode_shape_per_output_clause() -> None:
     """The ref rung carries the SAME -r as the master (not the old contract's bare absence): the sync
     oracle diffs the two rungs by frame INDEX, so a different grid compares different instants."""

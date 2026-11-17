@@ -22,9 +22,9 @@ _BT709_SET_PARAMS = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=
 # the engine's encode registry `master` (no registry/ on this package). NVENC cq 19 ~= x264 crf 21 (Codex condition).
 _FINAL_GPU = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-cq", "19",
               "-rc", "vbr", "-b:v", "0", "-maxrate", "12M", "-bufsize", "24M",
-              "-pix_fmt", "yuv420p", *_BT709]
+              "-g", "60", "-pix_fmt", "yuv420p", *_BT709]
 _FINAL_CPU = ["-c:v", "libx264", "-crf", "21", "-preset", "medium",
-              "-maxrate", "12M", "-bufsize", "24M", "-pix_fmt", "yuv420p", *_BT709]
+              "-maxrate", "12M", "-bufsize", "24M", "-g", "60", "-pix_fmt", "yuv420p", *_BT709]
 
 _POS = {
     "bottom-center": "(W-w)/2:H-h-{m}",
