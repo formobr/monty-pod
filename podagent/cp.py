@@ -397,13 +397,19 @@ class ControlPlane:
             r = requests.get(f"{self.base}/pod/driver-userspace/{version}", timeout=_DRIVER_REF_TIMEOUT_S,
                              headers={"Authorization": f"Bearer {self._job_token}"})
             if r.status_code != 200:
+                if r.status_code != 404:  # 404 = simply not mirrored: stays silent
+                    _log(f"driver-userspace mirror: {safe_text(version)} answered HTTP {r.status_code} — "
+                         "falling back to the vendor")
                 return None
             body = json.loads(r.content)
             size = body.get("size")
             return MirrorTarRef(url=str(body["url"]), sha256=str(body["sha256"]),
                                 size=int(size) if size is not None else None,
                                 version=str(body.get("version", version)))
-        except Exception:  # noqa: BLE001 — a mirror miss must never fail the boot
+        except Exception as exc:  # noqa: BLE001 — a mirror miss must never fail the boot
+            # type name only: the message may carry the URL, and a parse error can quote the body
+            _log(f"driver-userspace mirror: {safe_text(version)} lookup failed "
+                 f"({safe_text(type(exc).__name__)}) — falling back to the vendor")
             return None
 
     def poll_job(self) -> dict[str, Any] | None:

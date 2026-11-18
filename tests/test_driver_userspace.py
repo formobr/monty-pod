@@ -730,3 +730,44 @@ def test_the_ok_trailer_names_the_source(monkeypatch, tmp_path, source):
         monkeypatch.setenv(key, "x")
     ok, note = pod_main._driver_userspace_rank("595.112.07")
     assert ok and note.startswith(f"driver_userspace=ok source={source} elapsed=")
+
+
+_TOKEN = "job-token-SECRET"
+_BODY_SECRET = b"body-SECRET-do-not-log"
+
+
+def _cp_ref(monkeypatch, get):
+    from podagent import cp
+    monkeypatch.setattr(cp.requests, "get", get)
+    stub = SimpleNamespace(base="https://cp.example", _job_token=_TOKEN)
+    return cp.ControlPlane.driver_userspace_ref(stub, V)
+
+
+def _status(code):
+    return lambda *a, **k: SimpleNamespace(status_code=code, content=_BODY_SECRET)
+
+
+def _raises(exc):
+    def get(*a, **k):
+        raise exc
+    return get
+
+
+@pytest.mark.parametrize("get,etype", [
+    (_status(500), "500"),
+    (_status(401), "401"),
+    (_raises(TimeoutError(f"slow {_TOKEN}")), "TimeoutError"),
+    (lambda *a, **k: SimpleNamespace(status_code=200, content=_BODY_SECRET), "JSONDecodeError"),
+])
+def test_a_mirror_error_is_named_and_falls_back(monkeypatch, capsys, get, etype):
+    assert _cp_ref(monkeypatch, get) is None
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if ln.startswith("[podagent]")]
+    assert len(lines) == 1
+    assert V in lines[0] and etype in lines[0]
+    assert _TOKEN not in err and "body-SECRET" not in err
+
+
+def test_a_mirror_404_falls_back_silently(monkeypatch, capsys):
+    assert _cp_ref(monkeypatch, _status(404)) is None
+    assert capsys.readouterr().err == ""
