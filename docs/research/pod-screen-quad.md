@@ -105,7 +105,7 @@ corners as fractions of the picture. This kind finds them on the pod GPU.
    LFS sha256 and packs the licence texts: Microsoft's MIT LICENSE (microsoft/Florence-2-base@5ca5edf5bd01; florence-community has none)
    and the Apache-2.0 text for SAM 2.1.
 8. The effective generation config is logged in the kind's receipt; determinism measured on the dev card only.
-9. The phrase is a closed device enum {phone, tablet, laptop, monitor, tv} → «<device> screen» (English).
+9. The phrase is a closed device enum {phone, tablet, laptop, monitor, tv} → the phrases of SCREEN_PHRASES, tried in order (English; Amendment 2026-11-19).
 10. One SAM image embedding per picture; ≤ 4 boxes per picture, ≤ 16 items per request; the job deadline from the measured per-item time.
 11. The answer says `surface: "device_face"`: the quad is the device face incl. its bezel. Decision (orchestrator, owner 2026-11-16 «решай
     сам»): the pin covers the face; any inset is the caller's look decision made on rendered frames, not a detector change.
@@ -120,3 +120,15 @@ on 1 (a laptop cut by the frame); about 590 ms per picture. Eight other approach
 rectified face returns the whole crop; Florence referring segmentation returns slivers; Hough / LSD rectangles lose rounded corners and
 notches; SAM automatic mask generation finds no candidate on 4 of 11 and is 10x slower). The mask is answered as a PNG so a consumer can
 composite inside the glass only; small interior holes are filled, notches at the border are kept.
+
+## Amendment 2026-11-19 — the second phrase
+Measured on GPU (image 39cc024, the real weights) over the stock pictures struck «no_quad_fits_mask» (13 of 15 screen picks of the
+calling engine's run 056, mostly laptops): Florence «laptop screen» returns the WHOLE laptop box (pexels 7108094: box [17, 514, 1021, 1372] of 1280-wide), SAM's
+best mask is lid + keyboard deck and fit_quad IoU is 0.774 < QUAD_IOU_MIN 0.90. The phrase «the screen of the laptop» returns the screen
+alone (box [396, 556, 971, 1108], IoU 0.988). On a picture that already passed (7682249, IoU 0.96-0.97) both phrases give the same box. A
+laptop whose screen a hand covers (7109205) stays ~0.79 with every phrase and is correctly refused. Relaxing QUAD_IOU_MIN was measured and
+REJECTED: on the coarse lid+deck quad the glass step spans the whole face and leaves the frame (x 1.15).
+Condition 9 now means the ordered tuple SCREEN_PHRASES of podagent/infer_screen_quad.py, named once there: «<device> screen» FIRST, «the
+screen of the <device>» SECOND, asked only when the first yields no accepted quad; the reasons of the second are appended after the first's,
+each prefixed with its phrase. A box the first phrase already ran is not run again, and the SAM embedding is made once per picture
+(Condition 10). A picture therefore tries at most 2 × 4 boxes (the Condition 10 worst-case bound).

@@ -792,7 +792,7 @@ class ScreenQuadSrc(BaseModel):
 
     id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
     src_url: str = Field(min_length=1)      # presigned GET of the source picture
-    device: ScreenDevice                    # a closed enum -> the phrase «<device> screen» (docs/research/pod-screen-quad.md)
+    device: ScreenDevice                    # a closed enum -> the device phrases of podagent/infer_screen_quad.py SCREEN_PHRASES, tried in order (docs/research/pod-screen-quad.md)
     mask_url: str | None = Field(default=None, min_length=1)   # presigned PUT of the glass mask PNG (the picture's size)
 
 

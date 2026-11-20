@@ -31,8 +31,8 @@ def _manifest(**over) -> dict:
 
 def _write_weights(tmp_path: Path, **manifest_over) -> Path:
     wdir = tmp_path / "weights"
-    (wdir / "florence").mkdir(parents=True)
-    (wdir / "sam").mkdir()
+    (wdir / "florence").mkdir(parents=True, exist_ok=True)
+    (wdir / "sam").mkdir(exist_ok=True)
     (wdir / "config.json").write_text(json.dumps(_manifest(**manifest_over)))
     return wdir
 
@@ -231,7 +231,98 @@ def test_a_picture_florence_finds_nothing_in_is_none_with_a_reason(tmp_path):
     _picture(src)
     receipt = _run(tmp_path, _service(tmp_path, StubGrounder([]), StubSegmenter(_poly_mask(TILTED))), p=(src, "tv"))
     (item,) = receipt["items"]
-    assert item["status"] == "none" and item["reasons"] == ["florence_returned_no_box"]
+    assert item["status"] == "none"
+    assert item["reasons"] == ["tv screen: florence_returned_no_box", "the screen of the tv: florence_returned_no_box"]
+
+
+# ── the second phrase (docs/research/pod-screen-quad.md, Amendment 2026-11-19) ──────────────────────────────────────
+
+LAPTOP = json.loads((ROOT / "tests" / "fixtures" / "laptop_masks.json").read_text())
+
+
+def _laptop_mask(which: str):
+    import base64
+    import io
+
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(LAPTOP["masks_png_b64"][which]))).convert("L")) > 127
+
+
+class PhraseGrounder:
+    """phrase → box; a phrase it does not know finds nothing."""
+
+    def __init__(self, by_phrase):
+        self.by_phrase, self.asked = by_phrase, []
+
+    def boxes(self, img, phrase):
+        self.asked.append(phrase)
+        return self.by_phrase.get(phrase, [])
+
+
+class BoxSegmenter:
+    """box → the mask of the phrase that returned it; counts the embeddings of the picture (the face of the glass step is apart)."""
+
+    def __init__(self, by_box, size):
+        self.by_box, self.size, self.embeds = by_box, size, 0
+
+    def embed(self, img):
+        if img.size != self.size:
+            return ("face", img.size)
+        self.embeds += 1
+        return "embedding"
+
+    def masks(self, embedding, box, point=None):
+        if isinstance(embedding, tuple):
+            return [_blank(*embedding[1])] * 3, [0.9] * 3
+        mask = self.by_box.get(tuple(round(float(v)) for v in box))
+        if mask is None:                              # the second pass: a box around the mask it was given
+            mask = next(iter(self.by_box.values()))
+        return [mask] * 3, [0.95, 0.97, 0.93]
+
+
+def _laptop_stubs():
+    Image = pytest.importorskip("PIL.Image")
+    fw, fh = LAPTOP["fixture_size"]
+    sx, sy = fw / LAPTOP["size"][0], fh / LAPTOP["size"][1]
+    scale = lambda b: [b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy]
+    boxes = {LAPTOP[k]["phrase"]: [scale(LAPTOP[k]["box"])] for k in ("device", "of")}
+    masks = {tuple(round(v) for v in boxes[LAPTOP[k]["phrase"]][0]): _laptop_mask(k) for k in ("device", "of")}
+    return PhraseGrounder(boxes), BoxSegmenter(masks, (fw, fh)), Image.new("RGB", (fw, fh))
+
+
+def test_a_laptop_screen_is_asked_as_the_screen_of_the_laptop():
+    grounder, segmenter, img = _laptop_stubs()
+    answer = sq.locate_screen(grounder, segmenter, img, "laptop")
+    assert answer.quad is not None
+    assert grounder.asked == ["laptop screen", "the screen of the laptop"]
+    fw, fh = img.size
+    quad_px = [(x * fw, y * fh) for x, y in answer.quad]
+    assert sq.polygon_iou(quad_px, _laptop_mask("of")) >= 0.95
+    assert segmenter.embeds == 1, "ONE image embedding per picture, reused by the second phrase"
+    assert answer.reasons[0].startswith("laptop screen: box 0: no_quad_fits_mask")
+
+
+def test_the_second_phrase_is_never_asked_when_the_first_already_fits():
+    grounder = PhraseGrounder({"phone screen": [BOX]})
+    segmenter = StubSegmenter(_poly_mask(TILTED))
+    answer = sq.locate_screen(grounder, segmenter, _blank_image(), "phone")
+    assert answer.quad is not None and grounder.asked == ["phone screen"] and answer.reasons == []
+
+
+def _blank_image():
+    Image = pytest.importorskip("PIL.Image")
+    return Image.new("RGB", (W, H))
+
+
+def test_when_both_phrases_fail_the_reasons_name_both():
+    grounder = PhraseGrounder({"laptop screen": [BOX], "the screen of the laptop": [[20.0, 40.0, 280.0, 220.0]]})
+    segmenter = StubSegmenter(_poly_mask([(50, 200), (250, 200), (150, 60)]))
+    answer = sq.locate_screen(grounder, segmenter, _blank_image(), "laptop")
+    assert answer.quad is None and grounder.asked == ["laptop screen", "the screen of the laptop"]
+    assert any(r.startswith("laptop screen: box 0") for r in answer.reasons)
+    assert any(r.startswith("the screen of the laptop: box 0") for r in answer.reasons)
+    assert segmenter.embeds == 1
 
 
 def test_weights_built_for_another_runtime_refuse_the_kind_naming_both(tmp_path):

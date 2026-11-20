@@ -493,7 +493,7 @@
       }
     },
     "screen_quad": {
-      "description": "A batch of pictures whose device screen to find: per item the pod fetches src_url and finds the 4 corners of the named device's screen (Florence-2 phrase grounding «<device> screen» -> SAM 2.1 box mask -> opencv quad fit; both models from the weights tar, CUDA only). Nothing but the receipt (screen_quad.schema.json) is PUT, to put_url; an item with no screen is named `none` with its reasons.",
+      "description": "A batch of pictures whose device screen to find: per item the pod fetches src_url and finds the 4 corners of the named device's screen (Florence-2 phrase grounding with the device phrases of podagent/infer_screen_quad.py SCREEN_PHRASES, tried in order -> SAM 2.1 box mask -> opencv quad fit; both models from the weights tar, CUDA only). Nothing but the receipt (screen_quad.schema.json) is PUT, to put_url; an item with no screen is named `none` with its reasons.",
       "type": "object",
       "additionalProperties": false,
       "required": [

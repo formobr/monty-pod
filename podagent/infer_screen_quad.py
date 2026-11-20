@@ -1,5 +1,5 @@
 """screen_quad inference: the 4 corners of a device's screen in a still picture, on the pod GPU — Florence-2 base phrase grounding
-(`<device> screen`) → SAM 2.1 hiera base-plus box mask → an opencv 4-corner fit. The caller pins its own content onto those corners
+(the device phrases of SCREEN_PHRASES, tried in order) → SAM 2.1 hiera base-plus box mask → an opencv 4-corner fit. The caller pins its own content onto those corners
 (a perspective warp in its renderer). One receipt (screen_quad.schema.json) goes to put_url; nothing else is PUT.
 
 Settings and their sources: the research receipt docs/research/pod-screen-quad.md (its «Runtime settings» and Conditions 1-11; the
@@ -13,7 +13,7 @@ Settings and their sources: the research receipt docs/research/pod-screen-quad.m
             output_loading_info and ANY missing / unexpected / mismatched key refuses the kind.
   intake    exif_transpose; real transparency composited onto white; RGB; long side capped at 2048 (LANCZOS). The capped, upright
             picture's (W, H) is what Florence's post-process, the quad fractions and the answer's w / h use (Condition 5).
-  florence  `<CAPTION_TO_PHRASE_GROUNDING>` + `<device> screen`, device a closed enum, no «screen» fallback (Conditions 1, 9);
+  florence  `<CAPTION_TO_PHRASE_GROUNDING>` + the device phrases of SCREEN_PHRASES in order, device a closed enum, no «screen» fallback (Conditions 1, 9);
             generate(max_new_tokens=256, num_beams=3, do_sample=False) over the snapshot's generation_config; the EFFECTIVE
             config is logged and named in the receipt (Condition 8).
   boxes     drop a box over 80 % of the picture; drop a box that contains >= 2 other returned boxes (each >= 90 % inside it);
@@ -55,6 +55,9 @@ from .models import (
 
 LONG_SIDE_CAP = 2048          # a source bigger than this is shrunk (LANCZOS) first; the fractions are of THAT picture
 TASK = "<CAPTION_TO_PHRASE_GROUNDING>"
+# the grounding phrases of locate_screen, tried IN ORDER (docs/research/pod-screen-quad.md, Condition 9 + Amendment 2026-11-19):
+# the second is asked only when the first gave no accepted quad
+SCREEN_PHRASES = ("{device} screen", "the screen of the {device}")
 GENERATION_OVERRIDES: Mapping[str, Any] = {"max_new_tokens": 256, "num_beams": 3, "do_sample": False}
 # the thresholds below are calibrated on 15 stock pictures, not on an annotated set (the receipt's `verified`)
 PICTURE_MAX_SHARE = 0.80      # a box (or a mask) covering more of the picture than this is the whole scene, not a screen
@@ -413,16 +416,47 @@ def fill_small_holes(mask: Any) -> Any:
 
 
 def locate_screen(grounder: Any, segmenter: Any, img: Any, device: str) -> ScreenAnswer:
-    """One upright RGB picture + the device's name → its screen's quad (fractions) or the reasons there is none."""
+    """One upright RGB picture + the device's name → its screen's quad (fractions) or the reasons there is none. The phrases of
+    SCREEN_PHRASES are tried in order; the next is asked only when the one before gave no accepted quad."""
+    cache: list[Any] = []
+
+    def embed() -> Any:
+        if not cache:
+            cache.append(segmenter.embed(img))
+        return cache[0]
+
+    tried: set[tuple[float, ...]] = set()
+    failed: list[tuple[str, list[str]]] = []
+    for template in SCREEN_PHRASES:
+        phrase = template.format(device=device)
+        answer = _locate_with_phrase(grounder, segmenter, img, phrase, embed, tried)
+        if answer.quad is not None:
+            if not failed:
+                return answer                             # the first phrase's answer, untouched
+            answer.reasons = [f"{p}: {r}" for p, rs in failed for r in rs] + [f"{phrase}: {r}" for r in answer.reasons]
+            return answer
+        failed.append((phrase, answer.reasons))
+    return ScreenAnswer(None, [f"{p}: {r}" for p, rs in failed for r in rs])
+
+
+def _locate_with_phrase(grounder: Any, segmenter: Any, img: Any, phrase: str, embed: Callable[[], Any],
+                        tried: set[tuple[float, ...]]) -> ScreenAnswer:
+    """One grounding phrase's try: its answer, or (quad None) its reasons. `embed` is the picture's lazy single SAM embedding;
+    `tried` holds the boxes an earlier phrase already ran (the same box gives the same masks: it is not run twice)."""
     w, h = img.size
-    raw = grounder.boxes(img, f"{device} screen")
+    raw = grounder.boxes(img, phrase)
     boxes, reasons = select_boxes(raw, w, h)
     if not raw:
         return ScreenAnswer(None, ["florence_returned_no_box"])
     if not boxes:
         return ScreenAnswer(None, reasons)
-    embedding = segmenter.embed(img)                      # ONE image embedding for every box and pass of this picture
+    embedding = embed()                                   # ONE image embedding for every box, pass and phrase of this picture
     for i, box in boxes:
+        key = tuple(float(v) for v in box)
+        if key in tried:
+            reasons.append(f"box {i}: box_already_tried")
+            continue
+        tried.add(key)
         masks, ious = segmenter.masks(embedding, box)
         best = max(range(len(masks)), key=lambda k: ious[k])
         if ious[best] < SAM_IOU_MIN:
