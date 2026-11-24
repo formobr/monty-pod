@@ -510,6 +510,9 @@
             "centerY": {
               "type": "number"
             },
+            "centerX": {
+              "type": "number"
+            },
             "accent": {
               "type": "string"
             },

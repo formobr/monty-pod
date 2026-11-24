@@ -454,7 +454,7 @@ def _write_ass(caps, motion_plan, input_paths: dict, out_dir: Path, w: int, h: i
     ass.write_text(build_ass([wd.model_dump() for wd in caps.words], font=font, w=w, h=h, fg=fg,
                              accent=accent,
                              center_y=caps.centerY if caps.centerY is not None else 0.76,
-                             style=caps.style or "oneword"), encoding="utf-8")
+                             style=caps.style or "oneword", center_x=caps.centerX), encoding="utf-8")
     return ass, font.parent
 
 

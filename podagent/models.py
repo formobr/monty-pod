@@ -135,6 +135,7 @@ class SpecCaptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     centerY: float | None = None
+    centerX: float | None = None
     accent: str | None = None
     style: Literal["oneword", "phrase", "phrase_jump", "bold"] | None = None
     hot: list[float] = Field(default_factory=list)

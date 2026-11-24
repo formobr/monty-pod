@@ -63,6 +63,19 @@ def _caption_max_y(below_px: int, h: int) -> int:
     return round(_SAFE_BOTTOM * h / _REF_H) - below_px
 
 
+def _event_xc(w: int, center_x: float | None, widest: float) -> int:
+    """Block centre x. None → the safe centre. A number → center_x * w, clamped so a block whose widest
+    measured line is `widest` px stays inside the safe box (a line as wide as the box stays centred)."""
+    if center_x is None:
+        return round(_safe_center(w))
+    half = widest / 2.0
+    lo = _SAFE_LEFT * w / _REF_W + half
+    hi = _SAFE_RIGHT * w / _REF_W - half
+    if lo >= hi:
+        return round(_safe_center(w))
+    return round(min(max(center_x * w, lo), hi))
+
+
 def _ac(hexc: str, aa: str = "00") -> str:
     """#rrggbb → ASS &HaaBBGGRR."""
     h = hexc.lstrip("#")
@@ -114,20 +127,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def build_ass(words: list[dict], *, font: Path, w: int, h: int, fg: str, accent: str,
               center_y: float = 0.76, style: str = "oneword",
-              window_ms: int = PHRASE_WINDOW_MS) -> str:
+              window_ms: int = PHRASE_WINDOW_MS, center_x: float | None = None) -> str:
     """words = [{text,start,end,hot?}, …] → ASS text; `style` picks oneword/phrase/phrase_jump.
 
-    `fg` (body colour) and `accent` (hot-word colour) are required — see the module docstring."""
+    `fg` (body colour) and `accent` (hot-word colour) are required — see the module docstring.
+    `center_x` (fraction of the width, optional) moves the block's centre, clamped into the safe box."""
     if style in ("phrase", "phrase_jump"):
-        return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind=style)
+        return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind=style,
+                                  center_x=center_x)
     if style == "bold":
         return _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, kind="bold",
-                                  size=BOLD_SIZE, bold=True)
+                                  size=BOLD_SIZE, bold=True, center_x=center_x)
     white = _ac(fg)
     lime = _ac(accent)
     center_y = _clamp_cy(center_y, TITLE // 2 + RISE_PX, w, h)
     ymid = round(h / 2 + (center_y - 0.5) * h)
-    xc = round(_safe_center(w))
     head = _ass_head(white, w, h)
     maxw = _safe_maxw(w)
     warned: set = set()
@@ -140,7 +154,10 @@ def build_ass(words: list[dict], *, font: Path, w: int, h: int, fg: str, accent:
         su = su if su > st else st + 0.1
         txt = _clean(wd["text"])
         fs = _fit_size(font, txt, TITLE, maxw, warned)
-        tag = (f"{{\\move({xc},{ymid + RISE_PX},{xc},{ymid},0,{RISE_MS})"
+        xc = _event_xc(w, center_x,
+                       _font_at(str(font), _size_px(TITLE if fs is None else fs)).getlength(txt)
+                       if center_x is not None else 0.0)
+        tag =(f"{{\\move({xc},{ymid + RISE_PX},{xc},{ymid},0,{RISE_MS})"
                f"\\fad({FADE_IN_MS},0)\\blur{BLUR}{_fs_tag(fs)}")
         if wd.get("hot"):
             tag += f"\\1c{lime}"
@@ -224,7 +241,7 @@ def _group_blocks(words, fnt, spc, window_ms, w, maxw=None):
 
 
 def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kind,
-                       size=PHRASE_SIZE, bold=False):
+                       size=PHRASE_SIZE, bold=False, center_x=None):
     """Stable, centred ≤2-line block pinned at a fixed y (never jumps); kind = phrase | phrase_jump | bold
     (bold reuses the phrase colour-block layout at a bigger, Bold:1 style)."""
     white = _ac(fg)
@@ -236,7 +253,6 @@ def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kin
     line_h = round(px * 1.5)
     center_y = _clamp_cy(center_y, line_h, w, h)
     y_top = round(h * center_y) - line_h
-    xc = round(_safe_center(w))
     base_maxw = _safe_maxw(w)
     if kind == "phrase_jump":
         # jump's active word bounces up to JUMP_MAX_SCALE while animating, and lays words out with an
@@ -253,6 +269,15 @@ def _build_ass_phrase(words, font, w, h, fg, accent, center_y, window_ms, *, kin
         # the wrap leaves a word wider than the safe box alone on its line: shrink that line to fit
         fits = [_fit_size(font, _clean(ln[0][0]["text"]), size, wrap_maxw, warned) if len(ln) == 1 else None
                 for ln in lines]
+        widest = 0.0
+        if center_x is not None:
+            for ln, ft in zip(lines, fits):
+                if ft is not None:
+                    lw = _font_at(str(font), _size_px(ft)).getlength(_clean(ln[0][0]["text"]))
+                else:
+                    lw = sum(wp for _, wp in ln) + wrap_gap * (len(ln) - 1)
+                widest = max(widest, lw)
+        xc = _event_xc(w, center_x, widest)
         b_start = float(block[0]["start"])
         nxt = float(blocks[bi + 1][0]["start"]) if bi + 1 < len(blocks) else 1e9
         b_end = min(nxt, float(block[-1]["end"]) + HOLD_AFTER)
