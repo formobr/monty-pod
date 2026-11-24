@@ -35,6 +35,7 @@ _DOWNLOAD_LINES = (
     r"sudo install -m 0755 (\S+)/bin/ffmpeg (\S+)/bin/ffprobe /usr/local/bin",
     r"ffmpeg -version",
 )
+_UNDER_RUNNER_TEMP = re.compile(r'^"\$RUNNER_TEMP/[A-Za-z0-9_][A-Za-z0-9_.-]*"$')
 _DOWNLOAD_RES = tuple(re.compile(f"^{p}$") for p in _DOWNLOAD_LINES)
 # Any mention of pytest marks the step as running it — `.venv/bin/pytest`, `"pytest"`, `python -m 'pytest'`,
 # `pytest; true`. Conservative on purpose: a false red here costs a reworded step, a false green costs CI.
@@ -59,7 +60,11 @@ def _is_bounded_download(cmds: list[str]) -> bool:
     tar_archive, tar_dir = ms[6].groups()
     inst_a, inst_b = ms[7].groups()
     # the archive curl wrote is the one tar reads, and tar extracts into the dir the binaries are installed from
-    return archive == tar_archive and made == tar_dir == inst_a == inst_b
+    if not (archive == tar_archive and made == tar_dir == inst_a == inst_b):
+        return False
+    # every path the step writes (curl -o, mkdir, tar -C) is under $RUNNER_TEMP: nothing lands in the checkout,
+    # where the tree-scanning tests would read the unpacked docs
+    return all(_UNDER_RUNNER_TEMP.match(p) for p in (archive, made, tar_dir))
 
 
 def _has_timeout(step: dict) -> bool:
@@ -146,11 +151,11 @@ _REAL_LINES = (
     'FFMPEG_ASSET=$(sed -n "s/^ARG FFMPEG_ASSET=//p" Dockerfile)',
     'test -n "$FFMPEG_BUILD"',
     'test -n "$FFMPEG_ASSET"',
-    'curl -fL --retry 3 --max-time 300 -o ffmpeg.tar.xz '
+    'curl -fL --retry 3 --max-time 300 -o "$RUNNER_TEMP/ffmpeg.tar.xz" '
     '"https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_BUILD/$FFMPEG_ASSET"',
-    "mkdir ffmpeg-dist",
-    "tar -xJf ffmpeg.tar.xz -C ffmpeg-dist --strip-components=1",
-    "sudo install -m 0755 ffmpeg-dist/bin/ffmpeg ffmpeg-dist/bin/ffprobe /usr/local/bin",
+    'mkdir "$RUNNER_TEMP/ffmpeg-dist"',
+    'tar -xJf "$RUNNER_TEMP/ffmpeg.tar.xz" -C "$RUNNER_TEMP/ffmpeg-dist" --strip-components=1',
+    'sudo install -m 0755 "$RUNNER_TEMP/ffmpeg-dist"/bin/ffmpeg "$RUNNER_TEMP/ffmpeg-dist"/bin/ffprobe /usr/local/bin',
     "ffmpeg -version",
 )
 
@@ -239,6 +244,31 @@ def test_a_download_that_is_not_the_pinned_bounded_one_does_not_count():
     for sep in ("\\v", "\\r", "\\f"):  # one bash line: the download is inside the comment
         line = '"# disabled' + sep + curl.replace('"', '\\"') + '"'
         assert not ffmpeg_installed_before_pytest(_wf(f"      - timeout-minutes: 10\n        run: {line}", _PYTEST_STEP)), sep
+
+
+def test_an_install_that_writes_inside_the_checkout_does_not_count():
+    # run 45355036655: the in-tree unpack put ffmpeg-dist/doc/*.html where the tree-scanning tests read it
+    in_tree = (
+        _mutated(4, _REAL_LINES[4].replace('"$RUNNER_TEMP/ffmpeg.tar.xz"', "ffmpeg.tar.xz")),
+        _mutated(5, "mkdir ffmpeg-dist"),
+        _mutated(6, _REAL_LINES[6].replace('"$RUNNER_TEMP/ffmpeg-dist"', "ffmpeg-dist")),
+    )
+    for lines in in_tree:
+        assert not ffmpeg_installed_before_pytest(_wf(_step(lines), _PYTEST_STEP)), lines
+    all_in_tree = (
+        *_REAL_LINES[:4],
+        'curl -fL --retry 3 --max-time 300 -o ffmpeg.tar.xz '
+        '"https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_BUILD/$FFMPEG_ASSET"',
+        "mkdir ffmpeg-dist",
+        "tar -xJf ffmpeg.tar.xz -C ffmpeg-dist --strip-components=1",
+        "sudo install -m 0755 ffmpeg-dist/bin/ffmpeg ffmpeg-dist/bin/ffprobe /usr/local/bin",
+        "ffmpeg -version",
+    )
+    assert not ffmpeg_installed_before_pytest(_wf(_step(all_in_tree), _PYTEST_STEP))
+    for escape in ('"$RUNNER_TEMP/../ffmpeg-dist"', '"$RUNNER_TEMP"/x', '"$RUNNER_TEMP/a/b"'):
+        lines = _mutated(5, f"mkdir {escape}")
+        lines = tuple(ln.replace('"$RUNNER_TEMP/ffmpeg-dist"', escape) for ln in lines)
+        assert not ffmpeg_installed_before_pytest(_wf(_step(lines), _PYTEST_STEP)), escape
 
 
 def test_the_install_step_must_carry_a_timeout():

@@ -31,10 +31,10 @@ jobs:
           FFMPEG_ASSET=$(sed -n "s/^ARG FFMPEG_ASSET=//p" Dockerfile)
           test -n "$FFMPEG_BUILD"
           test -n "$FFMPEG_ASSET"
-          curl -fL --retry 3 --max-time 300 -o ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_BUILD/$FFMPEG_ASSET"
-          mkdir ffmpeg-dist
-          tar -xJf ffmpeg.tar.xz -C ffmpeg-dist --strip-components=1
-          sudo install -m 0755 ffmpeg-dist/bin/ffmpeg ffmpeg-dist/bin/ffprobe /usr/local/bin
+          curl -fL --retry 3 --max-time 300 -o "$RUNNER_TEMP/ffmpeg.tar.xz" "https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_BUILD/$FFMPEG_ASSET"
+          mkdir "$RUNNER_TEMP/ffmpeg-dist"
+          tar -xJf "$RUNNER_TEMP/ffmpeg.tar.xz" -C "$RUNNER_TEMP/ffmpeg-dist" --strip-components=1
+          sudo install -m 0755 "$RUNNER_TEMP/ffmpeg-dist"/bin/ffmpeg "$RUNNER_TEMP/ffmpeg-dist"/bin/ffprobe /usr/local/bin
           ffmpeg -version
       - run: pytest -q
 
