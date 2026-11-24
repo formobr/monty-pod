@@ -19,14 +19,23 @@ ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 TESTS = ROOT / "tests"
 
-# Flags an install/update line may carry: each makes apt quieter or non-interactive, none skips the install
-# (`-s`, `--dry-run`, `--download-only`, `--assume-no` all exit 0 having installed nothing, so they are not here).
-_APT_FLAG = r"(?:-y|--yes|-q|-qq|--quiet|--no-install-recommends)"
-# A whole line that installs ffmpeg and nothing else: no `&&`, `||`, `;`, `if`, or other prefix that might stop it.
-_APT_INSTALL_FFMPEG = re.compile(rf"^(?:sudo )?apt(?:-get)? install(?: {_APT_FLAG})* ffmpeg$")
-# The only other line an install step may carry. Anything else (`exit 0`, a function body, a heredoc, `if ... fi`)
-# could keep the install from running, so a step holding it does not count.
-_APT_UPDATE = re.compile(rf"^(?:sudo )?apt(?:-get)? update(?: {_APT_FLAG})*$")
+# The ONE install that counts: the bounded download of the pinned BtbN asset the Dockerfile uses (apt hung CI for
+# 25 min and has no bound), both names read from the Dockerfile inside `run:`. The step must be exactly these lines
+# in this order — anything else (`exit 0`, a function body, a heredoc, `if ... fi`, `&&`, `||`) could keep the
+# install from running, so a step holding it does not count.
+_DOWNLOAD_LINES = (
+    r'FFMPEG_BUILD=\$\(sed -n "s/\^ARG FFMPEG_BUILD=//p" Dockerfile\)',
+    r'FFMPEG_ASSET=\$\(sed -n "s/\^ARG FFMPEG_ASSET=//p" Dockerfile\)',
+    r'test -n "\$FFMPEG_BUILD"',
+    r'test -n "\$FFMPEG_ASSET"',
+    r'curl -fL --retry 3 --max-time 300 -o (\S+) '
+    r'"https://github\.com/BtbN/FFmpeg-Builds/releases/download/\$FFMPEG_BUILD/\$FFMPEG_ASSET"',
+    r"mkdir (\S+)",
+    r"tar -xJf (\S+) -C (\S+) --strip-components=1",
+    r"sudo install -m 0755 (\S+)/bin/ffmpeg (\S+)/bin/ffprobe /usr/local/bin",
+    r"ffmpeg -version",
+)
+_DOWNLOAD_RES = tuple(re.compile(f"^{p}$") for p in _DOWNLOAD_LINES)
 # Any mention of pytest marks the step as running it — `.venv/bin/pytest`, `"pytest"`, `python -m 'pytest'`,
 # `pytest; true`. Conservative on purpose: a false red here costs a reworded step, a false green costs CI.
 _PYTEST = re.compile(r"pytest")
@@ -34,8 +43,28 @@ _PYTEST = re.compile(r"pytest")
 # splitlines() would break on could hide the install inside a comment.
 _PRINTABLE = re.compile(r"^[ -~]*$")
 # The keys an install step may have. `if`/`continue-on-error` can skip it or let pytest run after it failed;
-# `shell`, `env` (BASH_ENV) and `working-directory` can change what the lines do.
-_SAFE_STEP_KEYS = {"name", "id", "run"}
+# `shell`, `env` (BASH_ENV) and `working-directory` can change what the lines do. `timeout-minutes` only bounds it
+# (and is REQUIRED: the step that hung had none).
+_SAFE_STEP_KEYS = {"name", "id", "run", "timeout-minutes"}
+
+
+def _is_bounded_download(cmds: list[str]) -> bool:
+    if len(cmds) != len(_DOWNLOAD_RES) or not all(_PRINTABLE.match(c) for c in cmds):
+        return False
+    ms = [r.match(c) for r, c in zip(_DOWNLOAD_RES, cmds)]
+    if not all(ms):
+        return False
+    archive, = ms[4].groups()
+    made, = ms[5].groups()
+    tar_archive, tar_dir = ms[6].groups()
+    inst_a, inst_b = ms[7].groups()
+    # the archive curl wrote is the one tar reads, and tar extracts into the dir the binaries are installed from
+    return archive == tar_archive and made == tar_dir == inst_a == inst_b
+
+
+def _has_timeout(step: dict) -> bool:
+    t = step.get("timeout-minutes")
+    return isinstance(t, int) and not isinstance(t, bool) and t > 0
 # The quoted program name a test hands to subprocess: "ffmpeg" or 'ffmpeg'.
 _SPAWNS_FFMPEG = re.compile(r"""["']ffmpeg["']""")
 
@@ -81,11 +110,7 @@ def ffmpeg_installed_before_pytest(workflow_text: str, job: str = "test") -> boo
         cmds = _commands(str(step.get("run") or ""))
         if any(_PYTEST.search(c) for c in cmds):
             return installed
-        if (
-            any(_APT_INSTALL_FFMPEG.match(c) for c in cmds)
-            and all(_PRINTABLE.match(c) and (_APT_INSTALL_FFMPEG.match(c) or _APT_UPDATE.match(c)) for c in cmds)
-            and set(step) <= _SAFE_STEP_KEYS
-        ):
+        if _is_bounded_download(cmds) and set(step) <= _SAFE_STEP_KEYS and _has_timeout(step):
             installed = True
     return False
 
@@ -116,55 +141,117 @@ def _wf(*steps: str) -> str:
 
 _CHECKOUT = "      - uses: actions/checkout@v7"
 _PYTEST_STEP = "      - run: pytest -q"
-_REAL_INSTALL = "      - run: |\n          sudo apt-get update\n          sudo apt-get install -y ffmpeg"
+_REAL_LINES = (
+    'FFMPEG_BUILD=$(sed -n "s/^ARG FFMPEG_BUILD=//p" Dockerfile)',
+    'FFMPEG_ASSET=$(sed -n "s/^ARG FFMPEG_ASSET=//p" Dockerfile)',
+    'test -n "$FFMPEG_BUILD"',
+    'test -n "$FFMPEG_ASSET"',
+    'curl -fL --retry 3 --max-time 300 -o ffmpeg.tar.xz '
+    '"https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_BUILD/$FFMPEG_ASSET"',
+    "mkdir ffmpeg-dist",
+    "tar -xJf ffmpeg.tar.xz -C ffmpeg-dist --strip-components=1",
+    "sudo install -m 0755 ffmpeg-dist/bin/ffmpeg ffmpeg-dist/bin/ffprobe /usr/local/bin",
+    "ffmpeg -version",
+)
+
+
+def _body(lines=_REAL_LINES) -> str:
+    return "\n".join(f"          {ln}" for ln in lines)
+
+
+def _step(lines=_REAL_LINES, head: str = "      - timeout-minutes: 10") -> str:
+    return f"{head}\n        run: |\n{_body(lines)}"
+
+
+_REAL_INSTALL = _step()
+_CURL = 4
+
+
+def _mutated(i: int, new: str | None) -> tuple[str, ...]:
+    lines = list(_REAL_LINES)
+    if new is None:
+        del lines[i]
+    else:
+        lines[i] = new
+    return tuple(lines)
 
 
 def test_a_real_install_step_before_pytest_counts():
     assert ffmpeg_installed_before_pytest(_wf(_CHECKOUT, _REAL_INSTALL, _PYTEST_STEP))
-    assert ffmpeg_installed_before_pytest(_wf("      - run: apt-get install ffmpeg  # needed by render tests", _PYTEST_STEP))
+    # a trailing comment is not a command
+    assert ffmpeg_installed_before_pytest(_wf(_step(_mutated(8, "ffmpeg -version  # smoke")), _PYTEST_STEP))
+
+
+def test_the_apt_install_that_hung_ci_does_not_count():
+    apt = "      - timeout-minutes: 10\n        run: |\n          sudo apt-get update\n          sudo apt-get install -y ffmpeg"
+    assert not ffmpeg_installed_before_pytest(_wf(_CHECKOUT, apt, _PYTEST_STEP))
+    assert not ffmpeg_installed_before_pytest(_wf("      - run: apt-get install ffmpeg", _PYTEST_STEP))
 
 
 def test_a_commented_out_install_does_not_count():
-    commented = "      - run: |\n          sudo apt-get update\n          # sudo apt-get install -y ffmpeg"
+    commented = _step(_mutated(_CURL, "# " + _REAL_LINES[_CURL]))
     assert not ffmpeg_installed_before_pytest(_wf(_CHECKOUT, commented, _PYTEST_STEP))
 
 
 def test_a_yaml_comment_does_not_count():
-    assert not ffmpeg_installed_before_pytest(_wf(_CHECKOUT, "      # - run: sudo apt-get install -y ffmpeg", _PYTEST_STEP))
+    commented = "\n".join("      # " + ln for ln in _REAL_INSTALL.splitlines())
+    assert not ffmpeg_installed_before_pytest(_wf(_CHECKOUT, commented, _PYTEST_STEP))
 
 
 def test_a_never_executed_install_does_not_count():
-    for guarded in ("false && sudo apt-get install -y ffmpeg", "true || apt-get install -y ffmpeg",
-                    "echo sudo apt-get install -y ffmpeg", "sudo apt-get install -y ffmpeg-doc"):
-        assert not ffmpeg_installed_before_pytest(_wf(f"      - run: {guarded}", _PYTEST_STEP)), guarded
+    curl = _REAL_LINES[_CURL]
+    for guarded in (f"false && {curl}", f"true || {curl}", f"echo {curl}", f"{curl} || true"):
+        assert not ffmpeg_installed_before_pytest(_wf(_step(_mutated(_CURL, guarded)), _PYTEST_STEP)), guarded
 
 
 def test_an_install_the_step_may_never_run_does_not_count():
-    install = "\n".join(_REAL_INSTALL.splitlines()[1:])
-    for skipped in ("      - if: false\n        run: |\n" + install,
-                    "      - if: ${{ github.event_name == 'nope' }}\n        run: |\n" + install,
-                    "      - continue-on-error: true\n        run: |\n" + install,
-                    "      - run: |\n          exit 0\n" + install,
-                    "      - run: |\n          f() {\n" + install + "\n          }",
-                    "      - run: |\n          if false; then\n" + install + "\n          fi",
-                    "      - run: |\n          cat <<'EOF'\n" + install + "\n          EOF"):
+    body = _body()
+    for skipped in ("      - timeout-minutes: 10\n        if: false\n        run: |\n" + body,
+                    "      - timeout-minutes: 10\n        if: ${{ github.event_name == 'nope' }}\n        run: |\n" + body,
+                    "      - timeout-minutes: 10\n        continue-on-error: true\n        run: |\n" + body,
+                    "      - timeout-minutes: 10\n        run: |\n          exit 0\n" + body,
+                    "      - timeout-minutes: 10\n        run: |\n          f() {\n" + body + "\n          }",
+                    "      - timeout-minutes: 10\n        run: |\n          if false; then\n" + body + "\n          fi",
+                    "      - timeout-minutes: 10\n        run: |\n          cat <<'EOF'\n" + body + "\n          EOF"):
         assert not ffmpeg_installed_before_pytest(_wf(skipped, _PYTEST_STEP)), skipped
 
 
-def test_an_install_that_installs_nothing_does_not_count():
-    for flag in ("-s", "--simulate", "-d", "--dry-run", "--download-only", "--assume-no", "--print-uris"):
-        line = f"sudo apt-get install -y {flag} ffmpeg"
-        assert not ffmpeg_installed_before_pytest(_wf(f"      - run: {line}", _PYTEST_STEP)), line
-    assert not ffmpeg_installed_before_pytest(_wf("      - run: sudo\u00a0apt-get install -y ffmpeg", _PYTEST_STEP))
-    for sep in ("\\v", "\\r", "\\f"):  # one bash line: the install is inside the comment
-        step = f'      - run: "# disabled{sep}sudo apt-get install -y ffmpeg"'
-        assert not ffmpeg_installed_before_pytest(_wf(step, _PYTEST_STEP)), sep
+def test_a_download_that_is_not_the_pinned_bounded_one_does_not_count():
+    curl = _REAL_LINES[_CURL]
+    variants = {
+        "no -f (an HTTP error installs nothing and exits 0)": curl.replace("-fL", "-L"),
+        "no --max-time": curl.replace(" --max-time 300", ""),
+        "no --retry": curl.replace(" --retry 3", ""),
+        "a hard-coded URL, not the Dockerfile's pin": curl.replace("$FFMPEG_BUILD/$FFMPEG_ASSET", "latest/ffmpeg.tar.xz"),
+        "a smoke check that cannot fail": "ffmpeg -version || true",
+    }
+    for why, line in variants.items():
+        idx = 8 if "-version" in line else _CURL
+        assert not ffmpeg_installed_before_pytest(_wf(_step(_mutated(idx, line)), _PYTEST_STEP)), why
+    for i in (0, 1, 2, 3, 7):  # a dropped read, dropped `test -n`, or dropped install
+        assert not ffmpeg_installed_before_pytest(_wf(_step(_mutated(i, None)), _PYTEST_STEP)), i
+    pinned_in_run = _mutated(0, "FFMPEG_BUILD=autobuild-2025-08-31-13-00")
+    assert not ffmpeg_installed_before_pytest(_wf(_step(pinned_in_run), _PYTEST_STEP))
+    # curl writes one file, tar reads another: nothing is installed from what was downloaded
+    assert not ffmpeg_installed_before_pytest(_wf(_step(_mutated(6, _REAL_LINES[6].replace("ffmpeg.tar.xz", "x.tar.xz"))), _PYTEST_STEP))
+    # non-breaking space is one word to bash
+    assert not ffmpeg_installed_before_pytest(_wf(_step(_mutated(7, _REAL_LINES[7].replace("sudo install", "sudo\u00a0install"))), _PYTEST_STEP))
+    for sep in ("\\v", "\\r", "\\f"):  # one bash line: the download is inside the comment
+        line = '"# disabled' + sep + curl.replace('"', '\\"') + '"'
+        assert not ffmpeg_installed_before_pytest(_wf(f"      - timeout-minutes: 10\n        run: {line}", _PYTEST_STEP)), sep
+
+
+def test_the_install_step_must_carry_a_timeout():
+    no_timeout = _step(head="      - name: Install ffmpeg")
+    assert not ffmpeg_installed_before_pytest(_wf(_CHECKOUT, no_timeout, _PYTEST_STEP))
+    for bad in ("0", "-1", "true", "'10'"):
+        assert not ffmpeg_installed_before_pytest(_wf(_step(head=f"      - timeout-minutes: {bad}"), _PYTEST_STEP)), bad
 
 
 def test_an_install_step_whose_environment_can_change_it_does_not_count():
-    install = "\n".join(_REAL_INSTALL.splitlines()[1:])
-    for key in ("env:\n          BASH_ENV: /tmp/noop", "working-directory: /tmp", "shell: bash", "timeout-minutes: 1"):
-        step = f"      - {key}\n        run: |\n" + install
+    body = _body()
+    for key in ("env:\n          BASH_ENV: /tmp/noop", "working-directory: /tmp", "shell: bash"):
+        step = f"      - timeout-minutes: 10\n        {key}\n        run: |\n" + body
         assert not ffmpeg_installed_before_pytest(_wf(step, _PYTEST_STEP)), key
     assert not ffmpeg_installed_before_pytest("defaults:\n  run:\n    shell: 'true {0}'\n" + _wf(_REAL_INSTALL, _PYTEST_STEP))
     job_defaults = _wf(_REAL_INSTALL, _PYTEST_STEP).replace(
@@ -173,7 +260,7 @@ def test_an_install_step_whose_environment_can_change_it_does_not_count():
     assert not ffmpeg_installed_before_pytest("env:\n  BASH_ENV: /tmp/noop\n" + _wf(_REAL_INSTALL, _PYTEST_STEP))
     job_env = _wf(_REAL_INSTALL, _PYTEST_STEP).replace("    runs-on:", "    env:\n      BASH_ENV: /tmp/noop\n    runs-on:")
     assert not ffmpeg_installed_before_pytest(job_env)
-    named = "      - name: Install ffmpeg\n        id: ffmpeg\n        run: |\n" + install
+    named = "      - name: Install ffmpeg\n        id: ffmpeg\n        timeout-minutes: 10\n        run: |\n" + _body()
     assert ffmpeg_installed_before_pytest(_wf(named, _PYTEST_STEP))
 
 
