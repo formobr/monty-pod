@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import sys
 from typing import Any, Callable, Mapping
 
 from .infer_cliprank import _VRAM_PER_LANE_MB, _VRAM_RESERVE_MB, _VRAM_WEIGHTS_MB, _free_vram_mb
@@ -29,55 +30,193 @@ ordering is the pool's and the bound is the envelope budget the box already gran
 unreadable card is treated as narrow, because serialising costs wall clock and guessing costs the envelope.
 """
 
+HEAVY_LANE_MEASURED_WHY = """
+THE HEAVY LANE NEXT TO clip_rank, MEASURED ON THE CARD THAT OOM'd (056 v13, 2026-10-22).
+
+The pod's own classes in the pod image (09adca1, torch 2.11+cu128) on the dev RTX 2060, card-wide nvidia-smi
+sampled every 20 ms (the number an OOM is about); the bench script and its JSON results are kept engine-side:
+  align (wav2vec2 xlsr-56)   weights resident 1244 MiB · one 20 s window forward +518 MiB over that
+  clip_rank (SigLIP so400m)  2322 MiB weights + context · 12-tile lanes at once: 1 → +354, 2 → +726, 3 → +864,
+                              4 → +1040 MiB (≤ 414 per lane: the per-lane figure holds)
+  person_matte (RVM 1080x1920, ds 0.25) first-frame autotune +958..1010 MiB over everything already resident
+                              (+1094 over an idle card, the figure below), 16 MiB weights, 228 between videos
+  align + SigLIP + 2 lanes running together: 4310 MiB over the idle card.
+The old floor said align = 1500 (weights + forward) and sized the clip_rank lanes against the WHOLE free card, as
+if align were never there: 4835 free → 4 lanes, + align 1762 → over the card, «Tried to allocate 72 MiB».
+Every kind's service stays cached, so on a card where the kinds coexist align's weights are resident while
+person_matte (same one-wide lane) autotunes: the heavy lane holds align_resident + max(align forward + RVM
+resident, RVM peak). That is subtracted from the clip_rank lane budget, and it is the second term of the
+coexist floor. A card under that floor serialises the kinds with the idle weights dropped (never the CPU).
+"""
+ALIGN_RESIDENT_MIB = 1244.0     # measured (HEAVY_LANE_MEASURED_WHY)
+ALIGN_FORWARD_MIB = 518.0       # one 20 s window (the engine aligns in 20 s chunks)
+PERSON_MATTE_PEAK_MIB = 1100.0  # +1094 over an idle card, first-frame cudnn autotune
+PERSON_MATTE_RESIDENT_MIB = 228.0
+# clean_plate (big-lama fp32 TorchScript + the masked median, podagent/infer_plate.py), MEASURED 2026-10-24 in the pod image
+# (torch 2.11+cu128) on the dev RTX 2060, nvidia-smi card-wide every 50 ms, two 3 s windows of the 1080x1920 head plate, LaMa at
+# the 1024 long-side cap: +1276 MiB over the idle card (torch: 677 allocated, 1040 reserved, + the CUDA context); 204 MiB of
+# weights stay resident once the service empties its allocator cache after each request (the clean-plate research receipt).
+CLEAN_PLATE_PEAK_MIB = 1300.0
+CLEAN_PLATE_RESIDENT_MIB = 210.0
+# cutout (BiRefNet_dynamic traced TorchScript fp16 at 1024, podagent/infer_cutout.py): the operator's bench 2026-11-06 on the desktop
+# RTX 2060 (torch 2.8 / torchvision 0.23, eager model, NOT the traced .pt): 2670 MiB peak at 1024 (process), 996 MiB resident.
+# PLACEHOLDERS — re-measure the traced .pt in the pod image at the 2048 cap (the cap changes the resize-back and the PNG buffers,
+# not the 1024 forward) with nvidia-smi card-wide, then replace both numbers and the pinned lane tests (the research receipt
+# docs/research/pod-cutout-birefnet.md says the same).
+CUTOUT_PEAK_MIB = 2670.0
+CUTOUT_RESIDENT_MIB = 996.0
+# screen_quad (Florence-2 base fp16 + SAM 2.1 base-plus fp32, podagent/infer_screen_quad.py): the research receipt's bench 2026-11-16 on
+# the desktop RTX 2060 (torch 2.11 / transformers 4.57.6): 452 + 285 = 737 MiB allocated resident, 1166 MiB allocated peak, ≈ 1.65 GB
+# for the process (nvidia-smi sampled every ~50 ms: a lower bound).
+# PLACEHOLDERS — «re-measure in the pod image» with nvidia-smi card-wide at 16 items x 4 boxes, then replace both numbers and the
+# pinned lane tests (docs/research/pod-screen-quad.md says the same).
+SCREEN_QUAD_PEAK_MIB = 1650.0
+SCREEN_QUAD_RESIDENT_MIB = 737.0
+
 KIND_VRAM_MIB: Mapping[str, float] = {      # measured; see INFER_KIND_RESIDENCY_WHY for each number
-    "align": 1500.0,
+    "align": ALIGN_RESIDENT_MIB + ALIGN_FORWARD_MIB,
     "clip_rank": _VRAM_WEIGHTS_MB + _VRAM_PER_LANE_MB,
     "face_probe": 0.0,
+    # RVM fp16 at 1080x1920: nvidia-smi peak +1094 MiB over the idle card during the first frame's cudnn autotune
+    # (torch max reserved 990), +228 MiB resident between videos — sized at the peak, the moment it must fit.
+    # It rides the one-wide heavy lane, so it never runs beside align; it CAN run beside a clip_rank lane.
+    "person_matte": PERSON_MATTE_PEAK_MIB,
+    # rides the same one-wide heavy lane (it reads the matte person_matte wrote, so the two never overlap in one job chain)
+    "clean_plate": CLEAN_PLATE_PEAK_MIB,
+    # a heavy-lane kind too (one pod job at a time, the BiRefNet forward is the lane's largest transient)
+    "cutout": CUTOUT_PEAK_MIB,
+    # a heavy-lane kind too: two cached HF models, one picture at a time
+    "screen_quad": SCREEN_QUAD_PEAK_MIB,
+    # runs on screen_quad's pair (SHARES_WEIGHTS_OF): the same peak, never a second set of weights
+    "object_mask": SCREEN_QUAD_PEAK_MIB,
 }
 RESERVE_MIB = _VRAM_RESERVE_MB
 
+# the heavy kinds other than align: (peak while running, weights that stay resident between jobs). THE owner of which kinds
+# ride the one-wide heavy lane: a kind is routed there exactly when it is sized here
+_HEAVY_PEAK_RESIDENT: Mapping[str, tuple[float, float]] = {
+    "person_matte": (PERSON_MATTE_PEAK_MIB, PERSON_MATTE_RESIDENT_MIB),
+    "clean_plate": (CLEAN_PLATE_PEAK_MIB, CLEAN_PLATE_RESIDENT_MIB),
+    "cutout": (CUTOUT_PEAK_MIB, CUTOUT_RESIDENT_MIB),
+    "screen_quad": (SCREEN_QUAD_PEAK_MIB, SCREEN_QUAD_RESIDENT_MIB),
+}
+# THE owner of which kind runs on another kind's cached weights: object_mask answers on screen_quad's Florence-2 + SAM 2.1 pair, so
+# it has no cache, no weights and no residency of its own — release_other_kinds and heavy_lane_mib read it through this map
+SHARES_WEIGHTS_OF: Mapping[str, str] = {"object_mask": "screen_quad"}
+# derived, never a second list (heavy_lane_mib sizes it, main.main's `heavy` set routes by it)
+HEAVY_KINDS: "frozenset[str]" = frozenset({"align", *_HEAVY_PEAK_RESIDENT, *SHARES_WEIGHTS_OF})
 
-def coresident_mib() -> float:
-    """Free MiB a card must report for both weight-holding kinds to be resident together: align + clip_rank +
-    reserve + ONE encode session (RENDER_HEADROOM_MIB, the gpu_admission unit), because infer and a heavy op
-    share the card by design (RENDER_HEADROOM_WHY). Without it the dev 2060 kept both kinds at 5694 MiB free
-    and a heavy op beside them ran the card out (MISC-998)."""
-    return KIND_VRAM_MIB["align"] + KIND_VRAM_MIB["clip_rank"] + RESERVE_MIB + RENDER_HEADROOM_MIB
+
+def heavy_lane_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
+    """The peak the one-wide heavy lane can hold beside a clip_rank lane (HEAVY_LANE_MEASURED_WHY): align's weights
+    stay resident once loaded, and the lane's transient is the largest of align's forward and each other heavy kind's
+    peak, each with the OTHER kinds' cached weights beside it. `served` None = every kind."""
+    kinds = {SHARES_WEIGHTS_OF.get(k, k) for k in (set(KIND_VRAM_MIB) if served is None else set(served)) & HEAVY_KINDS}
+    others = {k: _HEAVY_PEAK_RESIDENT[k] for k in kinds if k != "align"}      # a heavy kind with no entry raises KeyError
+    resident_all = sum(res for _, res in others.values())
+    resident = ALIGN_RESIDENT_MIB if "align" in kinds else 0.0
+    transient = max([(ALIGN_FORWARD_MIB + resident_all) if "align" in kinds else 0.0]
+                    + [peak + resident_all - res for peak, res in others.values()])
+    return resident + transient
 
 
-def kinds_fit_together(free_mib: float | None) -> tuple[bool, str]:
+def coresident_mib(served: "frozenset[str] | set[str] | None" = None) -> float:
+    """Free MiB a card must report for clip_rank (weights + one lane) to run beside the heavy lane AND one encode
+    session (RENDER_HEADROOM_MIB, the gpu_admission unit), because infer and a heavy op share the card by design
+    (RENDER_HEADROOM_WHY; without it the dev 2060 kept both kinds at 5694 MiB free and a heavy op beside them ran
+    the card out, MISC-998): 2736 + heavy_lane_mib + 512 + 960 — 9297 with every kind served."""
+    return KIND_VRAM_MIB["clip_rank"] + heavy_lane_mib(served) + RESERVE_MIB + RENDER_HEADROOM_MIB
+
+
+def kinds_fit_together(free_mib: float | None, served: "frozenset[str] | set[str] | None" = None
+                       ) -> tuple[bool, str]:
     """May align and clip_rank be resident at once on a card reporting `free_mib`, and why. Pure — the reading
     is injected."""
-    need = coresident_mib()
+    need = coresident_mib(served)
     if free_mib is None:
         return False, ("the card reports no free VRAM — one infer kind resident at a time, still the GPU, "
                        "never the CPU")
     if free_mib >= need:
-        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for align+clip_rank+encode session+reserve — both kinds may "
-                      f"hold the card, the lanes stay parallel")
-    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for align+clip_rank+encode session+reserve — the kinds "
+        return True, (f"{free_mib:.0f} MiB free >= {need:.0f} MiB for clip_rank+heavy lane+encode session+reserve — "
+                      f"both kinds may hold the card, the lanes stay parallel")
+    return False, (f"{free_mib:.0f} MiB free < {need:.0f} MiB for clip_rank+heavy lane+encode session+reserve — the kinds "
                    f"serialise on one lane and the idle kind's weights are dropped")
 
 
-def card_holds_both_kinds(probe: Callable[[], float | None] | None = None) -> tuple[bool, str]:
+def card_holds_both_kinds(probe: Callable[[], float | None] | None = None,
+                          served: "frozenset[str] | set[str] | None" = None) -> tuple[bool, str]:
     """The same answer against the LIVE card. A probe failure is a reading, not a raise (this is a budget)."""
     try:
         free = (probe or _free_vram_mb)()
     except (OSError, ValueError) as e:
         return False, f"could not ask the card for free VRAM ({type(e).__name__}: {e}) — one kind at a time"
-    return kinds_fit_together(free)
+    return kinds_fit_together(free, served)
 
 
 def release_other_kinds(kind: str, caches: Mapping[str, dict[Any, Any]]) -> list[str]:
     """Drop every OTHER kind's cached service so only `kind` holds weights; the allocator then recycles those
     blocks for this kind's load. Safe only where no other kind can be mid-forward — the caller serialises the
-    kinds onto one lane first."""
+    kinds onto one lane first. A kind that runs on another's weights (SHARES_WEIGHTS_OF) keeps that kind's cache."""
+    kind = SHARES_WEIGHTS_OF.get(kind, kind)
     freed = [other for other, cache in caches.items() if other != kind and cache]
     for other in freed:
         caches[other].clear()       # the service object holds the only reference to the model
     if freed:
         gc.collect()                # the service graph has cycles; the tensors outlive the dict without this
     return freed
+
+
+CARD_TURNS_WHY = """
+ON A CARD WHERE THE INFER KINDS TAKE TURNS, THE ENCODE IS ONE OF THE TURNS.
+
+A standing pod (decision `the-laptop-holds-a-standing-pod-like-the-fleet`) keeps whatever kind it served last
+on the card for its whole life. On a card too small for two kinds (INFER_KIND_RESIDENCY_WHY) that resident
+kind sat under every encode: 056 v13 r8 (dev RTX 2060, 6144 MiB, ~1.5-2.5 GiB held by the desktop) had SigLIP
+resident (2322 MiB) through cut.apply, whose ledger grant was 1388-1960 MiB, so 1 NVENC session (pm2 pod log
+«1768 MiB granted by the pod's admission ledger → 1 session(s)»); apply_cut took 99 s. The ledger also read
+its budget ONCE for the pod's life, so what the card held at the first heavy op sized every later one.
+
+So, on such a card only, ONE ledger serves both tenants: a weight-holding infer (align, clip_rank,
+person_matte) books the whole budget around its load + forward exactly as a self-sizing heavy op does
+(gpu_admission.admission), so the two never run at once and keep FIFO order with its bounded, visible park. A
+heavy op, once admitted, drops every cached infer service (all idle by construction — no infer can be inside
+the ledger beside it), returns the allocator's blocks to the driver (a separate ffmpeg process cannot use
+blocks torch merely caches), and re-reads the budget from the card (gpu_admission.remeasure_held). The dropped
+kind reloads from the pod's disk cache when next asked (SigLIP measured 6.5 s, r8 run.log). face_probe holds no
+card at all and takes no turn. On a fleet card the kinds coexist, this is never armed, and nothing changes.
+"""
+
+_TURNS: dict[str, Any] = {"armed": False, "caches": {}}
+
+
+def arm_card_turns(armed: bool, caches: Mapping[str, dict[Any, Any]]) -> None:
+    """Boot: arm CARD_TURNS_WHY when the kinds take turns on this card, and name the caches a heavy op may drop."""
+    _TURNS["armed"] = bool(armed)
+    _TURNS["caches"] = caches
+
+
+def card_turns_armed() -> bool:
+    return bool(_TURNS["armed"])
+
+
+def takes_card_turn(kind: str) -> bool:
+    """Does an infer of `kind` take the card's turn? Only a weight-holding kind, only on a turn-taking card."""
+    return card_turns_armed() and KIND_VRAM_MIB.get(kind, 0.0) > 0.0
+
+
+def clear_card_for_render() -> list[str]:
+    """Called by an ADMITTED heavy op (CARD_TURNS_WHY): drop every cached infer service, hand the blocks back to
+    the driver, re-read the ledger budget. Returns the dropped kinds; [] (and nothing touched) when not armed."""
+    if not card_turns_armed():
+        return []
+    from .ops import gpu_admission
+
+    dropped = release_other_kinds("", _TURNS["caches"])
+    torch = sys.modules.get("torch")      # never import torch on a pod that has not loaded a model
+    if dropped and torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gpu_admission.remeasure_held()
+    return dropped
 
 
 SERVED_INFER_KINDS_WHY = """

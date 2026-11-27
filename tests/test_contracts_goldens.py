@@ -11,20 +11,29 @@ monty-contracts bundle and its independent gate lives in test_wire_contracts.py.
 from __future__ import annotations
 
 import json
+import typing
 from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from podagent.infer_lanes import KIND_VRAM_MIB
 from podagent.models import (
     SPEC_VERSION,
+    CleanPlatePayload,
     ClipRankPayload,
+    CutoutPayload,
     FaceProbePayload,
+    InferKind,
     InferRequest,
     InferResult,
+    ObjectMaskOut,
+    PersonMattePayload,
     PodJob,
     RenderSpec,
+    ScreenDevice,
+    ScreenQuadPayload,
 )
 CONTRACTS = Path(__file__).resolve().parents[1] / "contracts"
 EXAMPLES = CONTRACTS / "examples"
@@ -37,6 +46,11 @@ MODELS = {
     "infer_result": InferResult,
     "face_probe": FaceProbePayload,
     "clip_rank": ClipRankPayload,
+    "person_matte": PersonMattePayload,
+    "clean_plate": CleanPlatePayload,
+    "cutout": CutoutPayload,
+    "screen_quad": ScreenQuadPayload,
+    "object_mask": ObjectMaskOut,
     "pod_job": PodJob,
 }
 
@@ -108,6 +122,20 @@ def test_top_level_required_parity() -> None:
         assert model_required == schema_required, (
             f"{prefix}: model-required {model_required} != schema-required {schema_required}"
         )
+
+
+def test_infer_kind_is_one_fact() -> None:
+    """models.InferKind owns the kind list; the two schema enums and infer_lanes.KIND_VRAM_MIB are copies kept equal to it
+    (main.INFER_KINDS, the block validator and the served-kinds test derive from it directly)."""
+    kinds = list(typing.get_args(InferKind))
+    assert SCHEMAS["infer_request"]["properties"]["kind"]["enum"] == kinds
+    assert SCHEMAS["infer_result"]["properties"]["kind"]["enum"] == kinds
+    assert set(KIND_VRAM_MIB) == set(typing.get_args(InferKind))
+    # the device enum is written in the request schema, the receipt schema and the model: one list
+    devices = list(typing.get_args(ScreenDevice))
+    req_item = SCHEMAS["infer_request"]["properties"]["screen_quad"]["properties"]["items"]["items"]
+    assert req_item["properties"]["device"]["enum"] == devices
+    assert SCHEMAS["screen_quad"]["properties"]["items"]["items"]["properties"]["device"]["enum"] == devices
 
 
 def test_version_pin() -> None:

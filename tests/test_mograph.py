@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -106,6 +107,27 @@ def test_qtrle_layer_encode_sets_bt709(monkeypatch, tmp_path: Path) -> None:
 
     assert layers and len(commands) == 1
     assert all(token in commands[0] for token in mograph._BT709)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_a_layer_keeps_its_alpha_after_an_opaque_first_frame(tmp_path: Path) -> None:
+    from PIL import Image
+
+    seqdir = tmp_path / "seq"; seqdir.mkdir()
+    Image.new("RGB", (16, 16), (250, 240, 220)).save(seqdir / "frame_001.png")        # opaque → stored as RGB
+    rgba = Image.new("RGBA", (16, 16), (0, 0, 0, 0))                                  # transparent corners
+    rgba.putpixel((8, 8), (200, 30, 30, 255))                                         # one opaque pixel
+    rgba.save(seqdir / "frame_002.png")
+
+    layers = mograph._pack([{"seqdir": seqdir, "start": 0.0, "glass": False}], tmp_path)
+
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", layers[0]["mov"], "-pix_fmt", "rgba",
+                          "-f", "rawvideo", "-"], check=True, capture_output=True).stdout
+    frame2 = raw[16 * 16 * 4:]
+    assert len(frame2) == 16 * 16 * 4
+    assert frame2[3] == 0                                    # corner pixel alpha 0
+    centre = (8 * 16 + 8) * 4
+    assert tuple(frame2[centre:centre + 4]) == (200, 30, 30, 255)
 
 
 def _batch_items(tmp_path: Path, comps, *, write_frames=True):
@@ -278,3 +300,62 @@ def test_render_layers_omits_the_bound_when_none_is_reachable(tmp_path: Path, mo
     sec = SimpleNamespace(comp="Stat", start=1.0, props={}, glass=False)
     mograph._render_layers([sec], None, {}, tmp_path)
     assert "maxSeconds" not in captured["items"][0]
+
+
+def test_bespoke_batches_run_side_by_side_on_a_split_tab_budget_and_keep_plan_order(tmp_path: Path, monkeypatch) -> None:
+    """BESPOKE_PARALLEL_WHY: each Bespoke entry still gets its own render_batch, after the catalog batch, at most
+    _BESPOKE_PARALLEL_MAX at once, each on its share of the tabs; the layers come back in plan order."""
+    import threading
+    import time
+    monkeypatch.setattr(mograph, "remotion_dir", lambda ref, tmp: tmp_path)
+    monkeypatch.setattr(mograph, "_render_concurrency", lambda: 10)
+    monkeypatch.setattr(mograph, "_pack", lambda metas, tmp: metas)
+    (tmp_path / "src").mkdir()
+    ids = ["Bespoke-a", "Bespoke-b", "Bespoke-c", "Bespoke-d"]
+    for i in ids:
+        (tmp_path / "src" / f"index.bespoke.{i}.tsx").write_text("x")
+    calls, live, peak, lock = [], [0], [0], threading.Lock()
+
+    def fake_batch(rd, items, spec, entry):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+            calls.append((entry, items[0]["comp"], mograph._batch_concurrency(), list(live)))
+        time.sleep(0.1)
+        with lock:
+            live[0] -= 1
+
+    monkeypatch.setattr(mograph, "_run_batch", fake_batch)
+    secs = [SimpleNamespace(comp="Stat", start=0.0, props={}, glass=False)] + [
+        SimpleNamespace(comp=i, start=float(n + 1), props={}, glass=False) for n, i in enumerate(ids)]
+    metas = mograph._render_layers(secs, None, {}, tmp_path)
+
+    assert calls[0][0] is None and calls[0][2] == 10, "the catalog batch runs first, alone, on every tab"
+    bes = calls[1:]
+    assert sorted(c[0] for c in bes) == sorted(f"src/index.bespoke.{i}.tsx" for i in ids)
+    assert all(c[2] == 10 // mograph._BESPOKE_PARALLEL_MAX for c in bes)
+    assert peak[0] == mograph._BESPOKE_PARALLEL_MAX
+    assert [m["start"] for m in metas] == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert mograph._batch_concurrency() == 10, "the share never leaks out of a bespoke worker"
+
+
+def test_a_failed_bespoke_batch_raises_only_after_its_siblings_land(tmp_path: Path, monkeypatch) -> None:
+    import time
+    monkeypatch.setattr(mograph, "remotion_dir", lambda ref, tmp: tmp_path)
+    monkeypatch.setattr(mograph, "_render_concurrency", lambda: 6)
+    (tmp_path / "src").mkdir()
+    for i in ("Bespoke-a", "Bespoke-b"):
+        (tmp_path / "src" / f"index.bespoke.{i}.tsx").write_text("x")
+    landed = []
+
+    def fake_batch(rd, items, spec, entry):
+        if items[0]["comp"] == "Bespoke-a":
+            raise RuntimeError("render_batch FAILED Bespoke-a")
+        time.sleep(0.1)
+        landed.append(items[0]["comp"])
+
+    monkeypatch.setattr(mograph, "_run_batch", fake_batch)
+    secs = [SimpleNamespace(comp=i, start=0.0, props={}, glass=False) for i in ("Bespoke-a", "Bespoke-b")]
+    with pytest.raises(RuntimeError, match="Bespoke-a"):
+        mograph._render_layers(secs, None, {}, tmp_path)
+    assert landed == ["Bespoke-b"]

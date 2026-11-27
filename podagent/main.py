@@ -16,7 +16,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 import requests
 from pydantic import ValidationError
@@ -25,15 +25,38 @@ from . import driver_userspace
 from .cp import ControlPlane, mark_rented_pod
 from .event_stream import DELIVERY_PENDING_MAX_ATTEMPTS, DeliveryPending, FrameRejected, TransportUnhealthy
 from .identity import worker_identity
-from .models import SPEC_VERSION, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
+from .models import SPEC_VERSION, InferKind, InferRequest, InferResult, InferTiming, PodJob, RenderSpec
 from .sanitize import safe_error, safe_text, safe_traceback
 
 if TYPE_CHECKING:
     from .infer_align import AlignService
     from .infer_cliprank import ClipRankService
+    from .infer_cutout import CutoutService
+    from .infer_matte import MatteService
+    from .infer_plate import PlateService
     from .infer_probe import ProbeService
+    from .infer_screen_quad import ScreenQuadService
 
-INFER_KINDS = ("align", "face_probe", "clip_rank")
+INFER_KINDS = get_args(InferKind)       # InferKind (podagent/models.py) owns the kind list
+# person_matte's frozen RVM, by model id (the baked file is sha-pinned, so the id names exactly one checkpoint).
+# Module-level so the one heavy lane reuses it across envelopes without widening _run_infer's positional surface.
+_MATTE_CACHE: "dict[str, MatteService]" = {}
+# clean_plate's big-lama, by model id (sha-pinned baked file, same reasoning as the RVM cache above).
+_PLATE_CACHE: "dict[str, PlateService]" = {}
+# cutout's traced BiRefNet, by the weights tar's sha256 (the content hash, like align / clip_rank: a re-traced checkpoint is a
+# different key). Dropped only by card turns (infer_lanes.release_other_kinds), like every cached kind.
+_CUTOUT_CACHE: "dict[str, CutoutService]" = {}
+# screen_quad's Florence-2 + SAM 2.1 pair, by the weights tar's sha256 (same rule as cutout: a re-built tar is a different key;
+# dropped only by card turns, infer_lanes.release_other_kinds)
+_SCREEN_QUAD_CACHE: "dict[str, ScreenQuadService]" = {}
+
+
+def _kind_caches(align: dict, clip_rank: dict, person_matte: dict, clean_plate: dict, cutout: dict,
+                 screen_quad: dict) -> "dict[str, dict]":
+    """ONE place that names which infer kind owns which service cache: what release_other_kinds and arm_card_turns drop."""
+    return {"align": align, "clip_rank": clip_rank, "person_matte": person_matte, "clean_plate": clean_plate,
+            "cutout": cutout, "screen_quad": screen_quad}
+
 
 # THERE IS NO POLL ANY MORE. Work arrives on the socket the pod already holds (podagent.event_stream); the
 # floor below survives it for one reason only — a socket that will NOT open returns immediately, and a bare
@@ -916,7 +939,11 @@ def _run_infer(
     rank_slots: threading.BoundedSemaphore | None = None,
     one_kind_resident: bool = False,
     served: "frozenset[str] | None" = None,
+    matte_cache: "dict[str, MatteService] | None" = None,
+    plate_cache: "dict[str, PlateService] | None" = None,
     coordinator: "RestartCoordinator | None" = None,
+    cutout_cache: "dict[str, CutoutService] | None" = None,
+    screen_quad_cache: "dict[str, ScreenQuadService] | None" = None,
 ) -> bool:
     """Runs one infer job, reports the result, and returns the updated boot_reported flag. An error whose text
     names an infra class (runner._INFRA_CLASSES) is reported FIRST and only then latches `coordinator`.
@@ -924,6 +951,14 @@ def _run_infer(
     corr_id is the claimed envelope's correlation id, echoed back on the posted result (pool demux)."""
     job_id = raw.get("job_id", "unknown")
     kind = raw.get("kind") if raw.get("kind") in INFER_KINDS else "align"
+    if matte_cache is None:
+        matte_cache = _MATTE_CACHE
+    if plate_cache is None:
+        plate_cache = _PLATE_CACHE
+    if cutout_cache is None:
+        cutout_cache = _CUTOUT_CACHE
+    if screen_quad_cache is None:
+        screen_quad_cache = _SCREEN_QUAD_CACHE
 
     @contextmanager
     def phase(name: str):
@@ -964,11 +999,14 @@ def _run_infer(
             from .infer_lanes import refuse_unserved
             refuse_unserved(req.kind, served)
         judge_tiles = req.clip_rank is not None and req.clip_rank.judge_tiles is not None
-        if one_kind_resident and not judge_tiles:
+        from .infer_lanes import KIND_VRAM_MIB
+        if one_kind_resident and not judge_tiles and KIND_VRAM_MIB.get(req.kind, 0.0) > 0.0:
             # A cached service holds its weights on the card forever, so on a card too small for both kinds
-            # the idle one must go before this load — the kinds are already serialised onto one lane.
+            # the idle one must go before this load — the kinds are already serialised onto one lane. A kind
+            # that holds no card (face_probe, CPU ONNX) loads nothing there and drops nobody's weights.
             from .infer_lanes import release_other_kinds
-            dropped = release_other_kinds(req.kind, {"align": align_cache, "clip_rank": rank_cache})
+            dropped = release_other_kinds(req.kind, _kind_caches(align_cache, rank_cache, matte_cache, plate_cache,
+                                                                 cutout_cache, screen_quad_cache))
             if dropped:
                 note(f"dropped {'+'.join(dropped)} weights: this card holds one infer kind at a time")
         if req.kind in ("align", "clip_rank") and not judge_tiles:
@@ -980,6 +1018,7 @@ def _run_infer(
         # Services are cached by the weights CONTENT hash, not by the model name: two requests naming the
         # same model but carrying different checkpoints must not share a loaded model, and a warm pod that
         # sees the same hash again skips both the fetch and the (dominant) load.
+        work_timings: dict | None = None      # a kind that books its own legs sets it; None = the default pair below
         if req.kind == "align":
             from .infer_align import AlignService
             from .weights import ensure
@@ -1034,6 +1073,91 @@ def _run_infer(
                 rank_run = rank_svc.run(req.clip_rank, req.put_url, note)
             infer_s = rank_run.infer_s
             work_timings = rank_run.timings
+        elif req.kind == "person_matte":
+            from .infer_matte import MatteRefused, MatteService
+            from .ops import dry as _ops_dry
+
+            assert req.person_matte is not None
+            if _ops_dry.armed():
+                raise MatteRefused("person_matte is a real GPU forward and a contour-dry pod does no GPU work "
+                                   "(DRY_POD_NO_GPU_WHY) — the engine must not send it to a dry pod")
+            matte_svc = matte_cache.get(req.model)
+            if matte_svc is None:
+                with phase("model_load"):
+                    note(f"loading {req.model}")
+                    matte_svc = matte_cache[req.model] = MatteService(req.model)
+            matte_run = matte_svc.run(req.person_matte, req.put_url, note)
+            infer_s = matte_run.infer_s
+            work_timings = {**matte_run.timings, "work_s": time.monotonic() - work_started}
+        elif req.kind == "clean_plate":
+            from .infer_plate import PlateRefused, PlateService
+            from .ops import dry as _ops_dry
+
+            assert req.clean_plate is not None
+            if _ops_dry.armed():
+                raise PlateRefused("clean_plate is a real GPU inpaint and a contour-dry pod does no GPU work "
+                                   "(DRY_POD_NO_GPU_WHY) — the engine must not send it to a dry pod")
+            plate_svc = plate_cache.get(req.model)
+            if plate_svc is None:
+                with phase("model_load"):
+                    note(f"loading {req.model}")
+                    plate_svc = plate_cache[req.model] = PlateService(req.model)
+            plate_run = plate_svc.run(req.clean_plate, req.put_url, note)
+            infer_s = plate_run.infer_s
+            work_timings = {**plate_run.timings, "work_s": time.monotonic() - work_started}
+        elif req.kind == "cutout":
+            from .infer_cutout import CutoutRefused, CutoutService
+            from .ops import dry as _ops_dry
+            from .weights import ensure
+
+            assert req.cutout is not None and req.weights is not None
+            if _ops_dry.armed():
+                raise CutoutRefused("cutout is a real GPU forward and a contour-dry pod does no GPU work "
+                                    "(DRY_POD_NO_GPU_WHY) — the engine must not send it to a dry pod")
+            cutout_svc = cutout_cache.get(req.weights.sha256)
+            if cutout_svc is None:
+                # Lanes race here; the SECOND one must wait for the load, not start its own (a second BiRefNet is an OOM).
+                with _SVC_LOAD_LOCK:
+                    cutout_svc = cutout_cache.get(req.weights.sha256)
+                    if cutout_svc is None:
+                        with phase("weights_fetch"):
+                            wdir = ensure(req.weights, req.model, note)
+                        with phase("model_load"):
+                            note(f"loading {req.model}")
+                            cutout_svc = cutout_cache[req.weights.sha256] = CutoutService(
+                                req.model, wdir, req.weights.sha256)
+            cutout_run = cutout_svc.run(req.cutout, req.put_url, note)
+            infer_s = cutout_run.infer_s
+            work_timings = {**cutout_run.timings, "work_s": time.monotonic() - work_started}
+        elif req.kind in ("screen_quad", "object_mask"):      # object_mask runs on screen_quad's pair and cache
+            from .infer_screen_quad import ScreenQuadRefused, ScreenQuadService
+            from .ops import dry as _ops_dry
+            from .weights import ensure
+
+            assert req.weights is not None
+            if _ops_dry.armed():
+                raise ScreenQuadRefused(f"{req.kind} is a real GPU forward and a contour-dry pod does no GPU work "
+                                        "(DRY_POD_NO_GPU_WHY) — the engine must not send it to a dry pod")
+            sq_svc = screen_quad_cache.get(req.weights.sha256)
+            if sq_svc is None:
+                # Lanes race here; the SECOND one must wait for the load, not start its own (a second pair is an OOM).
+                with _SVC_LOAD_LOCK:
+                    sq_svc = screen_quad_cache.get(req.weights.sha256)
+                    if sq_svc is None:
+                        with phase("weights_fetch"):
+                            wdir = ensure(req.weights, req.model, note)
+                        with phase("model_load"):
+                            note(f"loading {req.model}")
+                            sq_svc = screen_quad_cache[req.weights.sha256] = ScreenQuadService(
+                                req.model, wdir, req.weights.sha256)
+            if req.kind == "object_mask":
+                assert req.object_mask is not None
+                sq_run: Any = sq_svc.run_object_mask(req.object_mask, req.put_url, note)
+            else:
+                assert req.screen_quad is not None
+                sq_run = sq_svc.run(req.screen_quad, req.put_url, note)
+            infer_s = sq_run.infer_s
+            work_timings = {**sq_run.timings, "work_s": time.monotonic() - work_started}
         else:
             from .infer_probe import ProbeService
 
@@ -1044,7 +1168,7 @@ def _run_infer(
                 with phase("model_load"):
                     probe_svc = probe_cache[key] = ProbeService(yunet_path, req.model)
             infer_s = probe_svc.run(req.face_probe, req.put_url)
-        if req.kind != "clip_rank":
+        if work_timings is None:
             work_timings = {
                 "infer_s": infer_s,
                 "work_s": time.monotonic() - work_started,
@@ -1488,7 +1612,7 @@ class RestartCoordinator:
     A second latch, `infra_fault`, is tripped by an infrastructure-class run_error (runner.INFRA_FAULT_WHY):
     either one stops the claim loop before its next claim."""
 
-    _POOLS = ("ops", "heavy", "rank")
+    _POOLS = ("ops", "heavy", "rank", "probe")
 
     def __init__(self) -> None:
         self._latch = threading.Event()
@@ -1640,13 +1764,25 @@ def main() -> None:
         _log_gpu_status()
     from .artifact import range_fetch_width
     from .infer_cliprank import fetch_width, lane_width, usable_cores, vram_total_mb
-    from .infer_lanes import card_holds_both_kinds
-    rank_width = lane_width()
-    if {"align", "clip_rank"} <= served:
-        kinds_coexist, residency_why = card_holds_both_kinds()
+    from .infer_lanes import RENDER_HEADROOM_MIB, card_holds_both_kinds, heavy_lane_mib
+    from .infer_lanes import HEAVY_KINDS
+    heavy = served & HEAVY_KINDS
+    if "clip_rank" in served and heavy:
+        kinds_coexist, residency_why = card_holds_both_kinds(served=served)
     else:
         kinds_coexist, residency_why = True, "this pod serves at most one weight-holding kind"
     _log(f"infer kinds {'run in parallel' if kinds_coexist else 'take turns on one lane'}: {residency_why}")
+    # the rank lanes share the card with whatever the heavy lane can hold BESIDE them (infer_lanes
+    # HEAVY_LANE_MEASURED_WHY); when the kinds take turns, the idle kind's weights are dropped first, so the
+    # lanes own the card alone
+    # ... and a render op (one NVENC session, the boot floor's own RENDER_HEADROOM_MIB) is dispatched beside them
+    # either way, so the lanes leave it too — a contour-dry pod renders nothing and keeps no such headroom
+    render_mib = 0.0 if _dry_pod() else RENDER_HEADROOM_MIB
+    if kinds_coexist and "clip_rank" in served and heavy:
+        rank_width = lane_width(heavy_lane_mib(served) + render_mib,
+                                "heavy lane beside (align resident + its peak) + one NVENC render session")
+    else:
+        rank_width = lane_width(render_mib, "one NVENC render session (infer_lanes.RENDER_HEADROOM_WHY)")
     capacity = capacity_payload(rank_lanes=rank_width, fetch_workers=fetch_width(),
                                 vram_total_mb=vram_total_mb(),
                                 artifact_fetch_workers=range_fetch_width(),
@@ -1668,6 +1804,11 @@ def main() -> None:
     probe_cache: dict[tuple[Path, str], "ProbeService"] = {}
     rank_cache: dict[str, "ClipRankService"] = {}
     rank_slots = threading.BoundedSemaphore(rank_width)
+    # infer_lanes.CARD_TURNS_WHY: where the kinds take turns, the encode takes one too (a dry pod renders nothing)
+    from .infer_lanes import arm_card_turns, takes_card_turn
+    from .ops import gpu_admission
+    arm_card_turns(not kinds_coexist and not _dry_pod(),
+                   _kind_caches(align_cache, rank_cache, _MATTE_CACHE, _PLATE_CACHE, _CUTOUT_CACHE, _SCREEN_QUAD_CACHE))
     boot: list[bool] = [False]
     boot_lock = threading.Lock()
 
@@ -1683,11 +1824,16 @@ def main() -> None:
             assert pod_job.request is not None
             request_raw = _infer_request_raw(pod_job)
             mine = _claim_boot()
-            if not _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
-                              yunet_path, not mine, corr_id=pod_job.corr_id,
-                              session_id=pod_job.session_id, rank_parallel=rank_width,
-                              rank_slots=rank_slots, one_kind_resident=not kinds_coexist,
-                              served=served, coordinator=coordinator) and mine:
+            kind = pod_job.request.kind
+            # a weight-holding kind books the card's turn in the one ledger the heavy ops use (CARD_TURNS_WHY)
+            with (gpu_admission.admission(f"infer.{kind}")
+                  if takes_card_turn(kind) and not _is_judge_tiles(pod_job) else contextlib.nullcontext()):
+                ran = _run_infer(request_raw, cp, align_cache, probe_cache, rank_cache,
+                                 yunet_path, not mine, corr_id=pod_job.corr_id,
+                                 session_id=pod_job.session_id, rank_parallel=rank_width,
+                                 rank_slots=rank_slots, one_kind_resident=not kinds_coexist,
+                                 served=served, coordinator=coordinator)
+            if not ran and mine:
                 _claim_boot(taken=False)
         else:
             assert pod_job.spec is not None
@@ -1698,9 +1844,10 @@ def main() -> None:
     coordinator = RestartCoordinator()
     with cf.ThreadPoolExecutor(max_workers=ops_chain_pool_size(), thread_name_prefix="ops") as ops_pool, \
             cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as heavy_pool, \
-            cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool:
+            cf.ThreadPoolExecutor(max_workers=rank_width, thread_name_prefix="rank") as rank_pool, \
+            cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe") as probe_pool:
         _dispatch_loop(cp, ops_pool, heavy_pool, rank_pool, _heavy, coordinator=coordinator,
-                       kinds_coexist=kinds_coexist)
+                       kinds_coexist=kinds_coexist, probe_pool=probe_pool)
         if coordinator.infra_fault():
             # Before a pending restart: an exec onto the same broken card would claim onto it again.
             _drain_and_stop_on_infra_fault(cp, coordinator)
@@ -1721,11 +1868,33 @@ def _is_clip_rank(pod_job: PodJob) -> bool:
     return pod_job.type == "infer" and pod_job.request is not None and pod_job.request.kind == "clip_rank"
 
 
+def _is_judge_tiles(pod_job: PodJob) -> bool:
+    """Judge tiles are bytes in, JPEGs out — no weights, no card (main._run_infer)."""
+    req = pod_job.request
+    return req is not None and req.clip_rank is not None and req.clip_rank.judge_tiles is not None
+
+
+def _is_face_probe(pod_job: PodJob) -> bool:
+    """face_probe holds no card (infer_lanes.KIND_VRAM_MIB 0): it must never queue behind a weight-holding kind."""
+    return pod_job.type == "infer" and pod_job.request is not None and pod_job.request.kind == "face_probe"
+
+
+FACE_PROBE_LANE_WHY = """
+face_probe (yunet ONNX on the CPU, 0 MiB of card) rode the one-wide heavy lane behind person_matte's whole
+matte: 056 v13 r8 run.log — person_matte claimed at +319.7 s, face_probe claimed at +358.0 s and ran 0.044 s,
+head_segments 55 s on the preview's critical path. It gets its own one-wide lane here (a yunet instance is not
+shared across threads). The control plane admits face_probe under the `heavy` class credit too
+(the api's pod envelope class), so the wait ends only when that class moves; this lane is the
+pod's half and is a no-op until then.
+"""
+
+
 def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: Any, heavy: Any,
                    once: bool = False, coordinator: "RestartCoordinator | None" = None,
-                   kinds_coexist: bool = True) -> None:
+                   kinds_coexist: bool = True, probe_pool: Any = None) -> None:
     """Claim envelopes and hand them to a pool; `kinds_coexist=False` folds the rank lane onto the one-wide
-    heavy lane so the weight-holding kinds take turns (infer_lanes). `once` is the test seam — the production
+    heavy lane so the weight-holding kinds take turns (infer_lanes); face_probe takes `probe_pool` when given
+    (FACE_PROBE_LANE_WHY). `once` is the test seam — the production
     loop never returns on its own; a set restart or infra-fault latch is the one other way out, checked before
     each claim."""
     unhealthy_attempts = 0
@@ -1780,12 +1949,16 @@ def _dispatch_loop(cp: ControlPlane, ops_pool: Any, heavy_pool: Any, rank_pool: 
                 if coordinator is not None:
                     coordinator.track("ops", str(corr or raw_meta.get("job_id") or "?"), fut)
             else:
-                pool = rank_pool if (_is_clip_rank(pod_job) and kinds_coexist) else heavy_pool
+                if _is_clip_rank(pod_job) and kinds_coexist:
+                    pool, pool_name = rank_pool, "rank"
+                elif probe_pool is not None and _is_face_probe(pod_job):
+                    pool, pool_name = probe_pool, "probe"
+                else:
+                    pool, pool_name = heavy_pool, "heavy"
                 fut = pool.submit(_guarded,
                             lambda j=pod_job, m=raw_meta, q=queued_at:
                             _with_lifecycle(cp, m, q, lambda: heavy(j)), cp, raw_meta)
                 if coordinator is not None:
-                    pool_name = "rank" if pool is rank_pool else "heavy"
                     coordinator.track(pool_name, str(raw_meta.get("corr_id") or raw_meta.get("job_id") or "?"), fut)
             if once:
                 return

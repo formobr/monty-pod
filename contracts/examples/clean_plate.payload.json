@@ -1,0 +1,28 @@
+{
+  "model": "big_lama_torchscript",
+  "model_sha256": "344c77bbcb158f17dd143070d1e789f38a66c04202311ae3a258ef66667a9ea9",
+  "width": 720,
+  "height": 1280,
+  "plates": [
+    {
+      "id": "sd13-vertigo-1",
+      "bytes": 812345,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "samples": 12,
+      "covered": 0.62,
+      "inpainted": 0.38
+    }
+  ],
+  "timings": {
+    "decode_s": 0.41,
+    "median_s": 0.08,
+    "inpaint_s": 0.52,
+    "wall_s": 1.31
+  },
+  "refused": [
+    {
+      "id": "sd13-vertigo-2",
+      "reason": "81% of the frame is never uncovered in this window (limit 70%)"
+    }
+  ]
+}

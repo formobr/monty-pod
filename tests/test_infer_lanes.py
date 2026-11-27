@@ -37,10 +37,55 @@ class _CP:
 
 
 def test_the_dev_2060_cannot_hold_both_kinds_and_says_which_numbers_say_so():
-    """The measured wall: 3254 MiB free against align + clip_rank + encode session + reserve."""
+    """The measured wall: 3254 MiB free against 2736 clip_rank + 5089 heavy lane + 512 reserve + 960 encode session."""
     fits, why = m.kinds_fit_together(3254.0)
     assert fits is False
-    assert f"{m.coresident_mib():.0f}" in why and "3254" in why
+    assert "9297" in why and "3254" in why
+
+
+def test_the_056_oom_card_serialises_now():
+    """2026-10-22, 056 v13: 4835 MiB free passed the old 4748 floor and the lanes OOM'd. Measured (HEAVY_LANE_
+    MEASURED_WHY): align 1244 resident + 518 forward, RVM +1100 autotune / 228 resident, SigLIP 2322 + 414/lane."""
+    # + clean_plate (2026-10-24, measured +1276 over the idle card / 204 resident): the lane's transient is the largest of
+    # align's forward, RVM's autotune, the plate's peak — each with the OTHER kinds' cached weights beside it
+    # + cutout (PLACEHOLDER bench figures, 2670 peak / 996 resident, until the traced .pt is re-measured in the pod image)
+    # + screen_quad (PLACEHOLDERS 1650 peak / 737 resident, «re-measure in the pod image»)
+    assert m.heavy_lane_mib() == 1244.0 + max(518.0 + 228.0 + 210.0 + 996.0 + 737.0, 1100.0 + 210.0 + 996.0 + 737.0,
+                                              1300.0 + 228.0 + 996.0 + 737.0, 2670.0 + 228.0 + 210.0 + 737.0,
+                                              1650.0 + 228.0 + 210.0 + 996.0) == 5089.0
+    assert m.coresident_mib() == 2736.0 + 5089.0 + 512.0 + NVENC_SESSION_MIB == 9297.0
+    # the kinds the lane held before cutout keep their numbers when cutout / screen_quad are not served
+    served_before = {"align", "person_matte", "clean_plate", "clip_rank"}
+    assert m.heavy_lane_mib(served_before) == 1244.0 + max(518.0 + 228.0 + 210.0, 1100.0 + 210.0, 1300.0 + 228.0) == 2772.0
+    # cutout alone beside clip_rank: its peak; with align, align's resident + the larger transient
+    assert m.heavy_lane_mib({"cutout", "clip_rank"}) == 2670.0
+    assert m.heavy_lane_mib({"align", "cutout"}) == 1244.0 + max(518.0 + 996.0, 2670.0) == 3914.0
+    # screen_quad alone beside clip_rank: its peak; with align, align's resident + the larger transient
+    assert m.heavy_lane_mib({"screen_quad", "clip_rank"}) == 1650.0
+    assert m.heavy_lane_mib({"align", "screen_quad"}) == 1244.0 + max(518.0 + 737.0, 1650.0) == 2894.0
+    assert m.kinds_fit_together(4835.0)[0] is False
+    # without person_matte the heavy lane is align alone: 1762
+    assert m.heavy_lane_mib({"align", "clip_rank"}) == 1762.0
+    assert m.kinds_fit_together(4835.0, {"align", "clip_rank"})[0] is False
+    # person_matte alone beside clip_rank: its autotune peak
+    assert m.heavy_lane_mib({"person_matte", "clip_rank"}) == 1100.0
+    # clean_plate alone beside clip_rank: its measured peak; with align, align's resident + the larger transient
+    assert m.heavy_lane_mib({"clean_plate", "clip_rank"}) == 1300.0
+    assert m.heavy_lane_mib({"align", "clean_plate"}) == 1244.0 + max(518.0 + 210.0, 1300.0) == 2544.0
+
+
+def test_rank_lanes_are_sized_with_the_heavy_lane_beside_them():
+    from podagent import infer_cliprank as ic
+    # the OOM: 4835 free sized as if alone → 4 lanes; with the heavy lane held beside, the budget is gone → 1
+    assert ic._width_from(4835.0, 12)[0] == 4
+    assert ic._width_from(4835.0, 12, m.heavy_lane_mib())[0] == 1
+    # kinds taking turns still leave one NVENC render session (RENDER_HEADROOM_MIB 960, the boot floor's figure):
+    # (4835 − 512 − 2322 − 960) // 414 = 2 lanes; measured 2 lanes alone = 2322 + 726 MiB, + 960 = 4008 < 4323
+    assert m.RENDER_HEADROOM_MIB == 960.0
+    assert ic._width_from(4835.0, 12, m.RENDER_HEADROOM_MIB)[0] == 2
+    # a fleet card (min 14848): (14848 − 512 − 2322 − 5089) // 414 = 16 → host-bound
+    n, why = ic._width_from(14848.0, 16, m.heavy_lane_mib(), "heavy lane")
+    assert n == 16 and "− 5089 heavy lane" in why
 
 
 def test_a_6gb_card_with_desktop_apps_serves_one_kind_at_a_time():
@@ -49,7 +94,7 @@ def test_a_6gb_card_with_desktop_apps_serves_one_kind_at_a_time():
     fits, why = m.kinds_fit_together(5694.0)
     assert fits is False
     assert "encode session" in why
-    assert m.coresident_mib() == (m.KIND_VRAM_MIB["align"] + m.KIND_VRAM_MIB["clip_rank"]
+    assert m.coresident_mib() == (m.KIND_VRAM_MIB["clip_rank"] + m.heavy_lane_mib()
                                   + m.RESERVE_MIB + NVENC_SESSION_MIB)
 
 
@@ -83,6 +128,16 @@ def test_only_the_other_kinds_weights_are_dropped():
     assert m.release_other_kinds("clip_rank", {"align": align, "clip_rank": rank}) == ["align"]
     assert align == {} and list(rank) == ["sha-r"]
     assert m.release_other_kinds("clip_rank", {"align": align, "clip_rank": rank}) == []
+
+
+def test_an_object_mask_job_keeps_the_screen_quad_pair():
+    """object_mask runs on screen_quad's cached pair: it drops nobody's weights but the others', and is sized as screen_quad, once."""
+    sq, cutout = {"sha-s": object()}, {"sha-c": object()}
+    assert m.release_other_kinds("object_mask", {"screen_quad": sq, "cutout": cutout}) == ["cutout"]
+    assert list(sq) == ["sha-s"] and cutout == {}
+    assert "object_mask" in m.HEAVY_KINDS
+    assert m.heavy_lane_mib() == 5089.0
+    assert m.coresident_mib() == 9297.0
 
 
 def _pump(cp, ops_pool, heavy_pool, rank_pool, heavy, n, **kw):
@@ -119,3 +174,97 @@ def test_a_fleet_card_still_routes_clip_rank_to_its_own_lane():
             cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="rank") as rank:
         _pump(cp, ops, gpu, rank, heavy, 2, kinds_coexist=True)
     assert sorted(lanes) == ["gpu", "rank"], f"today's routing changed: {lanes}"
+
+
+_PROBE_REQ = {"infer_version": 7, "job_id": "j", "kind": "face_probe", "model": "yunet",
+              "put_url": "https://x/o/p.json",
+              "face_probe": {"video_url": "https://x/v.mp4", "shots": [[0.0, 1.0]], "stride": 1,
+                             "frame_diff": False}}
+
+
+def test_face_probe_never_queues_behind_a_weight_holding_kind():
+    """guards FACE_PROBE_LANE_WHY (056 v13 r8: face_probe claimed 38 s after person_matte, ran 0.044 s, on the
+    preview's critical path): a CPU probe claimed while the one-wide heavy lane is busy runs on its own lane."""
+    lanes: list[str] = []
+    busy = threading.Event()
+
+    def heavy(job):
+        lanes.append(threading.current_thread().name.split("_")[0])
+        if job.request.kind == "align":
+            assert busy.wait(timeout=5), "the probe never ran beside the busy heavy lane"
+        else:
+            busy.set()
+
+    cp = _CP([{"type": "infer", "session_id": "s", "corr_id": "a", "request": _ALIGN_REQ},
+              {"type": "infer", "session_id": "s", "corr_id": "p", "request": _PROBE_REQ}])
+    with cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ops") as ops, \
+            cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu") as gpu, \
+            cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="rank") as rank, \
+            cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe") as probe:
+        _pump(cp, ops, gpu, rank, heavy, 2, kinds_coexist=False, probe_pool=probe)
+    assert sorted(lanes) == ["gpu", "probe"], f"face_probe shared the heavy lane: {lanes}"
+
+
+def test_face_probe_drops_no_resident_weights_on_a_turn_taking_card(monkeypatch):
+    """guards INFER_KIND_RESIDENCY_WHY's own scope: only a kind that LOADS onto the card may drop the idle one —
+    a face_probe (0 MiB) on the 2060 used to throw SigLIP off the card for nothing, and the next rank reloaded it."""
+    import sys
+    import types
+    from pathlib import Path
+
+    class _Probe:
+        def __init__(self, *_a):
+            pass
+
+        def run(self, *_a):
+            return 0.01
+
+    class _ResultCP(_CP):
+        def report_infer_result(self, result):
+            self.events.append({"result": result})
+
+    # a stand-in module: the real one imports cv2, which the handler under test never needs here
+    fake = types.ModuleType("podagent.infer_probe")
+    fake.ProbeService = _Probe
+    monkeypatch.setitem(sys.modules, "podagent.infer_probe", fake)
+    rank = {"sha-r": object()}
+    cp = _ResultCP([])
+    agent_main._run_infer(dict(_PROBE_REQ), cp, {}, {}, rank, Path("/opt/models/yunet.onnx"), True,
+                          corr_id="p", session_id="s", one_kind_resident=True)
+    assert any("result" in e for e in cp.events), "the probe never reported — the test proves nothing"
+    assert list(rank) == ["sha-r"], "a face_probe dropped SigLIP's weights"
+
+
+def test_on_a_turn_taking_card_the_encode_takes_the_card_alone(monkeypatch):
+    """guards CARD_TURNS_WHY (056 v13 r8: SigLIP resident through cut.apply, ledger grant 1768 MiB → 1 NVENC
+    session, apply_cut 99 s): an admitted heavy op on a turn-taking card drops the idle infer weights and is
+    granted the card as it is NOW; a weight-holding infer queues in the same ledger; a fleet card is untouched."""
+    from podagent.ops import gpu_admission
+
+    gpu_admission._reset_for_tests(1768.0)                # the budget the first heavy op of the pod's life saw
+    monkeypatch.setattr(gpu_admission, "_free_vram_mb", lambda: 4100.0)   # the card with SigLIP gone
+    rank, align = {"sha-r": object()}, {}
+    try:
+        m.arm_card_turns(False, {"align": align, "clip_rank": rank})      # a fleet card: kinds coexist
+        assert not m.takes_card_turn("clip_rank")
+        with gpu_admission.admission("cut.apply"):
+            assert m.clear_card_for_render() == [] and list(rank) == ["sha-r"]
+            assert gpu_admission.budget_mib() == 1768.0
+
+        m.arm_card_turns(True, {"align": align, "clip_rank": rank})
+        assert m.takes_card_turn("clip_rank") and m.takes_card_turn("person_matte")
+        assert not m.takes_card_turn("face_probe")         # no card, no turn
+        with gpu_admission.admission("cut.apply"):
+            assert m.clear_card_for_render() == ["clip_rank"] and rank == {}
+            assert gpu_admission.budget_mib() == 4100.0 - gpu_admission._VRAM_RESERVE_MB
+            # a weight-holding infer that arrives now waits in the same FIFO for the whole card
+            parked = threading.Event()
+            t = threading.Thread(target=lambda: gpu_admission.admission(
+                "infer.clip_rank", deadline_s=5.0, on_park=lambda **_k: parked.set()).__enter__())
+            t.start()
+            assert parked.wait(timeout=5), "the infer ran beside the encode"
+        t.join(timeout=5)
+        assert not t.is_alive()
+    finally:
+        m.arm_card_turns(False, {})
+        gpu_admission._reset_for_tests()

@@ -79,7 +79,11 @@ COPY docker/10_nvidia.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 FROM base AS pydeps
 COPY constraints.txt /tmp/constraints.txt
 RUN set -eux; \
-    python3 -m pip install --no-cache-dir -c /tmp/constraints.txt torch torchaudio --index-url https://download.pytorch.org/whl/cu128; \
+    python3 -m pip install --no-cache-dir -c /tmp/constraints.txt torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu128; \
+    # torchvision rides THIS line (cu128 index, same pin family as torch) and never the PyPI line below: a PyPI wheel is not the cu128
+    # build torch is. It is here for the `torchvision::deform_conv2d` TorchScript op BiRefNet (the cutout kind) is traced
+    # with (docs/research/pod-cutout-birefnet.md); podagent/infer_cutout.py imports it before torch.jit.load — and for Sam2's image
+    # processor (Sam2ImageProcessorFast: batched_nms, resize), which the screen_quad kind loads (docs/research/pod-screen-quad.md).
     # soundfile: torchaudio 2.x has no bundled decoder — wav I/O needs a backend
     # transformers PINNED here (not just pyproject): the app is installed `--no-deps` below, so the
     # pyproject `transformers==4.57.6` pin never applied — this line is the EFFECTIVE pin. An unpinned
@@ -171,6 +175,27 @@ RUN mkdir -p /opt/models \
     && curl -L -o /opt/models/yunet.onnx \
         https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
 ENV MODEL_YUNET=/opt/models/yunet.onnx
+
+# RVM mobilenetv3 fp16 TorchScript (person_matte) STAYS baked for the same reason: 7.9 MB, the upstream's own
+# scripted export (why the image has torchvision: see the comment at the torch install above; the upstream's scripted export needs no model source). Pinned by sha256 here
+# AND in podagent/infer_matte.py, which refuses any other bytes. GPL-3.0 — owner decision 2026-10-22
+# (the engine's person-matte research receipt).
+RUN curl -fL -o /opt/models/rvm_mobilenetv3_fp16.torchscript \
+        https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp16.torchscript \
+    && echo "847a8b5139498afbf7abde9cc347b41030540f6498db593a0e3d9dde1eccdd96  /opt/models/rvm_mobilenetv3_fp16.torchscript" \
+        | sha256sum -c -
+ENV MODEL_RVM=/opt/models/rvm_mobilenetv3_fp16.torchscript
+
+# big-lama TorchScript (clean_plate, super-director v13 vertigo class) STAYS baked too: 206 MB, the TorchScript export of the
+# original advimman/lama «big-lama» checkpoint (Apache-2.0; weights card huggingface.co/smartywu/big-lama), loaded by the
+# same torch.jit path as RVM — no new runtime in the image. Pinned by sha256 here (the build FAILS on a mismatch) AND in
+# podagent/infer_plate.py, which reads the file once, checks it and hands torch.jit.load those very bytes. The sha256 is our own
+# measurement of the release asset; IOPaint's independent md5 e3aa4aaa15225a33ec84f9f4bc47e500 agrees (the clean-plate research receipt).
+RUN curl -fL -o /opt/models/big-lama.pt \
+        https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt \
+    && echo "344c77bbcb158f17dd143070d1e789f38a66c04202311ae3a258ef66667a9ea9  /opt/models/big-lama.pt" \
+        | sha256sum -c -
+ENV MODEL_LAMA=/opt/models/big-lama.pt
 
 # --- Montserrat (cover/caption rendering) -----------------------------------
 RUN mkdir -p /usr/share/fonts/truetype/montserrat \

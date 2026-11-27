@@ -2,44 +2,96 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "monty-pod/contracts/infer_request.schema.json",
   "title": "InferRequest — planner→pod inference task (CP-mediated; the pod polls, nothing dials in)",
-  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.words (owner decision 2026-11-01): then the align words cross, the pod runs the CTC forced alignment itself and PUTs per-word frame spans as JSON (align_spans.schema.json) instead — still no decision crosses, and seconds stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction.",
+  "description": "One BATCHED call per kind, never per-segment. align: the pod runs a pure wav2vec2 forward over the given windows and PUTs the emission log-softmax matrices (npz, layout in README) — post-processing stays on the planner, no text crosses; EXCEPT with align.words (owner decision 2026-11-01): then the align words cross, the pod runs the CTC forced alignment itself and PUTs per-word frame spans as JSON (align_spans.schema.json) instead — still no decision crosses, and seconds stay on the planner. face_probe: the pod runs YuNet over sampled frames of the given shots and PUTs raw boxes (+frame_diff) as JSON (face_probe.schema.json) — decisions stay on the planner. clip_rank: the pod runs both SigLIP towers over many (intent, images) groups and PUTs cosines + L2-normalized image embeddings as JSON (clip_rank.schema.json) — the reorder, the relevance floor and the MMR dedup stay on the planner, so no threshold appears here by construction. person_matte: the pod runs RVM (mobilenetv3, fp16 TorchScript baked in the image) over ONE whole video and PUTs the requested outputs to their own presigned URLs (alpha: lossless gray FFV1 Matroska; cutout: the input's pixels under the alpha as VP9-alpha yuva420p WebM) plus a receipt JSON (person_matte.schema.json) to put_url; the downsample_ratio is resolved by the planner. clean_plate (super-director v13 vertigo class): the pod makes the background of ONE video without the person, one PNG per window — a per-pixel temporal median over the frames sampled in the window with the person (the matte person_matte already produced for the SAME video, alpha above person_alpha grown by dilate_px) excluded, then LaMa (big-lama TorchScript baked in the image, CUDA only) for the pixels never uncovered — and PUTs each PNG to its own presigned URL plus a receipt JSON (clean_plate.schema.json) to put_url; every number is resolved by the planner (the engine's clean-plate registry entry). cutout: the pod cuts the subject out of each of a batch of pictures with BiRefNet_dynamic (traced TorchScript fp16 at 1024 from the weights tar, CUDA only) and PUTs one RGBA PNG per item to its own presigned URL plus a receipt JSON (cutout.schema.json) to put_url; an item the pod will not or need not cut is named in the receipt (already_cut / empty_cut / no_separation), never silently passed through. screen_quad: the pod finds the 4 corners of a named device's screen (phone / tablet / laptop / monitor / tv) in each of a batch of pictures — Florence-2 phrase grounding, SAM 2.1 box mask, an opencv quad fit, both models from the weights tar, CUDA only — and PUTs one receipt JSON (screen_quad.schema.json) to put_url; a picture with no screen is named `none` with its reasons, an unreadable one `unreadable`, never a fallback. object_mask: the pod cuts the object a caller's English noun phrase names out of each of a batch of pictures on screen_quad's weights (Florence-2 phrase grounding, SAM 2.1 mask) and PUTs per item an RGBA PNG to cut_url (and a grey mask PNG to mask_url when given) plus a receipt JSON to put_url; a picture without that object is named `none` with its reasons.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["infer_version", "job_id", "kind", "model", "put_url"],
+  "required": [
+    "infer_version",
+    "job_id",
+    "kind",
+    "model",
+    "put_url"
+  ],
   "properties": {
-    "infer_version": { "const": 7 },
-    "job_id": { "type": "string", "minLength": 1 },
-    "kind": { "enum": ["align", "face_probe", "clip_rank"] },
-    "model": { "type": "string", "minLength": 1 },
-    "put_url": { "type": "string", "minLength": 1 },
+    "infer_version": {
+      "const": 7
+    },
+    "job_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "enum": [
+        "align",
+        "face_probe",
+        "clip_rank",
+        "person_matte",
+        "clean_plate",
+        "cutout",
+        "screen_quad",
+        "object_mask"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "put_url": {
+      "type": "string",
+      "minLength": 1
+    },
     "weights": {
-      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align and clip_rank; forbidden on face_probe, whose 227 KB YuNet stays in the image.",
+      "description": "Where the pod gets this job's checkpoint — NOTHING heavy is baked into the image. A presigned GET for a tar of the model directory, plus that tar's sha256, which is BOTH the integrity check and the pod's cache key (so a revised checkpoint can never be served from a stale cache entry). REQUIRED for align, clip_rank, cutout (BiRefNet traced to TorchScript, with its config.json manifest) screen_quad (two HF snapshot dirs florence/ and sam/ with a config.json manifest) and object_mask (the same tar as screen_quad); forbidden on face_probe, person_matte and clean_plate, whose YuNet (227 KB), RVM (7.9 MB) and big-lama (206 MB) stay in the image.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["url", "sha256"],
+      "required": [
+        "url",
+        "sha256"
+      ],
       "properties": {
-        "url": { "type": "string", "minLength": 1 },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "size": { "description": "Expected tar size in bytes; a mismatch fails the fetch.", "type": "integer", "minimum": 1 }
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "description": "Expected tar size in bytes; a mismatch fails the fetch.",
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "align": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["audio_url", "windows"],
+      "required": [
+        "audio_url",
+        "windows"
+      ],
       "properties": {
-        "audio_url": { "type": "string", "minLength": 1 },
+        "audio_url": {
+          "type": "string",
+          "minLength": 1
+        },
         "windows": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/span" }
+          "items": {
+            "$ref": "#/$defs/span"
+          }
         },
         "keep_ids": {
           "description": "OPTIONAL column projection for the returned emissions: the sorted, de-duplicated set of vocab indices the caller's CTC forced alignment will read (its target ids plus blank). Present → the pod PUTs emissions_<i> with exactly these columns, in this order, and echoes keep_ids in the npz meta; absent → the full vocab width, byte-identical to before. It is an ALPHABET, not text: no word, no order and no count crosses with it, and nothing here decides anything — the alignment itself stays on the planner.",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "type": "integer", "minimum": 0 }
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
         },
         "words": {
           "description": "OPTIONAL words mode: the align words, in order. Present → the pod maps each word's characters to its own checkpoint's vocab ids (blank = the tokenizer's pad id; the vocab never leaves the pod), runs the same forward, concatenates the windows along frames and runs the CTC forced alignment itself (CPU, float32), PUTting per-word frame spans as JSON (align_spans.schema.json) instead of an npz. Mutually exclusive with keep_ids. The words cross here by owner decision 2026-11-01; no decision does.",
@@ -53,26 +105,63 @@
     "face_probe": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["video_url", "shots", "stride", "frame_diff"],
+      "required": [
+        "video_url",
+        "shots",
+        "stride",
+        "frame_diff"
+      ],
       "properties": {
-        "video_url": { "type": "string", "minLength": 1 },
+        "video_url": {
+          "type": "string",
+          "minLength": 1
+        },
         "shots": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/span" }
+          "items": {
+            "$ref": "#/$defs/span"
+          }
         },
-        "stride": { "type": "integer", "minimum": 1 },
-        "frame_diff": { "type": "boolean" }
+        "stride": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "frame_diff": {
+          "type": "boolean"
+        }
       }
     },
     "clip_rank": {
       "description": "MANY groups per call: a montage scores many candidates across many beats, and one round trip per beat would dominate the wall clock. A request is EITHER a rank (>=1 group, no judge_tiles) OR a judge-tiles request (groups == [] and >=1 judge tile); groups stays required.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["groups"],
+      "required": [
+        "groups"
+      ],
       "oneOf": [
-        { "properties": { "groups": { "minItems": 1 } }, "not": { "required": ["judge_tiles"] } },
-        { "properties": { "groups": { "maxItems": 0 } }, "required": ["judge_tiles"] }
+        {
+          "properties": {
+            "groups": {
+              "minItems": 1
+            }
+          },
+          "not": {
+            "required": [
+              "judge_tiles"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "groups": {
+              "maxItems": 0
+            }
+          },
+          "required": [
+            "judge_tiles"
+          ]
+        }
       ],
       "properties": {
         "judge_tiles": {
@@ -82,10 +171,19 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["origin_url", "put_url"],
+            "required": [
+              "origin_url",
+              "put_url"
+            ],
             "properties": {
-              "origin_url": { "type": "string", "minLength": 1 },
-              "put_url": { "type": "string", "minLength": 1 }
+              "origin_url": {
+                "type": "string",
+                "minLength": 1
+              },
+              "put_url": {
+                "type": "string",
+                "minLength": 1
+              }
             }
           }
         },
@@ -94,10 +192,39 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["intent"],
+            "required": [
+              "intent"
+            ],
             "oneOf": [
-              { "required": ["image_urls"], "not": { "required": ["origin_urls"] } },
-              { "required": ["origin_urls"], "not": { "anyOf": [{ "required": ["image_urls"] }, { "required": ["image_cells"] }] } }
+              {
+                "required": [
+                  "image_urls"
+                ],
+                "not": {
+                  "required": [
+                    "origin_urls"
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "origin_urls"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "image_urls"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "image_cells"
+                      ]
+                    }
+                  ]
+                }
+              }
             ],
             "properties": {
               "intent": {
@@ -108,31 +235,360 @@
                 "description": "Presigned GETs, fetched under the presigned-only rule. A group carries exactly one of image_urls or origin_urls.",
                 "type": "array",
                 "minItems": 1,
-                "items": { "type": "string", "minLength": 1 }
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
               },
               "origin_urls": {
                 "description": "Stock-provider ORIGIN thumbnail URLs the pod fetches itself (MISC-333). A group carries exactly one of image_urls or origin_urls; image_cells are not allowed with origin_urls.",
                 "type": "array",
                 "minItems": 1,
-                "items": { "type": "string", "minLength": 1 }
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
               },
               "image_cells": {
                 "description": "Optional crop per image_urls item: [x,y,width,height,sheet_width,sheet_height]. Only with image_urls.",
                 "type": "array",
                 "items": {
                   "anyOf": [
-                    { "type": "null" },
-                    { "type": "array", "minItems": 6, "maxItems": 6,
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": "array",
+                      "minItems": 6,
+                      "maxItems": 6,
                       "prefixItems": [
-                        { "type": "integer", "minimum": 0 },
-                        { "type": "integer", "minimum": 0 },
-                        { "type": "integer", "minimum": 1 },
-                        { "type": "integer", "minimum": 1 },
-                        { "type": "integer", "minimum": 1 },
-                        { "type": "integer", "minimum": 1 }
-                      ] }
+                        {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      ]
+                    }
                   ]
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "person_matte": {
+      "description": "ONE video, whole: RVM is recurrent, so its state runs frame to frame from the first frame (reset per request). At least one output URL.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "video_url",
+        "downsample_ratio"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "alpha_put_url"
+          ]
+        },
+        {
+          "required": [
+            "cutout_put_url"
+          ]
+        }
+      ],
+      "properties": {
+        "video_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "downsample_ratio": {
+          "description": "RVM's first-stage resize, resolved by the planner (480 / longest side above 512 px, else 1).",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "alpha_put_url": {
+          "description": "FINAL tier: PUT target of the alpha, gray FFV1 Matroska, frame-for-frame with the input.",
+          "type": "string",
+          "minLength": 1
+        },
+        "cutout_put_url": {
+          "description": "PREVIEW tier: PUT target of the input's pixels under the alpha, VP9-alpha (yuva420p) WebM, no audio.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "clean_plate": {
+      "description": "ONE video, one plate per window. The matte is the person_matte output of the SAME video (cutout WebM: its alpha plane; alpha Matroska: the gray stream). Every number is the planner's.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "video_url",
+        "matte_url",
+        "matte_kind",
+        "windows",
+        "samples",
+        "person_alpha",
+        "dilate_px",
+        "min_visible",
+        "stable_range",
+        "inpaint_long_side",
+        "max_hole_fraction"
+      ],
+      "properties": {
+        "video_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "matte_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "matte_kind": {
+          "enum": [
+            "cutout",
+            "alpha"
+          ]
+        },
+        "windows": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "t0",
+              "t1",
+              "put_url"
+            ],
+            "properties": {
+              "id": {
+                "description": "the sd layer id; the engine reads the plate back by it",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "t0": {
+                "type": "number",
+                "minimum": 0
+              },
+              "t1": {
+                "description": "seconds on the video's own clock; t0 < t1 (a cross-field rule the model enforces)",
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "put_url": {
+                "description": "PUT target of this window's plate PNG",
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "samples": {
+          "description": "frames sampled per window, evenly spread",
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 48
+        },
+        "person_alpha": {
+          "description": "a pixel whose matte alpha is above this (0..255) is the person",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 254
+        },
+        "dilate_px": {
+          "description": "the person silhouette grows by this many pixels before it is excluded",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
+        "min_visible": {
+          "description": "a pixel seen as background in fewer samples than this is a hole (cannot exceed samples)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 48
+        },
+        "stable_range": {
+          "description": "the largest channel range (max - min, 0..255) the samples where a pixel was background may have; a larger spread means the person's edge leaked into them, so the pixel is a hole",
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 255
+        },
+        "inpaint_long_side": {
+          "description": "LaMa works at most this big; its output is upsampled into the hole only",
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 2048
+        },
+        "max_hole_fraction": {
+          "description": "a window whose hole is a larger share of the frame is refused, never hallucinated",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "cutout": {
+      "description": "A batch of pictures to cut: per item the pod fetches src_url, cuts the subject out with BiRefNet (the traced TorchScript in the weights tar, CUDA only) and PUTs an RGBA PNG to out_url; the per-item outcome (cut / already_cut / empty_cut / no_separation) is in the receipt (cutout.schema.json) at put_url.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "src_url",
+              "out_url"
+            ],
+            "properties": {
+              "id": {
+                "description": "the caller's key for this picture; unique within the request",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "src_url": {
+                "description": "presigned GET of the source picture",
+                "type": "string",
+                "minLength": 1
+              },
+              "out_url": {
+                "description": "presigned PUT of the RGBA PNG",
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "screen_quad": {
+      "description": "A batch of pictures whose device screen to find: per item the pod fetches src_url and finds the 4 corners of the named device's screen (Florence-2 phrase grounding with the device phrases of podagent/infer_screen_quad.py SCREEN_PHRASES, tried in order -> SAM 2.1 box mask -> opencv quad fit; both models from the weights tar, CUDA only). Nothing but the receipt (screen_quad.schema.json) is PUT, to put_url; an item with no screen is named `none` with its reasons.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "src_url",
+              "device"
+            ],
+            "properties": {
+              "id": {
+                "description": "the caller's key for this picture; unique within the request",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "src_url": {
+                "description": "presigned GET of the source picture",
+                "type": "string",
+                "minLength": 1
+              },
+              "mask_url": {
+                "description": "optional presigned PUT of the glass mask: an 8-bit grey PNG of the picture's size, 255 inside the glass, 0 outside; put only when a glass was found",
+                "type": "string",
+                "minLength": 1
+              },
+              "device": {
+                "description": "the device whose screen to find; a closed enum, never free text",
+                "enum": [
+                  "phone",
+                  "tablet",
+                  "laptop",
+                  "monitor",
+                  "tv"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "object_mask": {
+      "description": "A batch of pictures whose named object to cut out: per item the pod fetches src_url, grounds the caller's English noun phrase (Florence-2 phrase grounding, the same task as screen_quad) and cuts the object out with SAM 2.1 — screen_quad's weights, no new download, CUDA only. It PUTs to cut_url an RGBA PNG of the picture's size (the picture's pixels, alpha 255 inside the mask, 0 outside) and, when mask_url is given, the 8-bit grey mask PNG; the receipt (object_mask.schema.json rows) goes to put_url. An item with no such object is named `none` with its reasons, nothing PUT for it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "src_url",
+              "phrase",
+              "cut_url"
+            ],
+            "properties": {
+              "id": {
+                "description": "the caller's key for this picture; unique within the request",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+              },
+              "src_url": {
+                "description": "presigned GET of the source picture",
+                "type": "string",
+                "minLength": 1
+              },
+              "phrase": {
+                "description": "the English noun phrase to cut out, 1..80 characters: letters, digits, spaces, hyphen",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9 -]{1,80}$"
+              },
+              "cut_url": {
+                "description": "presigned PUT of the RGBA PNG (the picture's size; alpha 255 inside the object, 0 outside); put only for a found item",
+                "type": "string",
+                "minLength": 1
+              },
+              "mask_url": {
+                "description": "optional presigned PUT of the mask: an 8-bit grey PNG of the picture's size, 255 inside the object, 0 outside; put only for a found item",
+                "type": "string",
+                "minLength": 1
               }
             }
           }
@@ -142,16 +598,472 @@
   },
   "allOf": [
     {
-      "if": { "properties": { "kind": { "const": "align" } }, "required": ["kind"] },
-      "then": { "required": ["align", "weights"], "not": { "anyOf": [{ "required": ["face_probe"] }, { "required": ["clip_rank"] }] } }
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "align"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "align",
+          "weights"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
     },
     {
-      "if": { "properties": { "kind": { "const": "face_probe" } }, "required": ["kind"] },
-      "then": { "required": ["face_probe"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["clip_rank"] }, { "required": ["weights"] }] } }
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "face_probe"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "face_probe"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "weights"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
     },
     {
-      "if": { "properties": { "kind": { "const": "clip_rank" } }, "required": ["kind"] },
-      "then": { "required": ["clip_rank", "weights"], "not": { "anyOf": [{ "required": ["align"] }, { "required": ["face_probe"] }] } }
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "clip_rank"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "clip_rank",
+          "weights"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "person_matte"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "person_matte"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "weights"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "clean_plate"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "clean_plate"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "weights"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "cutout"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "cutout",
+          "weights"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "screen_quad"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "screen_quad",
+          "weights"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "object_mask"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "object_mask"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "object_mask",
+          "weights"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "align"
+              ]
+            },
+            {
+              "required": [
+                "face_probe"
+              ]
+            },
+            {
+              "required": [
+                "clip_rank"
+              ]
+            },
+            {
+              "required": [
+                "person_matte"
+              ]
+            },
+            {
+              "required": [
+                "clean_plate"
+              ]
+            },
+            {
+              "required": [
+                "cutout"
+              ]
+            },
+            {
+              "required": [
+                "screen_quad"
+              ]
+            }
+          ]
+        }
+      }
     }
   ],
   "$defs": {
@@ -160,7 +1072,10 @@
       "type": "array",
       "minItems": 2,
       "maxItems": 2,
-      "items": { "type": "number", "minimum": 0 }
+      "items": {
+        "type": "number",
+        "minimum": 0
+      }
     }
   }
 }

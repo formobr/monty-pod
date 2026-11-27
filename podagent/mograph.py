@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections import namedtuple
 from pathlib import Path
 
@@ -18,7 +19,11 @@ from . import frames as _frames
 
 FPS = 30
 _BT709 = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
-_STAGE_PREFIX = "mograph/"  # input id `mograph/<rel>` → staged into <bundle>/<rel> (public/ fonts+media, src/ bespoke)
+# qtrle alpha format. `ffmpeg -h encoder=qtrle` lists «Supported pixel formats: rgb24 rgb555be argb gray»; without an
+# explicit format ffmpeg takes it from the first PNG, so a layer whose first frame is opaque (RGB → rgb24) packs
+# every later transparent pixel as opaque black.
+_QTRLE_PIX_FMT = ["-pix_fmt", "argb"]
+_STAGE_PREFIX ="mograph/"  # input id `mograph/<rel>` → staged into <bundle>/<rel> (public/ fonts+media, src/ bespoke)
 
 # HEAD BELOW (any media riding over a slid-down head): the live head slides DOWN so its face clears the top-band
 # picture/video, reversing at the beat end. Closed form of MontagePreview.headSettle (GLIDE spring) → master == preview.
@@ -198,10 +203,98 @@ def _box_facts(oom_before: int | None, conc: int, cache: int, tmp: Path) -> str:
 _BATCH_WALL_S = 900  # bundle + every comp; each comp is already ceilinged by maxSeconds inside the batch
 
 
+def _items_log(spec_path: Path) -> Path:
+    return spec_path.with_suffix(".items.jsonl")
+
+
+def read_item_log(path: Path) -> list[dict]:
+    """render_batch.mjs's per-item lines ({tag, comp, start} then {tag, comp, ok, frames, s, …}); absent = []."""
+    if not path.is_file():
+        return []
+    out = []
+    for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            continue
+    return out
+
+
+def item_progress(items: list, rows: list[dict]) -> str:
+    """Which TAGGED item (a v13 layer) the batch finished, failed, or still had in flight — the names a wall must carry."""
+    done = {r["tag"]: r for r in rows if "ok" in r}
+    started = [r["tag"] for r in rows if r.get("start")]
+    in_flight = [t for t in started if t not in done]
+    parts = [f"in flight: {', '.join(in_flight)}" if in_flight else ""]
+    bad = [f"{t} ({r.get('error') or 'failed'})" for t, r in done.items() if not r.get("ok")]
+    if bad:
+        parts.append(f"failed: {'; '.join(bad)}")
+    tagged = [it["tag"] for it in items if it.get("tag")]
+    never = [t for t in tagged if t not in started]
+    if never:
+        parts.append(f"not reached: {len(never)} layer(s)")
+    if done:
+        parts.append(f"done: {sum(1 for r in done.values() if r.get('ok'))}")
+    return " · ".join(p for p in parts if p)
+
+
+BESPOKE_PARALLEL_WHY = """
+EACH BESPOKE COMP IS ITS OWN ENTRY, SO ITS OWN WEBPACK BUNDLE — AND WEBPACK IS ONE CORE.
+
+r4c final (pm2 pod-pool log, 2026-10-22): after the catalog batch, three Bespoke batches ran back to back,
+each `bundled ONCE in 21.7-23.9s` then rendered ~9 s — 97 s of the mograph arm, ~70 s of it single-threaded
+bundling on a 12-core box. Measured on the dev box (cold webpack cache, the pod's state): the three entries
+bundle in 70.8 s one after another, 76.0 s as concurrent bundle() calls in ONE node process (no gain — the
+compile is JS on one event loop), and 36.5 s as three node processes side by side.
+
+So the Bespoke batches run as concurrent render_batch processes AFTER the catalog batch (never beside it: that
+batch already holds every tab the box can afford). The Chrome tab budget is SPLIT between them, so the box
+holds no more tabs than one batch did. Every comp still gets its own entry, its own bundle and its own seqdir;
+`concurrency` only decides how many frames render at once, never what a frame is — the PNGs are the same.
+"""
+_BESPOKE_PARALLEL_MAX = 3
+_TABS = threading.local()   # a bespoke worker's share of the tab budget; unset = the whole budget
+
+
+def _batch_concurrency() -> int:
+    share = getattr(_TABS, "share", None)
+    return share if share is not None else _render_concurrency()
+
+
+def _run_bespoke(rd: Path, bespoke: list, tmp: Path) -> None:
+    """Every (entry, item, meta) of `bespoke` through its own render_batch, up to _BESPOKE_PARALLEL_MAX at
+    once (BESPOKE_PARALLEL_WHY). All land before this returns; the FIRST failure in plan order is re-raised."""
+    if not bespoke:
+        return
+    width = min(len(bespoke), _BESPOKE_PARALLEL_MAX)
+    if width == 1:
+        for n, (entry, item, _meta) in enumerate(bespoke):
+            _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
+        return
+    share = max(2, _render_concurrency() // width)
+
+    def one(n: int) -> None:
+        entry, item, _meta = bespoke[n]
+        _TABS.share = share
+        try:
+            _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
+        finally:
+            _TABS.share = None
+
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(max_workers=width, thread_name_prefix="bespoke") as ex:
+        futs = [ex.submit(one, n) for n in range(len(bespoke))]
+        cf.wait(futs)          # every batch lands (or fails) before anything is raised — no orphan node
+    for f in futs:
+        f.result()             # first fault in plan order wins
+
+
 def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) -> None:
-    conc = _render_concurrency()
+    conc = _batch_concurrency()
     cache = _offthread_cache_bytes()
-    body = {"concurrency": conc, "offthreadVideoCacheSizeInBytes": cache, "items": items}
+    log = _items_log(spec_path)
+    log.unlink(missing_ok=True)
+    body = {"concurrency": conc, "offthreadVideoCacheSizeInBytes": cache, "items": items, "itemsLog": str(log)}
     if entry_point:
         body["entryPoint"] = entry_point
     spec_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
@@ -210,15 +303,29 @@ def _run_batch(rd: Path, items: list, spec_path: Path, entry_point: str | None) 
         r = subprocess.run(["node", "render_batch.mjs", str(spec_path)], cwd=rd, capture_output=True,
                            timeout=_BATCH_WALL_S)
     except subprocess.TimeoutExpired as exc:
+        prog = item_progress(items, read_item_log(log))
         raise RuntimeError(f"render_batch ran out its {_BATCH_WALL_S}s wall "
-                           f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]") from exc
+                           f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]"
+                           + (f" — {prog}" if prog else "")) from exc
     # Unconditional: the per-comp "[batch] <comp>: <frames> in <s>" line was DROPPED on the success path.
     batch_log = (r.stderr or b"").decode("utf-8", "replace")
     if batch_log.strip():
         sys.stderr.write(batch_log if batch_log.endswith("\n") else batch_log + "\n")
     # JUDGE THE FRAMES, NOT THE EXIT CODE: headless Chrome aborts on teardown often enough (SIGABRT after every
     # sequence is already on disk) that a rc check throws away finished work and fails the whole master.
-    missing = [str(i.get("comp")) for i in items if not any(Path(i["seqdir"]).glob("*.png"))]
+    rows = read_item_log(log)
+    for row in rows:   # the per-layer cost receipt, on the pod's own log
+        if "ok" in row:
+            print(f"mograph: layer {row['tag']} ({row.get('comp')}) {'ok' if row['ok'] else 'FAILED'} "
+                  f"{row.get('frames')} frames in {row.get('s')}s" + ("" if row["ok"] else f" — {row.get('error')}"),
+                  file=sys.stderr)
+    # a v13 layer render_batch reported FAILED is refused even when a crash-retry left some PNGs in its seqdir:
+    # packing those would ship a partial layer the preview never showed (stand bench r3b-056-bench-2: c2, c3)
+    failed = [f"{row['tag']} ({row.get('error') or 'failed'})" for row in rows if row.get("ok") is False]
+    if failed:
+        raise RuntimeError(f"render_batch FAILED {len(failed)} v13 layer(s): {'; '.join(failed)} "
+                           f"[{_box_facts(oom_before, conc, cache, spec_path.parent)}]")
+    missing = [str(i.get("tag") or i.get("comp")) for i in items if not any(Path(i["seqdir"]).glob("*.png"))]
     # The teardown keep is only for a batch that finished its work: a mid-render crash or a comp the batch itself
     # reports FAILED leaves a sequence short of frames that a "has one png" check cannot see.
     mid_render = []
@@ -249,22 +356,151 @@ def _pack(metas: list[dict], tmp: Path) -> list[dict]:
             continue
         mov = tmp / f"{m['seqdir'].name}.mov"
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-framerate", str(FPS), "-pattern_type", "glob",
-                        "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", *_BT709, str(mov)], check=True)
+                        "-i", str(m["seqdir"] / "*.png"), "-c:v", "qtrle", *_QTRLE_PIX_FMT, *_BT709, str(mov)], check=True)
         layers.append({"mov": str(mov), "start": m["start"], "dur": len(pngs) / FPS,
                        "glass": m["glass"], "head_below": m.get("head_below", False),
-                       "backing": m.get("backing")})
+                       "backing": m.get("backing"), "z": m.get("z")})
     return layers
 
 
+# SUPER-DIRECTOR v13 LAYOUT LAYERS (engine viewer_bridge.sd_layer_section): a `SdLayer` section whose props carry
+# `sdFace: "base"` draws the SPEAKER inside its layout (side_shift / pip / vsplit …) — the clean head plate this job
+# composites over. It is staged ONCE into the bundle's public/ and handed to the comp as faceSrc + faceStart (the
+# section's start on the plate's own clock), so the layout frames the very pixels the base shows outside its window.
+SD_FACE_KEY, SD_FACE_BASE = "sdFace", "base"
+_SD_FACE_DIR = "_sd"
+_SD_LAYER_COMP = "SdLayer"
+_SD_LAYER_TAIL_S = 2.0       # a long (persistent) layer's own ceiling: its length + this, never under the default
+# A v13 layer's render DEADLINE is a NO-PROGRESS deadline (render_batch.mjs `stallS`): the item is cancelled, by name,
+# only when no new frame has landed for this long — a hang-ender that never kills slow work that is moving. The live
+# 056 v13 final had a 60 s + 1 s/frame WALL cancel a side_shift layer at frame 108/124 while it rendered.
+# Derived from measurement (the panel bench, 2026-10-23: the pod's own _render_layers → render_batch on the 2060,
+# the layer that failed, one item per run, render_batch's own `firstFrameS` / `maxGapS`):
+#   worst wait seen         5.14 s — start → first frame of a blur_bg layer in the stand's L4 batch (run r3d-panels-norm2,
+#                                     10 tabs); that side_shift over its raw 4K one-keyframe panel clip: first frame
+#                                     3.4 s, max gap between frames 2.71 s, 52 s for 124 frames (normalised: 1.64 / 0.76)
+#   load factor            ×4      — the same layer on the loaded live pod: 108 frames in 184 s = 1.70 s/frame,
+#                                     vs 0.42 s/frame on the idle stand
+#   margin                 ×2.5    — the wall's own margin over the slowest measured layer (sd_stand L4)
+SD_STALL_WORST_WAIT_S = 5.14
+SD_STALL_LOAD_X = 4.0
+SD_STALL_MARGIN_X = 2.5
+SD_ITEM_STALL_S = round(SD_STALL_WORST_WAIT_S * SD_STALL_LOAD_X * SD_STALL_MARGIN_X, 1)   # 51.4 s
+
+
+def sd_layer_tag(props: dict) -> str | None:
+    """The v13 layer id a section renders (viewer_bridge: `sdLayer` on an engine section, `layer.id` on SdLayer)."""
+    if props.get("sdLayer"):
+        return str(props["sdLayer"])
+    layer = props.get("layer")
+    return str(layer["id"]) if isinstance(layer, dict) and layer.get("id") else None
+
+
+def sd_layer_z(props: dict) -> int | None:
+    """The v13 layer's stack z (sd_layers.LAYER_Z) a section renders: `layer.z` on SdLayer, `sdZ` on an engine section;
+    None = a legacy mograph section (drawn above the person plane, as the preview draws plan.mograph)."""
+    layer = props.get("layer")
+    z = layer.get("z") if isinstance(layer, dict) else props.get("sdZ")
+    return int(z) if isinstance(z, (int, float)) and not isinstance(z, bool) else None
+
+
+def sd_item_stall_s(_props: dict | None = None) -> float:
+    """The no-progress deadline of one v13 layer (SD_ITEM_STALL_S): a frame-rate fact, not a length — a long layer
+    that keeps landing frames is never cancelled; its absolute ceiling stays `maxSeconds` / the batch wall."""
+    return SD_ITEM_STALL_S
+
+
+def _stage_sd_face(rd: Path, base_path: Path) -> str:
+    """public/_sd/base<suffix> → the public-relative name; a hard link when the filesystem allows one, else a copy
+    (never a symlink: _stage_dest refuses anything resolving outside the workspace)."""
+    rel = f"{_SD_FACE_DIR}/base{Path(base_path).suffix.lower() or '.mp4'}"
+    dest = rd / "public" / rel
+    if not dest.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(base_path, dest)
+        except OSError:
+            shutil.copy2(base_path, dest)
+    return rel
+
+
+PANEL_NORMALISE_WHY = """
+A LAYOUT'S PANEL CLIP IS DECODED ONCE, AT THE PANEL'S SIZE, BEFORE THE BROWSER SEES IT.
+
+Live 056 v13 final: the b-roll lane downloaded the approved pexels original for a side_shift panel — 3840x2160 h264
+High, 22 Mb/s, 24 fps, ONE keyframe — and OffthreadVideo extracted every one of the layer's 124 frames out of it:
+~1.7 s per frame against 0.14-0.4 s for every other layer (the stand's L4), cancelled at 108/124. The panel only ever
+shows the clip COVER-fitted into its box (the layout's panel box, objectFit cover), so the clip is cut
+here to exactly that: the first clipStart + the layer's length (+ a frame), scaled to cover the box and centre-cropped
+to it — the same pixels a cover fit of the original shows (cover = scale-to-cover + centre crop) — with the source's
+OWN timestamps and frame rate (a 24→30 resample or a start-trim moved some frames by one against the preview on the
+stand), short GOP, h264_nvenc (the pod refuses to boot without it). clipStart stays as it was.
+"""
+PANEL_DIR = "_sd"
+
+
+def panel_normalise_argv(src: Path, start: float, dur: float, box_wh: tuple[int, int], out: Path) -> list[str]:
+    """Pure: the ffmpeg argv that turns a panel clip into its box (PANEL_NORMALISE_WHY)."""
+    w, h = (max(2, int(round(v / 2)) * 2) for v in box_wh)
+    vf = f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},setsar=1,format=yuv420p"
+    return ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", f"{max(0.0, start) + dur + 2.0 / FPS:.3f}",
+            "-an", "-vf", vf, "-fps_mode", "passthrough", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18",
+            "-g", str(FPS // 2), "-bf", "0", *_BT709, str(out)]
+
+
+def normalise_panel_clip(props: dict, rd: Path, i: int) -> dict:
+    """An SdLayer LAYOUT section with a video `src`: the clip cut to its panel box (PANEL_NORMALISE_WHY) and `src`
+    rewritten to it. Anything else passes through. A failed normalise is named."""
+    layer = props.get("layer")
+    src = props.get("src")
+    if not (isinstance(layer, dict) and layer.get("kind") == "layout" and isinstance(src, str) and src):
+        return props
+    lp = dict(layer.get("props") or {})
+    if lp.get("kind") == "image":
+        return props
+    path = rd / "public" / src
+    if not path.is_file():
+        return props        # the comp's own media error names it; nothing to cut
+    box = (layer.get("panel") or {}).get("box") or [0, 0, 1080, 1920]
+    rel = f"{PANEL_DIR}/panel_{i}.mp4"
+    out = rd / "public" / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    dur = float(props.get("durationInSeconds") or layer.get("dur") or 0.0)
+    r = subprocess.run(panel_normalise_argv(path, float(lp.get("clipStart") or 0.0), dur,
+                                            (float(box[2]), float(box[3])), out),
+                       capture_output=True, text=True, timeout=max(60.0, 20.0 * dur))
+    if r.returncode != 0 or not out.is_file():
+        raise RuntimeError(f"mograph: v13 layer {layer.get('id')} panel clip {src} could not be cut to its "
+                           f"{int(box[2])}x{int(box[3])} box: {r.stderr.strip()[-300:]}")
+    return {**props, "src": rel}
+
+
+def sd_face_props(props: dict, start: float, face_rel: str | None) -> dict:
+    """Pure: a section's props with `sdFace` swapped for the staged plate. No plate → the request is refused by name
+    (a layout with no speaker is a black panel the preview never showed)."""
+    if props.get(SD_FACE_KEY) != SD_FACE_BASE:
+        return props
+    if face_rel is None:
+        raise RuntimeError("mograph: an SdLayer layout asks for the head plate (sdFace=base) but no base input "
+                           "path reached _render_layers — refusing a master with an empty speaker slot")
+    out = {k: v for k, v in props.items() if k != SD_FACE_KEY}
+    out["faceSrc"], out["faceStart"] = face_rel, float(start)
+    return out
+
+
 def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: Path,
-                   bundle_ref=None, max_seconds: float | None = None) -> list[dict]:
+                   bundle_ref=None, max_seconds: float | None = None, base_path: Path | None = None) -> list[dict]:
     """Render sections to transparent qtrle layers: catalog comps in one bundle+Chrome batch; each Bespoke
     (LLM .tsx delivered + staged by the brain) via its own per-job entry. A missing bespoke entry = skip loud.
-    `max_seconds` rides on every item as render_batch.mjs's per-item ceiling (independent of props)."""
+    `max_seconds` rides on every item as render_batch.mjs's per-item ceiling (independent of props).
+    `base_path` = the head plate, staged only when a v13 layout layer asks for it (sd_face_props)."""
     rd = remotion_dir(bundle_ref, tmp)
     _stage_public(input_paths, rd)
+    wants_face = any((sec.props or {}).get(SD_FACE_KEY) == SD_FACE_BASE for sec in sections)
+    face_rel = _stage_sd_face(rd, base_path) if wants_face and base_path is not None else None
     tok = (brand or {}).get("tokens")
     fnt = (brand or {}).get("fonts")
+    lks = (brand or {}).get("looks")
 
     def _props(sec):
         p = dict(sec.props or {})
@@ -272,6 +508,8 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
             p["brandTokens"] = tok
         if fnt is not None:
             p["brandFonts"] = fnt
+        if lks is not None:
+            p["brandLooks"] = lks
         return p
 
     cat_items, cat_metas, bespoke = [], [], []
@@ -280,10 +518,19 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
         seqdir.mkdir(parents=True, exist_ok=True)
         meta = {"seqdir": seqdir, "start": float(sec.start), "glass": bool(sec.glass),
                 "head_below": bool((sec.props or {}).get("headBelow")),
-                "backing": (sec.props or {}).get("backing")}
-        item = {"comp": sec.comp, "props": _props(sec), "seqdir": str(seqdir)}
+                "backing": (sec.props or {}).get("backing"), "z": sd_layer_z(sec.props or {})}
+        props = _props(sec)
+        if sec.comp == _SD_LAYER_COMP:
+            props = normalise_panel_clip(props, rd, i)
+        item = {"comp": sec.comp, "props": sd_face_props(props, sec.start, face_rel), "seqdir": str(seqdir)}
         if max_seconds is not None:
             item["maxSeconds"] = max_seconds
+        if (tag := sd_layer_tag(sec.props or {})) is not None:
+            item["tag"], item["stallS"] = tag, sd_item_stall_s(sec.props or {})
+        if sec.comp == _SD_LAYER_COMP:
+            # a persistent layer can outlast render_batch's 120 s default; its own length is its ceiling
+            need = float((sec.props or {}).get("durationInSeconds") or 0.0) + _SD_LAYER_TAIL_S
+            item["maxSeconds"] = max(float(item.get("maxSeconds") or 120.0), need)
         if sec.comp.startswith("Bespoke"):
             entry = f"src/index.bespoke.{sec.comp}.tsx"
             if not (rd / entry).is_file():
@@ -298,10 +545,194 @@ def _render_layers(sections: list, brand: dict | None, input_paths: dict, tmp: P
     if cat_items:
         _run_batch(rd, cat_items, tmp / "batch_catalog.json", None)
         metas += cat_metas
-    for n, (entry, item, meta) in enumerate(bespoke):
-        _run_batch(rd, [item], tmp / f"batch_bespoke{n}.json", entry)
-        metas.append(meta)
+    _run_bespoke(rd, bespoke, tmp)
+    metas += [meta for _entry, _item, meta in bespoke]
     return _pack(metas, tmp)
+
+
+# ── PERSON PLANE (super-director v13 R4, spec overlays.person_matte) ─────────────────────────────────────
+PERSON_Z = 3   # sd_layers.LAYER_Z["person"]: layers below it draw UNDER the person cut-out, the rest over it
+
+
+def split_by_person(layers: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(below, above) the person plane, each in its own order: z < PERSON_Z below, everything else (z ≥ 3 and every
+    legacy section, which the preview draws between its two layer bands) above."""
+    below = [x for x in layers if x.get("z") is not None and int(x["z"]) < PERSON_Z]
+    above = [x for x in layers if not (x.get("z") is not None and int(x["z"]) < PERSON_Z)]
+    return below, above
+
+
+def person_plane_chain(plate_v: str, alpha_v: str, segments: list[tuple[str, str, str]], w: int, h: int,
+                       out: str) -> str:
+    """Pure: [plate][alpha] → the person plane `out` (yuva420p), cut through the base's own segments (trim + speed +
+    scale, the chain render.build_filtergraph runs on the plate) so frame i of the plane stays frame i of the base.
+    `segments` = (in, out, speed) per timeline segment, ALREADY spelled by render._num (the base chain's own
+    spelling — a re-formatted float would cut a different frame); the alpha is gray, merged before any rescale."""
+    n = len(segments)
+    parts = [f"[{plate_v}][{alpha_v}]alphamerge,format=yuva420p" + (f",split={n}" if n > 1 else "")
+             + "".join(f"[pmsrc{k}]" for k in range(n))]
+    pads = []
+    for k, (a, b, sp) in enumerate(segments):
+        parts.append(f"[pmsrc{k}]trim=start={a}:end={b},setpts=(PTS-STARTPTS)/{sp},"
+                     f"scale={w}:{h}:flags=lanczos,setsar=1,format=yuva420p[pmseg{k}]")
+        pads.append(f"[pmseg{k}]")
+    parts.append(f"{''.join(pads)}concat=n={n}:v=1:a=0[{out}]" if n > 1 else f"[pmseg0]null[{out}]")
+    return ";".join(parts)
+
+
+def person_overlay(base: str, plane: str, windows: list[tuple[float, float]], fps: float, out: str) -> str:
+    """Pure: the person plane over [base], shown only on the output frames of `windows` (frames.between — the same
+    frame rounding every other window of this graph gets)."""
+    enable = "+".join(_frames.between(*_frames.frame_range(a, b, fps), fps) for a, b in windows)
+    return f"[{base}][{plane}]overlay=enable='{enable}':eof_action=pass:format=yuv420[{out}]"
+
+
+def person_windows(windows: list[tuple[float, float]], cut: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """`windows` minus every `cut` span (the b-roll cutaways covering the head) — no cutaway between the plate and
+    the person plane."""
+    out = [(float(a), float(b)) for a, b in windows]
+    for c0, c1 in cut:
+        nxt: list[tuple[float, float]] = []
+        for a, b in out:
+            if c1 <= a or c0 >= b:
+                nxt.append((a, b))
+                continue
+            if c0 > a:
+                nxt.append((a, c0))
+            if c1 < b:
+                nxt.append((c1, b))
+        out = nxt
+    return [(a, b) for a, b in out if b - a > 1e-6]
+
+
+# ── PERSON STYLES (super-director R6, spec overlays.person_matte.styles) ──────────────────────────────────────
+# How the person plane is drawn on a style's windows — the twin of the preview player's SVG filter, operation for
+# operation: ring = the alpha dilated `width` times by a 3x3 max (`dilation`: a (2w+1) square,
+# SVG feMorphology dilate radius w), glow = `gblur` sigma g of that dilated alpha (feGaussianBlur stdDeviation g),
+# shadow = gblur of the ringed alpha, offset, black × opacity; gray = U = V = 128 (the BT.709 luma the SVG
+# saturate(0) keeps); bottom → top: shadow, glow, ring, the person. The heavy filters carry `enable` = the style's
+# windows, so outside them the frames pass through untouched (and are not shown: every overlay is gated too).
+
+
+def _cut(spans: list[tuple[float, float]], cut: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return person_windows(spans, cut)
+
+
+def _clip(spans: list[tuple[float, float]], within: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    out = []
+    for a, b in spans:
+        for c, d in within:
+            lo, hi = max(float(a), float(c)), min(float(b), float(d))
+            if hi - lo > 1e-6:
+                out.append((lo, hi))
+    return out
+
+
+def yuv709(hex_color: str) -> tuple[int, int, int]:
+    """#rrggbb → limited-range BT.709 (Y, Cb, Cr) — the matrix the master is tagged with (render._BT709)."""
+    r, g, b = (int(hex_color[k:k + 2], 16) / 255.0 for k in (1, 3, 5))
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return (round(16 + 219 * y), round(128 + 224 * (b - y) / 1.8556), round(128 + 224 * (r - y) / 1.5748))
+
+
+def style_windows(styles: list[dict], windows: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+    """Each style's own windows inside the plane's `windows` (already minus the b-roll cutaways) — a style given
+    later in the list wins where two overlap (the engine orders them by layer start, as the preview does)."""
+    taken: list[tuple[float, float]] = []
+    out: list[list[tuple[float, float]]] = [[] for _ in styles]
+    for k in range(len(styles) - 1, -1, -1):
+        own = _clip([(float(a), float(b)) for a, b in styles[k]["windows"]], windows)
+        out[k] = _cut(own, taken)
+        taken += [(float(a), float(b)) for a, b in styles[k]["windows"]]
+    return out
+
+
+def _enable(windows: list[tuple[float, float]], fps: float) -> str:
+    return "+".join(_frames.between(*_frames.frame_range(a, b, fps), fps) for a, b in windows)
+
+
+def frame_gray_chain(base: str, styles: list[dict], windows: list[tuple[float, float]], fps: float,
+                     out: str) -> str | None:
+    """Pure: the composite under the person greyed on the `frame_gray` styles' windows (hue s=0, timeline-gated),
+    None when no style asks for it — the preview greys its base video on the same spans."""
+    gw = [w for st, ws in zip(styles, style_windows(styles, windows), strict=True) if st.get("frame_gray") for w in ws]
+    if not gw:
+        return None
+    return f"[{base}]hue=s=0:enable='{_enable(gw, fps)}'[{out}]"
+
+
+def person_style_overlays(base: str, plane: str, windows: list[tuple[float, float]], styles: list[dict] | None,
+                          fps: float, out: str) -> str:
+    """Pure: the person plane over [base] — with no styles exactly person_overlay (the R4 graph); with styles the
+    plane is split: the plain cut-out on `windows` minus every style window, each style's look on its own windows."""
+    if not styles:
+        return person_overlay(base, plane, windows, fps, out)
+    per = style_windows(styles, windows)
+    plain = _cut(list(windows), [w for ws in per for w in ws])
+    branches = ([("plain", None, plain)] if plain else []) + [
+        (f"s{k}", st, ws) for k, (st, ws) in enumerate(zip(styles, per, strict=True)) if ws]
+    if not branches:
+        return person_overlay(base, plane, windows, fps, out)
+    parts = [f"[{plane}]split={len(branches)}" + "".join(f"[pp{tag}]" for tag, _, _ in branches)
+             if len(branches) > 1 else f"[{plane}]null[pp{branches[0][0]}]"]
+    link = base
+    n = 0
+
+    def over(src: str, en: str, xy: str = "") -> None:
+        nonlocal link, n
+        nxt = f"psv{n}"
+        n += 1
+        parts.append(f"[{link}][{src}]overlay={xy}enable='{en}':eof_action=pass:format=yuv420[{nxt}]")
+        link = nxt
+
+    for tag, st, ws in branches:
+        en = _enable(ws, fps)
+        src = f"pp{tag}"
+        if st is None:
+            over(src, en)
+            continue
+        ring, shadow = st.get("ring"), st.get("shadow")
+        glow = float(ring.get("glow") or 0) if ring else 0.0
+        masks = (1 if ring else 0) + (1 if glow else 0) + (1 if shadow else 0)
+        colours = masks
+        outs = ["p"] + (["a"] if masks else []) + [f"c{j}" for j in range(colours)]
+        parts.append(f"[{src}]split={len(outs)}" + "".join(f"[{tag}{o}]" for o in outs) if len(outs) > 1
+                     else f"[{src}]null[{tag}p]")
+        person = f"{tag}p"
+        if st.get("gray"):
+            parts.append(f"[{tag}p]lutyuv=u=128:v=128[{tag}pg]")
+            person = f"{tag}pg"
+        if masks:
+            dil = ",".join([f"dilation=enable='{en}'"] * int(ring["width"])) if ring else ""
+            parts.append(f"[{tag}a]alphaextract,format=gray" + (f",{dil}" if dil else "")
+                         + (f",split={masks}" if masks > 1 else "") + "".join(f"[{tag}m{j}]" for j in range(masks)))
+        layers: list[tuple[str, str]] = []       # (pad, overlay xy) bottom → top
+        m = c = 0
+        if shadow:
+            y0, u0, v0 = yuv709("#000000")
+            op = float(shadow["opacity"])
+            blur = float(shadow["blur"])
+            parts.append(f"[{tag}m{m}]" + (f"gblur=sigma={blur:g}:steps=3:enable='{en}'," if blur > 0 else "")
+                         + f"lut=c0=val*{op:g}[{tag}sm]")
+            parts.append(f"[{tag}c{c}]lutyuv=y={y0}:u={u0}:v={v0}[{tag}sc];[{tag}sc][{tag}sm]alphamerge[{tag}sh]")
+            layers.append((f"{tag}sh", f"x={int(shadow['dx'])}:y={int(shadow['dy'])}:"))
+            m += 1
+            c += 1
+        if ring:
+            y0, u0, v0 = yuv709(str(ring["color"]))
+            if glow:
+                parts.append(f"[{tag}m{m}]gblur=sigma={glow:g}:steps=3:enable='{en}'[{tag}gm]")
+                parts.append(f"[{tag}c{c}]lutyuv=y={y0}:u={u0}:v={v0}[{tag}gc];[{tag}gc][{tag}gm]alphamerge[{tag}gl]")
+                layers.append((f"{tag}gl", ""))
+                m += 1
+                c += 1
+            parts.append(f"[{tag}c{c}]lutyuv=y={y0}:u={u0}:v={v0}[{tag}rc];[{tag}rc][{tag}m{m}]alphamerge[{tag}rg]")
+            layers.append((f"{tag}rg", ""))
+        for pad, xy in layers:
+            over(pad, en, xy)
+        over(person, en)
+    parts.append(f"[{link}]null[{out}]")
+    return ";".join(parts)
 
 
 # ── MARK BACKING (the final half) ────────────────────────────────────────────────────────────────────────

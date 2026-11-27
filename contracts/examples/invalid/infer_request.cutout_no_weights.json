@@ -1,0 +1,16 @@
+{
+  "infer_version": 7,
+  "job_id": "job_8c3e19",
+  "kind": "cutout",
+  "model": "birefnet_dynamic_ts_fp16",
+  "put_url": "https://storage.example/o/40411.json?sig=PUT",
+  "cutout": {
+    "items": [
+      {
+        "id": "sticker-1",
+        "src_url": "https://storage.example/o/40412.jpg?sig=GET",
+        "out_url": "https://storage.example/o/40413.png?sig=PUT"
+      }
+    ]
+  }
+}

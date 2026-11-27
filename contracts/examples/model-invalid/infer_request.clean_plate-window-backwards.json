@@ -1,0 +1,27 @@
+{
+  "infer_version": 7,
+  "job_id": "job_5d21b7",
+  "kind": "clean_plate",
+  "model": "big_lama_torchscript",
+  "put_url": "https://storage.example/o/30411.json?sig=PUT",
+  "clean_plate": {
+    "video_url": "https://storage.example/o/14311.mp4?sig=GET",
+    "matte_url": "https://storage.example/o/20412.webm?sig=GET",
+    "matte_kind": "cutout",
+    "windows": [
+      {
+        "id": "sd13-vertigo-1",
+        "t0": 12.4,
+        "t1": 12.0,
+        "put_url": "https://storage.example/o/30412.png?sig=PUT"
+      }
+    ],
+    "samples": 12,
+    "person_alpha": 24,
+    "dilate_px": 10,
+    "min_visible": 3,
+    "stable_range": 40,
+    "inpaint_long_side": 1024,
+    "max_hole_fraction": 0.7
+  }
+}

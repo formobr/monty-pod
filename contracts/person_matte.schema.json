@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/person_matte.schema.json",
+  "title": "PersonMattePayload — the person_matte receipt the pod PUTs to put_url",
+  "description": "Numbers about the outputs the pod PUT to the request's alpha_put_url / cutout_put_url. `frames` is what the decoder delivered and what every output carries — the pod refuses a mismatch before it PUTs anything. `fps` is the input's r_frame_rate verbatim; each output is stamped with it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "model",
+    "model_sha256",
+    "width",
+    "height",
+    "fps",
+    "frames",
+    "downsample_ratio",
+    "timings"
+  ],
+  "anyOf": [
+    {
+      "required": [
+        "alpha"
+      ]
+    },
+    {
+      "required": [
+        "cutout"
+      ]
+    }
+  ],
+  "properties": {
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "fps": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(/[1-9][0-9]*)?$"
+    },
+    "frames": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "downsample_ratio": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1
+    },
+    "alpha": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "cutout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_s",
+        "first_frame_s",
+        "encode_drain_s",
+        "wall_s"
+      ],
+      "properties": {
+        "model_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "first_frame_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "encode_drain_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

@@ -3,7 +3,7 @@ tests/test_contracts_goldens.py — every golden must round-trip through both.""
 from __future__ import annotations
 
 import math
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, get_args
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
@@ -137,7 +137,7 @@ class SpecCaptions(BaseModel):
     centerY: float | None = None
     centerX: float | None = None
     accent: str | None = None
-    style: Literal["oneword", "phrase", "phrase_jump", "bold"] | None = None
+    style: Literal["oneword", "phrase", "phrase_jump", "bold", "word_accent"] | None = None
     hot: list[float] = Field(default_factory=list)
     words: list[SpecCaptionWord] = Field(default_factory=list)
     font: str | None = None
@@ -151,6 +151,7 @@ class SpecBrandManifest(BaseModel):
 
     tokens: dict[str, Any]
     fonts: dict[str, Any]
+    looks: dict[str, Any] | None = None
 
 
 class BundleRef(BaseModel):
@@ -389,6 +390,69 @@ class SpecFinalize(BaseModel):
     loudnorm: SpecLoudnorm | None = None
 
 
+class SpecPersonRing(BaseModel):
+    """A contour around the person plane: the alpha dilated `width` px ((2w+1) square max — ffmpeg `dilation` x w),
+    filled with `color` (#rrggbb); `glow` = Gaussian sigma px of a halo of the same colour (0 = none)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    width: int = Field(ge=1, le=32)
+    glow: float = Field(default=0.0, ge=0, le=40)
+
+
+class SpecPersonShadow(BaseModel):
+    """A drop shadow of the (ringed) person plane: offset dx/dy px, Gaussian sigma `blur` px, black at `opacity`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dx: int = Field(ge=-64, le=64)
+    dy: int = Field(ge=-64, le=64)
+    blur: float = Field(ge=0, le=40)
+    opacity: float = Field(gt=0, le=1)
+
+
+class SpecPersonStyle(BaseModel):
+    """super-director R6: how the person plane is drawn on `windows` (master clock, seconds, each inside
+    person_matte.windows; b-roll cutaway windows are cut out like the plane's own): `gray` = the plane in black and white
+    (U = V = 128), `frame_gray` = the composite under it too, `ring` / `shadow` = drawn under the plane."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    windows: list[tuple[float, float]] = Field(min_length=1)
+    gray: bool = False
+    frame_gray: bool = False
+    ring: SpecPersonRing | None = None
+    shadow: SpecPersonShadow | None = None
+
+    @model_validator(mode="after")
+    def _windows_forward(self) -> "SpecPersonStyle":
+        for a, b in self.windows:
+            if a < 0 or b <= a:
+                raise ValueError(f"person_matte style window [{a}, {b}] must be 0 <= start < end")
+        return self
+
+
+class SpecPersonMatte(BaseModel):
+    """super-director v13 R4 person plane (contracts/spec.schema.json `person_matte`): `alpha` = the inputs[].id of
+    the gray FFV1 alpha, frame-for-frame with timeline.segments[0].src; `windows` = [start, end) seconds on the master
+    clock where the plane shows (the union of the matte layers' windows minus layouts / head-below)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alpha: str = Field(min_length=1)
+    windows: list[tuple[float, float]] = Field(min_length=1)
+    # R6: the plane's looks per window (absent = the plain cut-out everywhere — the R4 graph, byte-identical)
+    styles: list[SpecPersonStyle] | None = None
+
+    @model_validator(mode="after")
+    def _windows_forward(self) -> "SpecPersonMatte":
+        for a, b in self.windows:
+            if a < 0 or b <= a:
+                raise ValueError(f"person_matte window [{a}, {b}] must be 0 <= start < end")
+        return self
+
+
 class Overlays(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -400,6 +464,7 @@ class Overlays(BaseModel):
     sfx: list[SpecSfx] | None = None
     finalize: SpecFinalize | None = None
     opener: SpecOpener | None = None
+    person_matte: SpecPersonMatte | None = None
 
 
 class Encode(BaseModel):
@@ -450,6 +515,14 @@ class RenderSpec(BaseModel):
             if seg.src not in ids:
                 raise ValueError(f"timeline.segments[{n}].src {seg.src!r} is not an inputs[].id")
         if self.overlays is not None:
+            pm = self.overlays.person_matte
+            if pm is not None:
+                if pm.alpha not in ids:
+                    raise ValueError(f"person_matte.alpha {pm.alpha!r} is not an inputs[].id")
+                plates = {seg.src for seg in self.timeline.segments}
+                if len(plates) != 1:
+                    raise ValueError(f"person_matte pairs its alpha frame-for-frame with ONE plate; the timeline "
+                                     f"cuts {sorted(plates)}")
             if self.overlays.broll_final is not None:
                 for n, c in enumerate(self.overlays.broll_final.broll):
                     if c.clip not in ids:
@@ -614,6 +687,161 @@ class ClipRankParams(BaseModel):
         return self
 
 
+class PersonMatteParams(BaseModel):
+    """RVM person matte over ONE whole video (the plate a tier's layers composite over). Every number is the
+    planner's: `downsample_ratio` is resolved from the frame size before the request is written. The pod PUTs
+    the requested outputs to their own presigned URLs and the receipt (person_matte.schema.json) to put_url."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    video_url: str = Field(min_length=1)
+    downsample_ratio: float = Field(gt=0, le=1)
+    # FINAL: the alpha as a lossless gray FFV1 Matroska, frame-for-frame with the input
+    alpha_put_url: str | None = Field(default=None, min_length=1)
+    # PREVIEW: the input's pixels under the alpha as a VP9-alpha (yuva420p) WebM, no audio
+    cutout_put_url: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _some_output(self) -> "PersonMatteParams":
+        if self.alpha_put_url is None and self.cutout_put_url is None:
+            raise ValueError("person_matte must request at least one output (alpha_put_url / cutout_put_url)")
+        return self
+
+
+class CleanPlateWindow(BaseModel):
+    """One plate the pod writes: the layer window [t0, t1] (seconds on the video's own clock) and the presigned PNG
+    target. `id` is the sd layer id — the engine reads the plate back by it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    t0: float = Field(ge=0)
+    t1: float = Field(gt=0)
+    put_url: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _forward(self) -> "CleanPlateWindow":
+        if self.t1 <= self.t0:
+            raise ValueError(f"clean_plate window {self.id!r} [{self.t0}, {self.t1}] must have t0 < t1")
+        return self
+
+
+class CleanPlateParams(BaseModel):
+    """The clean background plate of ONE video, one plate per window (super-director v13 vertigo class): a per-pixel
+    temporal median over the pixels the person matte does not cover, then LaMa for what is never uncovered. Every
+    number is the planner's (the engine's clean-plate registry entry); the matte is the one the person_matte kind already produced
+    for the SAME video (`matte_kind` says how to read its alpha), so no segmentation runs here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    video_url: str = Field(min_length=1)
+    matte_url: str = Field(min_length=1)
+    matte_kind: Literal["cutout", "alpha"]
+    windows: list[CleanPlateWindow] = Field(min_length=1, max_length=32)
+    samples: int = Field(ge=3, le=48)              # frames sampled per window, evenly spread
+    person_alpha: int = Field(ge=1, le=254)        # a pixel whose matte alpha is above this is the person
+    dilate_px: int = Field(ge=0, le=64)            # the person's silhouette grows by this before it is excluded
+    min_visible: int = Field(ge=1, le=48)          # a pixel seen as background in fewer samples is a hole
+    stable_range: int = Field(ge=4, le=255)        # visible samples that disagree by more than this (0..255) are a hole
+    inpaint_long_side: int = Field(ge=256, le=2048)  # LaMa works at most this big; the result is upsampled into the hole
+    max_hole_fraction: float = Field(gt=0, le=1)   # more hole than this and the plate is refused, not hallucinated
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "CleanPlateParams":
+        if self.min_visible > self.samples:
+            raise ValueError("clean_plate min_visible cannot exceed samples")
+        ids = [w.id for w in self.windows]
+        if len(set(ids)) != len(ids):
+            raise ValueError("clean_plate window ids must be unique")
+        return self
+
+
+class CutoutSrc(BaseModel):
+    """One picture of a cutout batch: where to read it and where to PUT its RGBA PNG. `id` is the caller's key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    src_url: str = Field(min_length=1)      # presigned GET of the source picture
+    out_url: str = Field(min_length=1)      # presigned PUT of the RGBA PNG
+
+
+class CutoutParams(BaseModel):
+    """Background removal (BiRefNet_dynamic, traced TorchScript fp16 at 1024) over a batch of pictures — the engine's
+    sticker / stock cut-out, made on the pod GPU instead of a paid call. The receipt (cutout.schema.json) goes to
+    put_url, each cut picture to its item's out_url. Every number lives in the weights tar's manifest, none here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[CutoutSrc] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _ids_unique(self) -> "CutoutParams":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("cutout item ids must be unique")
+        return self
+
+
+ScreenDevice = Literal["phone", "tablet", "laptop", "monitor", "tv"]
+
+
+class ScreenQuadSrc(BaseModel):
+    """One picture of a screen_quad batch: where to read it and which device's screen to find. `id` is the caller's key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    src_url: str = Field(min_length=1)      # presigned GET of the source picture
+    device: ScreenDevice                    # a closed enum -> the device phrases of podagent/infer_screen_quad.py SCREEN_PHRASES, tried in order (docs/research/pod-screen-quad.md)
+    mask_url: str | None = Field(default=None, min_length=1)   # presigned PUT of the glass mask PNG (the picture's size)
+
+
+class ScreenQuadParams(BaseModel):
+    """A device screen's 4 corners (Florence-2 phrase grounding -> SAM 2.1 box mask -> opencv quad fit) over a batch of
+    pictures. The receipt (screen_quad.schema.json) goes to put_url; nothing else is PUT. Every number lives in the
+    weights tar's manifest and the module's named constants, none here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ScreenQuadSrc] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _ids_unique(self) -> "ScreenQuadParams":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("screen_quad item ids must be unique")
+        return self
+
+
+class ObjectMaskSrc(BaseModel):
+    """One picture of an object_mask batch: where to read it, the English noun phrase to cut out of it, and where the cut goes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    src_url: str = Field(min_length=1)      # presigned GET of the source picture
+    phrase: str = Field(pattern=r"^[A-Za-z0-9 -]{1,80}$")     # English; letters, digits, spaces, hyphen
+    cut_url: str = Field(min_length=1)      # presigned PUT of the RGBA PNG (the picture's size)
+    mask_url: str | None = Field(default=None, min_length=1)   # presigned PUT of the 8-bit grey mask PNG
+
+
+class ObjectMaskParams(BaseModel):
+    """The object a phrase names, cut out of a batch of pictures (Florence-2 phrase grounding -> SAM 2.1 box mask), on
+    screen_quad's weights. Per item the cut PNG goes to cut_url, the mask PNG to mask_url; the receipt to put_url."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ObjectMaskSrc] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _ids_unique(self) -> "ObjectMaskParams":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("object_mask item ids must be unique")
+        return self
+
+
 class WeightsRef(BaseModel):
     """Where the pod gets this job's checkpoint. A presigned GET for a tar of the model directory, plus
     that tar's sha256 — which is BOTH the integrity check and the pod's cache key, so a re-exported or
@@ -626,7 +854,16 @@ class WeightsRef(BaseModel):
     size: int | None = Field(default=None, gt=0)
 
 
-_NEEDS_WEIGHTS = ("align", "clip_rank")   # face_probe's YuNet is 227 KB and stays baked in the image
+# face_probe's YuNet (227 KB), person_matte's RVM (7.9 MB fp16 TorchScript) and clean_plate's big-lama (206 MB
+# TorchScript) stay baked in the image; cutout's BiRefNet (463 MB, traced inside THIS image by the operator's build tool)
+# arrives as a weights tar like align's and clip_rank's; so does screen_quad's Florence-2 + SAM 2.1 pair (two HF snapshots)
+_NEEDS_WEIGHTS = ("align", "clip_rank", "cutout", "screen_quad", "object_mask")
+
+
+# THE one list of infer kinds: main.INFER_KINDS, the block validator below and the tests derive from it
+# (the two schema enums and infer_lanes.KIND_VRAM_MIB are held equal to it by test_infer_kind_is_one_fact)
+InferKind = Literal["align", "face_probe", "clip_rank", "person_matte", "clean_plate", "cutout", "screen_quad",
+                 "object_mask"]
 
 
 class InferRequest(BaseModel):
@@ -634,18 +871,22 @@ class InferRequest(BaseModel):
 
     infer_version: Literal[7]
     job_id: str = Field(min_length=1)
-    kind: Literal["align", "face_probe", "clip_rank"]
+    kind: InferKind
     model: str = Field(min_length=1)
     put_url: str = Field(min_length=1)
     weights: WeightsRef | None = None
     align: AlignParams | None = None
     face_probe: FaceProbeParams | None = None
     clip_rank: ClipRankParams | None = None
+    person_matte: PersonMatteParams | None = None
+    clean_plate: CleanPlateParams | None = None
+    cutout: CutoutParams | None = None
+    screen_quad: ScreenQuadParams | None = None
+    object_mask: ObjectMaskParams | None = None
 
     @model_validator(mode="after")
     def _block_matches_kind(self) -> "InferRequest":
-        blocks: dict[str, Any] = {"align": self.align, "face_probe": self.face_probe,
-                                  "clip_rank": self.clip_rank}
+        blocks: dict[str, Any] = {k: getattr(self, k) for k in get_args(InferKind)}
         if blocks[self.kind] is None:
             raise ValueError(f"kind={self.kind} requires its params block")
         extra = [k for k, v in blocks.items() if k != self.kind and v is not None]
@@ -676,7 +917,7 @@ class InferResult(BaseModel):
 
     infer_version: Literal[7]
     job_id: str = Field(min_length=1)
-    kind: Literal["align", "face_probe", "clip_rank"]
+    kind: InferKind
     status: Literal["ok", "error"]
     result_key: str | None = Field(default=None, min_length=1)
     # Echoed from the job corr_id for errors; a success also carries result_key as durable business identity.
@@ -945,6 +1186,299 @@ class FaceProbePayload(BaseModel):
     width: int = Field(ge=2)
     height: int = Field(ge=2)
     shots: list[ProbeShot] = Field(min_length=1)
+
+
+class MatteOutput(BaseModel):
+    """One PUT person_matte output, as the pod wrote it (the engine verifies the object against these)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class PersonMatteTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_s: float = Field(ge=0)          # GPU forward + device copies, summed over frames
+    first_frame_s: float = Field(ge=0)    # the cudnn autotune frame, inside model_s
+    encode_drain_s: float = Field(ge=0)   # encoders finishing after the last frame
+    wall_s: float = Field(ge=0)           # download excluded, upload excluded
+
+
+class PersonMattePayload(BaseModel):
+    """person_matte.schema.json — the receipt the pod PUTs to put_url. `frames` is what the decoder delivered
+    AND what each output carries (the pod refuses a mismatch, so a short matte can never be composited)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    width: int = Field(ge=2)
+    height: int = Field(ge=2)
+    fps: str = Field(pattern=r"^[1-9][0-9]*(/[1-9][0-9]*)?$")   # the input's r_frame_rate, verbatim
+    frames: int = Field(ge=1)
+    downsample_ratio: float = Field(gt=0, le=1)
+    alpha: MatteOutput | None = None
+    cutout: MatteOutput | None = None
+    timings: PersonMatteTimings
+
+    @model_validator(mode="after")
+    def _some_output(self) -> "PersonMattePayload":
+        if self.alpha is None and self.cutout is None:
+            raise ValueError("a person_matte receipt names at least one output")
+        return self
+
+
+class CleanPlateTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decode_s: float = Field(ge=0)     # ffmpeg sampling of the plate video and the matte, all windows
+    median_s: float = Field(ge=0)     # the masked temporal median on the card
+    inpaint_s: float = Field(ge=0)    # LaMa, all windows (0 when no window had a hole)
+    wall_s: float = Field(ge=0)       # download excluded, upload excluded
+
+
+class CleanPlateOut(BaseModel):
+    """One PUT plate, as the pod wrote it. `covered` + `inpainted` = 1: the share of the frame taken from the median
+    of real background pixels, and the share LaMa drew."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    samples: int = Field(ge=1)
+    covered: float = Field(ge=0, le=1)
+    inpainted: float = Field(ge=0, le=1)
+
+
+class CleanPlateRefusal(BaseModel):
+    """A window the pod would not draw a plate for, and why (the other windows are unaffected)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class CleanPlatePayload(BaseModel):
+    """clean_plate.schema.json — the receipt the pod PUTs to put_url. Every requested window is in `plates` (drawn and
+    PUT) or in `refused` (named, with the reason) — never in neither, never in both."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    width: int = Field(ge=2)
+    height: int = Field(ge=2)
+    plates: list[CleanPlateOut] = Field(default_factory=list)
+    refused: list[CleanPlateRefusal] = Field(default_factory=list)
+    timings: CleanPlateTimings
+
+    @model_validator(mode="after")
+    def _every_window_once(self) -> "CleanPlatePayload":
+        ids = [p.id for p in self.plates] + [r.id for r in self.refused]
+        if not ids:
+            raise ValueError("a clean_plate receipt names at least one window")
+        if len(set(ids)) != len(ids):
+            raise ValueError("a clean_plate window is drawn or refused, once")
+        return self
+
+
+CutoutStatus = Literal["cut", "already_cut", "empty_cut", "no_separation", "unreadable"]
+
+
+class CutoutTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_s: float = Field(ge=0)      # preprocess + GPU forward + postprocess, summed over the pictures that ran the model
+    wall_s: float = Field(ge=0)       # download excluded, upload excluded
+
+
+class CutoutOut(BaseModel):
+    """One picture's named outcome. Only `cut` is PUT to its out_url; every other status is a refusal or a
+    pass-through the engine reads by name — never a silent success. `bbox` = [x0, y0, x1, y1] as fractions of the
+    picture, over alpha >= 24/255; `w`/`h` = the size of the cut PNG (the source after exif_transpose and the 2048 cap)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    status: CutoutStatus
+    w: int | None = Field(default=None, ge=1)
+    h: int | None = Field(default=None, ge=1)
+    bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    bytes: int | None = Field(default=None, gt=0)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _shape_by_status(self) -> "CutoutOut":
+        if self.bbox is not None:
+            x0, y0, x1, y1 = self.bbox
+            if not (all(0.0 <= v <= 1.0 for v in self.bbox) and x0 < x1 and y0 < y1):
+                raise ValueError("cutout bbox must be fractions with x0 < x1 and y0 < y1")
+        if self.status == "cut":
+            if None in (self.w, self.h, self.bbox, self.bytes, self.sha256):
+                raise ValueError("a cut item names w, h, bbox, bytes and sha256 of the PNG it PUT")
+        elif self.bytes is not None or self.sha256 is not None:
+            raise ValueError(f"a {self.status} item PUT nothing and names no bytes / sha256")
+        if self.status in ("already_cut", "no_separation") and (self.w is None or self.h is None or self.bbox is None):
+            raise ValueError(f"a {self.status} item names w, h and bbox")
+        if self.status in ("empty_cut", "unreadable") and self.bbox is not None:
+            raise ValueError(f"a {self.status} item has no bbox")
+        return self
+
+
+class CutoutPayload(BaseModel):
+    """cutout.schema.json — the receipt the pod PUTs to put_url. Every requested item is in `items` exactly once."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")     # the weights tar's sha256 (the request's weights.sha256)
+    torch: str = Field(min_length=1)                          # the runtime that ran it (== the manifest's)
+    torchvision: str = Field(min_length=1)
+    items: list[CutoutOut] = Field(min_length=1)
+    timings: CutoutTimings
+
+    @model_validator(mode="after")
+    def _once(self) -> "CutoutPayload":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("a cutout item is named once in the receipt")
+        return self
+
+
+ScreenQuadStatus = Literal["found", "none", "unreadable"]
+
+# One corner of a screen quad, [x, y] as fractions of the picture. Its OWN bounded type, never RectT: a screen's corner may lie a
+# little outside the frame (the pin's warp is clipped by the picture box), so [-0.25, 1.25]; a corner beyond that is
+# `screen_cut_by_frame`, a `none` (docs/research/pod-screen-quad.md, Condition 2).
+QUAD_FRACTION_MIN: Final = -0.25
+QUAD_FRACTION_MAX: Final = 1.25
+QuadPointT = Annotated[list[Annotated[float, Field(ge=QUAD_FRACTION_MIN, le=QUAD_FRACTION_MAX)]],
+                       Field(min_length=2, max_length=2)]
+QuadT = Annotated[list[QuadPointT], Field(min_length=4, max_length=4)]
+
+
+class ScreenQuadTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_s: float = Field(ge=0)      # Florence + SAM + quad fit, summed over the pictures that ran the models
+    wall_s: float = Field(ge=0)       # download excluded, upload excluded
+
+
+class ScreenQuadOut(BaseModel):
+    """One picture's named outcome. `found` carries the device face's 4 corners TL, TR, BR, BL as fractions of the picture
+    (the source after exif_transpose and the 2048 cap, `w` x `h`); `none` is a normal answer with its reasons; `unreadable`
+    is a file PIL cannot open. `surface` is always «device_face»: the quad covers the device FACE incl. its bezel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    status: ScreenQuadStatus
+    device: ScreenDevice
+    quad: QuadT | None = None
+    w: int | None = Field(default=None, ge=1)
+    h: int | None = Field(default=None, ge=1)
+    surface: Literal["device_face"] | None = None
+    glass: QuadT | None = None              # found only: the glass inside the face; absent when no glass candidate passed
+    mask: Literal[True] | None = None       # found only: the glass mask PNG was PUT to mask_url
+    reasons: list[str] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _shape_by_status(self) -> "ScreenQuadOut":
+        if self.status == "found":
+            if None in (self.quad, self.w, self.h, self.surface):
+                raise ValueError("a found item names quad, w, h and surface")
+            if self.mask is not None and self.glass is None:
+                raise ValueError("a mask is put only with its glass")
+        else:
+            if self.quad is not None or self.surface is not None or self.glass is not None or self.mask is not None:
+                raise ValueError(f"a {self.status} item names no quad, surface, glass and mask")
+            if self.status == "none" and self.reasons is None:
+                raise ValueError("a none item names its reasons")
+            if self.status == "unreadable" and (self.reasons is not None or self.w is not None or self.h is not None):
+                raise ValueError("an unreadable item names nothing but its id and device")
+        return self
+
+
+class ScreenQuadPayload(BaseModel):
+    """screen_quad.schema.json — the receipt the pod PUTs to put_url. Every requested item is in `items` exactly once."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")     # the weights tar's sha256 (the request's weights.sha256)
+    torch: str = Field(min_length=1)                          # the runtime that ran it (== the manifest's)
+    torchvision: str = Field(min_length=1)
+    transformers: str = Field(min_length=1)
+    # the EFFECTIVE Florence generation config (the snapshot's own generation settings under the call's overrides), Condition 8
+    generation: dict[str, int | float | bool | str | None]
+    items: list[ScreenQuadOut] = Field(min_length=1)
+    timings: ScreenQuadTimings
+
+    @model_validator(mode="after")
+    def _once(self) -> "ScreenQuadPayload":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("a screen_quad item is named once in the receipt")
+        return self
+
+
+BBoxFractionsT = Annotated[list[Annotated[float, Field(ge=0, le=1)]], Field(min_length=4, max_length=4)]
+
+
+class ObjectMaskOut(BaseModel):
+    """object_mask.schema.json — one picture's named outcome. `found` carries the mask's bounding box [x, y, w, h] as fractions
+    of the picture (`w` x `h` px: the source after exif_transpose and the 2048 cap); `none` is a normal answer with its
+    reasons; `unreadable` is a file PIL cannot open. The cut PNG (and the mask PNG when asked) were PUT only for `found`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    status: ScreenQuadStatus
+    w: int | None = Field(default=None, ge=1)
+    h: int | None = Field(default=None, ge=1)
+    bbox: BBoxFractionsT | None = None
+    reasons: list[str] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _shape_by_status(self) -> "ObjectMaskOut":
+        if self.status == "found":
+            if None in (self.bbox, self.w, self.h):
+                raise ValueError("a found item names bbox, w and h")
+        else:
+            if self.bbox is not None:
+                raise ValueError(f"a {self.status} item names no bbox")
+            if self.status == "none" and self.reasons is None:
+                raise ValueError("a none item names its reasons")
+            if self.status == "unreadable" and (self.reasons is not None or self.w is not None or self.h is not None):
+                raise ValueError("an unreadable item names nothing but its id")
+        return self
+
+
+class ObjectMaskPayload(BaseModel):
+    """The object_mask receipt the pod PUTs to put_url: the runtime that ran it and every requested item once (its rows are
+    object_mask.schema.json)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    torch: str = Field(min_length=1)
+    torchvision: str = Field(min_length=1)
+    transformers: str = Field(min_length=1)
+    generation: dict[str, int | float | bool | str | None]
+    items: list[ObjectMaskOut] = Field(min_length=1)
+    timings: ScreenQuadTimings
+
+    @model_validator(mode="after")
+    def _once(self) -> "ObjectMaskPayload":
+        ids = [i.id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("an object_mask item is named once in the receipt")
+        return self
 
 
 def _json_number(value: Any) -> Any:

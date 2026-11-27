@@ -1,0 +1,12 @@
+{
+  "infer_version": 7,
+  "job_id": "job_9f2c1a",
+  "kind": "person_matte",
+  "model": "rvm_mobilenetv3_fp16",
+  "put_url": "https://storage.example/o/20411.json?sig=PUT",
+  "person_matte": {
+    "video_url": "https://storage.example/o/14311.mp4?sig=GET",
+    "downsample_ratio": 0.375,
+    "cutout_put_url": "https://storage.example/o/20412.webm?sig=PUT"
+  }
+}

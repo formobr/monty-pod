@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/clean_plate.schema.json",
+  "title": "CleanPlatePayload — the clean_plate receipt the pod PUTs to put_url",
+  "description": "One row per window: in `plates` (drawn, PUT to the window's put_url) or in `refused` (named with the reason). `covered` + `inpainted` = 1: the share of the frame that is the median of real background pixels and the share LaMa drew.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "model",
+    "model_sha256",
+    "width",
+    "height",
+    "timings"
+  ],
+  "anyOf": [
+    {
+      "properties": {
+        "plates": {
+          "minItems": 1
+        }
+      },
+      "required": [
+        "plates"
+      ]
+    },
+    {
+      "properties": {
+        "refused": {
+          "minItems": 1
+        }
+      },
+      "required": [
+        "refused"
+      ]
+    }
+  ],
+  "properties": {
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decode_s",
+        "median_s",
+        "inpaint_s",
+        "wall_s"
+      ],
+      "properties": {
+        "decode_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "median_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "inpaint_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "wall_s": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "plates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "bytes",
+          "sha256",
+          "samples",
+          "covered",
+          "inpainted"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "samples": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "covered": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "inpainted": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        }
+      }
+    },
+    "refused": {
+      "description": "windows the pod would not draw a plate for (a hole larger than the request's max_hole_fraction, a window outside the video); the other windows are unaffected",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "reason"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

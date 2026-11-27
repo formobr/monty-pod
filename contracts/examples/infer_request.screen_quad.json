@@ -1,0 +1,27 @@
+{
+  "infer_version": 7,
+  "job_id": "job_5d21c7",
+  "kind": "screen_quad",
+  "model": "florence2_base_sam2_1_base_plus",
+  "put_url": "https://storage.example/o/50411.json?sig=PUT",
+  "weights": {
+    "url": "https://storage.example/o/50400.tar?sig=GET",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "size": 790000000
+  },
+  "screen_quad": {
+    "items": [
+      {
+        "id": "phone-1",
+        "src_url": "https://storage.example/o/50412.jpg?sig=GET",
+        "device": "phone",
+        "mask_url": "https://storage.example/o/50413.png?sig=PUT"
+      },
+      {
+        "id": "laptop-1",
+        "src_url": "https://storage.example/o/50414.jpg?sig=GET",
+        "device": "laptop"
+      }
+    ]
+  }
+}

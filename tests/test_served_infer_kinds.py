@@ -2,6 +2,7 @@
 a cassette-replayed release smoke sends no align / clip_rank, so the pod must not need the card for them."""
 from __future__ import annotations
 
+import typing
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from podagent import infer_cliprank
 from podagent import infer_lanes as lanes
 from podagent import main as agent_main
+from podagent.models import InferKind
 
 _W = {"url": "https://x/w.tar", "sha256": "b" * 64}
 _RANK_REQ = {"infer_version": 7, "job_id": "j", "kind": "clip_rank", "model": "siglip",
@@ -59,16 +61,17 @@ def test_a_pod_serves_and_sizes_only_its_given_infer_kinds(monkeypatch, tmp_path
     # the floor follows the served set, plus one NVENC session for the render ops every full pod serves
     # (infer_lanes.RENDER_HEADROOM_WHY)
     assert agent_main.boot_vram_floor_mib({"clip_rank", "align"}) == 4208.0
-    assert agent_main.boot_vram_floor_mib({"align"}) == 2972.0
+    # align = 1244 resident + 518 for one 20 s window (infer_lanes.HEAVY_LANE_MEASURED_WHY) + 960 NVENC + 512
+    assert agent_main.boot_vram_floor_mib({"align"}) == 3234.0
     assert agent_main.boot_vram_floor_mib({"face_probe"}) == 1472.0
     assert agent_main.boot_vram_floor_mib(set()) == 1472.0
     assert agent_main.boot_vram_floor_mib({"clip_rank", "align"}, render=False) == 3248.0
-    assert agent_main.boot_vram_floor_mib({"align"}, render=False) == 2012.0
+    assert agent_main.boot_vram_floor_mib({"align"}, render=False) == 2274.0
     assert agent_main.boot_vram_floor_mib({"face_probe"}, render=False) is None
     assert agent_main.boot_vram_floor_mib(set(), render=False) is None
 
     # unset env = every kind, the fleet floor
-    assert lanes.served_kinds(None) == frozenset({"align", "clip_rank", "face_probe"})
+    assert lanes.served_kinds(None) == frozenset(typing.get_args(InferKind))
     assert agent_main.boot_vram_floor_mib() == 4208.0
     with pytest.raises(SystemExit) as exc:
         _boot(monkeypatch, env=None, free=3236.0)          # the 2026-10-02 laptop, all kinds

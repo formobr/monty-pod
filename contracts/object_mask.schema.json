@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "monty-pod/contracts/object_mask.schema.json",
+  "title": "ObjectMaskOut — one row of the object_mask receipt (the receipt the pod PUTs to put_url carries one row per requested picture in `items`)",
+  "description": "One picture's NAMED outcome for the noun phrase asked of it. `found`: the object was cut — the RGBA PNG went to the item's cut_url (and the grey mask PNG to mask_url when given); `w`/`h` = the size of the picture those files and the fractions are of (the source after exif_transpose, transparency composited on white, and the 2048 long-side cap); `bbox` = the mask's bounding box [x, y, w, h] as fractions of that picture. `none`: no object of that phrase was found — a normal answer, `reasons` names why, nothing was PUT. `unreadable`: the source bytes are not a picture, nothing was PUT. The receipt itself is {model, model_sha256, torch, torchvision, transformers, generation, items: [row, …], timings: {model_s, wall_s}}, the screen_quad receipt's envelope with these rows.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "found",
+        "none",
+        "unreadable"
+      ]
+    },
+    "w": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "h": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "bbox": {
+      "description": "found only: [x, y, w, h], the mask's bounding box as fractions of the picture, each in [0, 1]",
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      }
+    },
+    "reasons": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "found"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "bbox",
+          "w",
+          "h"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "bbox"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "none"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reasons"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "unreadable"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "reasons"
+              ]
+            },
+            {
+              "required": [
+                "w"
+              ]
+            },
+            {
+              "required": [
+                "h"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
